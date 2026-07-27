@@ -16,6 +16,87 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+/// The `RAEEN_*` variables Settings bridges to the guest runtime: the
+/// Advanced dump/trace toggles plus Video ▸ Frame Limit. One list shared by
+/// the startup bridge in `main.rs` and the per-launch runner environment
+/// below, so the two can never drift.
+pub(crate) const RUNNER_ENV_VARS: &[&str] = &[
+    "RAEEN_DUMP_SHADERS",
+    "RAEEN_DUMP_GPU_RESOURCES",
+    "RAEEN_TRACE_HLE",
+    "RAEEN_DUMP_FRAMES",
+    "RAEEN_CALL_STATS",
+    "RAEEN_STALL_DUMP",
+    "RAEEN_VBLANK_HZ",
+];
+
+/// Names from [`RUNNER_ENV_VARS`] that were already set in the environment
+/// when Raeen started — a developer's manual override, which always wins over
+/// the Settings toggles. Recorded once in `main` before the startup bridge
+/// writes anything.
+fn dev_env_overrides() -> &'static std::sync::OnceLock<std::collections::HashSet<String>> {
+    static OVERRIDES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    &OVERRIDES
+}
+
+/// Record which [`RUNNER_ENV_VARS`] the environment already carried at
+/// startup. Call from `main` **before** the startup env bridge runs.
+pub(crate) fn record_dev_env_overrides() {
+    let set = RUNNER_ENV_VARS
+        .iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .map(|name| (*name).to_string())
+        .collect();
+    let _ = dev_env_overrides().set(set);
+}
+
+/// The environment the next isolated-runner child receives, derived from the
+/// launching title's *effective* config (global settings + per-game
+/// overrides). `Some(value)` sets the variable on the child, `None` removes
+/// it — so turning an Advanced toggle Off in Settings really turns the dump
+/// off for the next launch even though the Shell's own environment still
+/// carries the startup bridge's value.
+fn runner_env() -> &'static Mutex<Vec<(String, Option<String>)>> {
+    static ENV: std::sync::OnceLock<Mutex<Vec<(String, Option<String>)>>> =
+        std::sync::OnceLock::new();
+    ENV.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Build the per-launch runner environment from an effective config and stage
+/// it for the next spawn. Variables the developer set manually at startup are
+/// skipped (the child inherits them from the Shell's environment instead).
+pub(crate) fn stage_runner_env(config: &raeen_core::config::EmulatorConfig) {
+    let flag = |on: bool| if on { Some("1".to_string()) } else { None };
+    let pairs = vec![
+        ("RAEEN_DUMP_SHADERS", flag(config.debug.dump_shaders)),
+        (
+            "RAEEN_DUMP_GPU_RESOURCES",
+            flag(config.debug.dump_gpu_commands),
+        ),
+        ("RAEEN_TRACE_HLE", flag(config.debug.trace_syscalls)),
+        ("RAEEN_DUMP_FRAMES", flag(config.debug.dump_frames)),
+        ("RAEEN_CALL_STATS", flag(config.debug.call_stats)),
+        ("RAEEN_STALL_DUMP", flag(config.debug.stall_dump)),
+        (
+            "RAEEN_VBLANK_HZ",
+            Some(config.graphics.frame_limit.to_string()),
+        ),
+    ];
+    let overrides = dev_env_overrides().get();
+    *runner_env().lock().unwrap() = pairs
+        .into_iter()
+        .filter(|(name, _)| !overrides.is_some_and(|o| o.contains(*name)))
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+}
+
+/// Test-only view of the currently staged runner environment.
+#[cfg(test)]
+pub(crate) fn staged_runner_env() -> Vec<(String, Option<String>)> {
+    runner_env().lock().unwrap().clone()
+}
+
 /// Opaque handle to a launched session, returned by [`GameLauncher::launch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionHandle(u64);
@@ -325,16 +406,30 @@ fn run_isolated_child(
             return SessionOutcome::Faulted(format!("Cannot locate raeen runner: {error}"));
         }
     };
-    let mut child = match std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    command
         .arg("--run-eboot")
         .arg(path)
         .env("RAEEN_RUNNER_CHILD", "1")
         .env(raeen_gpu::frame_ipc::FRAME_IPC_ENV, frame_receiver.name())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::inherit());
+    // The launching title's effective Settings (Advanced dumps, Frame Limit),
+    // staged by the Shell just before launch. Explicit set/remove per var so
+    // the child sees the *current* Settings, not whatever the Shell's own
+    // environment was frozen to at startup.
+    for (name, value) in runner_env().lock().unwrap().iter() {
+        match value {
+            Some(value) => {
+                command.env(name, value);
+            }
+            None => {
+                command.env_remove(name);
+            }
+        }
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             raeen_gpu::frame_ipc::clear_receiver(&frame_receiver);
@@ -498,7 +593,10 @@ impl FirmwareLauncher {
         path: &Path,
         #[cfg(target_os = "windows")] process: std::sync::Arc<std::sync::Mutex<ProcessControl>>,
     ) -> SessionOutcome {
-        let bytes = match std::fs::read(path) {
+        // Memory-mapped: the eboot is the largest single file on the launch
+        // path; mapping starts parsing immediately instead of after a full
+        // buffered copy.
+        let bytes = match raeen_loader::mapped::MappedFile::open(path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 return SessionOutcome::Faulted(format!(
@@ -553,8 +651,12 @@ impl FirmwareLauncher {
         let linked = match loaded.map(|process| process.linked) {
             Ok(linked) => linked,
             Err(FirmwareError::MissingKey { .. }) => {
+                // Honest about the current state: `key_provider_path` is
+                // stored by Settings but no file-based KeyProvider consumes
+                // it yet — the launcher always runs `NoKeysProvider`.
                 return SessionOutcome::Faulted(
-                    "Encrypted module — no KeyProvider configured (Settings ▸ Key Provider)"
+                    "Encrypted module — decryption needs user-supplied keys, and key-provider \
+                     support is not implemented yet"
                         .to_string(),
                 );
             }
@@ -910,6 +1012,33 @@ mod tests {
         LaunchTarget::Game {
             path: PathBuf::from("Games/nova/eboot.bin"),
         }
+    }
+
+    #[test]
+    fn stage_runner_env_maps_settings_to_set_and_remove() {
+        let mut config = raeen_core::config::EmulatorConfig::default();
+        config.debug.dump_shaders = true;
+        config.debug.dump_frames = false;
+        config.graphics.frame_limit = 120;
+        stage_runner_env(&config);
+        let staged = staged_runner_env();
+        let get = |name: &str| {
+            staged
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .expect("var must be staged")
+        };
+        // On → set "1"; Off → explicit remove (the child must not inherit a
+        // stale startup value); Frame Limit always carries its number.
+        assert_eq!(get("RAEEN_DUMP_SHADERS"), Some("1".to_string()));
+        assert_eq!(get("RAEEN_DUMP_FRAMES"), None);
+        assert_eq!(get("RAEEN_VBLANK_HZ"), Some("120".to_string()));
+        assert_eq!(
+            staged.len(),
+            RUNNER_ENV_VARS.len(),
+            "every bridged variable is staged when no dev override exists"
+        );
     }
 
     #[test]

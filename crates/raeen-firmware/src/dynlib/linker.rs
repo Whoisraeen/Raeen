@@ -26,7 +26,10 @@
 //! rebase before this image-relative assumption holds; that's out of LM1
 //! scope.
 
-use std::collections::HashMap;
+// FxHashMap: NID/address lookups run once per relocation (~719k in the
+// measured retail title) with small integer/string keys we build ourselves —
+// SipHash's DoS resistance buys nothing here and costs on every probe.
+use rustc_hash::FxHashMap as HashMap;
 
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 use raeen_core::error::FirmwareError;
@@ -492,7 +495,7 @@ fn link_inner(
     // A large C++ title may carry hundreds of thousands of relocations but
     // only tens of thousands of symbols. Provider lookup, NID resolution, and
     // marker allocation are symbol properties, so perform them once per r_sym.
-    let mut import_cache: HashMap<usize, CachedImport> = HashMap::new();
+    let mut import_cache: HashMap<usize, CachedImport> = HashMap::default();
     let relocation_started = std::time::Instant::now();
 
     for reloc in &dynlib.relocations {

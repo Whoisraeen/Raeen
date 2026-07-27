@@ -4461,3 +4461,51 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   stashing this session's gpu changes — still fails). Spawned follow-up task.
   Also: Application Control policy blocks cargo-clippy + some fresh test
   exes (kyty-graphics gcn_to_spirv) — environmental, os error 4551.
+
+## 2026-07-27 (later) — GPU test unblocked; Game Folders UX; settings-backend audit
+* shader_memory_phase2 FIXED: not a code regression — persistent shader cache
+  (default ON, `shader_cache/` under test CWD) served the fixture PS from a
+  prior run's disk entry, so `translated_ok` never incremented. Tests now
+  disable the persistent cache (hermetic; passes repeatedly); stale
+  crates/raeen-gpu/shader_cache removed. NOTE: user separately started the
+  spawned fix-task chip — that worktree session is now redundant.
+* game-folders UX: complete (raeen-gui 169/169). Settings ▸ Game Folders adds
+  "Browse & Add Folder…" (rfd native picker, new workspace dep rfd 0.15) and
+  "Rescan Games"; any folder add/remove auto-rescans. Shell::rescan_library
+  swaps library/meta/ledgers/covers/key-art/nav rail in place
+  (NavState::set_games_rail, tested); verified live (rescanned count=9).
+* settings-backend audit: Advanced dumps + Frame Limit now REALLY apply on
+  next launch — launcher::stage_runner_env stages explicit set/remove env for
+  the isolated runner child from the per-game *effective* config (dev env
+  vars recorded at startup still win; unit-tested). Previously env was bridged
+  once at Shell startup only, and Off could never unset. Honest-hint pass:
+  VSync = restart; Spatial Audio + DualSense Features labeled reserved (no
+  consumer exists — raeen_audio mixer is stereo-only, InputManager never
+  constructed); encrypted-SELF fault message no longer points at Settings ▸
+  Key Provider (key_provider_path is stored but unconsumed; file KeyProvider
+  is future work).
+
+## 2026-07-27 (later still) — PS5-style Settings redesign; wallpapers; sound packs
+* settings-redesign: complete (raeen-gui 173/173 + audio/core green). Settings
+  rebuilt PS5-style: icon sidebar (9 new/reused painter glyphs — Monitor,
+  Folder, Key, Palette, Puzzle, Wrench added to icons.rs), row cards with
+  rounded focus fill + accent bar, right-aligned values, top sheen gradient,
+  per-section hints. CLICK-ALIGNMENT FIXED STRUCTURALLY: every row/sidebar
+  entry is an allocated egui widget so hit rect == painted rect (the old
+  fixed-28px overlay grid drifted from the painted pitch). Verified live.
+* wallpapers: complete. `wallpapers/` (user-supplied images) + Settings ▸
+  Theme ▸ Wallpaper cycles them; overrides theme background, applies live,
+  persists as general.wallpaper. settings::available_wallpapers tested.
+* ui-sound-packs: complete. `sounds/<pack>/` with move/confirm/back/launch
+  .wav (hound-decoded, mono→stereo, 5s cap); raeen-audio gains a UI ring
+  mixed additively over guest PCM in the cpal callback (clamped, respects
+  volume/enable, never touches guest submit diagnostics). Settings ▸ Audio ▸
+  UI Sound Pack cycles with audible preview; cues wired to nav moves,
+  confirm/back, launch, and all pointer paths. shell/sounds.rs tested
+  (decode, widen, listing).
+* new workspace crates: rfd 0.15 (folder picker), hound 3.5 (wav), opener
+  0.7 (plugins-folder open — replaced manual explorer spawn). Candidates
+  noted for later: notify (auto-rescan watcher).
+* NOTE: user has parallel Codex sessions building in this repo — watch the
+  target/ lock (cargo-parallel-build-deadlock memory) and expect screenshots
+  to be occluded by their windows.

@@ -1154,7 +1154,9 @@ pub fn load_process(
             );
         }
 
-        let dep_bytes = match std::fs::read(&path) {
+        // Memory-mapped: NEEDED modules can be large, and this loop runs once
+        // per dependency — map instead of copying the whole file up front.
+        let dep_bytes = match raeen_loader::mapped::MappedFile::open(&path) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(

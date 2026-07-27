@@ -18,6 +18,7 @@ pub mod nav;
 pub mod per_game;
 pub(crate) mod present;
 pub mod settings;
+pub mod sounds;
 
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
 use crate::library::{Gradient, LaunchTarget, LibraryItem, MetaCache};
@@ -87,6 +88,12 @@ struct ActiveSession {
 
 /// Cap on the Switcher's recent-titles history (spec §10).
 const MAX_RECENT_TITLES: usize = 6;
+
+/// User-supplied UI sound packs live under `sounds/<pack>/` (repo-root
+/// relative, like `themes/` and `Games/`).
+const SOUNDS_ROOT: &str = "sounds";
+/// User-supplied wallpapers live directly under `wallpapers/`.
+const WALLPAPERS_ROOT: &str = "wallpapers";
 
 /// Stick deflection that registers as a menu-navigation step.
 const STICK_NAV_PRESS: f32 = 0.6;
@@ -211,6 +218,9 @@ pub struct Shell {
     /// Latched left-stick state so analog flicks navigate menus like the
     /// D-pad, one step per flick (see [`StickNav`]).
     stick_nav: StickNav,
+    /// The active UI sound pack (Settings ▸ Audio ▸ UI Sound Pack) — the
+    /// silent pack when `"off"` or nothing decodes.
+    sound_pack: sounds::SoundPack,
     /// Ids of launched titles, most-recent-first, deduplicated and capped —
     /// backs the Control Center's Switcher panel (spec §10).
     recent: Vec<String>,
@@ -338,7 +348,8 @@ impl Shell {
         let (updater_tx, updater_rx) = std::sync::mpsc::channel();
 
         theme::install_fonts(ctx, &theme);
-        let background_texture = background_texture_for(ctx, &theme);
+        let background_texture = wallpaper_texture_for(ctx, &config.general.wallpaper)
+            .or_else(|| background_texture_for(ctx, &theme));
         let cover_textures = cover_textures_for(ctx, &library);
         let game_backgrounds = background_textures_for(ctx, &library);
         // Seed the hero background with the initially-focused tile's key art.
@@ -360,6 +371,10 @@ impl Shell {
             gilrs,
             native_input: raeen_input::NativeGamepads::start(),
             stick_nav: StickNav::default(),
+            sound_pack: sounds::SoundPack::load(
+                std::path::Path::new(SOUNDS_ROOT),
+                &config.general.sound_pack,
+            ),
             recent: Vec::new(),
             config,
             config_path,
@@ -492,7 +507,9 @@ impl Shell {
         }
 
         for input in inputs {
-            match self.nav.apply(input) {
+            let action = self.nav.apply(input);
+            self.play_nav_sound(input, action);
+            match action {
                 NavAction::Launch(index) => self.begin_launch(index),
                 NavAction::LaunchMedia(index) => self.confirm_media(index),
                 NavAction::ActivateOption { card, option } => {
@@ -522,6 +539,29 @@ impl Shell {
                 | NavAction::None => {}
             }
         }
+    }
+
+    /// Voice one navigation step through the active UI sound pack. Launch is
+    /// deliberately absent — `begin_launch` plays the launch cue itself so
+    /// pointer-initiated launches sound identical to pad ones.
+    fn play_nav_sound(&self, input: NavInput, action: NavAction) {
+        use sounds::UiSound;
+        let sound = match action {
+            NavAction::Launch(_) => return,
+            NavAction::CloseControlCenter
+            | NavAction::CloseSettings
+            | NavAction::CloseGameOptions => UiSound::Back,
+            _ => match input {
+                NavInput::Left
+                | NavInput::Right
+                | NavInput::Up
+                | NavInput::Down
+                | NavInput::Tab => UiSound::Move,
+                NavInput::Confirm | NavInput::Options | NavInput::Guide => UiSound::Confirm,
+                NavInput::Back => UiSound::Back,
+            },
+        };
+        self.sound_pack.play(sound);
     }
 
     /// Confirm on a Media-tab tile (spec §10 SM2). There is no media
@@ -693,6 +733,17 @@ impl Shell {
                 raeen_audio::output::set_volume(self.config.audio.volume);
             }
             (1, 2) => self.config.audio.spatial_audio = !self.config.audio.spatial_audio,
+            (1, 3) => {
+                let packs = sounds::available_packs(std::path::Path::new(SOUNDS_ROOT));
+                self.config.general.sound_pack =
+                    settings::cycle_option(&self.config.general.sound_pack, delta, &packs);
+                self.sound_pack = sounds::SoundPack::load(
+                    std::path::Path::new(SOUNDS_ROOT),
+                    &self.config.general.sound_pack,
+                );
+                // Audible preview so cycling packs is self-demonstrating.
+                self.sound_pack.play(sounds::UiSound::Confirm);
+            }
             (2, 0) => self.config.input.dualsense_features = !self.config.input.dualsense_features,
             (2, 1) => {
                 self.config.input.deadzone =
@@ -703,6 +754,12 @@ impl Shell {
                     self.config.input.controller_icon_style.cycle(delta)
             }
             (settings::SECTION_THEME, 0) => self.cycle_theme(ctx, delta),
+            (settings::SECTION_THEME, 1) => {
+                let options = settings::available_wallpapers(std::path::Path::new(WALLPAPERS_ROOT));
+                self.config.general.wallpaper =
+                    settings::cycle_option(&self.config.general.wallpaper, delta, &options);
+                self.refresh_background(ctx);
+            }
             (settings::SECTION_ADVANCED, 0) => {
                 self.config.debug.logging = !self.config.debug.logging;
                 self.apply_log_settings();
@@ -757,7 +814,7 @@ impl Shell {
             | settings::SECTION_CONTROLLER
             | settings::SECTION_THEME
             | settings::SECTION_ADVANCED => self.apply_setting_adjust(ctx, section, row, 1),
-            settings::SECTION_GAME_FOLDERS => self.activate_game_folder_row(row),
+            settings::SECTION_GAME_FOLDERS => self.activate_game_folder_row(ctx, row),
             settings::SECTION_PLUGINS => self.activate_plugin_row(row),
             settings::SECTION_SYSTEM => self.activate_system_row(ctx, row),
             _ => {} // Key Provider: pure text-entry, nothing to "confirm".
@@ -824,23 +881,79 @@ impl Shell {
         }
     }
 
-    /// Confirm within the Game Folders section: the last row ("Add
-    /// Folder") pushes the typed path; any other row removes that folder.
-    fn activate_game_folder_row(&mut self, row: usize) {
+    /// Confirm within the Game Folders section: a folder row removes that
+    /// folder; "Add Folder" pushes the typed path; "Browse & Add Folder"
+    /// opens the system folder picker; "Rescan Games" re-reads the folders.
+    /// Any folder change rescans the library immediately, so the Home rail
+    /// always reflects the folder list Settings shows.
+    fn activate_game_folder_row(&mut self, ctx: &egui::Context, row: usize) {
         let folder_count = self.config.paths.game_folders.len();
-        if row == folder_count {
+        let mut folders_changed = false;
+        if row < folder_count {
+            self.config.paths.game_folders.remove(row);
+            folders_changed = true;
+        } else if row == folder_count {
             let trimmed = self.settings_new_folder_input.trim();
             if !trimmed.is_empty() {
-                let path = PathBuf::from(trimmed);
-                if !self.config.paths.game_folders.contains(&path) {
-                    self.config.paths.game_folders.push(path);
-                }
+                folders_changed = self.add_game_folder(PathBuf::from(trimmed));
                 self.settings_new_folder_input.clear();
             }
-        } else if row < folder_count {
-            self.config.paths.game_folders.remove(row);
+        } else if row == folder_count + 1 {
+            // Native folder picker. Blocks the UI thread for the dialog's
+            // lifetime — standard native-app behavior, and the Shell has no
+            // background work a modal pick would starve.
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Add Game Folder")
+                .pick_folder()
+            {
+                folders_changed = self.add_game_folder(path);
+            }
+        } else if row == folder_count + 2 {
+            self.rescan_library(ctx);
         }
-        self.refresh_settings_row_counts();
+        if folders_changed {
+            self.refresh_settings_row_counts();
+            self.rescan_library(ctx);
+        }
+    }
+
+    /// Append a game folder if it is not already configured. Returns whether
+    /// the list changed.
+    fn add_game_folder(&mut self, path: PathBuf) -> bool {
+        if self.config.paths.game_folders.contains(&path) {
+            return false;
+        }
+        self.config.paths.game_folders.push(path);
+        true
+    }
+
+    /// Re-scan the configured game folders and swap the Home library in
+    /// place: items, metadata, ledgers, cover/key-art textures, and the nav
+    /// rail follow the new list; navigation mode and Settings focus are
+    /// untouched, so a rescan from Settings stays in Settings.
+    fn rescan_library(&mut self, ctx: &egui::Context) {
+        let mut library = crate::app::scan_game_folders(&self.config.paths.game_folders);
+        if library.is_empty() {
+            library = crate::library::sample_library();
+        } else {
+            library.extend(crate::library::built_in_apps());
+        }
+
+        self.meta_cache = MetaCache::from_items(&library);
+        let ledger_dir = self.ledger_dir();
+        self.ledgers = library
+            .iter()
+            .map(|item| (item.id.clone(), ledger::load(&ledger_dir, &item.id)))
+            .collect();
+        self.cover_textures = cover_textures_for(ctx, &library);
+        self.game_backgrounds = background_textures_for(ctx, &library);
+        let settings_tile_index = library.iter().position(|item| item.id == "settings");
+        self.nav.set_games_rail(library.len(), settings_tile_index);
+        self.library = library;
+        // Old texture handles may be stale — force the hero refresh path in
+        // `tick_animations` to re-resolve the focused tile's art.
+        self.last_rail_index = usize::MAX;
+        tracing::info!(count = self.library.len(), "game library rescanned");
     }
 
     /// Re-derive the Settings nav's per-section row counts from the live
@@ -881,8 +994,15 @@ impl Shell {
         let theme =
             theme::loader::load_theme(&self.themes_root, &self.config.general.selected_theme);
         theme::install_fonts(ctx, &theme);
-        self.background_texture = background_texture_for(ctx, &theme);
         self.theme = theme;
+        self.refresh_background(ctx);
+    }
+
+    /// Resolve the Home background: the configured wallpaper wins, else the
+    /// active theme's own background, else none (mesh-gradient hero).
+    fn refresh_background(&mut self, ctx: &egui::Context) {
+        self.background_texture = wallpaper_texture_for(ctx, &self.config.general.wallpaper)
+            .or_else(|| background_texture_for(ctx, &self.theme));
     }
 
     /// Handle Confirm on a Control Center card's option list (currently
@@ -1138,10 +1258,15 @@ impl Shell {
         } else {
             "off"
         });
+        // Stage the Advanced dump/trace toggles + Frame Limit for the isolated
+        // runner child, so "applies on the next launch" is actually true and
+        // per-game overrides reach the guest process.
+        crate::launcher::stage_runner_env(&effective);
 
         self.session_quit_hold.reset();
         match self.launcher.launch(&item.launch) {
             Ok(handle) => {
+                self.sound_pack.play(sounds::UiSound::Launch);
                 push_recent(&mut self.recent, &item.id, MAX_RECENT_TITLES);
                 // Session ledger: stamp the launch immediately (a crash later
                 // must not lose the "last played" fact).
@@ -1390,6 +1515,7 @@ impl Shell {
             );
         });
         if clicked_gear {
+            self.sound_pack.play(sounds::UiSound::Confirm);
             self.nav.mode = NavMode::Settings;
             self.nav.settings_section = 0;
             self.nav.settings_row = 0;
@@ -1399,6 +1525,7 @@ impl Shell {
             // Clicking a pill focuses and activates it in one go — the same
             // path a pad Confirm takes, so tab switching / opening Settings
             // stay in one place (`nav::apply_pills`).
+            self.sound_pack.play(sounds::UiSound::Confirm);
             self.nav.mode = NavMode::Pills;
             self.nav.pill_index = pill;
             if self.nav.apply(NavInput::Confirm) == NavAction::OpenSettings {
@@ -1416,6 +1543,7 @@ impl Shell {
                     // Focus the clicked card; a second meaning (drilling into
                     // its option list) comes from the same Confirm the pad
                     // uses, so display-only cards simply focus.
+                    self.sound_pack.play(sounds::UiSound::Move);
                     self.nav.mode = NavMode::ControlCenter;
                     self.nav.cc_index = index;
                     self.nav.apply(NavInput::Confirm);
@@ -1423,6 +1551,7 @@ impl Shell {
                 control_center::CcClick::Option(option) => {
                     // Drill into the focused card's list if not already there,
                     // select the clicked line, and activate it.
+                    self.sound_pack.play(sounds::UiSound::Confirm);
                     if self.nav.mode == NavMode::ControlCenter {
                         self.nav.apply(NavInput::Confirm);
                     }
@@ -1437,6 +1566,7 @@ impl Shell {
                 }
                 control_center::CcClick::Dismiss => {
                     // Same as pressing Guide: close the overlay entirely.
+                    self.sound_pack.play(sounds::UiSound::Back);
                     self.nav.apply(NavInput::Guide);
                 }
             }
@@ -1444,7 +1574,9 @@ impl Shell {
         if let Some(index) = clicked_home_tile {
             self.nav.mode = NavMode::Home;
             self.nav.rail_index = index;
-            match self.nav.apply(NavInput::Confirm) {
+            let action = self.nav.apply(NavInput::Confirm);
+            self.play_nav_sound(NavInput::Confirm, action);
+            match action {
                 NavAction::Launch(index) => self.begin_launch(index),
                 NavAction::LaunchMedia(index) => self.confirm_media(index),
                 NavAction::OpenSettings => self.enter_settings(),
@@ -1454,17 +1586,25 @@ impl Shell {
         if let Some(clicked) = clicked_setting {
             match clicked {
                 settings::SettingsClick::Section(section) => {
+                    self.sound_pack.play(sounds::UiSound::Move);
                     self.nav.settings_section = section;
                     self.nav.settings_row = 0;
                 }
                 settings::SettingsClick::Row(row) => {
                     self.nav.settings_row = row;
-                    // Text-entry sections retain native egui widget behavior;
-                    // clicking other rows has the same meaning as Confirm.
-                    if !matches!(
-                        self.nav.settings_section,
-                        settings::SECTION_GAME_FOLDERS | settings::SECTION_KEY_PROVIDER
-                    ) {
+                    // Text-entry rows retain native egui widget behavior;
+                    // clicking any other row has the same meaning as Confirm
+                    // (in Game Folders that includes remove-on-click for
+                    // folder rows and the Browse/Rescan action rows).
+                    let is_text_row = match self.nav.settings_section {
+                        settings::SECTION_KEY_PROVIDER => true,
+                        settings::SECTION_GAME_FOLDERS => {
+                            row == self.config.paths.game_folders.len()
+                        }
+                        _ => false,
+                    };
+                    if !is_text_row {
+                        self.sound_pack.play(sounds::UiSound::Confirm);
                         self.apply_setting_activate(ctx, self.nav.settings_section, row);
                     }
                 }
@@ -1536,13 +1676,7 @@ fn open_plugins_folder() {
         tracing::warn!(error = %err, "could not create plugins/ directory");
         return;
     }
-    #[cfg(windows)]
-    let result = std::process::Command::new("explorer").arg(dir).spawn();
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(dir).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(dir).spawn();
-    if let Err(err) = result {
+    if let Err(err) = opener::open(dir) {
         tracing::warn!(error = %err, "could not open plugins/ in the file manager");
     }
 }
@@ -1675,6 +1809,22 @@ fn merge_pad_states(
 /// Upload `theme`'s background image (if any) to the GPU as a fresh
 /// texture. `None` when the theme carries no background — `home.rs` falls
 /// back to its mesh-gradient hero in that case (spec §6).
+/// Load a user wallpaper (`wallpapers/<file>`) as the Home background
+/// texture. `"off"`, a missing file, or a failed decode all yield `None` so
+/// the theme background (or gradient) shows instead — never an error.
+fn wallpaper_texture_for(ctx: &egui::Context, wallpaper: &str) -> Option<egui::TextureHandle> {
+    if wallpaper == "off" || wallpaper.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(WALLPAPERS_ROOT).join(wallpaper);
+    let Some(image) = theme::loader::load_image_file_capped(&path) else {
+        tracing::warn!(path = %path.display(), "wallpaper failed to load — using theme background");
+        return None;
+    };
+    let fitted = fit_texture_source(image, ctx.input(|i| i.max_texture_side));
+    Some(ctx.load_texture("raeen-wallpaper", fitted, egui::TextureOptions::LINEAR))
+}
+
 fn background_texture_for(ctx: &egui::Context, theme: &Theme) -> Option<egui::TextureHandle> {
     theme.assets.background.as_ref().map(|image| {
         let fitted = fit_texture_source((**image).clone(), ctx.input(|i| i.max_texture_side));
@@ -1726,24 +1876,33 @@ fn cover_textures_for(
     ctx: &egui::Context,
     library: &[LibraryItem],
 ) -> HashMap<String, egui::TextureHandle> {
-    let mut textures = HashMap::new();
-    for item in library {
-        let Some(path) = &item.cover_path else {
-            continue;
-        };
-        let Some(image) = theme::loader::load_image_file_capped(path) else {
-            tracing::warn!(path = %path.display(), title = %item.title, "cover image failed to load — using gradient art");
-            continue;
-        };
-        let fitted = fit_texture_source(image, ctx.input(|i| i.max_texture_side));
-        let texture = ctx.load_texture(
-            format!("raeen-cover-{}", item.id),
-            fitted,
-            egui::TextureOptions::LINEAR,
-        );
-        textures.insert(item.id.clone(), texture);
-    }
-    textures
+    use rayon::prelude::*;
+    let max_side = ctx.input(|i| i.max_texture_side);
+    // Decode + downscale in parallel (pure CPU work, one image per title —
+    // the startup/rescan hot spot for a big library); GPU upload stays
+    // serial on this thread because it needs the egui context.
+    let decoded: Vec<(String, egui::ColorImage)> = library
+        .par_iter()
+        .filter_map(|item| {
+            let path = item.cover_path.as_ref()?;
+            let Some(image) = theme::loader::load_image_file_capped(path) else {
+                tracing::warn!(path = %path.display(), title = %item.title, "cover image failed to load — using gradient art");
+                return None;
+            };
+            Some((item.id.clone(), fit_texture_source(image, max_side)))
+        })
+        .collect();
+    decoded
+        .into_iter()
+        .map(|(id, fitted)| {
+            let texture = ctx.load_texture(
+                format!("raeen-cover-{id}"),
+                fitted,
+                egui::TextureOptions::LINEAR,
+            );
+            (id, texture)
+        })
+        .collect()
 }
 
 /// Decode + upload each scanned game's key-art background — the title's own
@@ -1755,27 +1914,35 @@ fn background_textures_for(
     ctx: &egui::Context,
     library: &[LibraryItem],
 ) -> HashMap<String, egui::TextureHandle> {
-    let mut textures = HashMap::new();
-    for item in library {
-        let LaunchTarget::Game { path } = &item.launch else {
-            continue;
-        };
-        let Some(bg_path) = crate::library::scan::title_background(path) else {
-            continue;
-        };
-        let Some(image) = theme::loader::load_image_file_capped(&bg_path) else {
-            tracing::warn!(path = %bg_path.display(), title = %item.title, "background image failed to load — using gradient hero");
-            continue;
-        };
-        let fitted = fit_texture_source(image, ctx.input(|i| i.max_texture_side));
-        let texture = ctx.load_texture(
-            format!("raeen-bg-{}", item.id),
-            fitted,
-            egui::TextureOptions::LINEAR,
-        );
-        textures.insert(item.id.clone(), texture);
-    }
-    textures
+    use rayon::prelude::*;
+    let max_side = ctx.input(|i| i.max_texture_side);
+    // Same split as `cover_textures_for`: parallel decode of the (often 4K)
+    // key art, serial upload.
+    let decoded: Vec<(String, egui::ColorImage)> = library
+        .par_iter()
+        .filter_map(|item| {
+            let LaunchTarget::Game { path } = &item.launch else {
+                return None;
+            };
+            let bg_path = crate::library::scan::title_background(path)?;
+            let Some(image) = theme::loader::load_image_file_capped(&bg_path) else {
+                tracing::warn!(path = %bg_path.display(), title = %item.title, "background image failed to load — using gradient hero");
+                return None;
+            };
+            Some((item.id.clone(), fit_texture_source(image, max_side)))
+        })
+        .collect();
+    decoded
+        .into_iter()
+        .map(|(id, fitted)| {
+            let texture = ctx.load_texture(
+                format!("raeen-bg-{id}"),
+                fitted,
+                egui::TextureOptions::LINEAR,
+            );
+            (id, texture)
+        })
+        .collect()
 }
 
 fn draw_session_overlay(

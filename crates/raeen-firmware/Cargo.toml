@@ -19,3 +19,12 @@ iced-x86 = { workspace = true }
 memchr = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+# NID-link / lookup benchmarks (`cargo bench -p raeen-firmware`).
+criterion = { workspace = true }
+
+[[bench]]
+name = "nid_link"
+harness = false

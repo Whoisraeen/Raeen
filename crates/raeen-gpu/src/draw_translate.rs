@@ -420,10 +420,18 @@ fn vulkan_format(
         (0xa, 6, 0) => Ok(vk::Format::R8G8B8A8_SRGB),
         (0xa, 0, 1) => Ok(vk::Format::B8G8R8A8_UNORM),
         (0xa, 6, 1) => Ok(vk::Format::B8G8R8A8_SRGB),
+        // 32 FLOAT (CB format 4, number type 7). GTA V programs this scalar
+        // target immediately after its packed 10_10_10_2 pass.
+        (0x4, 7, 0) => Ok(vk::Format::R32_SFLOAT),
         // 10_11_11 / 11_11_10 FLOAT (channel_type 7): the packed HDR
         // intermediate render target ASTRO.BOT draws into. SharpEmu maps both
         // CB formats 6 and 7 with channel_type 7 to B10G11R11_UFLOAT_PACK32.
         (0x6 | 0x7, 7, 0) => Ok(vk::Format::B10G11R11_UFLOAT_PACK32),
+        // 10_10_10_2 UNORM (CB format 9, number type 0). GTA V uses this
+        // packed 32-bit target in its first live DCB. SharpEmu's
+        // GetRenderTargetFormat maps CB format 9 to the same Vulkan packed
+        // layout (R in bits 0..9, A in 30..31).
+        (0x9, 0, 0) => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
         // 16_16_16_16 FLOAT (CB format 0xc, channel_type 7): the 64bpp HDR main
         // scene target ASTRO.BOT renders into before tone-mapping. The offscreen
         // readback is bpp-aware (8 bytes/pixel for this one).
@@ -1750,6 +1758,33 @@ fn decode_texture(
                     pixels[dst..dst + row].copy_from_slice(&tiled[src..src + row]);
                 }
             }
+            (pixels, hash)
+        }
+        // GTA V's first tiled volume is the degenerate 1x1x1 RGBA8 case.
+        // Coordinate (0, 0, 0) is the first element of every block layout, so
+        // reading that one element is exact without guessing the still-open
+        // general GFX10 3D tile-mode-5 address equation. Keep the format and
+        // extent guard deliberately narrow: larger/non-RGBA8 volumes continue
+        // to name the unsupported layout below instead of silently detiling
+        // with a 2D equation.
+        5 if volume && width == 1 && height == 1 && depth == 1 && t.format() == 56 => {
+            let src_len = u64::from(bpp);
+            let (hash, hit) = texture_cache_probe(
+                t.base40(),
+                src_len,
+                width,
+                height,
+                layers,
+                depth,
+                cube,
+                array,
+                t.tile_mode(),
+                format,
+            );
+            if let Some(upload) = hit {
+                return Ok(upload);
+            }
+            let pixels = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
             (pixels, hash)
         }
         other if volume => {
@@ -6598,7 +6633,9 @@ mod tests {
     fn cb_colour_formats_map_and_have_readback_sizes() {
         for (fmt, ty, order, want, bpp) in [
             (0xa, 0, 0, vk::Format::R8G8B8A8_UNORM, 4u32),
+            (0x4, 7, 0, vk::Format::R32_SFLOAT, 4),
             (0x6, 7, 0, vk::Format::B10G11R11_UFLOAT_PACK32, 4),
+            (0x9, 0, 0, vk::Format::A2B10G10R10_UNORM_PACK32, 4),
             (0xc, 7, 0, vk::Format::R16G16B16A16_SFLOAT, 8),
         ] {
             let got = vulkan_format(fmt, ty, order)
@@ -7130,5 +7167,45 @@ mod tests {
         assert_eq!((tex.width, tex.height, tex.depth), (w, h, d));
         assert_eq!(tex.format, vk::Format::R8_UNORM);
         assert_eq!(tex.pixels, voxels, "all slices must decode in order");
+    }
+
+    /// GTA V's first non-linear 3D T# is a one-voxel RGBA8 texture in tile
+    /// mode 5. Every block layout places coordinate (0, 0, 0) at the source
+    /// base, so this trivial extent does not need (and must not pretend to
+    /// implement) the still-unknown general 3D tile-mode-5 equation.
+    #[test]
+    fn gta_tile5_single_voxel_volume_reads_the_origin_texel() {
+        let rgba = [0x12, 0x34, 0x56, 0x78];
+        let mut blob = vec![0u8; rgba.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + rgba.len()].copy_from_slice(&rgba);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 56 << 20; // unified format 8_8_8_8 UNORM
+        t.fields[3] |= 5 << 20; // measured GTA tile mode
+        t.fields[3] |= 10 << 28; // type = 3D volume
+
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("the single origin voxel needs no general 3D detile equation");
+        assert!(!tex.cube);
+        assert_eq!(tex.layers, 1);
+        assert_eq!((tex.width, tex.height, tex.depth), (1, 1, 1));
+        assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(tex.pixels, rgba);
+
+        t.fields[4] = 1; // depth = 2: no longer the measured trivial extent
+        let refused =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                decode_texture(&t)
+            })
+            .expect_err("a nontrivial tiled volume still needs the real 3D equation");
+        assert!(
+            refused.0.contains("3D texture tile mode 5 not implemented"),
+            "the refusal must name the missing layout: {refused:?}"
+        );
     }
 }

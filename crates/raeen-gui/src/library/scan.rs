@@ -225,26 +225,37 @@ fn find_eboot(dir: &Path) -> Option<PathBuf> {
         return Some(flat);
     }
 
-    let mut fallback = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let sub = entry.path();
-        if !sub.is_dir() {
+    // Bounded recursive walk (walkdir): real installs nest the eboot behind
+    // extractor-created folders (`Title/CUSA/Title-app/eboot.bin`), which a
+    // single-level scan missed. An `-app` directory wins immediately (the
+    // packaging convention for the app image); otherwise the shallowest
+    // eboot found. Deterministic order via sorted names.
+    let mut fallback: Option<(usize, PathBuf)> = None;
+    for entry in walkdir::WalkDir::new(dir)
+        .min_depth(2)
+        .max_depth(4)
+        .sort_by_file_name()
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() || entry.file_name() != "eboot.bin" {
             continue;
         }
-        let candidate = sub.join("eboot.bin");
-        if !candidate.is_file() {
-            continue;
-        }
-        let is_app_dir = sub
-            .file_name()
+        let depth = entry.depth();
+        let candidate = entry.into_path();
+        let in_app_dir = candidate
+            .parent()
+            .and_then(Path::file_name)
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.ends_with("-app"));
-        if is_app_dir {
+        if in_app_dir {
             return Some(candidate);
         }
-        fallback.get_or_insert(candidate);
+        if fallback.as_ref().is_none_or(|(d, _)| depth < *d) {
+            fallback = Some((depth, candidate));
+        }
     }
-    fallback
+    fallback.map(|(_, path)| path)
 }
 
 /// Conventional cover-image file names looked for inside a game folder, in

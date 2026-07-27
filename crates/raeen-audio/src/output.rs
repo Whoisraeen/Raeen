@@ -36,6 +36,12 @@ static DEVICE_RATE: AtomicU32 = AtomicU32::new(0);
 /// samples, so a slow/stalled consumer can never grow memory without bound.
 const MAX_RING_SAMPLES: usize = 48_000 * 2 / 4;
 
+/// Shell UI one-shots (navigation ticks, confirm/back cues) — a second ring
+/// mixed additively over the guest ring in [`fill`], so a menu sound never
+/// competes with or delays guest PCM. Bounded at ~2 s of stereo.
+static UI_RING: OnceLock<Ring> = OnceLock::new();
+const MAX_UI_RING_SAMPLES: usize = 48_000 * 2 * 2;
+
 /// Number of [`submit`] calls the guest audio path has made. Incremented on
 /// every call — including before [`init`], where `submit` is otherwise a silent
 /// no-op — so its diagnostics ("is any guest lib actually feeding audio?") and
@@ -101,6 +107,7 @@ pub fn init() {
     }
     let ring: Ring = Arc::new(Mutex::new(VecDeque::new()));
     let _ = RING.set(ring.clone());
+    let _ = UI_RING.set(Arc::new(Mutex::new(VecDeque::new())));
 
     // `cpal::Stream` is `!Send` on some backends and stops when dropped, so
     // build it on a dedicated thread and park to keep it alive for the process
@@ -188,9 +195,18 @@ fn fill(out: &mut [f32], out_channels: usize, ring: &Ring) {
     let mut ring = ring
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut ui = UI_RING
+        .get()
+        .map(|r| r.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     for frame in out.chunks_mut(out_channels.max(1)) {
-        let l = ring.pop_front().unwrap_or(0.0) * g;
-        let r = ring.pop_front().unwrap_or(0.0) * g;
+        let (ui_l, ui_r) = ui
+            .as_mut()
+            .map(|ui| (ui.pop_front().unwrap_or(0.0), ui.pop_front().unwrap_or(0.0)))
+            .unwrap_or((0.0, 0.0));
+        // Additive mix, clamped: a UI cue over quiet menu audio never clips,
+        // and over loud guest audio it degrades to a soft limiter.
+        let l = ((ring.pop_front().unwrap_or(0.0) + ui_l) * g).clamp(-1.0, 1.0);
+        let r = ((ring.pop_front().unwrap_or(0.0) + ui_r) * g).clamp(-1.0, 1.0);
         for (i, s) in frame.iter_mut().enumerate() {
             *s = match i {
                 0 => l,
@@ -199,6 +215,36 @@ fn fill(out: &mut [f32], out_channels: usize, ring: &Ring) {
             };
         }
     }
+}
+
+/// Queue a Shell UI one-shot (interleaved-stereo f32 at `src_rate`) for
+/// additive mixing over the guest stream. Respects the master volume/enable
+/// like everything else; a clip longer than the ~2 s UI budget is truncated.
+/// No-op before [`init`] or while muted. Never touches the guest-PCM
+/// diagnostics ([`submit_call_count`]) — a menu tick is not guest audio.
+pub fn play_ui(src_rate: u32, samples: &[f32]) {
+    let Some(ring) = UI_RING.get() else {
+        return;
+    };
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let dst_rate = DEVICE_RATE.load(Ordering::Relaxed);
+    let owned;
+    let frames: &[f32] = if src_rate == 0 || dst_rate == 0 || src_rate == dst_rate {
+        samples
+    } else {
+        // One-shot clips are independent — a fresh resampler per call, no
+        // shared phase to carry.
+        let mut state = Resampler::default();
+        owned = resample_stereo(&mut state, src_rate, dst_rate, samples);
+        &owned
+    };
+    let mut ring = ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let budget = MAX_UI_RING_SAMPLES.saturating_sub(ring.len());
+    ring.extend(frames.iter().copied().take(budget));
 }
 
 /// Submit interleaved-stereo f32 samples from the guest at `src_rate` Hz

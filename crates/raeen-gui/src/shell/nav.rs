@@ -262,6 +262,20 @@ impl NavState {
         self.settings_tile_index == Some(index)
     }
 
+    /// Replace the Games rail after a library rescan: new rail length and the
+    /// (possibly moved) Settings tile index. Rail focus is clamped back into
+    /// range; every other piece of navigation state (mode, tab, Settings
+    /// focus) is untouched, so a rescan from inside Settings stays in
+    /// Settings.
+    pub fn set_games_rail(&mut self, rail_len: usize, settings_tile_index: Option<usize>) {
+        self.games_rail_len = rail_len;
+        self.settings_tile_index = settings_tile_index;
+        if self.tab == RailTab::Games {
+            self.rail_len = rail_len;
+            self.rail_index = self.rail_index.min(rail_len.saturating_sub(1));
+        }
+    }
+
     /// Replace the Settings section/row-count table — e.g. after adding or
     /// removing a game folder changes the Game Folders section's row count
     /// — clamping the current section/row focus back into range.
@@ -1006,6 +1020,37 @@ mod tests {
         assert_eq!(nav.mode, NavMode::Home);
         // The Home rail focus (the Settings tile itself) survived the trip.
         assert_eq!(nav.rail_index, 8);
+    }
+
+    #[test]
+    fn set_games_rail_clamps_focus_and_preserves_mode() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11])
+            .with_settings(Some(8), vec![4])
+            .with_media_rail_len(3);
+        nav.mode = NavMode::Settings;
+        nav.rail_index = 8;
+        // Library shrank from 9 to 3 tiles; Settings tile moved to index 2.
+        nav.set_games_rail(3, Some(2));
+        assert_eq!(nav.rail_len, 3);
+        assert_eq!(nav.rail_index, 2, "focus clamps into the new rail");
+        assert_eq!(nav.mode, NavMode::Settings, "mode is untouched");
+        // Confirm on the new Settings tile index diverts to Settings.
+        nav.mode = NavMode::Home;
+        nav.rail_index = 2;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::OpenSettings);
+    }
+
+    #[test]
+    fn set_games_rail_on_the_media_tab_defers_to_tab_switch() {
+        let mut nav = NavState::with_cc_options(5, 11, vec![0; 11]).with_media_rail_len(3);
+        nav.apply(NavInput::Tab); // -> Media
+        nav.rail_index = 1;
+        nav.set_games_rail(2, None);
+        // Media rail untouched now; the new Games length applies on switch.
+        assert_eq!(nav.rail_len, 3);
+        assert_eq!(nav.rail_index, 1);
+        nav.apply(NavInput::Tab); // -> Games
+        assert_eq!(nav.rail_len, 2);
     }
 
     #[test]

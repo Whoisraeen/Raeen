@@ -16,3 +16,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 bitflags = { workspace = true }
+
+[dev-dependencies]
+# Property tests: the ELF/SELF/PKG parsers must reject arbitrary bytes with
+# errors, never panics.
+proptest = { workspace = true }

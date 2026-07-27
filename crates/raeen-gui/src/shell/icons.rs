@@ -44,6 +44,18 @@ pub enum Glyph {
     Cross,
     /// Three-line menu (bottom-bar "Options" hint).
     Menu,
+    /// Display with a stand — Settings ▸ Video.
+    Monitor,
+    /// Tabbed folder — Settings ▸ Game Folders.
+    Folder,
+    /// Round-bow key — Settings ▸ Key Provider.
+    Key,
+    /// Painter's palette — Settings ▸ Theme.
+    Palette,
+    /// Puzzle piece — Settings ▸ Plugins.
+    Puzzle,
+    /// Wrench — Settings ▸ Advanced.
+    Wrench,
 }
 
 pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Color32) {
@@ -335,6 +347,93 @@ pub fn draw(painter: &Painter, glyph: Glyph, center: Pos2, size: f32, color: Col
                     stroke,
                 );
             }
+        }
+        Glyph::Monitor => {
+            let screen_rect = egui::Rect::from_min_max(
+                center + vec2(-r * 0.85, -r * 0.65),
+                center + vec2(r * 0.85, r * 0.35),
+            );
+            painter.rect_stroke(screen_rect, 2.0, stroke, StrokeKind::Outside);
+            painter.line_segment(
+                [center + vec2(0.0, r * 0.35), center + vec2(0.0, r * 0.7)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.4, r * 0.7),
+                    center + vec2(r * 0.4, r * 0.7),
+                ],
+                stroke,
+            );
+        }
+        Glyph::Folder => {
+            // Tab on the top-left, then the body.
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.8, -r * 0.45),
+                    center + vec2(-r * 0.25, -r * 0.45),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.25, -r * 0.45),
+                    center + vec2(-r * 0.05, -r * 0.25),
+                ],
+                stroke,
+            );
+            let body = egui::Rect::from_min_max(
+                center + vec2(-r * 0.8, -r * 0.25),
+                center + vec2(r * 0.8, r * 0.55),
+            );
+            painter.rect_stroke(body, 2.0, stroke, StrokeKind::Outside);
+        }
+        Glyph::Key => {
+            painter.circle_stroke(center + vec2(-r * 0.4, 0.0), r * 0.32, stroke);
+            painter.line_segment(
+                [center + vec2(-r * 0.08, 0.0), center + vec2(r * 0.85, 0.0)],
+                stroke,
+            );
+            for dx in [0.45_f32, 0.7] {
+                painter.line_segment(
+                    [center + vec2(r * dx, 0.0), center + vec2(r * dx, r * 0.35)],
+                    stroke,
+                );
+            }
+        }
+        Glyph::Palette => {
+            painter.circle_stroke(center, r * 0.8, stroke);
+            // Thumb notch: a filled dot of background-agnostic accent wells.
+            for (dx, dy) in [(-0.35_f32, -0.3_f32), (0.1, -0.45), (0.4, -0.1)] {
+                painter.circle_filled(center + vec2(r * dx, r * dy), r * 0.13, color);
+            }
+            painter.circle_stroke(center + vec2(r * 0.25, r * 0.4), r * 0.16, stroke);
+        }
+        Glyph::Puzzle => {
+            let body = egui::Rect::from_min_max(
+                center + vec2(-r * 0.65, -r * 0.5),
+                center + vec2(r * 0.5, r * 0.65),
+            );
+            painter.rect_stroke(body, 2.0, stroke, StrokeKind::Outside);
+            // Connector knobs on the top and right edges.
+            painter.circle_stroke(center + vec2(-r * 0.08, -r * 0.5), r * 0.2, stroke);
+            painter.circle_stroke(center + vec2(r * 0.5, r * 0.08), r * 0.2, stroke);
+        }
+        Glyph::Wrench => {
+            // Open jaw: an arc with a gap, plus a diagonal handle.
+            painter.arc(
+                center + vec2(-r * 0.35, -r * 0.35),
+                r * 0.32,
+                0.6..=5.0,
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + vec2(-r * 0.12, -r * 0.12),
+                    center + vec2(r * 0.65, r * 0.65),
+                ],
+                stroke,
+            );
         }
     }
 }

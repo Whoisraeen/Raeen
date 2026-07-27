@@ -1433,6 +1433,15 @@ pub fn shader_get_direct_sgpr(
     start_index: i32,
     user_sgpr: &UserSgprInfo,
 ) -> Result<(), ShaderAnalysisError> {
+    shader_get_direct_sgpr_impl(info, start_index, user_sgpr, false)
+}
+
+fn shader_get_direct_sgpr_impl(
+    info: &mut ShaderDirectSgprsResources,
+    start_index: i32,
+    user_sgpr: &UserSgprInfo,
+    allow_typed_scalar: bool,
+) -> Result<(), ShaderAnalysisError> {
     if info.sgprs_num < 0 || info.sgprs_num as usize >= ShaderDirectSgprsResources::SGPRS_MAX {
         return Err(ni("too many direct sgprs"));
     }
@@ -1448,7 +1457,10 @@ pub fn shader_get_direct_sgpr(
 
     info.start_register[index] = start_index;
 
-    if user_sgpr.type_[start] != UserSgprType::Unknown && user_sgpr.value[start] != 0 {
+    if !allow_typed_scalar
+        && user_sgpr.type_[start] != UserSgprType::Unknown
+        && user_sgpr.value[start] != 0
+    {
         // Instrumented refusal: the Gen5 collection loop routes typed
         // registers into their resource tables before calling here, so a
         // hit names whichever path (legacy walk, or a routing gap) still
@@ -2680,6 +2692,7 @@ pub fn shader_parse_usage2(
     user_sgpr: &UserSgprInfo,
     user_sgpr_num: i32,
     eud: Option<EudView<'_>>,
+    mem: Option<&dyn ShaderMemory>,
 ) -> Result<(), ShaderAnalysisError> {
     // Same reset list as ShaderParseUsage (vertex_attrib not reset upstream).
     info.fetch = false;
@@ -3125,6 +3138,20 @@ pub fn shader_parse_usage2(
             continue;
         }
         if user_sgpr.type_[i] != UserSgprType::Unknown {
+            // An inline SRT is raw application-defined scalar data. Resource
+            // entries explicitly declared by the direct/sharp tables were
+            // consumed above; every unclaimed dword inside `srt_size_dw`
+            // remains a direct push constant even when the persistent AGC
+            // `hu` marker tagged its SET_SH_REG write as Vsharp/Region.
+            // Measured on GTA V compute 0x100003948200: direct[t1] consumes
+            // s0..s3, while typed s4..s7 alternate between 1.0f and 0x07070707.
+            // Promoting that SRT tail invented huge storage descriptors.
+            if user_data.srt_size_dw != 0 && i < usize::from(user_data.srt_size_dw) {
+                shader_get_direct_sgpr_impl(&mut bind.direct_sgprs, i as i32, user_sgpr, true)?;
+                info.direct_sgprs += 1;
+                direct_sgprs[i] = false;
+                continue;
+            }
             // Beyond Kyty (`ShaderGetDirectSgpr` EXITs on any typed
             // register): a register still unclaimed at collection time but
             // TYPED by a PM4 'hu' marker (0x4 = Vsharp, 0xd = Region — the
@@ -3148,15 +3175,33 @@ pub fn shader_parse_usage2(
                 extended_buffer,
                 &mut peek,
             )?;
-            // A typed run whose descriptor quad is entirely ZERO is not a
-            // resource: the driver typed the registers but never wrote a
-            // descriptor there. Measured on ASTRO.BOT: its 170 working draw
-            // VS/PS carry exactly such a quad, and binding it as a V#
-            // produced "storage buffer at 0x0 has invalid byte size 0",
-            // killing every previously-working draw. Restore the flags the
-            // peek consumed and keep the register direct.
-            if peek == [0; 4] {
-                // Keep the WHOLE verified-zero quad direct, not just s{i}:
+            let inferred_buffer = sharp_dword3_is_buffer(peek[3]);
+            let inferred_buffer_is_bindable = if inferred_buffer {
+                let resource = ShaderBufferResource { fields: peek };
+                let size = if resource.stride() == 0 {
+                    u64::from(resource.num_records())
+                } else {
+                    u64::from(resource.stride()) * u64::from(resource.num_records())
+                };
+                // This path is only a fallback for a typed run that NO
+                // usage/direct table declared. Demand the same basic
+                // invariants the binding path needs before inventing a V#:
+                // a non-null extent must be dword-addressable, and its base
+                // must resolve in the current guest address space when the
+                // caller can check it. This rejects scalar/sentinel tuples
+                // whose stale `hu` marker merely made them look descriptor
+                // shaped (GTA V: [0x07070707; 4] => an unmapped 212-GB V#).
+                (resource.base48() == 0 || size == 0)
+                    || (size.is_multiple_of(4)
+                        && mem.is_none_or(|guest| guest.dwords_at(resource.base48()).is_some()))
+            } else {
+                true
+            };
+            // A typed zero run or an unbindable inferred V# is raw scalar
+            // user data, not a resource. Restore the flags the peek consumed
+            // and keep the register direct.
+            if peek == [0; 4] || !inferred_buffer_is_bindable {
+                // Keep the WHOLE rejected quad direct, not just s{i}:
                 // leaving s{i+1}..s{i+3} typed-and-flagged makes the next
                 // iteration peek a quad that runs past the typed run
                 // (measured: "user sgpr type is not Vsharp/Region (Unknown
@@ -3167,13 +3212,18 @@ pub fn shader_parse_usage2(
                     if !direct_sgprs[reg] {
                         continue;
                     }
-                    shader_get_direct_sgpr(&mut bind.direct_sgprs, reg as i32, user_sgpr)?;
+                    shader_get_direct_sgpr_impl(
+                        &mut bind.direct_sgprs,
+                        reg as i32,
+                        user_sgpr,
+                        true,
+                    )?;
                     info.direct_sgprs += 1;
                     direct_sgprs[reg] = false;
                 }
                 continue;
             }
-            if sharp_dword3_is_buffer(peek[3]) {
+            if inferred_buffer {
                 // ReadWrite: no usage slot declared intent, and the compute
                 // path writes every storage buffer back unconditionally, so
                 // the writable superset is the faithful choice.
@@ -3863,6 +3913,7 @@ pub fn shader_get_input_info_vs_decoded(
                 data,
                 base_dw: *base_dw,
             }),
+            Some(mem),
         )?;
     } else {
         if gs_instead_of_vs {
@@ -4184,6 +4235,7 @@ pub fn shader_get_input_info_ps_decoded(
             &regs.ps_user_sgpr,
             i32::from(regs.ps_regs.rsrc2.user_sgpr),
             eud_view,
+            Some(mem),
         )?;
         if let Some(view) = eud_view {
             let mut capture = |code: &ShaderCode| -> Result<(), ShaderAnalysisError> {
@@ -4327,6 +4379,7 @@ pub fn shader_get_input_info_cs_decoded(
             &regs.cs_user_sgpr,
             i32::from(regs.cs_regs.user_sgpr),
             eud_view,
+            Some(mem),
         )?;
         // Raw-EUD image descriptors: T#/S#s the shader loads itself (no
         // usage-table slot) get captured from the EUD snapshot at the covered
@@ -6097,7 +6150,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 10, None).unwrap();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 10, None, None).unwrap();
         assert_eq!(info.samplers, 1);
         assert_eq!(info.storage_buffers_constant, 1);
         assert_eq!(bind.samplers.samplers_num, 1);
@@ -6149,7 +6202,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None).unwrap();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None, None).unwrap();
         // type-0 sharp -> read-only storage buffer, NOT a texture.
         assert_eq!(info.storage_buffers_readonly, 1);
         assert_eq!(bind.storage_buffers.buffers_num, 1);
@@ -6188,7 +6241,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 14, None).unwrap();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 14, None, None).unwrap();
         assert_eq!(info.storage_buffers_readwrite, 1);
         assert_eq!(bind.storage_buffers.buffers_num, 1);
         assert_eq!(bind.storage_buffers.start_register[0], 0);
@@ -6198,6 +6251,76 @@ mod tests {
         // s12/s13 are declared but untyped -> plain direct SGPRs.
         assert_eq!(info.direct_sgprs, 2);
         assert_eq!(&bind.direct_sgprs.start_register[..2], &[12, 13]);
+    }
+
+    #[test]
+    fn gta_typed_poison_quad_stays_direct_instead_of_becoming_a_storage_buffer() {
+        // Measured on GTA V's first compute submissions: AGC leaves s4..s7
+        // typed as Vsharp while their captured values are the scalar fill
+        // 0x07070707. Treating that tuple as a V# invents a 212-GB storage
+        // buffer at unmapped guest address 0x070707070707 and rejects the
+        // dispatch before the shader can replace/use the registers.
+        let user_sgpr = UserSgprInfo {
+            value: [0x0707_0707; UserSgprInfo::SGPRS_MAX],
+            type_: [UserSgprType::Vsharp; UserSgprInfo::SGPRS_MAX],
+            count: 4,
+        };
+        let user_data = ShaderUserData {
+            direct_resource_offset: vec![0xffff; 8],
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 0,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None, None)
+            .expect("unmapped typed scalar data must remain usable as direct SGPRs");
+
+        assert_eq!(
+            bind.storage_buffers.buffers_num, 0,
+            "an unmapped repeated-byte tuple is not a captured V#"
+        );
+        assert_eq!(info.direct_sgprs, 4);
+        assert_eq!(&bind.direct_sgprs.start_register[..4], &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn gta_unclaimed_typed_srt_tail_stays_direct_scalar_data() {
+        // GTA V compute 0x100003948200 declares an eight-dword inline SRT:
+        // direct type 1 consumes s0..s3 as its sampler, while s4..s7 carry
+        // ordinary scalar constants (measured as 1.0f or 0x07070707).
+        // The persistent AGC `hu` marker still tags that tail Vsharp; the SRT
+        // declaration is authoritative and must keep unclaimed dwords direct.
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[0..4].copy_from_slice(&[0x5b22_0000, 0x0010_0001, 0x0008_7000, 0x0004_bfac]);
+        value[4..8].fill(0x3f80_0000);
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[0..8].fill(UserSgprType::Vsharp);
+        let user_sgpr = UserSgprInfo {
+            value,
+            type_,
+            count: 8,
+        };
+        let mut direct_resource_offset = vec![0xffff; 8];
+        direct_resource_offset[1] = 0;
+        let user_data = ShaderUserData {
+            direct_resource_offset,
+            sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+            eud_size_dw: 0,
+            srt_size_dw: 8,
+        };
+        let mut info = ShaderParsedUsage::default();
+        let mut bind = ShaderBindResources::default();
+
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None, None)
+            .expect("typed inline-SRT constants must remain direct");
+
+        assert_eq!(bind.samplers.samplers_num, 1);
+        assert_eq!(bind.storage_buffers.buffers_num, 0);
+        assert_eq!(info.direct_sgprs, 4);
+        assert_eq!(&bind.direct_sgprs.start_register[..4], &[4, 5, 6, 7]);
+        assert_eq!(bind.direct_sgprs.sgprs[0].field, 0x3f80_0000);
     }
 
     #[test]
@@ -6230,7 +6353,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None).unwrap();
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None, None).unwrap();
         assert_eq!(info.storage_buffers_readwrite, 1);
         assert_eq!(bind.storage_buffers.buffers_num, 1);
         assert_eq!(info.textures2d_readwrite, 1);
@@ -6263,7 +6386,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None, None)
             .expect("type-8 RGBA32F UAV accepted");
         assert_eq!(info.textures2d_readwrite, 1);
         assert_eq!(bind.textures2d.desc[0].texture.type_(), 8);
@@ -6403,7 +6526,7 @@ mod tests {
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
 
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 16, None, None)
             .expect("runtime-bound table-0 T# must not reject the shader");
 
         assert_eq!(info.textures2d_readonly, 1);
@@ -6816,7 +6939,7 @@ mod tests {
         // The refusal is owned so it can carry the diagnostic payload the
         // next session needs: the declared/captured SGPR counts and every
         // nonzero SGPR value (the EUD-pointer candidates).
-        match shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 0, None) {
+        match shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 0, None, None) {
             Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
                 assert!(what.contains("EUD unreadable"), "{what}");
                 assert!(what.contains("eud_size_dw=4"), "{what}");
@@ -6851,7 +6974,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None, None)
             .expect("an inline SRT must not be refused");
         assert_eq!(info.direct_sgprs, 4);
         assert_eq!(bind.direct_sgprs.sgprs_num, 4);
@@ -6879,7 +7002,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        match shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None) {
+        match shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 4, None, None) {
             Err(ShaderAnalysisError::NotImplementedOwned { what }) => {
                 assert!(what.contains("srt_size_dw (20)"), "{what}");
                 assert!(what.contains("declared=4"), "{what}");
@@ -6911,7 +7034,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 3, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 3, None, None)
             .expect("direct type 5 must not be refused");
         assert_eq!(info.direct_sgprs, 3, "s0..s2 all stay direct");
         assert_eq!(bind.direct_sgprs.sgprs[2].field, 0x3f80_0000);
@@ -6945,7 +7068,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None, None)
             .expect("direct type 1 (IMM_SAMPLER) must bind");
         assert_eq!(info.samplers, 1);
         assert_eq!(bind.samplers.samplers_num, 1);
@@ -6994,6 +7117,7 @@ mod tests {
                 data: &eud,
                 base_dw: 12,
             }),
+            None,
         )
         .expect("EUD-bearing shader must parse");
         assert!(bind.extended.used);
@@ -7034,7 +7158,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None, None)
             .expect("direct type 0 (IMM_RESOURCE) must bind");
         assert_eq!(info.storage_buffers_readonly, 1);
         assert_eq!(bind.storage_buffers.buffers_num, 1);
@@ -7077,7 +7201,7 @@ mod tests {
         };
         let mut info = ShaderParsedUsage::default();
         let mut bind = ShaderBindResources::default();
-        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None)
+        shader_parse_usage2(&user_data, &mut info, &mut bind, &user_sgpr, 8, None, None)
             .expect("direct type 0 (IMM_RESOURCE, T#) must bind");
         assert_eq!(info.textures2d_readonly, 1);
         assert_eq!(bind.textures2d.textures_num, 1);

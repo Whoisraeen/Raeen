@@ -1212,10 +1212,10 @@ impl ShaderTranslateCache {
             let _ = std::fs::remove_file(path);
             return None;
         }
-        let spirv: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte SPIR-V word")))
-            .collect();
+        // Native-endian POD cast (alignment-safe copy). Identical bytes to
+        // the old per-word `from_le_bytes` loop on every supported host —
+        // the guest ABI is x86-64 (Zen 2), so the host is little-endian.
+        let spirv: Vec<u32> = bytemuck::pod_collect_to_vec(&bytes);
         if spirv.first().copied() != Some(0x0723_0203) {
             warn!(
                 path = %path.display(),
@@ -1261,7 +1261,9 @@ impl ShaderTranslateCache {
             );
             return false;
         }
-        let bytes: Vec<u8> = spirv.iter().flat_map(|word| word.to_le_bytes()).collect();
+        // Zero-copy view of the words as bytes (see the load-side endianness
+        // note); replaces a per-word copy loop.
+        let bytes: &[u8] = bytemuck::cast_slice(spirv);
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
         if let Err(error) = std::fs::write(&temp, bytes) {
             warn!(

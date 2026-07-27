@@ -49,7 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 bitflags = "2"
-bytemuck = { version = "1", features = ["derive"] }
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 memmap2 = "0.9"
 rayon = "1"
@@ -85,6 +85,40 @@ tracing-appender = "0.2"
 
 # Input
 gilrs = "0.11"
+
+# Native file/folder picker (Settings ▸ Game Folders ▸ Browse)
+rfd = "0.15"
+# WAV decoding for Shell UI sound packs (sounds/<pack>/*.wav)
+hound = "3.5"
+# Open a folder in the host file manager (Settings ▸ Plugins ▸ Open Folder)
+opener = "0.7"
+# Shell toast notifications (save failures, rescan results)
+egui-notify = "0.19"
+# Filesystem watcher: auto-rescan the game library when folders change
+notify = "8"
+# Out-of-process crash reporting: the Shell hosts a minidump server, the
+# isolated runner child requests dumps from its crash handler
+crash-handler = "0.6"
+minidumper = "0.10"
+# Host CPU/RAM/OS facts for logs and crash reports
+sysinfo = "0.33"
+# Frame profiler: scopes in the Shell + GPU paths, viewed via puffin_viewer
+puffin = "0.19"
+puffin_http = "0.16"
+# Programmatic RenderDoc frame captures when running under RenderDoc
+renderdoc = "0.12"
+# High-quality sinc resampling for UI sound clips
+rubato = "0.16"
+# Fast non-cryptographic HashMap hasher for NID lookup hot paths
+rustc-hash = "2"
+# Bounded-depth recursive directory walking for game-folder scans
+walkdir = "2"
+# Property testing (nav state machine, parser robustness) — dev-only
+proptest = "1"
+# Snapshot testing (PM4 decode pinning) — dev-only
+insta = "1"
+# Benchmarks (NID linking, shader translate) — dev-only
+criterion = "0.5"
 
 # Compression / Decompression
 lz4_flex = "0.11"

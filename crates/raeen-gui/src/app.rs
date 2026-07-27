@@ -94,7 +94,9 @@ impl eframe::App for RaeenApp {
 /// accidentally repeated folder entries never list the same game twice. An
 /// empty folder list — or one whose folders are all missing — yields an empty
 /// `Vec`, which the caller reads as "fall back to the sample library".
-fn scan_game_folders(folders: &[PathBuf]) -> Vec<LibraryItem> {
+/// `pub(crate)` because the Shell's Settings ▸ Game Folders ▸ Rescan runs the
+/// exact same scan at runtime.
+pub(crate) fn scan_game_folders(folders: &[PathBuf]) -> Vec<LibraryItem> {
     let mut items: Vec<LibraryItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for folder in folders {

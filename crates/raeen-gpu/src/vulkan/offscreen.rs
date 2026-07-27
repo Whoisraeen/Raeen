@@ -80,7 +80,9 @@ pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_UNORM
         | vk::Format::B8G8R8A8_SRGB
-        | vk::Format::B10G11R11_UFLOAT_PACK32 => Ok(4),
+        | vk::Format::R32_SFLOAT
+        | vk::Format::B10G11R11_UFLOAT_PACK32
+        | vk::Format::A2B10G10R10_UNORM_PACK32 => Ok(4),
         vk::Format::R16G16B16A16_SFLOAT => Ok(8),
         other => Err(GpuError::VulkanInitFailed(format!(
             "render target format {other:?} has no readback byte size mapping"

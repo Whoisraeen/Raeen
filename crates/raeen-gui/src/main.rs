@@ -1581,6 +1581,12 @@ fn main() -> anyhow::Result<()> {
     raeen_audio::output::set_enabled(config.audio.enabled);
     raeen_audio::output::init();
 
+    // Record which RAEEN_* bridge variables the developer set manually BEFORE
+    // the bridge below writes any of them — those manual overrides win over the
+    // Settings toggles both here and in every per-launch runner environment
+    // (`launcher::stage_runner_env`).
+    launcher::record_dev_env_overrides();
+
     // Bridge the persisted Advanced diagnostics to the environment variables the
     // GPU/runtime read, so those settings actually take effect. A manually-set
     // env var always wins (a dev CLI override is never clobbered).

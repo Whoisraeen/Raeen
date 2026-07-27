@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 raeen-core = { workspace = true }
 kyty-graphics = { workspace = true }
+puffin = { workspace = true }
+renderdoc = { workspace = true }
 # In-process spirv-val (the real Khronos validator, compiled in): the
 # translate-time validity gate. An invalid module reaching the driver is
 # undefined behavior — measured as an AMD driver access violation that kills
@@ -39,6 +41,8 @@ rayon = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+# Snapshot tests pinning PM4/DCB decode output.
+insta = { workspace = true }
 # SPIR-V structural validator for the shader-emitter tests. Used under its MIT
 # license option (GPL-2.0-only compatible). Test-only — not linked into the
 # distributed emulator. See docs/reference-port-ledger.md (SPIR-V body rows).

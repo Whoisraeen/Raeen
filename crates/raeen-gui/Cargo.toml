@@ -24,6 +24,19 @@ eframe = { workspace = true }
 egui = { workspace = true }
 image = { workspace = true }
 gilrs = { workspace = true }
+rfd = { workspace = true }
+hound = { workspace = true }
+opener = { workspace = true }
+egui-notify = { workspace = true }
+notify = { workspace = true }
+sysinfo = { workspace = true }
+puffin = { workspace = true }
+puffin_http = { workspace = true }
+rubato = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+crash-handler = { workspace = true }
+minidumper = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
@@ -56,3 +69,5 @@ windows-sys = { workspace = true }
 # segments, dynamic symbols, and relocations. Workspace-pinned (0.9), same as
 # raeen-firmware.
 goblin = { workspace = true }
+# Property tests over the pure nav state machine.
+proptest = { workspace = true }

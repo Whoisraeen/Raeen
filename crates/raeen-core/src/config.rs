@@ -44,6 +44,14 @@ pub struct GeneralConfig {
     /// single-item selector for now; SM2b's on-disk theme loader is what
     /// actually resolves this name to a `themes/<name>` directory.
     pub selected_theme: String,
+    /// Custom Home wallpaper: an image file name under `wallpapers/`, or
+    /// `"off"` to use the active theme's own background (if any). A wallpaper
+    /// overrides the theme background without editing the theme.
+    pub wallpaper: String,
+    /// UI sound pack: a directory name under `sounds/` holding `move.wav`,
+    /// `confirm.wav`, `back.wav`, `launch.wav` (all optional), or `"off"`
+    /// for a silent shell.
+    pub sound_pack: String,
 }
 
 impl Default for GeneralConfig {
@@ -54,6 +62,8 @@ impl Default for GeneralConfig {
             window_height: 1080,
             vsync: true,
             selected_theme: "default".to_string(),
+            wallpaper: "off".to_string(),
+            sound_pack: "off".to_string(),
         }
     }
 }

@@ -11,6 +11,7 @@
 //! them into the emulated PS5 virtual address space.
 
 pub mod elf;
+pub mod mapped;
 pub mod pkg;
 pub mod self_format;
 
