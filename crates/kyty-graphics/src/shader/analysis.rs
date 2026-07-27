@@ -3192,7 +3192,7 @@ pub fn shader_parse_usage2(
                 // whose stale `hu` marker merely made them look descriptor
                 // shaped (GTA V: [0x07070707; 4] => an unmapped 212-GB V#).
                 (resource.base48() == 0 || size == 0)
-                    || (size.is_multiple_of(4)
+                    || (size % 4 == 0
                         && mem.is_none_or(|guest| guest.dwords_at(resource.base48()).is_some()))
             } else {
                 true
