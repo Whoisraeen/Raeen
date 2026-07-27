@@ -54,17 +54,25 @@ top-down, update statuses in place, and keep it committed.**
   `crates/raeen-runtime/tests/` (M3 test as pattern), CLAUDE.md milestone table.
 
 ### 2. GTA V wall: AGC ACB / async compute breadth
-- [~] Phase A IN PROGRESS — delegated to `gpu-pipeline` agent (worktree), 2026-07-27.
 - **What (phased):**
-  - [~] **A. `*GetSize` families + ACB builder scaffolding.** The 83 missing
-    `libSceAgc` NIDs (`docs/gta5-blocker-analysis-2026-07-27.md`) are
-    dominated by `sceAgcAcb*` and `*GetSize`. GetSize functions are mechanical
-    (return command-packet sizes); implement against Kyty Gen5 / KytyPS5
-    reference semantics with tests. Scaffold the ACB (async compute buffer)
-    builder mirroring the DCB builder structure.
-  - [ ] **B. Compute queue in the PM4 processor.** `kyty-graphics` run.rs
-    (`GraphicsRunSubmit` path) currently drives the graphics DCB; add an ACB
-    submission path + compute dispatch handling. KytyPS5 is the pattern source.
+  - [x] **A. DONE 2026-07-27** (commit `d19261b`, merged; raeen-hle 461 green,
+    kyty-graphics 477 green). All 83 measured-missing `libSceAgc` NIDs
+    registered: 63 real (KytyPS5 ports — faithful 14-DW `CbBranch`, rewinds,
+    workload markers, packet-patch families, 32 GetSize pinned to paired
+    writers/Mesa PM4), 11 `register_incomplete` honest-error (arg order or
+    semantics unreferenced in any license-compatible source — never guessed
+    packets). MEASURED: GTA V render-path unresolved **83 → 0**; total 265 →
+    88 (all online/dialog/input = item 3 territory). Attribution updated
+    (THIRD_PARTY_NOTICES: KytyPS5 + Mesa; reference-port-ledger).
+  - [ ] **B. Compute queue in the PM4 processor.** Phase B plan (from A):
+    (1) execute submitted ACBs — port KytyPS5 `GraphicsRunSubmitCompute`
+    incl. the 5-DW ACB descriptor indirection (magic 0x5533ccaa) in
+    `submit_acb`; (2) graphics↔compute ordering — port
+    `flush_pending_graphics_segment_before_acb` (agc.cpp:3698-3839), matching
+    ACB R_WAIT_MEM waits against pending RELEASE_MEM producers; integrate at
+    the cross-queue label latch in `raeen-gpu/src/agc_exec.rs`; (3)
+    queue-indexed execution context for DISPATCH/ACQUIRE_MEM/RELEASE_MEM/
+    WAIT/COND_EXEC arms already encoded in `kyty-graphics/src/run.rs`.
   - [ ] **C. `libSceAmpr` (46 NIDs)** — async memory prefetch; honest
     semantics (likely synchronous completion) after A/B.
   - [ ] **D. Re-measure GTA V** stop point; update
