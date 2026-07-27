@@ -58,6 +58,12 @@ const IT_DRAW_INDIRECT_MULTI: u32 = 0x2C;
 const IT_INDIRECT_BUFFER: u32 = 0x3F;
 const IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
 const IT_COPY_DATA: u32 = 0x40;
+/// Multi-instanced indexed draw preamble (`sceAgcDcbDrawIndexMultiInstanced`).
+/// Standard PM4 numbering, mirrored by KytyPS5 `pm4.h` `IT_DISPATCH_DRAW_PREAMBLE`.
+const IT_DISPATCH_DRAW_PREAMBLE: u32 = 0x3A;
+/// Command-buffer rewind point (`sceAgc{Dcb,Acb}Rewind`). Standard PM4
+/// numbering, mirrored by KytyPS5 `pm4.h` `IT_REWIND`.
+const IT_REWIND: u32 = 0x59;
 const R_WAIT_MEM32: u32 = 0x0A;
 const R_WAIT_MEM64: u32 = 0x16;
 const R_RELEASE_MEM: u32 = 0x18;
@@ -687,6 +693,407 @@ pub fn register(registry: &HleRegistry) {
         registry.register("libSceAgc", name, implementation);
         registry.register("libSceAgcDriver", name, implementation);
     }
+
+    // ------------------------------------------------------------------
+    // GTA V (PPSA04264) AGC wall, Phase A — the *GetSize sizing family and
+    // the ACB (async compute buffer) builder surface. Measured missing set:
+    // artifacts/compat/nid-coverage.json (2026-07-27); every name below is
+    // dictionary-proven to hash to the NID the title imports. See the
+    // "Phase A" section near the end of this file for the implementations
+    // and their per-function derivation notes.
+    // ------------------------------------------------------------------
+
+    // Sizing probes whose writer is a fixed packet in this file or KytyPS5.
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbEventWriteGetSize",
+        hle_event_write_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbEventWriteGetSize",
+        hle_event_write_get_size,
+    );
+    // COPY_DATA is 6 DWORDs on either queue (KytyPS5 GraphicsDcbCopyData and
+    // this file's hle_dcb_copy_data / hle_acb_copy_data).
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbCopyDataGetSize",
+        hle_get_size_6_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbCopyDataGetSize",
+        hle_get_size_6_dwords,
+    );
+    // ACB DISPATCH_INDIRECT is 4 DWORDs (hle_acb_dispatch_indirect; KytyPS5
+    // GraphicsAcbDispatchIndirect).
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbDispatchIndirectGetSize",
+        hle_get_size_4_dwords,
+    );
+    // Jump/Rewind/WaitOnAddress are queue-agnostic packets; the ACB probes
+    // reuse the DCB handlers.
+    registry.register("libSceAgc", "sceAgcAcbJumpGetSize", hle_dcb_jump_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbRewindGetSize",
+        hle_dcb_rewind_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbWaitOnAddressGetSize",
+        hle_dcb_wait_on_address_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbAtomicMemGetSize",
+        hle_atomic_mem_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbAtomicMemGetSize",
+        hle_atomic_mem_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbAtomicGdsGetSize",
+        hle_atomic_gds_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbAtomicGdsGetSize",
+        hle_atomic_gds_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbPrimeUtcl2GetSize",
+        hle_prime_utcl2_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbPrimeUtcl2GetSize",
+        hle_prime_utcl2_get_size,
+    );
+    registry.register("libSceAgc", "sceAgcCbBranchGetSize", hle_cb_branch_get_size);
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbCondWriteGetSize",
+        hle_cb_cond_write_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetShRegistersDirectGetSize",
+        hle_cb_set_registers_direct_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetUcRegistersDirectGetSize",
+        hle_cb_set_registers_direct_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetUcRegisterRangeDirectGetSize",
+        hle_cb_set_uc_register_range_get_size,
+    );
+    // SET_BASE-family probes: the indirect-args base packet is 4 DWORDs
+    // (hle_dcb_set_base_indirect_args; KytyPS5 GraphicsDcbSetBaseIndirectArgs).
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetBaseDrawIndirectArgsGetSize",
+        hle_get_size_4_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetBaseDispatchIndirectArgsGetSize",
+        hle_get_size_4_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetIndexIndirectArgsGetSize",
+        hle_get_size_4_dwords,
+    );
+    // SET_PREDICATION-family probes: 4 DWORDs (hle_dcb_set_predication;
+    // KytyPS5 GraphicsDcbSetPredication).
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetPredicationDisableGetSize",
+        hle_get_size_4_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetZPassPredicationEnableGetSize",
+        hle_get_size_4_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetBoolPredicationEnableGetSize",
+        hle_get_size_4_dwords,
+    );
+    // Occlusion queries begin/end with an address-carrying EVENT_WRITE
+    // (ZPASS_DONE) — 4 DWORDs (reference/mesa radeonsi occlusion queries).
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbBeginOcclusionQueryGetSize",
+        hle_get_size_4_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbEndOcclusionQueryGetSize",
+        hle_get_size_4_dwords,
+    );
+    // End-of-shader actions are RELEASE_MEM-shaped like end-of-pipe (gfx10
+    // EOS events ride RELEASE_MEM): 8 DWORDs = 32 bytes, the same probe as
+    // sceAgcCbQueueEndOfPipeActionGetSize.
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbQueueEndOfShaderActionGetSize",
+        hle_queue_eop_action_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbQueueEndOfShaderActionGetSize",
+        hle_queue_eop_action_get_size,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbContextStateOpGetSize",
+        hle_dcb_context_state_op_get_size,
+    );
+    // Multi-indirect draw probes match this file's 9-DWORD emitters
+    // (hle_dcb_draw_index_indirect_multi / hle_dcb_draw_indirect_multi) —
+    // the size a probe must report is the size the paired writer emits.
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexIndirectMultiGetSize",
+        hle_get_size_9_dwords,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndirectMultiGetSize",
+        hle_get_size_9_dwords,
+    );
+
+    // ACB/DCB builders (KytyPS5 ports and queue-agnostic aliases).
+    registry.register("libSceAgc", "sceAgcDcbRewind", hle_dcb_rewind);
+    registry.register("libSceAgc", "sceAgcAcbRewind", hle_dcb_rewind);
+    registry.register("libSceAgc", "sceAgcAcbJump", hle_dcb_jump);
+    registry.register("libSceAgc", "sceAgcAcbSetFlip", hle_dcb_set_flip);
+    registry.register("libSceAgc", "sceAgcAcbSetMarker", hle_dcb_set_marker);
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbWaitUntilSafeForRendering",
+        hle_dcb_wait_until_safe,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetWorkloadsActive",
+        hle_dcb_set_workloads_active,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbSetWorkloadsActive",
+        hle_dcb_set_workloads_active,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetWorkloadComplete",
+        hle_dcb_set_workload_complete,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbSetWorkloadComplete",
+        hle_dcb_set_workload_complete,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbSetWorkloadStreamInactive",
+        hle_dcb_set_workload_stream_inactive,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAcbSetWorkloadStreamInactive",
+        hle_dcb_set_workload_stream_inactive,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDcbDrawIndexMultiInstanced",
+        hle_dcb_draw_index_multi_instanced,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetUcRegisterRangeDirect",
+        hle_cb_set_uc_register_range,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCbSetUcRegistersDirect",
+        hle_cb_set_uc_registers_direct,
+    );
+    registry.register("libSceAgc", "sceAgcDcbPrimeUtcl2", hle_prime_utcl2);
+    registry.register("libSceAgc", "sceAgcAcbPrimeUtcl2", hle_prime_utcl2);
+
+    // Packet patch surface (post-emission fixups on packets this file's
+    // emitters produced).
+    registry.register(
+        "libSceAgc",
+        "sceAgcQueueEndOfPipeActionPatchData",
+        hle_queue_eop_patch_data,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcQueueEndOfPipeActionPatchGcrCntl",
+        hle_queue_eop_patch_gcr_cntl,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcQueueEndOfPipeActionPatchType",
+        hle_queue_eop_patch_type,
+    );
+    // The Async* names are the ACB-side spellings of queue-agnostic packet
+    // patches (KytyPS5 binds both NIDs of each pair to one function).
+    registry.register(
+        "libSceAgc",
+        "sceAgcCondExecPatchSetEnd",
+        hle_cond_exec_patch_set_end,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAsyncCondExecPatchSetEnd",
+        hle_cond_exec_patch_set_end,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcCondExecPatchSetCommandAddress",
+        hle_cond_exec_patch_set_command_address,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAsyncCondExecPatchSetCommandAddress",
+        hle_cond_exec_patch_set_command_address,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcRewindPatchSetRewindState",
+        hle_rewind_patch_set_rewind_state,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcAsyncRewindPatchSetRewindState",
+        hle_rewind_patch_set_rewind_state,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcBranchPatchSetCompareAddress",
+        hle_branch_patch_set_compare_address,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcWaitRegMemPatchReference",
+        hle_wait_reg_mem_patch_reference,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcWaitRegMemPatchCompareFunction",
+        hle_wait_reg_mem_patch_compare_function,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate",
+        hle_dma_data_patch_src,
+    );
+    // The Cx spelling is registered in the loop above; GTA V also imports the
+    // Sh/Uc spellings of the same count-field overwrite.
+    registry.register(
+        "libSceAgc",
+        "sceAgcSetShRegIndirectPatchSetNumRegisters",
+        hle_set_indirect_patch_set_num_registers,
+    );
+    registry.register(
+        "libSceAgc",
+        "sceAgcSetUcRegIndirectPatchSetNumRegisters",
+        hle_set_indirect_patch_set_num_registers,
+    );
+
+    // Non-packet helpers with KytyPS5 references.
+    registry.register("libSceAgc", "sceAgcUpdatePrimState", hle_update_prim_state);
+    registry.register(
+        "libSceAgc",
+        "sceAgcGetDataPacketPayloadRange",
+        hle_get_data_packet_payload_range,
+    );
+
+    // Honest-error surface: imported by GTA V, no reference encoding or
+    // established guest signature anywhere in the license-compatible
+    // references. Each logs loudly and fails honestly — never a guessed
+    // packet. (See the per-function docs for what is and isn't known.)
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcDcbAtomicMem",
+        hle_atomic_mem_unavailable,
+        "ATOMIC_MEM guest signature unreferenced — returns null, never a guessed packet",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcAcbAtomicMem",
+        hle_atomic_mem_unavailable,
+        "ATOMIC_MEM guest signature unreferenced — returns null, never a guessed packet",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcDcbMemSemaphore",
+        hle_mem_semaphore_unavailable,
+        "MEM_SEMAPHORE layout/signature unreferenced — returns null",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcAcbMemSemaphore",
+        hle_mem_semaphore_unavailable,
+        "MEM_SEMAPHORE layout/signature unreferenced — returns null",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcCbCondWrite",
+        hle_cb_cond_write_unavailable,
+        "COND_WRITE guest signature unreferenced — returns null",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcDcbSetIndexIndirectArgs",
+        hle_set_index_indirect_args_unavailable,
+        "SET_BASE select constant unreferenced — returns null",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcGetDefaultCxStateFlat",
+        hle_get_default_cx_state_flat_unavailable,
+        "flat default-CX-state layout unreferenced — returns null",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcSetNop",
+        hle_set_nop_unavailable,
+        "signature unreferenced — writes nothing, returns 0",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcGetGsOversubscription",
+        hle_get_gs_oversubscription_unavailable,
+        "semantics unreferenced — returns 0",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcSetAmmSemaphoreMemory",
+        hle_set_amm_semaphore_memory_unavailable,
+        "semantics unreferenced — returns SCE_ERROR_INVALID_ARGUMENT",
+    );
+    registry.register_incomplete(
+        "libSceAgc",
+        "sceAgcGetSemaphoreLabel",
+        hle_get_semaphore_label_unavailable,
+        "semantics unreferenced — returns null",
+    );
 }
 
 /// Return the total DWORD length encoded by a Gen5 PM4 packet header.
@@ -2757,6 +3164,22 @@ fn hle_acb_copy_data(ctx: &HleContext, args: &[u64]) -> u64 {
 /// the FIRST packet emitted, or 0 on failure. Ported from SharpEmu
 /// `CbSetShRegistersDirect` (AgcExports.cs L970-1040).
 fn hle_cb_set_sh_registers_direct(ctx: &HleContext, args: &[u64]) -> u64 {
+    cb_set_registers_direct_runs(ctx, args, IT_SET_SH_REG)
+}
+
+/// `sceAgcCbSetUcRegistersDirect(cb, registers, registerCount)`: the UCONFIG
+/// sibling of [`hle_cb_set_sh_registers_direct`] — identical run-coalescing
+/// emission with `IT_SET_UCONFIG_REG` packets (KytyPS5's Sh writer pattern,
+/// `GraphicsCbSetShRegistersDirect`, with the register-space opcode swapped
+/// exactly as the direct single-register family does).
+fn hle_cb_set_uc_registers_direct(ctx: &HleContext, args: &[u64]) -> u64 {
+    cb_set_registers_direct_runs(ctx, args, IT_SET_UCONFIG_REG)
+}
+
+/// Shared body for `sceAgcCbSet{Sh,Uc}RegistersDirect`: read `count`
+/// `(offset, value)` pairs, sort, and emit one `op` packet per contiguous
+/// offset run.
+fn cb_set_registers_direct_runs(ctx: &HleContext, args: &[u64], op: u32) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     let registers_addr = args.get(1).copied().unwrap_or(0);
     let count = args.get(2).copied().unwrap_or(0) as u32;
@@ -2786,12 +3209,12 @@ fn hle_cb_set_sh_registers_direct(ctx: &HleContext, args: &[u64]) -> u64 {
         let Some(addr) = alloc_command_dwords(ctx, cb, u64::from(packet_dwords)) else {
             return 0;
         };
-        if !ctx.mem.write(
-            addr,
-            &pm4(packet_dwords, IT_SET_SH_REG, R_ZERO).to_le_bytes(),
-        ) || !ctx
+        if !ctx
             .mem
-            .write(addr + 4, &(registers[start].0 & 0xFFFF).to_le_bytes())
+            .write(addr, &pm4(packet_dwords, op, R_ZERO).to_le_bytes())
+            || !ctx
+                .mem
+                .write(addr + 4, &(registers[start].0 & 0xFFFF).to_le_bytes())
         {
             return 0;
         }
@@ -3047,16 +3470,59 @@ fn hle_dcb_jump(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
-/// `sceAgcCbBranch(cb, target, sizeDwords)`: branch into another command
-/// buffer. SharpEmu implements only `DcbJump`; Branch is modeled on it — the
-/// same 4-DWORD INDIRECT_BUFFER chain packet (both transfer the command
-/// processor to `target` for `sizeDwords`) — so the assumption is that any
-/// Jump/Branch distinction (e.g. a return/chain flag) is not encoded in fields
-/// this emission fills. Measured Until Dawn + Dragon Ball Sparking Zero import
-/// (NID `w1KFAHVqpaU`). Same consumption gap as [`hle_dcb_jump`]: chained
-/// buffers are not yet executed by the in-tree command processors.
+/// `sceAgcCbBranch(cb, mode, compareFunction, compareAddress, mask, reference,
+/// cachePolicy1, buffer1, sizeInDwords1, cachePolicy2, buffer2,
+/// sizeInDwords2)`: conditional chain — the command processor compares the
+/// 64-bit value at `compareAddress` (masked) against `reference` with
+/// `compareFunction` and transfers to `buffer1` (then-branch) or `buffer2`
+/// (else-branch). Emits the 14-DWORD conditional INDIRECT_BUFFER packet.
+/// Ported from KytyPS5 `GraphicsCbBranch` (src/libs/agc.cpp; the measured
+/// Until Dawn / Dragon Ball NID `w1KFAHVqpaU` binds exactly this function
+/// there — the earlier Jump-alias model was wrong). Args 7–12 arrive on the
+/// stack → `args[6]`..`args[11]`. Returns the command address, or 0.
 fn hle_cb_branch(ctx: &HleContext, args: &[u64]) -> u64 {
-    hle_dcb_jump(ctx, args)
+    let cb = args.first().copied().unwrap_or(0);
+    let mode = (args.get(1).copied().unwrap_or(0) & 0x3) as u32;
+    let compare_function = (args.get(2).copied().unwrap_or(0) & 0x7) as u32;
+    let compare_addr = args.get(3).copied().unwrap_or(0);
+    let mask = args.get(4).copied().unwrap_or(0);
+    let reference = args.get(5).copied().unwrap_or(0);
+    let cache_policy1 = (args.get(6).copied().unwrap_or(0) & 0x3) as u32;
+    let buffer1 = args.get(7).copied().unwrap_or(0);
+    let size_dwords1 = args.get(8).copied().unwrap_or(0) as u32;
+    let cache_policy2 = (args.get(9).copied().unwrap_or(0) & 0x3) as u32;
+    let buffer2 = args.get(10).copied().unwrap_or(0);
+    let size_dwords2 = args.get(11).copied().unwrap_or(0) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 14) else {
+        return 0;
+    };
+    let dwords = [
+        pm4(14, IT_INDIRECT_BUFFER, R_ZERO),
+        mode | (compare_function << 8),
+        (compare_addr as u32) & 0xFFFF_FFF8,
+        (compare_addr >> 32) as u32,
+        mask as u32,
+        (mask >> 32) as u32,
+        reference as u32,
+        (reference >> 32) as u32,
+        (buffer1 as u32) & 0xFFFF_FFFC,
+        (buffer1 >> 32) as u32,
+        (size_dwords1 & 0xF_FFFF) | (cache_policy1 << 28),
+        (buffer2 as u32) & 0xFFFF_FFFC,
+        (buffer2 >> 32) as u32,
+        (size_dwords2 & 0xF_FFFF) | (cache_policy2 << 28),
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
 }
 
 /// `sceAgcSetPacketPredication(...)`: global predication toggle on a packet.
@@ -4247,6 +4713,855 @@ fn hle_unknown_krz_wek_v120(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
+// ---------------------------------------------------------------------------
+// GTA V (PPSA04264) AGC wall, Phase A — *GetSize sizing family + ACB builders
+//
+// The measured missing set (artifacts/compat/nid-coverage.json, 2026-07-27) is
+// dominated by size probes and async-compute-buffer emitters. GetSize values
+// are BYTES (this file's convention) and each is pinned to the writer it must
+// stay consistent with: this file's own emitter when one exists, otherwise the
+// KytyPS5 Gen5 emitter (reference/kytyps5 src/libs/agc.cpp, MIT lineage) or
+// the architectural PM4 packet (reference/mesa, MIT).
+// ---------------------------------------------------------------------------
+
+/// Fixed 4-DWORD packets (SET_BASE / SET_PREDICATION / occlusion EVENT_WRITE /
+/// ACB DISPATCH_INDIRECT): 16 bytes.
+fn hle_get_size_4_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    16
+}
+
+/// `sceAgc{Dcb,Acb}EventWriteGetSize()`: BYTES an EVENT_WRITE packet occupies.
+/// The packet is 2 DWORDs, or 4 for the address-carrying event types
+/// (`eventType & ~1 == 0x38` — see [`hle_acb_event_write`] and KytyPS5
+/// `GraphicsDcbEventWrite`). The probe's signature is not established, so
+/// return the 4-DWORD worst case: over-reserving is harmless, under-reserving
+/// is the buffer-overflow class this family exists to prevent.
+fn hle_event_write_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    16
+}
+
+/// `sceAgc{Dcb,Acb}AtomicMemGetSize()`: BYTES an ATOMIC_MEM packet occupies —
+/// 9 DWORDs (header, op/command control, 64-bit address, 64-bit source data,
+/// 64-bit compare data, loop interval), per the architectural PM4 emitter
+/// `ac_emit_cp_atomic_mem` (reference/mesa `src/amd/common/ac_cmdbuf_cp.c`).
+fn hle_atomic_mem_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    36
+}
+
+/// `sceAgc{Dcb,Acb}AtomicGdsGetSize()`: BYTES a GDS atomic occupies. No
+/// reference emits ATOMIC_GDS (mesa only defines the opcode), so this returns
+/// the ATOMIC_MEM size (36) as a documented ceiling — GDS atomics carry
+/// 16-bit GDS offsets instead of 64-bit addresses, so the memory form bounds
+/// the GDS form. Explicitly an assumption, not a measured size.
+fn hle_atomic_gds_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgc*AtomicGdsGetSize: no reference emitter — returning the ATOMIC_MEM \
+             ceiling (36 bytes); verify against a real dump before trusting GDS atomics"
+        );
+    }
+    36
+}
+
+/// `sceAgc{Dcb,Acb}PrimeUtcl2GetSize()`: BYTES a PRIME_UTCL2 packet occupies —
+/// 5 DWORDs (header, cache-perm/prime-mode/engine control, 64-bit base
+/// address, requested pages). Opcode from reference/mesa `sid.h`
+/// (`PKT3_PRIME_UTCL2`); field layout is the architectural PM4 packet.
+fn hle_prime_utcl2_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    20
+}
+
+/// `sceAgcCbBranchGetSize()`: BYTES a conditional-chain packet occupies — the
+/// 14-DWORD INDIRECT_BUFFER emission of [`hle_cb_branch`] (KytyPS5
+/// `GraphicsCbBranch` allocates 14 DWORDs).
+fn hle_cb_branch_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    56
+}
+
+/// `sceAgcCbCondWriteGetSize()`: BYTES a COND_WRITE packet occupies — 9 DWORDs
+/// (header, function/space control, 64-bit poll address, reference, mask,
+/// 64-bit write address, write data). Opcode from reference/mesa `sid.h`
+/// (`PKT3_COND_WRITE`); field layout is the architectural PM4 packet.
+fn hle_cb_cond_write_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    36
+}
+
+/// `sceAgcCbSet{Sh,Uc}RegistersDirectGetSize(numRegisters)`: BYTES the
+/// run-coalescing register writers ([`hle_cb_set_sh_registers_direct`] /
+/// [`hle_cb_set_uc_registers_direct`]) can occupy in the worst case — one
+/// 3-DWORD packet per register when no offsets are contiguous (12 bytes per
+/// register). Coalescing only shrinks the emission, so this is a safe upper
+/// bound. The single-`numRegisters` signature is inferred from the writers
+/// (their size depends on nothing else); warns once.
+fn hle_cb_set_registers_direct_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let num_registers = args.first().copied().unwrap_or(0) as u32;
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcCbSet*RegistersDirectGetSize: signature inferred (numRegisters in \
+             the first argument register) — returning the per-register worst case \
+             ({} bytes for numRegisters={num_registers})",
+            u64::from(num_registers) * 12
+        );
+    }
+    u64::from(num_registers) * 12
+}
+
+/// `sceAgcCbSetUcRegisterRangeDirectGetSize(numValues)`: BYTES the UCONFIG
+/// range writer ([`hle_cb_set_uc_register_range`]) occupies — one
+/// `numValues + 2` DWORD packet (KytyPS5's Sh-range sizing,
+/// `GraphicsCbSetShRegisterRangeDirectGetSize` = `4 * num + 8`, with the
+/// register-space opcode swapped).
+fn hle_cb_set_uc_register_range_get_size(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let num_values = args.first().copied().unwrap_or(0) as u32;
+    u64::from(num_values) * 4 + 8
+}
+
+/// `sceAgcDcbContextStateOpGetSize()`: BYTES a context-state operation
+/// occupies. No reference names or emits this packet; the nearest analogue is
+/// the 2-DWORD CLEAR_STATE-shaped queue reset ([`hle_dcb_reset_queue`] /
+/// KytyPS5 `GraphicsDcbResetQueue`), so return 8 as a documented assumption
+/// (warns once).
+fn hle_dcb_context_state_op_get_size(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgcDcbContextStateOpGetSize: no reference emitter — returning the \
+             2-DWORD CLEAR_STATE-shaped size (8 bytes) as a documented assumption"
+        );
+    }
+    8
+}
+
+/// `sceAgc{Dcb,Acb}Rewind(cb, initialState)`: emit a 2-DWORD REWIND packet —
+/// the command processor stalls here until the packet's high bit is cleared
+/// by the CPU. Ported from KytyPS5 `GraphicsDcbRewind`; the ACB packet is
+/// identical (queue-agnostic, like CondExec/AcquireMem).
+fn hle_dcb_rewind(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let initial_state = (args.get(1).copied().unwrap_or(0) & 0x1) as u32;
+    if cb == 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx
+        .mem
+        .write(addr, &pm4(2, IT_REWIND, R_ZERO).to_le_bytes())
+        || !ctx
+            .mem
+            .write(addr + 4, &(initial_state << 31).to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+// Workload bookkeeping packets (KytyPS5 emits these as private NOP-marker
+// packets its command processor recognizes; ours currently skips NOPs, which
+// is the correct degradation — workload tracking is profiling metadata).
+const WORKLOAD_STREAM_MIN_ID: u64 = 1;
+const WORKLOAD_STREAM_MAX_ID: u64 = 31;
+const WORKLOAD_ID_MAX: u64 = 63;
+const WORKLOAD_ACTIVE_COUNT_MAX: u64 = 63;
+/// KytyPS5 `WORKLOAD_ACTIVE_PACKET_SIZE_DW`.
+const WORKLOAD_ACTIVE_PACKET_DWORDS: u64 = 18;
+/// KytyPS5 `WORKLOAD_COMPLETE_PACKET_SIZE_DW`.
+const WORKLOAD_COMPLETE_PACKET_DWORDS: u64 = 12;
+
+/// `sceAgc{Dcb,Acb}SetWorkloadsActive(cb, streamId, workloadIds,
+/// workloadCount)`: emit the 18-DWORD workload-activation marker
+/// (`[streamId, maskLo, maskHi, 0...]` behind a NOP header). Ported from
+/// KytyPS5 `GraphicsDcbSetWorkloadsActive`, minus its registered-stream-mask
+/// check (our `sceAgcDriverRegisterWorkloadStream` records nothing). Returns
+/// the command address, or 0 on invalid ids / duplicate workloads.
+fn hle_dcb_set_workloads_active(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let stream_id = args.get(1).copied().unwrap_or(0);
+    let workload_ids = args.get(2).copied().unwrap_or(0);
+    let workload_count = args.get(3).copied().unwrap_or(0);
+    if cb == 0
+        || workload_ids == 0
+        || workload_count == 0
+        || workload_count > WORKLOAD_ACTIVE_COUNT_MAX
+        || !(WORKLOAD_STREAM_MIN_ID..=WORKLOAD_STREAM_MAX_ID).contains(&stream_id)
+    {
+        return 0;
+    }
+    let mut workload_mask = 0u64;
+    for index in 0..workload_count {
+        let mut id = [0u8; 4];
+        if !ctx.mem.read(workload_ids + index * 4, &mut id) {
+            return 0;
+        }
+        let workload_id = u64::from(u32::from_le_bytes(id));
+        if workload_id > WORKLOAD_ID_MAX {
+            return 0;
+        }
+        let workload_bit = 1u64 << workload_id;
+        if workload_mask & workload_bit != 0 {
+            return 0;
+        }
+        workload_mask |= workload_bit;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, WORKLOAD_ACTIVE_PACKET_DWORDS) else {
+        return 0;
+    };
+    let mut dwords = [0u32; WORKLOAD_ACTIVE_PACKET_DWORDS as usize];
+    dwords[0] = pm4(WORKLOAD_ACTIVE_PACKET_DWORDS as u32, IT_NOP, R_ZERO);
+    dwords[1] = stream_id as u32;
+    dwords[2] = workload_mask as u32;
+    dwords[3] = (workload_mask >> 32) as u32;
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgc{Dcb,Acb}SetWorkloadComplete(cb, streamId, workloadId)`: emit the
+/// 12-DWORD workload-completion marker (`[streamId, workloadId, clearMaskLo,
+/// clearMaskHi, 0...]` behind a NOP header). Ported from KytyPS5
+/// `GraphicsDcbSetWorkloadComplete` (same stream-mask caveat as
+/// [`hle_dcb_set_workloads_active`]).
+fn hle_dcb_set_workload_complete(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let stream_id = args.get(1).copied().unwrap_or(0);
+    let workload_id = args.get(2).copied().unwrap_or(0);
+    if cb == 0
+        || workload_id > WORKLOAD_ID_MAX
+        || !(WORKLOAD_STREAM_MIN_ID..=WORKLOAD_STREAM_MAX_ID).contains(&stream_id)
+    {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, WORKLOAD_COMPLETE_PACKET_DWORDS) else {
+        return 0;
+    };
+    let workload_clear_mask = !(1u64 << workload_id);
+    let mut dwords = [0u32; WORKLOAD_COMPLETE_PACKET_DWORDS as usize];
+    dwords[0] = pm4(WORKLOAD_COMPLETE_PACKET_DWORDS as u32, IT_NOP, R_ZERO);
+    dwords[1] = stream_id as u32;
+    dwords[2] = workload_id as u32;
+    dwords[3] = workload_clear_mask as u32;
+    dwords[4] = (workload_clear_mask >> 32) as u32;
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgc{Dcb,Acb}SetWorkloadStreamInactive(cb, streamId)`: no reference
+/// implements this sibling; workload tracking is profiling metadata, so a
+/// 2-DWORD NOP marker carrying the stream id is the honest inert emission
+/// (documented derivation from the Active/Complete markers above; warns
+/// once).
+fn hle_dcb_set_workload_stream_inactive(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let cb = args.first().copied().unwrap_or(0);
+    let stream_id = args.get(1).copied().unwrap_or(0);
+    if cb == 0 || !(WORKLOAD_STREAM_MIN_ID..=WORKLOAD_STREAM_MAX_ID).contains(&stream_id) {
+        return 0;
+    }
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgc*SetWorkloadStreamInactive: no reference implementation — emitting \
+             an inert 2-DWORD NOP bookkeeping marker (streamId={stream_id})"
+        );
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 2) else {
+        return 0;
+    };
+    if !ctx.mem.write(addr, &pm4(2, IT_NOP, R_ZERO).to_le_bytes())
+        || !ctx.mem.write(addr + 4, &(stream_id as u32).to_le_bytes())
+    {
+        return 0;
+    }
+    addr
+}
+
+/// KytyPS5 `decode_draw_index_initiator`: the DRAW_INDEX initiator bits a
+/// draw modifier contributes.
+fn draw_index_initiator(modifier: u64) -> u32 {
+    if modifier & (1u64 << 32) != 0 {
+        0
+    } else {
+        ((modifier as u32) >> 3) & 0x20
+    }
+}
+
+/// `sceAgcDcbDrawIndexMultiInstanced(dcb, indexCount, indexAddress, objectIds,
+/// instanceCount, modifier)`: emit the 9-DWORD multi-instanced draw preamble.
+/// Ported from KytyPS5 `GraphicsDcbDrawIndexMultiInstanced`. Returns the
+/// command address, or 0 on failure.
+fn hle_dcb_draw_index_multi_instanced(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let index_count = args.get(1).copied().unwrap_or(0) as u32;
+    let index_addr = args.get(2).copied().unwrap_or(0);
+    let object_ids = args.get(3).copied().unwrap_or(0);
+    let instance_count = args.get(4).copied().unwrap_or(0) as u32;
+    let modifier = args.get(5).copied().unwrap_or(0);
+    if cb == 0 || index_addr == 0 || object_ids == 0 || index_addr & 1 != 0 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 9) else {
+        return 0;
+    };
+    let dwords = [
+        pm4(9, IT_DISPATCH_DRAW_PREAMBLE, R_ZERO),
+        index_count,
+        index_addr as u32,
+        (index_addr >> 32) as u32,
+        if instance_count == 0 {
+            1
+        } else {
+            instance_count
+        },
+        object_ids as u32,
+        (object_ids >> 32) as u32,
+        instance_count,
+        draw_index_initiator(modifier) | 0x80,
+    ];
+    if !dwords
+        .iter()
+        .enumerate()
+        .all(|(index, value)| ctx.mem.write(addr + index as u64 * 4, &value.to_le_bytes()))
+    {
+        return 0;
+    }
+    addr
+}
+
+/// `sceAgcCbSetUcRegisterRangeDirect(cb, offset, values, valueCount)`: emit
+/// one `valueCount + 2` DWORD SET_UCONFIG_REG packet writing `valueCount`
+/// contiguous UCONFIG registers starting at `offset`. Mirrors KytyPS5's
+/// Sh-range writer (`GraphicsCbSetShRegisterRangeDirect`) with the
+/// register-space opcode swapped; unlike the SharpEmu-derived Sh entry point
+/// in this file there is no marker prefix — the reference emits exactly one
+/// packet, and [`hle_cb_set_uc_register_range_get_size`] must match this
+/// emission. A null `values` zero-fills (reference parity).
+fn hle_cb_set_uc_register_range(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cb = args.first().copied().unwrap_or(0);
+    let offset = args.get(1).copied().unwrap_or(0) as u32;
+    let values_addr = args.get(2).copied().unwrap_or(0);
+    let value_count = args.get(3).copied().unwrap_or(0);
+    if cb == 0 || value_count == 0 || value_count > 4096 {
+        return 0;
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, value_count + 2) else {
+        return 0;
+    };
+    if !ctx.mem.write(
+        addr,
+        &pm4((value_count + 2) as u32, IT_SET_UCONFIG_REG, R_ZERO).to_le_bytes(),
+    ) || !ctx.mem.write(addr + 4, &(offset & 0xFFFF).to_le_bytes())
+    {
+        return 0;
+    }
+    for i in 0..value_count {
+        let mut v = [0u8; 4];
+        if values_addr != 0 {
+            let _ = ctx.mem.read(values_addr + i * 4, &mut v);
+        }
+        if !ctx.mem.write(addr + 8 + i * 4, &v) {
+            return 0;
+        }
+    }
+    addr
+}
+
+/// `sceAgc{Dcb,Acb}PrimeUtcl2(cb, ...)`: UTCL2 (GPU L2 TLB) prefetch hint.
+/// Priming is a pure performance hint — skipping it is functionally identity —
+/// and the guest argument order is not established by any reference, so this
+/// emits a size-consistent 5-DWORD NOP (the PRIME_UTCL2 packet's
+/// architectural size, matching [`hle_prime_utcl2_get_size`]) instead of a
+/// guessed encoding. Warns once.
+fn hle_prime_utcl2(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let cb = args.first().copied().unwrap_or(0);
+    if cb == 0 {
+        return 0;
+    }
+    if warn_once(&WARNED) {
+        warn!(
+            "sceAgc*PrimeUtcl2: prefetch hint dropped — emitting a size-consistent \
+             5-DWORD NOP instead of a guessed PRIME_UTCL2 encoding (args={args:x?})"
+        );
+    }
+    let Some(addr) = alloc_command_dwords(ctx, cb, 5) else {
+        return 0;
+    };
+    let ok = ctx.mem.write(addr, &pm4(5, IT_NOP, R_ZERO).to_le_bytes())
+        && (1..5).all(|i| ctx.mem.write(addr + i * 4, &0u32.to_le_bytes()));
+    if !ok {
+        return 0;
+    }
+    addr
+}
+
+/// Total DWORD length encoded in a packet header at `command`, or `None` if
+/// unreadable.
+fn packet_total_dwords(ctx: &HleContext, command: u64) -> Option<u32> {
+    let mut hdr = [0u8; 4];
+    if command == 0 || !ctx.mem.read(command, &mut hdr) {
+        return None;
+    }
+    Some(((u32::from_le_bytes(hdr) >> 16) & 0x3FFF).wrapping_add(2))
+}
+
+/// `sceAgcQueueEndOfPipeActionPatchData(command, contextId, dataSelection,
+/// data)`: patch a RELEASE_MEM packet's 64-bit data payload (`command + 20`,
+/// this file's release-mem layout — see [`hle_cb_release_mem`] and the
+/// sibling `PatchAddress`). KytyPS5's `GraphicsQueueEndOfPipeActionPatchData`
+/// additionally expands Agc Core ring-buffer generations: for
+/// `contextId > 1 && dataSelection == 1` the packed generation byte in bits
+/// 24..31 is replaced with the monotonic generation carried by `contextId`.
+/// Ported faithfully.
+fn hle_queue_eop_patch_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let context_id = args.get(1).copied().unwrap_or(0) as u32;
+    let data_selection = args.get(2).copied().unwrap_or(0) as u32;
+    let data = args.get(3).copied().unwrap_or(0);
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_RELEASE_MEM => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    let packet_data = if context_id > 1 && data_selection == 1 {
+        (u64::from(context_id - 2) << 24) | (data & 0x00FF_FFFF)
+    } else {
+        data
+    };
+    if !ctx.mem.write(command + 20, &packet_data.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcQueueEndOfPipeActionPatchGcrCntl(command, gcrControl)`: patch the
+/// GCR (cache-control) field of a RELEASE_MEM packet. In this file's
+/// release-mem layout ([`hle_cb_release_mem`]) the GCR word occupies bits
+/// 0..15 of DWORD 2 (`command + 8`); the data-selection and interrupt fields
+/// above it are preserved.
+fn hle_queue_eop_patch_gcr_cntl(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let gcr_control = args.get(1).copied().unwrap_or(0) as u32;
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_RELEASE_MEM => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    let mut word = [0u8; 4];
+    if !ctx.mem.read(command + 8, &mut word) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let patched = (u32::from_le_bytes(word) & 0xFFFF_0000) | (gcr_control & 0xFFFF);
+    if !ctx.mem.write(command + 8, &patched.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcQueueEndOfPipeActionPatchType(command, eventType)`: patch the
+/// end-of-pipe action/event field of a RELEASE_MEM packet. In this file's
+/// release-mem layout the action occupies bits 0..7 of DWORD 1
+/// (`command + 4`); the cache-policy byte above it is preserved.
+fn hle_queue_eop_patch_type(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let event_type = args.get(1).copied().unwrap_or(0) as u32;
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_RELEASE_MEM => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    let mut word = [0u8; 4];
+    if !ctx.mem.read(command + 4, &mut word) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let patched = (u32::from_le_bytes(word) & !0xFF) | (event_type & 0xFF);
+    if !ctx.mem.write(command + 4, &patched.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgc{,Async}CondExecPatchSetEnd(command, bufferEnd)`: recompute a
+/// COND_EXEC packet's predicated-region length so it covers everything from
+/// the end of the packet to `bufferEnd`. Ported from KytyPS5
+/// `GraphicsCondExecPatchSetEnd` (the Async NID binds the same function —
+/// the packet is queue-agnostic). The count lives in the low 14 bits of
+/// DWORD 4 (`command + 16`, matching [`hle_dcb_cond_exec`]).
+fn hle_cond_exec_patch_set_end(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let buffer_end = args.get(1).copied().unwrap_or(0);
+    if buffer_end == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    match packet_identity(ctx, command) {
+        Some((op, _)) if op == IT_COND_EXEC => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    let packet_end = command + 5 * 4;
+    if buffer_end < packet_end {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let num_dwords = (buffer_end - packet_end) / 4;
+    if num_dwords > 0x3FFF {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut word = [0u8; 4];
+    if !ctx.mem.read(command + 16, &mut word) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let patched = (u32::from_le_bytes(word) & !0x3FFF) | num_dwords as u32;
+    if !ctx.mem.write(command + 16, &patched.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgc{,Async}CondExecPatchSetCommandAddress(command, predicateAddress)`:
+/// re-point a COND_EXEC packet's predicate label. Ported from KytyPS5
+/// `GraphicsCondExecPatchSetCommandAddress` — DWORDs 1/2 (`command + 4`),
+/// low bits of DWORD 1 preserved.
+fn hle_cond_exec_patch_set_command_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let predicate = args.get(1).copied().unwrap_or(0);
+    if predicate == 0 || predicate & 3 != 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    match packet_identity(ctx, command) {
+        Some((op, _)) if op == IT_COND_EXEC => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    let mut word = [0u8; 4];
+    if !ctx.mem.read(command + 4, &mut word) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let low = (u32::from_le_bytes(word) & 0x3) | (predicate as u32 & 0xFFFF_FFFC);
+    if !ctx.mem.write(command + 4, &low.to_le_bytes())
+        || !ctx
+            .mem
+            .write(command + 8, &((predicate >> 32) as u32).to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgc{,Async}RewindPatchSetRewindState(command, state)`: arm or release a
+/// REWIND packet's stall bit (bit 31 of DWORD 1 — the field
+/// [`hle_dcb_rewind`] emits).
+fn hle_rewind_patch_set_rewind_state(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let state = (args.get(1).copied().unwrap_or(0) & 0x1) as u32;
+    match packet_identity(ctx, command) {
+        Some((op, _)) if op == IT_REWIND => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    if !ctx.mem.write(command + 4, &(state << 31).to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcBranchPatchSetCompareAddress(command, compareAddress)`: re-point the
+/// 64-bit compare label of a conditional-chain packet ([`hle_cb_branch`]'s
+/// 14-DWORD INDIRECT_BUFFER form — the total length distinguishes it from the
+/// 4-DWORD unconditional jump, which has no compare field). DWORDs 2/3
+/// (`command + 8`), address forced 8-byte aligned like the emitter.
+fn hle_branch_patch_set_compare_address(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let compare_addr = args.get(1).copied().unwrap_or(0);
+    match packet_identity(ctx, command) {
+        Some((op, _)) if op == IT_INDIRECT_BUFFER => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    if packet_total_dwords(ctx, command) != Some(14) {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    if !ctx.mem.write(
+        command + 8,
+        &((compare_addr as u32) & 0xFFFF_FFF8).to_le_bytes(),
+    ) || !ctx
+        .mem
+        .write(command + 12, &((compare_addr >> 32) as u32).to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcWaitRegMemPatchReference(command, reference)`: patch the reference
+/// value of a wait packet, in whichever of this file's three wait layouts the
+/// packet uses ([`hle_dcb_wait_reg_mem`]): standard WAIT_REG_MEM keeps a
+/// 32-bit reference at DWORD 4; the 32-bit wait-memory NOP at DWORD 5; the
+/// 64-bit form a 64-bit reference at DWORDs 5/6.
+fn hle_wait_reg_mem_patch_reference(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let reference = args.get(1).copied().unwrap_or(0);
+    let Some((op, reg)) = packet_identity(ctx, command) else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    let ok = if op == IT_WAIT_REG_MEM {
+        ctx.mem
+            .write(command + 16, &(reference as u32).to_le_bytes())
+    } else if op == IT_NOP && reg == R_WAIT_MEM32 {
+        ctx.mem
+            .write(command + 20, &(reference as u32).to_le_bytes())
+    } else if op == IT_NOP && reg == R_WAIT_MEM64 {
+        ctx.mem.write(command + 20, &reference.to_le_bytes())
+    } else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    if !ok {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcWaitRegMemPatchCompareFunction(command, compareFunction)`: patch the
+/// compare function of a wait packet — bits 0..7 of the control word in each
+/// of this file's three wait layouts (standard: DWORD 1; 32-bit NOP form:
+/// DWORD 4; 64-bit form: DWORD 7), preserving the operation bits above.
+fn hle_wait_reg_mem_patch_compare_function(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let compare_function = (args.get(1).copied().unwrap_or(0) & 0xFF) as u32;
+    let Some((op, reg)) = packet_identity(ctx, command) else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    let field_offset = if op == IT_WAIT_REG_MEM {
+        4
+    } else if op == IT_NOP && reg == R_WAIT_MEM32 {
+        16
+    } else if op == IT_NOP && reg == R_WAIT_MEM64 {
+        28
+    } else {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    };
+    let mut word = [0u8; 4];
+    if !ctx.mem.read(command + field_offset, &mut word) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let patched = (u32::from_le_bytes(word) & !0xFF) | compare_function;
+    if !ctx
+        .mem
+        .write(command + field_offset, &patched.to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// `sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(command, source)`:
+/// patch a DMA_DATA packet's 64-bit source field. In this file's DMA layout
+/// ([`hle_dcb_dma_data`]) the source lives at DWORDs 6/7 (`command + 24`);
+/// the destination sibling (`...SetDstAddressOrOffset`) patches `+16`.
+fn hle_dma_data_patch_src(ctx: &HleContext, args: &[u64]) -> u64 {
+    let command = args.first().copied().unwrap_or(0);
+    let source = args.get(1).copied().unwrap_or(0);
+    match packet_identity(ctx, command) {
+        Some((op, reg)) if op == IT_NOP && reg == R_DMA_DATA => {}
+        _ => return SCE_ERROR_INVALID_ARGUMENT,
+    }
+    if !ctx.mem.write(command + 24, &source.to_le_bytes()) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+/// KytyPS5 `GraphicsPrimitiveTypeToGsOut`: map a Prospero primitive type to
+/// the GS output primitive class (`0` points, `1` lines, `2` triangles,
+/// `3` 2D rectangle, `4` legacy rect list).
+fn primitive_type_to_gs_out(prim_type: u32) -> u32 {
+    match prim_type {
+        1 => 0,                    // point list
+        2 | 3 | 10 | 11 | 18 => 1, // line list/strip/adjacency/loop
+        7 => 3,                    // rect list
+        17 => 4,                   // legacy rect list
+        _ => 2,                    // triangles
+    }
+}
+
+/// `sceAgcUpdatePrimState(cxRegisters, ucRegisters, primitiveType)`: refresh a
+/// prim-state register pair in place for a new primitive type. Ported from
+/// KytyPS5 `GraphicsUpdatePrimState`: when the CX table's shader-stages value
+/// has neither GS-driven bit set (`value & 0x24 == 0`), the GS-out class
+/// (low 3 bits of `cx[1].value`) is recomputed from `primitiveType`; the UC
+/// table's `VGT_PRIMITIVE_TYPE` value (low 5 bits of `uc[2].value`) is always
+/// rewritten. Null tables are legal and skipped.
+fn hle_update_prim_state(ctx: &HleContext, args: &[u64]) -> u64 {
+    let cx_regs = args.first().copied().unwrap_or(0);
+    let uc_regs = args.get(1).copied().unwrap_or(0);
+    let prim_type = args.get(2).copied().unwrap_or(0) as u32;
+    // ShaderRegister is { offset: u32, value: u32 } — values sit at +4 within
+    // each 8-byte entry.
+    if cx_regs != 0 {
+        let mut cx0_value = [0u8; 4];
+        let mut cx1_value = [0u8; 4];
+        if !ctx.mem.read(cx_regs + 4, &mut cx0_value) || !ctx.mem.read(cx_regs + 12, &mut cx1_value)
+        {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        if u32::from_le_bytes(cx0_value) & 0x24 == 0 {
+            let patched =
+                (u32::from_le_bytes(cx1_value) & !0x7) | primitive_type_to_gs_out(prim_type);
+            if !ctx.mem.write(cx_regs + 12, &patched.to_le_bytes()) {
+                return SCE_ERROR_MEMORY_FAULT;
+            }
+        }
+    }
+    if uc_regs != 0 {
+        let mut uc2_value = [0u8; 4];
+        if !ctx.mem.read(uc_regs + 20, &mut uc2_value) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        let patched = (u32::from_le_bytes(uc2_value) & !0x1F) | (prim_type & 0x1F);
+        if !ctx.mem.write(uc_regs + 20, &patched.to_le_bytes()) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+    }
+    0
+}
+
+/// `sceAgcGetDataPacketPayloadRange(range, command, type)`: report the
+/// payload span of a data packet as a `{ base: *u32, size: u64 }` pair.
+/// Ported from KytyPS5 `GraphicsGetDataPacketPayloadRange`: `type != 0` skips
+/// two header DWORDs and spans the body; `type == 0` skips one and adds the
+/// extra DWORD, with the all-ones length field meaning "no payload".
+fn hle_get_data_packet_payload_range(ctx: &HleContext, args: &[u64]) -> u64 {
+    let range = args.first().copied().unwrap_or(0);
+    let command = args.get(1).copied().unwrap_or(0);
+    let packet_type = args.get(2).copied().unwrap_or(0) as u32;
+    if range == 0 || command == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    let mut hdr = [0u8; 4];
+    if !ctx.mem.read(command, &mut hdr) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let cmd_id = u32::from_le_bytes(hdr);
+    let body_bytes = u64::from((cmd_id >> 14) & 0xFFFC);
+    let (base, size) = if packet_type != 0 {
+        (command + 8, body_bytes)
+    } else if !cmd_id & 0x3FFF_0000 == 0 {
+        (0, 0)
+    } else {
+        (command + 4, body_bytes + 4)
+    };
+    if !ctx.mem.write(range, &base.to_le_bytes()) || !ctx.mem.write(range + 8, &size.to_le_bytes())
+    {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Honest-error surface: imported by GTA V but with NO reference encoding or
+// established guest signature. Each logs loudly (error on first call, debug
+// after) and returns the documented failure value — never a guessed packet.
+// ---------------------------------------------------------------------------
+
+/// Log an unimplementable AGC entry point: `error!` on first call per flag,
+/// `debug!` thereafter.
+fn log_unavailable(flag: &std::sync::atomic::AtomicBool, name: &str, args: &[u64]) {
+    if warn_once(flag) {
+        error!(
+            "{name}: no reference encoding — honest failure (see libsce_agc.rs \
+             Phase A notes); args={args:x?}"
+        );
+    } else {
+        debug!("{name}: honest failure (args={args:x?})");
+    }
+}
+
+/// `sceAgc{Dcb,Acb}AtomicMem(...)`: the ATOMIC_MEM packet shape is known
+/// (see [`hle_atomic_mem_get_size`]) but no reference establishes the guest
+/// argument order, and a misassembled atomic corrupts GPU synchronization
+/// silently. Returns null (the builder-failure convention).
+fn hle_atomic_mem_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgc*AtomicMem", args);
+    0
+}
+
+/// `sceAgc{Dcb,Acb}MemSemaphore(...)`: MEM_SEMAPHORE opcode is known (mesa
+/// `sid.h`) but neither the field layout nor the guest signature has a
+/// reference. Returns null.
+fn hle_mem_semaphore_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgc*MemSemaphore", args);
+    0
+}
+
+/// `sceAgcCbCondWrite(...)`: COND_WRITE packet shape is architectural (see
+/// [`hle_cb_cond_write_get_size`]) but the guest argument order has no
+/// reference. Returns null.
+fn hle_cb_cond_write_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcCbCondWrite", args);
+    0
+}
+
+/// `sceAgcDcbSetIndexIndirectArgs(...)`: almost certainly a 4-DWORD SET_BASE
+/// (its GetSize sibling returns 16) but the base-select constant is not
+/// established, and a wrong select clobbers the draw/dispatch indirect base.
+/// Returns null.
+fn hle_set_index_indirect_args_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcDcbSetIndexIndirectArgs", args);
+    0
+}
+
+/// `sceAgcGetDefaultCxStateFlat(...)`: returns a pointer to a flat default
+/// context-register image whose layout no reference documents (the tabled
+/// `GetRegisterDefaults2` family is a different, non-flat shape). Returns
+/// null.
+fn hle_get_default_cx_state_flat_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcGetDefaultCxStateFlat", args);
+    0
+}
+
+/// `sceAgcSetNop(...)`: presumably rewrites a command range with NOPs, but
+/// with no reference for the signature, writing guest memory on a guess is
+/// exactly the garbage this surface bans. Returns 0 (null/no-op).
+fn hle_set_nop_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcSetNop", args);
+    0
+}
+
+/// `sceAgcGetGsOversubscription(...)`: GS oversubscription tuning query with
+/// no reference semantics. Returns 0 ("no oversubscription data").
+fn hle_get_gs_oversubscription_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcGetGsOversubscription", args);
+    0
+}
+
+/// `sceAgcSetAmmSemaphoreMemory(...)`: AMM semaphore backing-memory
+/// registration with no reference. Returns the generic invalid-argument
+/// error so an int-interpreting caller sees an honest failure.
+fn hle_set_amm_semaphore_memory_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcSetAmmSemaphoreMemory", args);
+    SCE_ERROR_INVALID_ARGUMENT
+}
+
+/// `sceAgcGetSemaphoreLabel(...)`: semaphore label lookup with no reference.
+/// Returns null.
+fn hle_get_semaphore_label_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    log_unavailable(&WARNED, "sceAgcGetSemaphoreLabel", args);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5181,10 +6496,9 @@ mod tests {
         );
     }
 
-    /// SharpEmu `DcbJump` parity: 4-DWORD INDIRECT_BUFFER chain packet, with
-    /// `CbBranch` emitting the identical chain (modeled on Jump — see docs).
+    /// SharpEmu `DcbJump` parity: 4-DWORD INDIRECT_BUFFER chain packet.
     #[test]
-    fn dcb_jump_and_cb_branch_emit_the_chain_packet() {
+    fn dcb_jump_emits_the_chain_packet() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let cb = 0x40;
@@ -5201,11 +6515,61 @@ mod tests {
             "size & 0xFFFFF"
         );
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x410);
-        // Branch: byte-identical emission at the next cursor position.
-        assert_eq!(hle_cb_branch(&ctx, &[cb, target, 8]), 0x410);
-        assert_eq!(read_u32(&ctx, 0x410), pm4(4, IT_INDIRECT_BUFFER, R_ZERO));
-        assert_eq!(read_u32(&ctx, 0x41C), 8);
         assert_eq!(hle_dcb_jump(&ctx, &[0, target, 8]), 0, "null dcb → 0");
+    }
+
+    /// KytyPS5 `GraphicsCbBranch` parity: the 14-DWORD conditional chain,
+    /// with args 7–12 arriving as stack args.
+    #[test]
+    fn cb_branch_emits_the_fourteen_dword_conditional_chain() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let compare_addr = 0x0000_0012_3456_789Fu64; // low bits masked to 8-byte alignment
+        let mask = 0x1122_3344_5566_7788u64;
+        let reference = 0x99AA_BBCC_DDEE_FF00u64;
+        let buffer1 = 0x0000_0045_0000_1003u64; // low bits masked to 4-byte alignment
+        let buffer2 = 0x0000_0046_0000_2002u64;
+        let ret = hle_cb_branch(
+            &ctx,
+            &[
+                cb,
+                1,            // mode
+                5,            // compare function
+                compare_addr, // compare address
+                mask,
+                reference,
+                2,        // cache policy 1 (stack)
+                buffer1,  // then-buffer
+                0x123,    // then-size
+                3,        // cache policy 2
+                buffer2,  // else-buffer
+                0x456_78, // else-size
+            ],
+        );
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(14, IT_INDIRECT_BUFFER, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 1 | (5 << 8), "mode + compare fn");
+        assert_eq!(read_u32(&ctx, 0x408), 0x3456_7898, "compare lo &~7");
+        assert_eq!(read_u32(&ctx, 0x40C), 0x12, "compare hi");
+        assert_eq!(read_u32(&ctx, 0x410), 0x5566_7788, "mask lo");
+        assert_eq!(read_u32(&ctx, 0x414), 0x1122_3344, "mask hi");
+        assert_eq!(read_u32(&ctx, 0x418), 0xDDEE_FF00, "reference lo");
+        assert_eq!(read_u32(&ctx, 0x41C), 0x99AA_BBCC, "reference hi");
+        assert_eq!(read_u32(&ctx, 0x420), 0x0000_1000, "then lo &~3");
+        assert_eq!(read_u32(&ctx, 0x424), 0x45, "then hi");
+        assert_eq!(read_u32(&ctx, 0x428), 0x123 | (2 << 28), "then size+policy");
+        assert_eq!(read_u32(&ctx, 0x42C), 0x0000_2000, "else lo &~3");
+        assert_eq!(read_u32(&ctx, 0x430), 0x46, "else hi");
+        assert_eq!(
+            read_u32(&ctx, 0x434),
+            0x4_5678 | (3u32 << 28),
+            "else size+policy"
+        );
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 14 * 4);
+        // GetSize must match the emission.
+        assert_eq!(hle_cb_branch_get_size(&ctx, &[]), 14 * 4);
     }
 
     /// DRAW_INDIRECT is the non-indexed sibling of DRAW_INDEX_INDIRECT: same
@@ -6517,5 +7881,585 @@ mod tests {
             "cachePolicy<<28 | enable<<19 | reset<<18 | mask<<10 | select<<2"
         );
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408 + 20);
+    }
+
+    // -----------------------------------------------------------------
+    // GTA V (PPSA04264) Phase A — GetSize family + ACB builder tests
+    // -----------------------------------------------------------------
+
+    /// Every Phase A sizing probe returns the exact byte size of the writer
+    /// it is paired with (references in each handler's docs).
+    #[test]
+    fn gta5_get_size_family_returns_reference_byte_sizes() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Fixed-size probes.
+        assert_eq!(hle_get_size_4_dwords(&ctx, &[]), 16);
+        assert_eq!(hle_event_write_get_size(&ctx, &[]), 16);
+        assert_eq!(hle_atomic_mem_get_size(&ctx, &[]), 36);
+        assert_eq!(hle_atomic_gds_get_size(&ctx, &[]), 36);
+        assert_eq!(hle_prime_utcl2_get_size(&ctx, &[]), 20);
+        assert_eq!(hle_cb_branch_get_size(&ctx, &[]), 56);
+        assert_eq!(hle_cb_cond_write_get_size(&ctx, &[]), 36);
+        assert_eq!(hle_dcb_context_state_op_get_size(&ctx, &[]), 8);
+        // Value-dependent probes.
+        assert_eq!(hle_cb_set_registers_direct_get_size(&ctx, &[7]), 84);
+        assert_eq!(hle_cb_set_registers_direct_get_size(&ctx, &[0]), 0);
+        assert_eq!(hle_cb_set_uc_register_range_get_size(&ctx, &[5]), 28);
+        // Queue-agnostic reuses (ACB name → DCB handler).
+        assert_eq!(hle_dcb_jump_get_size(&ctx, &[]), 16);
+        assert_eq!(hle_dcb_rewind_get_size(&ctx, &[]), 8);
+        assert_eq!(hle_queue_eop_action_get_size(&ctx, &[]), 32);
+        assert_eq!(hle_dcb_wait_on_address_get_size(&ctx, &[0]), 56);
+        assert_eq!(hle_dcb_wait_on_address_get_size(&ctx, &[1]), 64);
+    }
+
+    /// `sceAgc{Dcb,Acb}Rewind` emits the 2-DWORD REWIND packet with the stall
+    /// bit from `initialState`, and the rewind-state patch flips it.
+    #[test]
+    fn rewind_emits_and_patches_the_stall_bit() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        assert_eq!(hle_dcb_rewind(&ctx, &[cb, 1]), 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(2, IT_REWIND, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 1 << 31, "stall bit armed");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x408, "2 DWORDs");
+        // Patch releases the stall bit (both spellings use this handler).
+        assert_eq!(hle_rewind_patch_set_rewind_state(&ctx, &[0x400, 0]), 0);
+        assert_eq!(read_u32(&ctx, 0x404), 0);
+        assert_eq!(hle_rewind_patch_set_rewind_state(&ctx, &[0x400, 1]), 0);
+        assert_eq!(read_u32(&ctx, 0x404), 1 << 31);
+        // Non-REWIND packet is rejected.
+        assert!(ctx.mem.write(0x500, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert_eq!(
+            hle_rewind_patch_set_rewind_state(&ctx, &[0x500, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_dcb_rewind(&ctx, &[0, 1]), 0, "null cb → 0");
+    }
+
+    /// Workload markers: 18-DWORD active mask, 12-DWORD completion, and the
+    /// 2-DWORD stream-inactive bookkeeping NOP; invalid ids are rejected.
+    #[test]
+    fn workload_markers_emit_kyty_fixed_packets() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0xC00);
+        // Workload id list in guest memory: ids 1 and 40.
+        assert!(ctx.mem.write(0x300, &1u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x304, &40u32.to_le_bytes()));
+        assert_eq!(
+            hle_dcb_set_workloads_active(&ctx, &[cb, 3, 0x300, 2]),
+            0x400
+        );
+        assert_eq!(read_u32(&ctx, 0x400), pm4(18, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 3, "stream id");
+        let mask = (1u64 << 1) | (1u64 << 40);
+        assert_eq!(read_u32(&ctx, 0x408), mask as u32, "mask lo");
+        assert_eq!(read_u32(&ctx, 0x40C), (mask >> 32) as u32, "mask hi");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 18 * 4);
+        // Duplicate ids rejected.
+        assert!(ctx.mem.write(0x304, &1u32.to_le_bytes()));
+        assert_eq!(hle_dcb_set_workloads_active(&ctx, &[cb, 3, 0x300, 2]), 0);
+        // Stream id out of range rejected.
+        assert_eq!(hle_dcb_set_workloads_active(&ctx, &[cb, 0, 0x300, 1]), 0);
+        assert_eq!(hle_dcb_set_workloads_active(&ctx, &[cb, 32, 0x300, 1]), 0);
+        // Completion packet.
+        let complete = hle_dcb_set_workload_complete(&ctx, &[cb, 3, 40]);
+        assert_eq!(complete, 0x400 + 18 * 4);
+        assert_eq!(read_u32(&ctx, complete), pm4(12, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, complete + 4), 3, "stream id");
+        assert_eq!(read_u32(&ctx, complete + 8), 40, "workload id");
+        let clear = !(1u64 << 40);
+        assert_eq!(read_u32(&ctx, complete + 12), clear as u32);
+        assert_eq!(read_u32(&ctx, complete + 16), (clear >> 32) as u32);
+        assert_eq!(hle_dcb_set_workload_complete(&ctx, &[cb, 3, 64]), 0);
+        // Stream-inactive bookkeeping NOP.
+        let inactive = hle_dcb_set_workload_stream_inactive(&ctx, &[cb, 3]);
+        assert_eq!(inactive, complete + 12 * 4);
+        assert_eq!(read_u32(&ctx, inactive), pm4(2, IT_NOP, R_ZERO));
+        assert_eq!(read_u32(&ctx, inactive + 4), 3);
+        assert_eq!(hle_dcb_set_workload_stream_inactive(&ctx, &[cb, 0]), 0);
+    }
+
+    /// KytyPS5 `GraphicsDcbDrawIndexMultiInstanced` parity: 9-DWORD preamble
+    /// with the zero-instances fixup and the `| 0x80` initiator.
+    #[test]
+    fn draw_index_multi_instanced_emits_nine_dwords() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let index_addr = 0x0000_0012_0000_4000u64;
+        let object_ids = 0x0000_0034_0000_8000u64;
+        // modifier bit 32 clear, bit 8 set → initiator contributes 0x20.
+        let ret =
+            hle_dcb_draw_index_multi_instanced(&ctx, &[cb, 6, index_addr, object_ids, 0, 0x100]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(
+            read_u32(&ctx, 0x400),
+            pm4(9, IT_DISPATCH_DRAW_PREAMBLE, R_ZERO)
+        );
+        assert_eq!(read_u32(&ctx, 0x404), 6, "index count");
+        assert_eq!(read_u32(&ctx, 0x408), 0x4000, "index lo");
+        assert_eq!(read_u32(&ctx, 0x40C), 0x12, "index hi");
+        assert_eq!(read_u32(&ctx, 0x410), 1, "zero instances → 1");
+        assert_eq!(read_u32(&ctx, 0x414), 0x8000, "objects lo");
+        assert_eq!(read_u32(&ctx, 0x418), 0x34, "objects hi");
+        assert_eq!(read_u32(&ctx, 0x41C), 0, "raw instance count");
+        assert_eq!(read_u32(&ctx, 0x420), 0x20 | 0x80, "initiator | 0x80");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 36);
+        // Odd index address / null pointers rejected.
+        assert_eq!(
+            hle_dcb_draw_index_multi_instanced(&ctx, &[cb, 6, index_addr | 1, object_ids, 1, 0]),
+            0
+        );
+        assert_eq!(
+            hle_dcb_draw_index_multi_instanced(&ctx, &[cb, 6, 0, object_ids, 1, 0]),
+            0
+        );
+    }
+
+    /// UCONFIG register writers mirror the SH family with the UCONFIG opcode:
+    /// one range packet, and run-coalesced direct packets.
+    #[test]
+    fn cb_uc_register_writers_emit_uconfig_packets() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // Range: values at 0x300.
+        for (i, v) in [0xAAu32, 0xBB, 0xCC].iter().enumerate() {
+            assert!(ctx.mem.write(0x300 + i as u64 * 4, &v.to_le_bytes()));
+        }
+        let ret = hle_cb_set_uc_register_range(&ctx, &[cb, 0x1_0242, 0x300, 3]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(5, IT_SET_UCONFIG_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 0x0242, "offset & 0xFFFF");
+        assert_eq!(read_u32(&ctx, 0x408), 0xAA);
+        assert_eq!(read_u32(&ctx, 0x40C), 0xBB);
+        assert_eq!(read_u32(&ctx, 0x410), 0xCC);
+        // The paired GetSize matches the emission exactly.
+        assert_eq!(hle_cb_set_uc_register_range_get_size(&ctx, &[3]), 5 * 4);
+        // Direct: two runs — {0x10, 0x11} and {0x20}.
+        let regs = 0x340u64;
+        for (i, (off, val)) in [(0x10u32, 1u32), (0x20, 3), (0x11, 2)].iter().enumerate() {
+            assert!(ctx.mem.write(regs + i as u64 * 8, &off.to_le_bytes()));
+            assert!(ctx.mem.write(regs + i as u64 * 8 + 4, &val.to_le_bytes()));
+        }
+        let first = hle_cb_set_uc_registers_direct(&ctx, &[cb, regs, 3]);
+        assert_eq!(first, 0x414);
+        assert_eq!(read_u32(&ctx, first), pm4(4, IT_SET_UCONFIG_REG, R_ZERO));
+        assert_eq!(read_u32(&ctx, first + 4), 0x10);
+        assert_eq!(read_u32(&ctx, first + 8), 1);
+        assert_eq!(read_u32(&ctx, first + 12), 2);
+        assert_eq!(
+            read_u32(&ctx, first + 16),
+            pm4(3, IT_SET_UCONFIG_REG, R_ZERO)
+        );
+        assert_eq!(read_u32(&ctx, first + 20), 0x20);
+        assert_eq!(read_u32(&ctx, first + 24), 3);
+        // Worst-case GetSize is never smaller than any emission.
+        assert!(hle_cb_set_registers_direct_get_size(&ctx, &[3]) >= 7 * 4);
+    }
+
+    /// PrimeUtcl2 is a prefetch hint: the emission is a size-consistent
+    /// 5-DWORD NOP that matches its GetSize probe.
+    #[test]
+    fn prime_utcl2_emits_size_consistent_nop_hint() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let ret = hle_prime_utcl2(&ctx, &[cb, 0x9000, 4]);
+        assert_eq!(ret, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(5, IT_NOP, R_ZERO));
+        for i in 1..5u64 {
+            assert_eq!(read_u32(&ctx, 0x400 + i * 4), 0);
+        }
+        let advanced = read_u64(&ctx, cb + CB_CURSOR_UP) - 0x400;
+        assert_eq!(advanced, hle_prime_utcl2_get_size(&ctx, &[]));
+        assert_eq!(hle_prime_utcl2(&ctx, &[0]), 0);
+    }
+
+    /// COND_EXEC patch pair: SetEnd recomputes the predicated span from a
+    /// buffer-end pointer; SetCommandAddress re-points the predicate label.
+    #[test]
+    fn cond_exec_patches_adjust_span_and_label() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let packet = hle_dcb_cond_exec(&ctx, &[cb, 0x9000, 2]);
+        assert_eq!(packet, 0x400);
+        // End = packet end + 6 DWORDs.
+        let end = packet + 5 * 4 + 6 * 4;
+        assert_eq!(hle_cond_exec_patch_set_end(&ctx, &[packet, end]), 0);
+        assert_eq!(read_u32(&ctx, packet + 16), 6);
+        // End before the packet end is invalid.
+        assert_eq!(
+            hle_cond_exec_patch_set_end(&ctx, &[packet, packet]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        // Label re-point (both sync and async spellings use this handler).
+        assert_eq!(
+            hle_cond_exec_patch_set_command_address(&ctx, &[packet, 0x00AB_0000_9004]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, packet + 4), 0x9004);
+        assert_eq!(read_u32(&ctx, packet + 8), 0xAB);
+        // Misaligned label rejected; non-COND_EXEC packet rejected.
+        assert_eq!(
+            hle_cond_exec_patch_set_command_address(&ctx, &[packet, 0x9002]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert!(ctx.mem.write(0x500, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert_eq!(
+            hle_cond_exec_patch_set_end(&ctx, &[0x500, 0x600]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+    }
+
+    /// RELEASE_MEM patch trio against this file's release-mem layout: data
+    /// (with the Agc Core generation expansion), GCR bits, and action type.
+    #[test]
+    fn queue_eop_patches_rewrite_release_mem_fields() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        // action=0x28, gcr=0x123, dst=0, cachePolicy=1, addr, dataSel=1,
+        // data, gds*=0, interrupt=2, ctxId.
+        let packet = hle_cb_release_mem(
+            &ctx,
+            &[cb, 0x28, 0x123, 0, 1, 0x9100, 1, 0xDEAD_BEEF, 0, 0, 2, 7],
+        );
+        assert_eq!(packet, 0x400);
+        // Plain data patch (contextId ≤ 1: no expansion).
+        assert_eq!(
+            hle_queue_eop_patch_data(&ctx, &[packet, 1, 1, 0x1111_2222_3333_4444]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, packet + 20), 0x1111_2222_3333_4444);
+        // Generation expansion: contextId=5, dataSel=1 → gen byte 3 in bits
+        // 24..31, low 24 bits kept.
+        assert_eq!(
+            hle_queue_eop_patch_data(&ctx, &[packet, 5, 1, 0xAABB_CCDD]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, packet + 20), (3u64 << 24) | 0x00BB_CCDD);
+        // GCR patch preserves the data-sel/interrupt bits above it.
+        let word2_before = read_u32(&ctx, packet + 8);
+        assert_eq!(hle_queue_eop_patch_gcr_cntl(&ctx, &[packet, 0x0456]), 0);
+        assert_eq!(
+            read_u32(&ctx, packet + 8),
+            (word2_before & 0xFFFF_0000) | 0x0456
+        );
+        // Type patch preserves the cache-policy byte.
+        let word1_before = read_u32(&ctx, packet + 4);
+        assert_eq!(hle_queue_eop_patch_type(&ctx, &[packet, 0x2F]), 0);
+        assert_eq!(read_u32(&ctx, packet + 4), (word1_before & !0xFF) | 0x2F);
+        // Non-RELEASE_MEM packets rejected by all three.
+        assert!(ctx.mem.write(0x500, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        for result in [
+            hle_queue_eop_patch_data(&ctx, &[0x500, 0, 0, 0]),
+            hle_queue_eop_patch_gcr_cntl(&ctx, &[0x500, 0]),
+            hle_queue_eop_patch_type(&ctx, &[0x500, 0]),
+        ] {
+            assert_eq!(result, SCE_ERROR_INVALID_ARGUMENT);
+        }
+    }
+
+    /// Wait-packet patches hit the reference/compare fields of all three wait
+    /// layouts this file emits.
+    #[test]
+    fn wait_reg_mem_patches_cover_all_three_layouts() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0xC00);
+        // 32-bit NOP form (size=0, op=0): 6 DWORDs.
+        let wait32 = hle_dcb_wait_reg_mem(&ctx, &[cb, 0, 3, 0, 0, 0x9000, 0x11, 0xFF, 0]);
+        assert_eq!(wait32, 0x400);
+        assert_eq!(hle_wait_reg_mem_patch_reference(&ctx, &[wait32, 0x77]), 0);
+        assert_eq!(read_u32(&ctx, wait32 + 20), 0x77);
+        assert_eq!(
+            hle_wait_reg_mem_patch_compare_function(&ctx, &[wait32, 5]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, wait32 + 16) & 0xFF, 5);
+        assert_eq!(read_u32(&ctx, wait32 + 16) >> 8, 0, "op bits preserved");
+        // 64-bit NOP form (size=1): 9 DWORDs.
+        let wait64 = hle_dcb_wait_reg_mem(&ctx, &[cb, 1, 3, 0, 0, 0x9000, 0x11, 0xFF, 0]);
+        assert_eq!(
+            hle_wait_reg_mem_patch_reference(&ctx, &[wait64, 0x8888_0000_1111_2222]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, wait64 + 20), 0x8888_0000_1111_2222);
+        assert_eq!(
+            hle_wait_reg_mem_patch_compare_function(&ctx, &[wait64, 2]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, wait64 + 28) & 0xFF, 2);
+        // Standard WAIT_REG_MEM form (op=2): 7 DWORDs.
+        let standard = hle_dcb_wait_reg_mem(&ctx, &[cb, 0, 3, 2, 0, 0x9000, 0x11, 0xFF, 0]);
+        assert_eq!(hle_wait_reg_mem_patch_reference(&ctx, &[standard, 0x55]), 0);
+        assert_eq!(read_u32(&ctx, standard + 16), 0x55);
+        assert_eq!(
+            hle_wait_reg_mem_patch_compare_function(&ctx, &[standard, 1]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, standard + 4) & 0xFF, 1);
+        // Non-wait packets rejected.
+        assert!(ctx.mem.write(0x700, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert_eq!(
+            hle_wait_reg_mem_patch_reference(&ctx, &[0x700, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+    }
+
+    /// DMA_DATA source patch writes the source field of this file's DMA
+    /// layout (destination sibling already covered elsewhere).
+    #[test]
+    fn dma_data_patch_src_writes_source_field() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let packet = hle_dcb_dma_data(&ctx, &[cb, 1, 0, 2, 0x9100, 0, 0, 0x9200, 64, 0, 1, 0]);
+        assert_eq!(packet, 0x400);
+        assert_eq!(
+            hle_dma_data_patch_src(&ctx, &[packet, 0x00CD_1234_5678_0000]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, packet + 24), 0x00CD_1234_5678_0000);
+        assert!(ctx.mem.write(0x600, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert_eq!(
+            hle_dma_data_patch_src(&ctx, &[0x600, 1]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+    }
+
+    /// Branch compare-address patch targets only the 14-DWORD conditional
+    /// chain — the 4-DWORD unconditional jump has no compare field.
+    #[test]
+    fn branch_patch_rejects_jump_packets() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let branch = hle_cb_branch(&ctx, &[cb, 0, 3, 0x9000, 0, 0, 0, 0x9100, 4, 0, 0x9200, 4]);
+        assert_eq!(branch, 0x400);
+        assert_eq!(
+            hle_branch_patch_set_compare_address(&ctx, &[branch, 0x00EF_0000_A00F]),
+            0
+        );
+        assert_eq!(read_u32(&ctx, branch + 8), 0xA008, "lo &~7");
+        assert_eq!(read_u32(&ctx, branch + 12), 0xEF, "hi");
+        let jump = hle_dcb_jump(&ctx, &[cb, 0x9300, 8]);
+        assert_eq!(
+            hle_branch_patch_set_compare_address(&ctx, &[jump, 0xA000]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+    }
+
+    /// KytyPS5 `GraphicsUpdatePrimState` parity: GS-out class rewritten only
+    /// when the stages value has neither GS bit; UC prim type always
+    /// rewritten; null tables legal.
+    #[test]
+    fn update_prim_state_rewrites_gs_out_and_prim_type() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cx = 0x100u64; // reg[0] at 0x100, reg[1] at 0x108
+        let uc = 0x180u64; // reg[2].value at 0x194
+        // cx[0].value = 0 (no GS bits) → gs-out recomputed. Line list (2) → 1.
+        assert!(ctx.mem.write(cx + 4, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(cx + 12, &0xFFFF_FFF8u32.to_le_bytes()));
+        assert!(ctx.mem.write(uc + 20, &0xFFFF_FFE0u32.to_le_bytes()));
+        assert_eq!(hle_update_prim_state(&ctx, &[cx, uc, 2]), 0);
+        assert_eq!(read_u32(&ctx, cx + 12), 0xFFFF_FFF8 | 1);
+        assert_eq!(read_u32(&ctx, uc + 20), 0xFFFF_FFE0 | 2);
+        // GS-driven stages (bit 2 set → 0x24 mask hits): cx untouched.
+        assert!(ctx.mem.write(cx + 4, &0x4u32.to_le_bytes()));
+        assert!(ctx.mem.write(cx + 12, &0u32.to_le_bytes()));
+        assert_eq!(hle_update_prim_state(&ctx, &[cx, uc, 7]), 0);
+        assert_eq!(read_u32(&ctx, cx + 12), 0, "GS-driven: untouched");
+        assert_eq!(read_u32(&ctx, uc + 20), (0xFFFF_FFE0u32 | 2) & !0x1F | 7);
+        // Rect list (7) → gs-out 3 when recomputed; triangles default.
+        assert!(ctx.mem.write(cx + 4, &0u32.to_le_bytes()));
+        assert_eq!(hle_update_prim_state(&ctx, &[cx, 0, 7]), 0);
+        assert_eq!(read_u32(&ctx, cx + 12), 3);
+        assert_eq!(hle_update_prim_state(&ctx, &[0, 0, 4]), 0, "nulls legal");
+    }
+
+    /// KytyPS5 `GraphicsGetDataPacketPayloadRange` parity for both packet
+    /// types and the no-payload marker.
+    #[test]
+    fn get_data_packet_payload_range_decodes_headers() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let range = 0x200u64;
+        let command = 0x300u64;
+        // 6-DWORD packet: body = 4 DWORDs = 16 bytes.
+        assert!(
+            ctx.mem
+                .write(command, &pm4(6, IT_NOP, R_ZERO).to_le_bytes())
+        );
+        assert_eq!(
+            hle_get_data_packet_payload_range(&ctx, &[range, command, 1]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, range), command + 8, "type!=0: skip 2 DWORDs");
+        assert_eq!(read_u64(&ctx, range + 8), 16);
+        assert_eq!(
+            hle_get_data_packet_payload_range(&ctx, &[range, command, 0]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, range), command + 4, "type==0: skip 1 DWORD");
+        assert_eq!(read_u64(&ctx, range + 8), 20);
+        // All-ones length field → no payload.
+        assert!(ctx.mem.write(command, &0x3FFF_0000u32.to_le_bytes()));
+        assert_eq!(
+            hle_get_data_packet_payload_range(&ctx, &[range, command, 0]),
+            0
+        );
+        assert_eq!(read_u64(&ctx, range), 0);
+        assert_eq!(read_u64(&ctx, range + 8), 0);
+        assert_eq!(
+            hle_get_data_packet_payload_range(&ctx, &[0, command, 0]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+    }
+
+    /// The honest-error surface fails loudly with the documented values and
+    /// never writes guest memory.
+    #[test]
+    fn honest_error_surface_returns_documented_failures() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_atomic_mem_unavailable(&ctx, &[0x40, 1, 2]), 0);
+        assert_eq!(hle_mem_semaphore_unavailable(&ctx, &[0x40, 0x9000]), 0);
+        assert_eq!(hle_cb_cond_write_unavailable(&ctx, &[0x40]), 0);
+        assert_eq!(hle_set_index_indirect_args_unavailable(&ctx, &[0x40]), 0);
+        assert_eq!(hle_get_default_cx_state_flat_unavailable(&ctx, &[12]), 0);
+        assert_eq!(hle_set_nop_unavailable(&ctx, &[0x9000, 4]), 0);
+        assert_eq!(hle_get_gs_oversubscription_unavailable(&ctx, &[]), 0);
+        assert_eq!(
+            hle_set_amm_semaphore_memory_unavailable(&ctx, &[0x9000]),
+            SCE_ERROR_INVALID_ARGUMENT
+        );
+        assert_eq!(hle_get_semaphore_label_unavailable(&ctx, &[1]), 0);
+    }
+
+    /// Every Phase A name resolves through the registry (name-hash NIDs), and
+    /// the honest-error names are flagged incomplete for coverage tooling.
+    #[test]
+    fn gta5_phase_a_names_resolve_in_the_registry() {
+        let registry = HleRegistry::new();
+        register(&registry);
+        let registered: std::collections::HashSet<String> = registry
+            .registered_names()
+            .into_iter()
+            .filter(|(library, _)| library == "libSceAgc")
+            .map(|(_, function)| function)
+            .collect();
+        for name in [
+            // GetSize family.
+            "sceAgcDcbEventWriteGetSize",
+            "sceAgcAcbEventWriteGetSize",
+            "sceAgcDcbCopyDataGetSize",
+            "sceAgcAcbCopyDataGetSize",
+            "sceAgcAcbDispatchIndirectGetSize",
+            "sceAgcAcbJumpGetSize",
+            "sceAgcAcbRewindGetSize",
+            "sceAgcAcbWaitOnAddressGetSize",
+            "sceAgcDcbAtomicMemGetSize",
+            "sceAgcAcbAtomicMemGetSize",
+            "sceAgcDcbAtomicGdsGetSize",
+            "sceAgcAcbAtomicGdsGetSize",
+            "sceAgcDcbPrimeUtcl2GetSize",
+            "sceAgcAcbPrimeUtcl2GetSize",
+            "sceAgcCbBranchGetSize",
+            "sceAgcCbCondWriteGetSize",
+            "sceAgcCbSetShRegistersDirectGetSize",
+            "sceAgcCbSetUcRegistersDirectGetSize",
+            "sceAgcCbSetUcRegisterRangeDirectGetSize",
+            "sceAgcDcbSetBaseDrawIndirectArgsGetSize",
+            "sceAgcDcbSetBaseDispatchIndirectArgsGetSize",
+            "sceAgcDcbSetIndexIndirectArgsGetSize",
+            "sceAgcDcbSetPredicationDisableGetSize",
+            "sceAgcDcbSetZPassPredicationEnableGetSize",
+            "sceAgcDcbSetBoolPredicationEnableGetSize",
+            "sceAgcDcbBeginOcclusionQueryGetSize",
+            "sceAgcDcbEndOcclusionQueryGetSize",
+            "sceAgcDcbQueueEndOfShaderActionGetSize",
+            "sceAgcAcbQueueEndOfShaderActionGetSize",
+            "sceAgcDcbContextStateOpGetSize",
+            "sceAgcDcbDrawIndexIndirectMultiGetSize",
+            "sceAgcDcbDrawIndirectMultiGetSize",
+            // Builders + aliases.
+            "sceAgcDcbRewind",
+            "sceAgcAcbRewind",
+            "sceAgcAcbJump",
+            "sceAgcAcbSetFlip",
+            "sceAgcAcbSetMarker",
+            "sceAgcAcbWaitUntilSafeForRendering",
+            "sceAgcDcbSetWorkloadsActive",
+            "sceAgcAcbSetWorkloadsActive",
+            "sceAgcDcbSetWorkloadComplete",
+            "sceAgcAcbSetWorkloadComplete",
+            "sceAgcDcbSetWorkloadStreamInactive",
+            "sceAgcAcbSetWorkloadStreamInactive",
+            "sceAgcDcbDrawIndexMultiInstanced",
+            "sceAgcCbSetUcRegisterRangeDirect",
+            "sceAgcCbSetUcRegistersDirect",
+            "sceAgcDcbPrimeUtcl2",
+            "sceAgcAcbPrimeUtcl2",
+            // Patch surface.
+            "sceAgcQueueEndOfPipeActionPatchData",
+            "sceAgcQueueEndOfPipeActionPatchGcrCntl",
+            "sceAgcQueueEndOfPipeActionPatchType",
+            "sceAgcCondExecPatchSetEnd",
+            "sceAgcAsyncCondExecPatchSetEnd",
+            "sceAgcCondExecPatchSetCommandAddress",
+            "sceAgcAsyncCondExecPatchSetCommandAddress",
+            "sceAgcRewindPatchSetRewindState",
+            "sceAgcAsyncRewindPatchSetRewindState",
+            "sceAgcBranchPatchSetCompareAddress",
+            "sceAgcWaitRegMemPatchReference",
+            "sceAgcWaitRegMemPatchCompareFunction",
+            "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate",
+            "sceAgcSetShRegIndirectPatchSetNumRegisters",
+            "sceAgcSetUcRegIndirectPatchSetNumRegisters",
+            // Misc.
+            "sceAgcUpdatePrimState",
+            "sceAgcGetDataPacketPayloadRange",
+            // Honest-error surface.
+            "sceAgcDcbAtomicMem",
+            "sceAgcAcbAtomicMem",
+            "sceAgcDcbMemSemaphore",
+            "sceAgcAcbMemSemaphore",
+            "sceAgcCbCondWrite",
+            "sceAgcDcbSetIndexIndirectArgs",
+            "sceAgcGetDefaultCxStateFlat",
+            "sceAgcSetNop",
+            "sceAgcGetGsOversubscription",
+            "sceAgcSetAmmSemaphoreMemory",
+            "sceAgcGetSemaphoreLabel",
+        ] {
+            assert!(registered.contains(name), "{name} must be registered");
+        }
+        let incomplete = registry.incomplete_registrations();
+        for name in ["sceAgcDcbAtomicMem", "sceAgcCbCondWrite", "sceAgcSetNop"] {
+            assert!(
+                incomplete
+                    .iter()
+                    .any(|(library, function, _)| library == "libSceAgc" && function == name),
+                "{name} must be flagged incomplete"
+            );
+        }
     }
 }
