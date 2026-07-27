@@ -8,6 +8,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod crashdump;
 mod launcher;
 mod library;
 mod shell;
@@ -116,6 +117,43 @@ fn main() -> anyhow::Result<()> {
             tracing::warn!("file logging unavailable ({e}); continuing with stderr only");
             guard
         }
+    };
+
+    // Host facts (CPU model, cores, RAM, OS build) at the top of every log —
+    // the difference between a diagnosable user report and guesswork.
+    {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        info!(
+            cpu = sys.cpus().first().map(|c| c.brand().trim()).unwrap_or("unknown"),
+            cores = sys.cpus().len(),
+            ram_gb = format_args!("{:.1}", sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0)),
+            os = %sysinfo::System::long_os_version().unwrap_or_else(|| "unknown".into()),
+            "host system"
+        );
+    }
+
+    // Opt-in frame profiler: `RAEEN_PROFILE=1` turns puffin scopes on and
+    // serves them on the default port (34567) for `puffin_viewer` to attach.
+    // Off (the default) the scope macros compile to a cheap branch.
+    let _puffin_server = if std::env::var_os("RAEEN_PROFILE").is_some() {
+        puffin::set_scopes_on(true);
+        match puffin_http::Server::new(&format!("127.0.0.1:{}", puffin_http::DEFAULT_PORT)) {
+            Ok(server) => {
+                info!(
+                    port = puffin_http::DEFAULT_PORT,
+                    "puffin profiler serving — connect with puffin_viewer"
+                );
+                Some(server)
+            }
+            Err(e) => {
+                tracing::warn!("puffin profiler server failed to start ({e})");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // Now that logging exists, say what the startup reservation achieved. A
@@ -922,6 +960,12 @@ fn main() -> anyhow::Result<()> {
         // was silently dropped because the host ring had never been created.
         // Load the same persisted settings as the Shell so mute and master
         // volume remain authoritative in both launch modes.
+        // Crash reporting: when launched by the Shell, connect back to its
+        // minidump server so a fatal fault in this guest-executing process
+        // produces a dump under logs/crashes/ instead of a silent death.
+        if let Ok(socket) = std::env::var("RAEEN_CRASH_SOCKET") {
+            crashdump::attach_client(&socket);
+        }
         let runner_config =
             raeen_core::config::EmulatorConfig::load(std::path::Path::new("config.toml"))?;
         raeen_gpu::AgcGpuSession::set_runtime_config(

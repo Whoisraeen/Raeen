@@ -524,7 +524,8 @@ pub(crate) struct DrawCaches {
     submit: Option<(vk::CommandBuffer, vk::Fence)>,
     pool: Option<PoolState>,
     /// The device-persistent GDS arena (see [`DrawCaches::gds_buffer`]).
-    gds: Option<(vk::Buffer, vk::DeviceMemory)>,
+    gds: Option<(vk::Buffer, GdsBacking)>,
+    // (GdsBacking is defined below the struct.)
     /// Deferred draws whose GPU work is submitted but not yet fence-waited.
     pending: Vec<PendingDrawResources>,
     /// One primary command buffer kept in RECORDING state for the whole PM4
@@ -604,6 +605,15 @@ pub(crate) const HOST_POOL_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::f
 /// Byte size of the emulated GDS arena — the real chip's Global Data Share is
 /// 64 KiB.
 pub(crate) const GDS_SIZE: usize = 64 * 1024;
+
+/// Backing memory for the GDS arena: sub-allocated through the device's
+/// `gpu-allocator` when available (the preferred path — see
+/// `VulkanDevice::allocator`), or one raw dedicated `vkAllocateMemory`
+/// otherwise. Freed by the matching arm in [`DrawCaches::destroy`].
+pub(crate) enum GdsBacking {
+    Managed(gpu_allocator::vulkan::Allocation),
+    Raw(vk::DeviceMemory),
+}
 
 impl DrawCaches {
     /// Get or create the `VkShaderModule` for exactly these SPIR-V words.
@@ -810,8 +820,8 @@ impl DrawCaches {
     /// ASTRO.BOT). GDS is on-chip memory, so nothing is ever written back to
     /// guest memory.
     pub(crate) fn gds_buffer(&mut self, dev: &VulkanDevice) -> Result<vk::Buffer, GpuError> {
-        if let Some((buffer, _)) = self.gds {
-            return Ok(buffer);
+        if let Some((buffer, _)) = &self.gds {
+            return Ok(*buffer);
         }
         let info = vk::BufferCreateInfo::default()
             .size(GDS_SIZE as u64)
@@ -828,45 +838,102 @@ impl DrawCaches {
             unsafe { dev.device().destroy_buffer(buffer, None) };
             e
         };
-        let memory_type = dev
-            .find_memory_type(
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .map_err(cleanup_buffer)?;
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(memory_type);
-        // SAFETY: allocation size/type come from this buffer's requirements.
-        let memory = unsafe { dev.device().allocate_memory(&alloc, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkAllocateMemory: {e}")))
-            .map_err(cleanup_buffer)?;
-        let cleanup_both = |e| {
-            // SAFETY: destroying the never-bound buffer and its allocation.
-            unsafe {
-                dev.device().destroy_buffer(buffer, None);
-                dev.device().free_memory(memory, None);
-            }
-            e
+
+        // Preferred path: sub-allocate through the device's gpu-allocator
+        // (first adopted site). CpuToGpu is host-visible|coherent and comes
+        // back persistently mapped, so zeroing needs no map/unmap round trip.
+        let managed = {
+            let mut guard = dev.allocator().lock();
+            guard.as_mut().and_then(|allocator| {
+                match allocator.allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                    name: "raeen-gds",
+                    requirements: req,
+                    location: gpu_allocator::MemoryLocation::CpuToGpu,
+                    linear: true,
+                    allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                }) {
+                    Ok(allocation) => Some(allocation),
+                    Err(e) => {
+                        tracing::warn!("GDS sub-allocation failed ({e}); using a raw allocation");
+                        None
+                    }
+                }
+            })
         };
-        // SAFETY: buffer and allocation are compatible live handles.
-        unsafe { dev.device().bind_buffer_memory(buffer, memory, 0) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkBindBufferMemory: {e}")))
-            .map_err(cleanup_both)?;
-        // Zero the arena once — hardware GDS starts each session cold and the
-        // shaders themselves initialize the counters they use.
-        // SAFETY: host-visible coherent allocation, not in use by the GPU
-        // (never yet bound to a descriptor), mapped for its full size.
-        unsafe {
-            let ptr = dev
-                .device()
-                .map_memory(memory, 0, GDS_SIZE as u64, vk::MemoryMapFlags::empty())
-                .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkMapMemory: {e}")))
+        let backing = if let Some(allocation) = managed {
+            let cleanup_managed = |allocation, e| {
+                if let Some(allocator) = dev.allocator().lock().as_mut() {
+                    let _ = allocator.free(allocation);
+                }
+                // SAFETY: destroying the just-created, never-bound buffer.
+                unsafe { dev.device().destroy_buffer(buffer, None) };
+                e
+            };
+            // SAFETY: buffer and the sub-allocation are compatible live
+            // handles; offset comes from the allocator for these exact
+            // requirements.
+            if let Err(e) = unsafe {
+                dev.device()
+                    .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+            } {
+                return Err(cleanup_managed(
+                    allocation,
+                    GpuError::VulkanInitFailed(format!("GDS vkBindBufferMemory: {e}")),
+                ));
+            }
+            let Some(ptr) = allocation.mapped_ptr() else {
+                return Err(cleanup_managed(
+                    allocation,
+                    GpuError::VulkanInitFailed("GDS CpuToGpu allocation is unmapped".to_string()),
+                ));
+            };
+            // Zero the arena once — hardware GDS starts each session cold and
+            // the shaders themselves initialize the counters they use.
+            // SAFETY: persistently-mapped host-visible allocation of at least
+            // GDS_SIZE bytes, not yet visible to the GPU.
+            unsafe { std::ptr::write_bytes(ptr.as_ptr().cast::<u8>(), 0, GDS_SIZE) };
+            GdsBacking::Managed(allocation)
+        } else {
+            // Fallback: dedicated raw allocation (allocator unavailable).
+            let memory_type = dev
+                .find_memory_type(
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .map_err(cleanup_buffer)?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(memory_type);
+            // SAFETY: allocation size/type come from this buffer's requirements.
+            let memory = unsafe { dev.device().allocate_memory(&alloc, None) }
+                .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkAllocateMemory: {e}")))
+                .map_err(cleanup_buffer)?;
+            let cleanup_both = |e| {
+                // SAFETY: destroying the never-bound buffer and its allocation.
+                unsafe {
+                    dev.device().destroy_buffer(buffer, None);
+                    dev.device().free_memory(memory, None);
+                }
+                e
+            };
+            // SAFETY: buffer and allocation are compatible live handles.
+            unsafe { dev.device().bind_buffer_memory(buffer, memory, 0) }
+                .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkBindBufferMemory: {e}")))
                 .map_err(cleanup_both)?;
-            std::ptr::write_bytes(ptr.cast::<u8>(), 0, GDS_SIZE);
-            dev.device().unmap_memory(memory);
-        }
-        self.gds = Some((buffer, memory));
+            // SAFETY: host-visible coherent allocation, not in use by the GPU
+            // (never yet bound to a descriptor), mapped for its full size.
+            unsafe {
+                let ptr = dev
+                    .device()
+                    .map_memory(memory, 0, GDS_SIZE as u64, vk::MemoryMapFlags::empty())
+                    .map_err(|e| GpuError::VulkanInitFailed(format!("GDS vkMapMemory: {e}")))
+                    .map_err(cleanup_both)?;
+                std::ptr::write_bytes(ptr.cast::<u8>(), 0, GDS_SIZE);
+                dev.device().unmap_memory(memory);
+            }
+            GdsBacking::Raw(memory)
+        };
+        self.gds = Some((buffer, backing));
         Ok(buffer)
     }
 
@@ -2068,8 +2135,15 @@ impl DrawCaches {
     }
 
     /// Destroy everything. Called from `VulkanDevice::drop` after
-    /// `device_wait_idle`, before the command pool and device go away.
-    pub(crate) fn destroy(&mut self, device: &ash::Device, command_pool: vk::CommandPool) {
+    /// `device_wait_idle`, before the command pool, the memory allocator,
+    /// and the device go away. `allocator` takes back sub-allocated backings
+    /// (currently the GDS arena).
+    pub(crate) fn destroy(
+        &mut self,
+        device: &ash::Device,
+        command_pool: vk::CommandPool,
+        allocator: &mut Option<gpu_allocator::vulkan::Allocator>,
+    ) {
         // SAFETY: the caller waited the device idle; every handle below was
         // created from `device` and is destroyed exactly once, children before
         // parents.
@@ -2122,9 +2196,16 @@ impl DrawCaches {
             if let Some(pool) = self.pool.take() {
                 device.destroy_descriptor_pool(pool.pool, None);
             }
-            if let Some((buffer, memory)) = self.gds.take() {
+            if let Some((buffer, backing)) = self.gds.take() {
                 device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
+                match backing {
+                    GdsBacking::Managed(allocation) => {
+                        if let Some(allocator) = allocator.as_mut() {
+                            let _ = allocator.free(allocation);
+                        }
+                    }
+                    GdsBacking::Raw(memory) => device.free_memory(memory, None),
+                }
             }
             for (_, pipeline) in self.graphics_pipelines.drain() {
                 device.destroy_pipeline(pipeline, None);

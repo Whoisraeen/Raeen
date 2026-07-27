@@ -77,7 +77,13 @@ impl SoundPack {
                 continue;
             }
             match decode_wav(&path) {
-                Ok(clip) => pack.clips[sound.index()] = Some(clip),
+                Ok((rate, samples)) => {
+                    // Resample once at load (rubato windowed-sinc) so playback
+                    // needs no per-play linear resampling and clips sound
+                    // clean on the 48 kHz output path.
+                    let (rate, samples) = resample_clip_to_48k(rate, samples);
+                    pack.clips[sound.index()] = Some((rate, Arc::new(samples)));
+                }
                 Err(err) => {
                     tracing::warn!(file = %path.display(), error = %err, "sound pack clip skipped");
                 }
@@ -105,7 +111,7 @@ impl SoundPack {
 /// 16/24/32-bit integer and 32-bit float PCM; mono is duplicated to stereo,
 /// >2 channels take the first two. Clips are capped at ~5 s — a UI cue, not a
 /// soundtrack.
-fn decode_wav(path: &PathBuf) -> Result<Clip, String> {
+fn decode_wav(path: &PathBuf) -> Result<(u32, Vec<f32>), String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
     let max_frames = spec.sample_rate as usize * 5;
@@ -135,7 +141,66 @@ fn decode_wav(path: &PathBuf) -> Result<Clip, String> {
         stereo.push(l);
         stereo.push(r);
     }
-    Ok((spec.sample_rate, Arc::new(stereo)))
+    Ok((spec.sample_rate, stereo))
+}
+
+/// The host mixer's native rate; every clip is converted to this at load.
+const TARGET_RATE: u32 = 48_000;
+
+/// One-shot windowed-sinc resample (rubato) of an interleaved-stereo clip to
+/// [`TARGET_RATE`]. Any setup or processing failure returns the clip
+/// unchanged at its native rate — the mixer's linear fallback still plays it.
+fn resample_clip_to_48k(rate: u32, stereo: Vec<f32>) -> (u32, Vec<f32>) {
+    use rubato::Resampler;
+    let frames = stereo.len() / 2;
+    if rate == TARGET_RATE || rate == 0 || frames == 0 {
+        return (rate, stereo);
+    }
+    const SINC_LEN: usize = 128;
+    let ratio = f64::from(TARGET_RATE) / f64::from(rate);
+    // Zero-pad the input past the sinc filter's group delay so the clip's
+    // real ending flushes out of the filter within one process call.
+    let padded = frames + SINC_LEN;
+    let mut left = Vec::with_capacity(padded);
+    let mut right = Vec::with_capacity(padded);
+    for frame in stereo.chunks_exact(2) {
+        left.push(frame[0]);
+        right.push(frame[1]);
+    }
+    left.resize(padded, 0.0);
+    right.resize(padded, 0.0);
+    let params = rubato::SincInterpolationParameters {
+        sinc_len: SINC_LEN,
+        f_cutoff: 0.95,
+        interpolation: rubato::SincInterpolationType::Linear,
+        oversampling_factor: 128,
+        window: rubato::WindowFunction::BlackmanHarris2,
+    };
+    let mut resampler = match rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, padded, 2) {
+        Ok(resampler) => resampler,
+        Err(e) => {
+            tracing::warn!(error = %e, "clip resampler setup failed — keeping native rate");
+            return (rate, stereo);
+        }
+    };
+    let delay = resampler.output_delay();
+    let out = match resampler.process(&[left, right], None) {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(error = %e, "clip resample failed — keeping native rate");
+            return (rate, stereo);
+        }
+    };
+    // Skip the filter latency, keep exactly the clip's resampled length.
+    let expected = (frames as f64 * ratio).round() as usize;
+    let available = out[0].len().min(out[1].len()).saturating_sub(delay);
+    let out_frames = expected.min(available);
+    let mut interleaved = Vec::with_capacity(out_frames * 2);
+    for i in delay..delay + out_frames {
+        interleaved.push(out[0][i]);
+        interleaved.push(out[1][i]);
+    }
+    (TARGET_RATE, interleaved)
 }
 
 /// Selectable pack names: `"off"` plus every directory under `root`.
@@ -179,9 +244,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!("raeen-sounds-{}", std::process::id()));
         let pack_dir = base.join("testpack");
         std::fs::create_dir_all(&pack_dir).expect("mkdir pack");
+        // Authored at 48 kHz already, so no resampling — samples are exact.
         let spec = hound::WavSpec {
             channels: 1,
-            sample_rate: 44_100,
+            sample_rate: 48_000,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
@@ -192,7 +258,7 @@ mod tests {
         let (rate, samples) = pack.clips[UiSound::Move.index()]
             .as_ref()
             .expect("move.wav decoded");
-        assert_eq!(*rate, 44_100);
+        assert_eq!(*rate, 48_000);
         // Mono widened: 3 frames -> 6 samples, L == R.
         assert_eq!(samples.len(), 6);
         assert_eq!(samples[0], samples[1]);
@@ -200,6 +266,32 @@ mod tests {
         assert!((samples[4] + 1.0).abs() < 1e-1);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn non_native_rate_clips_are_sinc_resampled_to_48k() {
+        // 0.1 s of a constant tone at 44.1 kHz -> ~0.1 s at 48 kHz.
+        let frames = 4_410usize;
+        let stereo: Vec<f32> = std::iter::repeat_n([0.5f32, 0.5], frames)
+            .flatten()
+            .collect();
+        let (rate, out) = resample_clip_to_48k(44_100, stereo);
+        assert_eq!(rate, 48_000);
+        let out_frames = out.len() / 2;
+        let expected = frames * 48_000 / 44_100;
+        assert!(
+            out_frames.abs_diff(expected) <= expected / 10,
+            "expected ~{expected} frames, got {out_frames}"
+        );
+        // The steady-state middle of the clip preserves the amplitude.
+        let mid = out_frames / 2 * 2;
+        assert!((out[mid] - 0.5).abs() < 0.05, "mid sample {}", out[mid]);
+        // 48 kHz input passes through untouched.
+        let passthrough = vec![0.25f32; 8];
+        assert_eq!(
+            resample_clip_to_48k(48_000, passthrough.clone()),
+            (48_000, passthrough)
+        );
     }
 
     #[test]

@@ -73,6 +73,13 @@ pub struct VulkanDevice {
     /// for a whole synchronous draw or dispatch, which serializes every user
     /// of the cached resources and of the queue.
     caches: Mutex<DrawCaches>,
+    /// Sub-allocating device-memory allocator (`gpu-allocator`) — the VMA
+    /// equivalent every real title workload eventually needs, since naive
+    /// one-`vkAllocateMemory`-per-resource exhausts `maxMemoryAllocationCount`
+    /// and thrashes the driver. `None` when its creation failed (the raw
+    /// allocation paths still work). Adoption is per-site: the GDS arena is
+    /// the first consumer; remaining sites migrate as they are touched.
+    allocator: Mutex<Option<gpu_allocator::vulkan::Allocator>>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Debug messenger, present only when validation is active.
     debug: Option<(debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -222,6 +229,25 @@ impl VulkanDevice {
             "Vulkan device ready: {device_name} (validation={validation_enabled}, depth_range_unrestricted={depth_range_unrestricted}, graphics queue family {queue_family_index})"
         );
 
+        // Sub-allocating memory allocator. Failure is non-fatal: sites that
+        // consult it fall back to raw `vkAllocateMemory`.
+        let allocator = match gpu_allocator::vulkan::Allocator::new(
+            &gpu_allocator::vulkan::AllocatorCreateDesc {
+                instance: instance.clone(),
+                device: device.clone(),
+                physical_device,
+                debug_settings: Default::default(),
+                buffer_device_address: false,
+                allocation_sizes: Default::default(),
+            },
+        ) {
+            Ok(allocator) => Some(allocator),
+            Err(e) => {
+                warn!("gpu-allocator unavailable ({e}); using raw vkAllocateMemory");
+                None
+            }
+        };
+
         Ok(Self {
             entry,
             instance,
@@ -234,6 +260,7 @@ impl VulkanDevice {
             pipeline_cache_path,
             pipeline_cache_generation: AtomicU64::new(0),
             caches: Mutex::new(DrawCaches::default()),
+            allocator: Mutex::new(allocator),
             memory_properties,
             debug,
             device_name,
@@ -341,6 +368,12 @@ impl VulkanDevice {
     /// Needed by the presentation path to check surface support on this family.
     pub fn queue_family_index(&self) -> u32 {
         self.queue_family_index
+    }
+
+    /// The device's sub-allocating memory allocator (`None` if creation
+    /// failed — callers fall back to raw allocation).
+    pub(crate) fn allocator(&self) -> &Mutex<Option<gpu_allocator::vulkan::Allocator>> {
+        &self.allocator
     }
 
     pub(crate) fn device(&self) -> &Device {
@@ -750,9 +783,11 @@ impl Drop for VulkanDevice {
         // device cannot be recovered here and drop must not panic.
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.caches
-                .get_mut()
-                .destroy(&self.device, self.command_pool);
+            self.caches.get_mut().destroy(
+                &self.device,
+                self.command_pool,
+                self.allocator.get_mut(),
+            );
             if self.pipeline_cache != vk::PipelineCache::null() {
                 if let Some(path) = &self.pipeline_cache_path {
                     match self.device.get_pipeline_cache_data(self.pipeline_cache) {
@@ -782,6 +817,9 @@ impl Drop for VulkanDevice {
                     .destroy_pipeline_cache(self.pipeline_cache, None);
             }
             self.device.destroy_command_pool(self.command_pool, None);
+            // The allocator frees its heap blocks in its own Drop using its
+            // internal device clone — it must go before vkDestroyDevice.
+            *self.allocator.get_mut() = None;
             self.device.destroy_device(None);
             if let Some((loader, messenger)) = self.debug.take() {
                 loader.destroy_debug_utils_messenger(messenger, None);

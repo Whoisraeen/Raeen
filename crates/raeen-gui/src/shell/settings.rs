@@ -369,7 +369,7 @@ impl Rows<'_> {
             painter.rect_stroke(
                 rect,
                 10.0,
-                egui::Stroke::new(1.0, self.theme.palette.focus.gamma_multiply(0.5)),
+                egui::Stroke::new(1.0_f32, self.theme.palette.focus.gamma_multiply(0.5)),
                 StrokeKind::Inside,
             );
         }
@@ -438,7 +438,7 @@ pub fn draw(
             Pos2::new(screen.left() + MARGIN_X, screen.top() + HEADER_H - 22.0),
             Pos2::new(screen.right() - MARGIN_X, screen.top() + HEADER_H - 22.0),
         ],
-        egui::Stroke::new(1.0, theme.palette.line),
+        egui::Stroke::new(1.0_f32, theme.palette.line),
     );
 
     let mut clicked = None;

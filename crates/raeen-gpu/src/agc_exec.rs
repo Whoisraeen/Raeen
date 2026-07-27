@@ -801,6 +801,7 @@ impl AgcGpuSession {
     /// the invariant "every presented frame is a COMPLETE frame" holds by
     /// construction — the guarantee the async flip must not break.
     fn publish_frame(&self, presented: Arc<RenderedImage>) {
+        puffin::profile_function!();
         // Offer the finished frame to the active present plugin (upscaler /
         // frame-gen). The default is a zero-cost identity — with no plugin
         // selected this returns the same `Arc`, so the "every presented frame is
@@ -1985,6 +1986,11 @@ impl AgcGpuSession {
         words: &[u32],
         is_compute: bool,
     ) -> Result<Option<RenderedImage>, AgcExecError> {
+        puffin::profile_function!();
+        // RenderDoc capture bracket (RAEEN_RENDERDOC_CAPTURE + running under
+        // RenderDoc): each remaining budgeted DCB execution becomes one
+        // capture, swapchain or not.
+        let _renderdoc = crate::diagnostics::renderdoc_dcb_capture();
         // Synchronous entry (tests, inline fallback): there is no worker to
         // re-check a suspended buffer, so an unmet wait cannot park it.
         // Continue past it — the pre-suspend behaviour — rather than dropping

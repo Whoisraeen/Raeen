@@ -4509,3 +4509,55 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * NOTE: user has parallel Codex sessions building in this repo — watch the
   target/ lock (cargo-parallel-build-deadlock memory) and expect screenshots
   to be occluded by their windows.
+
+## 2026-07-27 (eve) — Crate adoption sweep: 17 crates wired, all verified
+* Goal: wire every recommended crate for real. 662 tests green across
+  gui/gpu/loader/firmware/audio/core. All integrations live:
+  - memmap2: raeen_loader::mapped::MappedFile (map-with-read-fallback,
+    tested) — eboot launch read + NEEDED dep loads (PUP already mapped).
+  - rayon: parallel cover/key-art decode in the Shell (was already live in
+    texture detiling).
+  - bytemuck: SPIR-V disk-cache serialize/deserialize (pod_collect/cast_slice,
+    LE-identical to old per-word loop).
+  - rustc-hash: FxHashMap across the NID linker maps (~719k-reloc hot path).
+  - walkdir: find_eboot now finds eboots nested to depth 4 (-app dir wins,
+    else shallowest).
+  - egui-notify: Shell toasts (save-failure TODO paid, rescan results,
+    plugin rescan, update staged). GOTCHA: default TopRight anchor rendered
+    OFF-SCREEN because the user's window (1920 wide, windowed) exceeds the
+    1080-wide portrait display — anchored TopLeft. Verified visually.
+  - notify: recursive watcher on the game folders, 800ms debounce after the
+    last event -> auto-rescan + toast. Verified end-to-end (drop/remove a
+    game dir on disk -> library + toast update, no input).
+  - sysinfo: host CPU/cores/RAM/OS logged at startup (verified in log).
+  - puffin + puffin_http: RAEEN_PROFILE=1 -> scopes on + viewer server :8585
+    default port; new_frame in RaeenApp; scopes on execute_dcb_cp /
+    publish_frame / shell_update. (puffin_egui skipped: no egui 0.31 build —
+    puffin_http+puffin_viewer is the supported pairing.)
+  - renderdoc: RAEEN_RENDERDOC_CAPTURE=N brackets N DCB executions in
+    Start/EndFrameCapture (headless offscreen needs explicit brackets).
+  - gpu-allocator: Allocator now lives in VulkanDevice (created at init,
+    dropped before vkDestroyDevice); GDS arena is the first sub-allocated
+    consumer (managed/raw fallback split). Remaining 7 raw allocate_memory
+    sites are pooled by hand and migrate per-site later — full conversion is
+    its own refactor.
+  - crash-handler + minidumper: Shell hosts a minidump server (unix-socket
+    in temp, thread for process lifetime); runner child attaches
+    crash-handler via RAEEN_CRASH_SOCKET and requests dumps out-of-process
+    into logs/crashes/*.dmp. VEH coexistence: HLE traps are handled
+    first-chance and never reach the last-chance handler.
+  - rubato: UI sound clips sinc-resampled to 48k once at load
+    (output_delay-compensated, padded flush; tested), replacing per-play
+    linear resampling for clips.
+  - proptest: nav state machine bounded under arbitrary input sequences;
+    loader parse_elf/parse_pkg_header never panic on arbitrary bytes.
+  - insta: PM4 fixture DCB encodings pinned (m2 + cp scissor halves,
+    snapshots checked in).
+  - criterion: benches/nid_link.rs (nid_of/encode/resolve vs 4k-name
+    corpus); compiles (cargo bench runnable; AppControl policy may block
+    fresh bench exes — known env issue).
+  - cargo-fuzz: fuzz/ scaffolding (parse_elf, parse_pkg_header targets +
+    README), workspace-excluded, nightly tool-gated.
+* NOTE: user's window is windowed 1920x1080 on a 1080x1920 portrait display
+  — right ~840px of the Shell render off-screen. Worth surfacing to the
+  user; also why Settings looked clipped in screenshots.

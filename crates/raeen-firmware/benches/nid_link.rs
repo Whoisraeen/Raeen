@@ -5,7 +5,7 @@
 //! screen. Run with `cargo bench -p raeen-firmware`.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use raeen_firmware::dynlib::nid::{NidTable, encode_nid, nid_of};
+use raeen_firmware::dynlib::nid::{NidDatabase, encode_nid, nid_of};
 
 /// A registry-shaped corpus: enough distinct names to make the lookup table
 /// realistic (the real HLE registry is in the same order of magnitude).
@@ -29,7 +29,7 @@ fn bench_encode(c: &mut Criterion) {
 }
 
 fn bench_resolve(c: &mut Criterion) {
-    let table = NidTable::from_hle_names(corpus());
+    let table = NidDatabase::from_hle_names(corpus());
     let hit = nid_of("sceBenchFn1234");
     let miss = nid_of("sceDoesNotExist");
     c.bench_function("NidTable::resolve hit", |b| {

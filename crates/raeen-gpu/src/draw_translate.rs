@@ -423,6 +423,11 @@ fn vulkan_format(
         // 32 FLOAT (CB format 4, number type 7). GTA V programs this scalar
         // target immediately after its packed 10_10_10_2 pass.
         (0x4, 7, 0) => Ok(vk::Format::R32_SFLOAT),
+        // 16_16 FLOAT (CB format 5, number type 7). GTA V programs this
+        // two-channel intermediate in its first live render sequence.
+        // KytyPS5 names layout 5 `k16_16`; SharpEmu maps the exact pair
+        // `(5, 7)` to `R16G16Sfloat`.
+        (0x5, 7, 0) => Ok(vk::Format::R16G16_SFLOAT),
         // 10_11_11 / 11_11_10 FLOAT (channel_type 7): the packed HDR
         // intermediate render target ASTRO.BOT draws into. SharpEmu maps both
         // CB formats 6 and 7 with channel_type 7 to B10G11R11_UFLOAT_PACK32.
@@ -6634,6 +6639,7 @@ mod tests {
         for (fmt, ty, order, want, bpp) in [
             (0xa, 0, 0, vk::Format::R8G8B8A8_UNORM, 4u32),
             (0x4, 7, 0, vk::Format::R32_SFLOAT, 4),
+            (0x5, 7, 0, vk::Format::R16G16_SFLOAT, 4),
             (0x6, 7, 0, vk::Format::B10G11R11_UFLOAT_PACK32, 4),
             (0x9, 0, 0, vk::Format::A2B10G10R10_UNORM_PACK32, 4),
             (0xc, 7, 0, vk::Format::R16G16B16A16_SFLOAT, 8),

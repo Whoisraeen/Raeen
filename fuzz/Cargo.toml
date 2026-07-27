@@ -1,0 +1,27 @@
+[package]
+name = "raeen-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-2.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+raeen-loader = { path = "../crates/raeen-loader" }
+
+[[bin]]
+name = "parse_elf"
+path = "fuzz_targets/parse_elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_pkg_header"
+path = "fuzz_targets/parse_pkg_header.rs"
+test = false
+doc = false
+bench = false

@@ -415,6 +415,12 @@ fn run_isolated_child(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
+    // Out-of-process crash dumps: the Shell hosts the minidump server; the
+    // child attaches a crash handler that requests dumps from it. A server
+    // that failed to start simply means no dumps, never no launch.
+    if let Some(socket) = crate::crashdump::ensure_server() {
+        command.env("RAEEN_CRASH_SOCKET", socket);
+    }
     // The launching title's effective Settings (Advanced dumps, Frame Limit),
     // staged by the Shell just before launch. Explicit set/remove per var so
     // the child sees the *current* Settings, not whatever the Shell's own

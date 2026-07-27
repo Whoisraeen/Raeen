@@ -221,6 +221,19 @@ pub struct Shell {
     /// The active UI sound pack (Settings ▸ Audio ▸ UI Sound Pack) — the
     /// silent pack when `"off"` or nothing decodes.
     sound_pack: sounds::SoundPack,
+    /// Toast notifications (egui-notify): save failures, rescan results,
+    /// update staged — surfaced in-UI instead of only in the log.
+    toasts: egui_notify::Toasts,
+    /// Filesystem watcher over the configured game folders; dropping a game
+    /// in (or deleting one) rescans the library without touching Settings.
+    /// `None` when the watcher backend failed — manual rescan still works.
+    library_watcher: Option<notify::RecommendedWatcher>,
+    /// Set by the watcher thread on any create/modify/remove under a game
+    /// folder; drained by [`Self::tick_library_watcher`].
+    library_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Time of the most recent watcher event — the rescan debounce anchor,
+    /// so a multi-file copy triggers one rescan at the end, not dozens.
+    library_dirty_since: Option<std::time::Instant>,
     /// Ids of launched titles, most-recent-first, deduplicated and capped —
     /// backs the Control Center's Switcher panel (spec §10).
     recent: Vec<String>,
@@ -357,7 +370,7 @@ impl Shell {
             .first()
             .and_then(|i| game_backgrounds.get(i.id.as_str()).cloned());
 
-        Self {
+        let mut shell = Self {
             theme,
             library,
             library_media,
@@ -401,6 +414,82 @@ impl Shell {
             last_rail_index: 0,
             last_tab: RailTab::Games,
             console: console::ConsolePane::default(),
+            // Top-LEFT anchor: the Shell's top-left is free chrome space, and
+            // a windowed shell wider than the display (seen in the field)
+            // pushes the right edge — and any right-anchored toast — off
+            // screen entirely.
+            toasts: egui_notify::Toasts::default()
+                .with_anchor(egui_notify::Anchor::TopLeft)
+                .with_margin(egui::vec2(16.0, 16.0)),
+            library_watcher: None,
+            library_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            library_dirty_since: None,
+        };
+        shell.rebuild_library_watcher(ctx);
+        shell
+    }
+
+    /// (Re)attach the filesystem watcher to the current game-folder list.
+    /// Called at construction and whenever the folder list changes. A missing
+    /// folder is skipped quietly (it may be created later — a rebuild then
+    /// picks it up); a failed watcher backend downgrades to manual rescans.
+    fn rebuild_library_watcher(&mut self, ctx: &egui::Context) {
+        use notify::Watcher;
+        self.library_watcher = None;
+        let flag = std::sync::Arc::clone(&self.library_dirty);
+        let repaint = ctx.clone();
+        let handler = move |event: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = event
+                && matches!(
+                    event.kind,
+                    notify::EventKind::Create(_)
+                        | notify::EventKind::Modify(_)
+                        | notify::EventKind::Remove(_)
+                )
+            {
+                flag.store(true, Ordering::Relaxed);
+                // Wake the UI loop so the debounce timer runs while idle.
+                repaint.request_repaint();
+            }
+        };
+        let mut watcher = match notify::recommended_watcher(handler) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                tracing::warn!(error = %err, "game-folder watcher unavailable — rescan manually");
+                return;
+            }
+        };
+        let mut watched = 0usize;
+        for folder in &self.config.paths.game_folders {
+            match watcher.watch(folder, notify::RecursiveMode::Recursive) {
+                Ok(()) => watched += 1,
+                Err(err) => {
+                    tracing::warn!(folder = %folder.display(), error = %err, "game folder not watched");
+                }
+            }
+        }
+        tracing::info!(
+            watched,
+            of = self.config.paths.game_folders.len(),
+            "game-folder watcher attached"
+        );
+        self.library_watcher = Some(watcher);
+    }
+
+    /// Debounced reaction to watcher events: rescan once, 800 ms after the
+    /// *last* filesystem event, so bulk copies coalesce into one rescan.
+    fn tick_library_watcher(&mut self, ctx: &egui::Context) {
+        if self.library_dirty.swap(false, Ordering::Relaxed) {
+            self.library_dirty_since = Some(std::time::Instant::now());
+        }
+        let Some(since) = self.library_dirty_since else {
+            return;
+        };
+        if since.elapsed() >= std::time::Duration::from_millis(800) {
+            self.library_dirty_since = None;
+            self.rescan_library(ctx);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
 
@@ -436,13 +525,15 @@ impl Shell {
 
         self.route_input(ctx);
         self.pump_updater_events(ctx);
+        self.tick_library_watcher(ctx);
         self.poll_session();
         self.push_pad_state(ctx);
         self.tick_session_quit(ctx);
         self.tick_animations(ctx);
         self.draw(ctx);
-        // Drawn last: the console floats above every screen.
+        // Drawn last: the console floats above every screen, toasts above it.
         self.console.ui(ctx);
+        self.toasts.show(ctx);
     }
 
     /// Kick off the startup update check (called once from `app.rs`, not
@@ -471,6 +562,8 @@ impl Shell {
                 }
                 UpdaterEvent::Staged { tag, staged } => {
                     tracing::info!(tag = %tag, staged = %staged.display(), "update staged — restart to apply");
+                    self.toasts
+                        .success(format!("Update {tag} downloaded — restart to apply"));
                     self.updater_state = UpdaterState::Staged { tag, staged };
                 }
                 UpdaterEvent::CheckFailed(err) => {
@@ -590,10 +683,9 @@ impl Shell {
         self.config.paths.key_provider_path =
             PathBuf::from(self.settings_key_provider_input.trim());
         if let Err(err) = self.config.save(&self.config_path) {
-            // TODO: surface a save failure to the user in-UI instead of
-            // just logging it (spec doesn't yet define a Settings toast/
-            // error surface).
             tracing::warn!(error = %err, path = %self.config_path.display(), "failed to save settings");
+            self.toasts
+                .error(format!("Settings could not be saved: {err}"));
         }
     }
 
@@ -851,6 +943,11 @@ impl Shell {
             raeen_gpu::AgcGpuSession::load_present_plugins_from(std::path::Path::new("plugins"))
         };
         tracing::info!(count = loaded.len(), plugins = ?loaded, "plugins folder rescanned");
+        self.toasts.info(if loaded.is_empty() {
+            "Plugins rescanned — nothing new loaded".to_string()
+        } else {
+            format!("Plugins rescanned — loaded: {}", loaded.join(", "))
+        });
         // The persisted selection may name a plugin that just (re)appeared.
         apply_present_plugin(&self.config.graphics);
         self.refresh_settings_row_counts();
@@ -914,6 +1011,8 @@ impl Shell {
         if folders_changed {
             self.refresh_settings_row_counts();
             self.rescan_library(ctx);
+            // The watcher's folder set just changed with the config.
+            self.rebuild_library_watcher(ctx);
         }
     }
 
@@ -933,10 +1032,15 @@ impl Shell {
     /// untouched, so a rescan from Settings stays in Settings.
     fn rescan_library(&mut self, ctx: &egui::Context) {
         let mut library = crate::app::scan_game_folders(&self.config.paths.game_folders);
+        let scanned = library.len();
         if library.is_empty() {
             library = crate::library::sample_library();
+            self.toasts
+                .info("Library rescanned — no games found (showing samples)");
         } else {
             library.extend(crate::library::built_in_apps());
+            self.toasts
+                .success(format!("Library rescanned — {scanned} titles"));
         }
 
         self.meta_cache = MetaCache::from_items(&library);

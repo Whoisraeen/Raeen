@@ -31,7 +31,7 @@ members = [
 # feature is enabled — so every clean clone and every CI run failed workspace
 # resolution outright. That crate now lives at `crates/raeen-upscale`. Do not
 # reintroduce a path dependency on anything under `plugins/`.
-exclude = ["plugins"]
+exclude = ["plugins", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"

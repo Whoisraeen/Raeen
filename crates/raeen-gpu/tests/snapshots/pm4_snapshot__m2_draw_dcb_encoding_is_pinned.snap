@@ -1,0 +1,6 @@
+---
+source: crates/raeen-gpu/tests/pm4_snapshot.rs
+expression: hex_words(&build_m2_draw_dcb())
+---
+0000: 0xc0001010
+0001: 0x00000003

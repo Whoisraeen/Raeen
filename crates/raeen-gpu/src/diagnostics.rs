@@ -76,3 +76,78 @@ pub(crate) fn gpu_env() -> &'static GpuEnv {
     static ENV: OnceLock<GpuEnv> = OnceLock::new();
     ENV.get_or_init(GpuEnv::capture)
 }
+
+// ─── RenderDoc programmatic captures ────────────────────────────────────────
+//
+// `RAEEN_RENDERDOC_CAPTURE=N` (with Raeen launched *under RenderDoc*) wraps
+// the next N DCB executions in explicit Start/EndFrameCapture calls. Raeen
+// renders offscreen — there is no swapchain "frame" for RenderDoc to latch
+// onto by itself — so the bracket is what turns a headless draw into a
+// capturable event. Without the env var, or outside RenderDoc, everything
+// here is a no-op.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn renderdoc_api() -> &'static Mutex<Option<renderdoc::RenderDoc<renderdoc::V141>>> {
+    static API: OnceLock<Mutex<Option<renderdoc::RenderDoc<renderdoc::V141>>>> = OnceLock::new();
+    API.get_or_init(|| {
+        let api = match renderdoc::RenderDoc::<renderdoc::V141>::new() {
+            Ok(api) => Some(api),
+            Err(e) => {
+                tracing::warn!(
+                    "RAEEN_RENDERDOC_CAPTURE set but the RenderDoc API is unavailable \
+                     (launch Raeen from RenderDoc): {e}"
+                );
+                None
+            }
+        };
+        Mutex::new(api)
+    })
+}
+
+/// Remaining capture budget from `RAEEN_RENDERDOC_CAPTURE` (`0` = disabled).
+fn renderdoc_budget() -> &'static AtomicU64 {
+    static BUDGET: OnceLock<AtomicU64> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        AtomicU64::new(
+            std::env::var("RAEEN_RENDERDOC_CAPTURE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        )
+    })
+}
+
+/// RAII guard: ends the RenderDoc capture when the wrapped DCB execution
+/// returns (any path — success or error).
+pub(crate) struct RenderdocCapture(());
+
+impl Drop for RenderdocCapture {
+    fn drop(&mut self) {
+        if let Some(api) = renderdoc_api().lock().unwrap().as_mut() {
+            api.end_frame_capture(std::ptr::null(), std::ptr::null());
+            tracing::info!("RenderDoc capture ended for one DCB execution");
+        }
+    }
+}
+
+/// Begin a RenderDoc capture for one DCB execution if budget remains.
+/// Returns `None` (no-op) when disabled, exhausted, or not under RenderDoc.
+pub(crate) fn renderdoc_dcb_capture() -> Option<RenderdocCapture> {
+    let budget = renderdoc_budget();
+    if budget.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let mut api = renderdoc_api().lock().unwrap();
+    let api = api.as_mut()?;
+    // Claim one unit of budget; a concurrent claimant losing the race skips.
+    if budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_err()
+    {
+        return None;
+    }
+    api.start_frame_capture(std::ptr::null(), std::ptr::null());
+    Some(RenderdocCapture(()))
+}

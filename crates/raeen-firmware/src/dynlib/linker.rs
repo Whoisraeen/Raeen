@@ -986,7 +986,7 @@ mod tests {
     fn uniquely_named_hle_function(hle: &HleRegistry) -> (String, String) {
         let mut names = hle.registered_names();
         names.sort();
-        let mut counts = HashMap::<&str, usize>::new();
+        let mut counts = HashMap::<&str, usize>::default();
         for (_, function) in &names {
             *counts.entry(function).or_default() += 1;
         }

@@ -83,6 +83,10 @@ impl RaeenApp {
 
 impl eframe::App for RaeenApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Frame boundary for the opt-in puffin profiler (RAEEN_PROFILE=1);
+        // a no-op branch when scopes are off.
+        puffin::GlobalProfiler::lock().new_frame();
+        puffin::profile_scope!("shell_update");
         self.shell.update(ctx);
     }
 }

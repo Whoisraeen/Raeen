@@ -1337,6 +1337,47 @@ mod tests {
         );
     }
 
+    // --- Property tests (proptest) -------------------------------------------
+
+    proptest::proptest! {
+        /// ANY input sequence keeps every focus index in bounds and the state
+        /// machine panic-free — the invariant every render path relies on
+        /// when it indexes rows/tiles by the nav state.
+        #[test]
+        fn any_input_sequence_keeps_focus_in_bounds(
+            inputs in proptest::collection::vec(0usize..9, 0..96)
+        ) {
+            const ALL: [NavInput; 9] = [
+                NavInput::Left,
+                NavInput::Right,
+                NavInput::Up,
+                NavInput::Down,
+                NavInput::Confirm,
+                NavInput::Guide,
+                NavInput::Back,
+                NavInput::Tab,
+                NavInput::Options,
+            ];
+            let counts = vec![4usize, 3, 2];
+            let mut nav = NavState::with_cc_options(9, 5, vec![0, 0, 3, 0, 0])
+                .with_settings(Some(8), counts.clone())
+                .with_media_rail_len(3)
+                .with_game_options(5);
+            for index in inputs {
+                nav.apply(ALL[index]);
+                proptest::prop_assert!(nav.rail_index < nav.rail_len.max(1));
+                proptest::prop_assert!(nav.pill_index < PILL_COUNT);
+                proptest::prop_assert!(nav.cc_index < 5);
+                proptest::prop_assert!(nav.cc_option_index < 3.max(1));
+                proptest::prop_assert!(nav.settings_section < counts.len());
+                proptest::prop_assert!(
+                    nav.settings_row < counts[nav.settings_section].max(1)
+                );
+                proptest::prop_assert!(nav.game_options_row < 5);
+            }
+        }
+    }
+
     #[test]
     fn game_options_back_closes_and_signals_persist() {
         let mut nav = NavState::with_cc_options(5, 11, vec![0; 11])
