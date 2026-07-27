@@ -136,6 +136,9 @@ pub fn capability_label(caps: &raeen_gpu::Capabilities) -> String {
     if caps.wants_motion_vectors {
         parts.push("Motion Vectors");
     }
+    if caps.gpu_frames {
+        parts.push("GPU");
+    }
     if parts.is_empty() {
         "Passthrough".to_string()
     } else {
@@ -898,8 +901,9 @@ mod tests {
                 frame_gen: true,
                 wants_depth: true,
                 wants_motion_vectors: true,
+                gpu_frames: true,
             }),
-            "Upscale · Frame Gen · Depth · Motion Vectors"
+            "Upscale · Frame Gen · Depth · Motion Vectors · GPU"
         );
     }
 

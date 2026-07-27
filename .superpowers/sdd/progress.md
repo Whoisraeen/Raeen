@@ -4561,3 +4561,33 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * NOTE: user's window is windowed 1920x1080 on a 1080x1920 portrait display
   — right ~840px of the Shell render off-screen. Worth surfacing to the
   user; also why Settings looked clipped in screenshots.
+
+## 2026-07-27 (night) — Present-path spike: native wgpu upload + plugin ABI v2
+* USER-PRIORITIZED graphics spike (explicit). 481 gpu+gui tests green.
+* shell-present: complete. GameFrameView now uploads guest frames into a
+  native wgpu texture (Rgba8UnormSrgb, registered via egui-wgpu
+  register_native_texture, one queue.write_texture per published frame) —
+  the per-frame egui::ColorImage::from_rgba_unmultiplied conversion copy +
+  egui delta copy are GONE. ColorImage path retained as non-wgpu/non-RGBA8
+  fallback. RenderState plumbed RaeenApp -> Shell::update -> overlay.
+  MEASURED live (Minecraft menu, epoch 8192): egui_upload_us 369-671us
+  (was: same upload PLUS a full-frame per-pixel CPU conversion). Visual
+  correctness verified on the real Minecraft menu (colors exact).
+* plugin-abi-v2: complete (raeen-gpu present_plugin::cabi; 24 ABI tests).
+  `raeen_plugin_v2` entry (authoritative when exported; v1 fully supported),
+  RaeenHostContextV2 (host_flags + opaque Vulkan dispatch context, zeroed
+  until RAEEN_HOST_GPU_FRAMES), frame `kind` = CPU now / VULKAN later,
+  RAEEN_CAP_GPU_FRAMES (Settings shows "GPU"), reserved GPU output
+  (produced_kind/produced_image; claiming GPU output on a CPU host = named
+  refusal). DynamicPlugin drives both vtables; loader negotiates v2-first.
+  A v2 plugin written today needs NO changes when GPU frames arrive.
+  LEGAL BOUNDARY unchanged and restated in plugins/README.md: vendor-neutral
+  socket, proprietary implementations (DLSS/XeSS) are user-supplied
+  out-of-tree binaries, never shipped/fetched/named as supported; FSR-class
+  MIT code fills the same slot in-tree.
+* plan: docs/superpowers/plans/2026-07-27-gpu-resident-present.md — phased
+  path to full GPU residency: (1) VK_EXT_external_memory_host GPU-copy
+  straight into the IPC slot, (2) cross-process image sharing
+  (external_memory_win32 -> wgpu-hal import), (3) set RAEEN_HOST_GPU_FRAMES
+  + GPU plugin passes, (4) PM4 motion-vector/depth extraction (the moat).
+  Phases 3-4 gated on M4/M5 titles rendering — no queue jumping.

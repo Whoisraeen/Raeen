@@ -1,10 +1,17 @@
-//! # raeen-upscale — all-in-one BYO upscaler / frame-gen plugin
+//! # raeen-upscale — in-tree upscaler backends for the present-plugin ABI
 //!
-//! **This crate is git-ignored and is NOT part of the Raeen repository.** It
-//! lives under `plugins/` (ignored by `.gitignore`), is hosted separately, and
-//! is compiled in only by a user who opts into it. Raeen itself ships and
-//! distributes none of this — see `plugins/README.md` and the license note
-//! below.
+//! **This crate is in the repository and builds in CI.** It is a normal
+//! workspace member, but it is **opt-in at compile time**: `raeen-gui` depends
+//! on it optionally and only pulls it in under `--features upscale-plugins`, so
+//! the default build carries just the vendor-neutral built-ins.
+//!
+//! It lived under the git-ignored `plugins/` tree until 2026-07-26, which broke
+//! every clean clone and every CI run — an *optional* path dependency still has
+//! to resolve at manifest-load time, and the directory was not in the
+//! repository. `plugins/` is now reserved for genuinely user-supplied plugin
+//! **binaries** loaded through the C ABI (see `plugins/README.md`); GPL-clean
+//! Rust backends that Raeen ships belong here. Do not reintroduce a path
+//! dependency under `plugins/`.
 //!
 //! It implements the vendor-neutral [`raeen_gpu::PresentPlugin`] ABI once per
 //! backend and registers them all with the running app, so the Shell's

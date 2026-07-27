@@ -84,10 +84,30 @@ impl PresentedFrameRate {
     }
 }
 
+/// A frame texture owned directly on egui's wgpu device, registered as a
+/// native egui texture. Written with one `queue.write_texture` per published
+/// frame — no `ColorImage` conversion, no per-frame allocation, no egui
+/// texture-delta copy. Reused across frames (and titles) while the size
+/// matches; freed and re-registered on resize.
+struct NativeFrame {
+    /// Kept alive for the registered view; rewritten in place every frame.
+    texture: eframe::egui_wgpu::wgpu::Texture,
+    id: egui::TextureId,
+    width: u32,
+    height: u32,
+}
+
 /// Presents the newest rendered guest frame, if there is one.
 #[derive(Default)]
 pub(crate) struct GameFrameView {
     texture: Option<egui::TextureHandle>,
+    /// The zero-conversion present path (see [`NativeFrame`]); `texture`
+    /// remains the fallback when no wgpu render state exists (tests,
+    /// non-wgpu backends) or for non-RGBA8 frames.
+    native: Option<NativeFrame>,
+    /// What `paint` last uploaded and should draw: texture id + pixel size.
+    /// `None` until the first complete frame (or after [`Self::clear`]).
+    displayed: Option<(egui::TextureId, egui::Vec2)>,
     /// The GPU session's `present_epoch` when `texture` was last refreshed.
     /// `last_image()` is now an `Arc` bump (no frame copy), but REFRESHING the
     /// texture still costs a full 8 MB (1080p RGBA) `ColorImage` build plus a
@@ -120,12 +140,88 @@ pub(crate) enum Presented {
 }
 
 impl GameFrameView {
+    /// Upload `image` through the zero-conversion native-wgpu path. Returns
+    /// the egui texture id + size to draw, or `None` when this frame can't
+    /// take it (non-RGBA8) and must use the `ColorImage` fallback.
+    fn upload_native(
+        &mut self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        image: &raeen_gpu::RenderedImage,
+    ) -> Option<(egui::TextureId, egui::Vec2)> {
+        use eframe::egui_wgpu::wgpu;
+        if image.bytes_per_pixel != 4 {
+            return None;
+        }
+        let (width, height) = (image.width, image.height);
+        let recreate = self
+            .native
+            .as_ref()
+            .is_none_or(|n| n.width != width || n.height != height);
+        if recreate {
+            if let Some(old) = self.native.take() {
+                render_state.renderer.write().free_texture(&old.id);
+            }
+            let texture = render_state
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("raeen-guest-frame"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    // Same encoding egui uses for its managed textures, so the
+                    // native path is pixel-identical to the ColorImage path.
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let id = render_state.renderer.write().register_native_texture(
+                &render_state.device,
+                &view,
+                wgpu::FilterMode::Linear,
+            );
+            self.native = Some(NativeFrame {
+                texture,
+                id,
+                width,
+                height,
+            });
+        }
+        let native = self.native.as_ref().expect("just ensured above");
+        render_state.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &native.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Some((native.id, egui::vec2(width as f32, height as f32)))
+    }
+
     /// Paint the latest guest frame into `screen`, letterboxed.
     pub(crate) fn paint(
         &mut self,
         ui: &egui::Ui,
         screen: egui::Rect,
         presented_frames: Option<u64>,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
     ) -> Presented {
         let session = raeen_gpu::AgcGpuSession::global();
         let remote = raeen_gpu::frame_ipc::latest_remote_frame();
@@ -159,17 +255,30 @@ impl GameFrameView {
                 let size = [image.width as usize, image.height as usize];
                 if size[0] > 0 && size[1] > 0 && image.pixels.len() == size[0] * size[1] * 4 {
                     let upload_at = Instant::now();
-                    let color = egui::ColorImage::from_rgba_unmultiplied(size, &image.pixels);
-                    match &mut self.texture {
-                        Some(texture) => texture.set(color, egui::TextureOptions::LINEAR),
-                        None => {
-                            self.texture = Some(ui.ctx().load_texture(
-                                "guest-frame",
-                                color,
-                                egui::TextureOptions::LINEAR,
-                            ));
-                        }
-                    }
+                    // Preferred: one direct write into a native wgpu texture.
+                    // Fallback (no wgpu render state, or a format the native
+                    // path declines): egui's ColorImage upload, which costs a
+                    // full-frame conversion copy first.
+                    let uploaded = render_state
+                        .and_then(|rs| self.upload_native(rs, &image))
+                        .or_else(|| {
+                            let color =
+                                egui::ColorImage::from_rgba_unmultiplied(size, &image.pixels);
+                            match &mut self.texture {
+                                Some(texture) => texture.set(color, egui::TextureOptions::LINEAR),
+                                None => {
+                                    self.texture = Some(ui.ctx().load_texture(
+                                        "guest-frame",
+                                        color,
+                                        egui::TextureOptions::LINEAR,
+                                    ));
+                                }
+                            }
+                            self.texture
+                                .as_ref()
+                                .map(|texture| (texture.id(), texture.size_vec2()))
+                        });
+                    self.displayed = uploaded;
                     let mut timing = remote
                         .as_ref()
                         .map_or_else(|| session.present_timing(), |frame| frame.timing);
@@ -194,12 +303,12 @@ impl GameFrameView {
             }
         }
 
-        let Some(texture) = &self.texture else {
+        let Some((texture_id, size)) = self.displayed else {
             return Presented::NoFrameYet;
         };
-        let rect = letterbox(screen, texture.size_vec2());
+        let rect = letterbox(screen, size);
         ui.painter().image(
-            texture.id(),
+            texture_id,
             rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
@@ -247,6 +356,12 @@ impl GameFrameView {
     /// previous title's last frame.
     pub(crate) fn clear(&mut self) {
         self.texture = None;
+        // Stop DRAWING the old title's frame immediately. The native wgpu
+        // texture itself is kept: its registration survives, its contents are
+        // fully overwritten before `displayed` points at it again, and
+        // freeing it here would need the renderer lock this method doesn't
+        // have. `upload_native` frees + recreates it on any size change.
+        self.displayed = None;
         self.shown_at_epoch = 0;
         self.frame_rate.reset();
         self.present_timing = None;

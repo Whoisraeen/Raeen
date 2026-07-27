@@ -261,14 +261,55 @@ impl PresentPlugin for MyUpscaler {
 raeen_gpu::AgcGpuSession::register_present_plugin(Box::new(MyUpscaler::new()));
 ```
 
+## ABI v2 — GPU-capable frames (for real hardware upscalers)
+
+Real hardware upscalers and frame generators run as GPU passes and want a
+`VkImage`, not a CPU pixel buffer. **ABI v2** is the stable contract for that,
+designed so a plugin written today keeps working unchanged when Raeen's
+GPU-resident present path lands:
+
+```c
+const RaeenPluginV2 *raeen_plugin_v2(void);   // abi_version == 2
+```
+
+- A binary may export **both** `raeen_plugin_v1` and `raeen_plugin_v2`; when
+  v2 is present it is authoritative and must be valid.
+- `create` receives a `RaeenHostContextV2` (valid only during the call):
+  `host_flags` says what this host delivers, and a `RaeenVulkanContext`
+  (instance/physical device/device/queue as opaque `u64`s plus a
+  `vkGetInstanceProcAddr`) — **all zero today**, because the host does not yet
+  set `RAEEN_HOST_GPU_FRAMES`.
+- Every `RaeenPresentFrameV2` carries a `kind`: `RAEEN_FRAME_KIND_CPU`
+  (delivered today; `color`/`color_len` have exactly the v1 semantics) or
+  `RAEEN_FRAME_KIND_VULKAN` (a live `RaeenVulkanImage`, delivered once the
+  GPU-resident present path exists). A plugin that only supports one kind
+  simply declines the other from `process` — a declined frame is presented
+  unchanged, never an error.
+- Output is the v1 CPU output plus a reserved `produced_image` +
+  `produced_kind`; the host reads the GPU output only when it advertised
+  `RAEEN_HOST_GPU_FRAMES` (never today — claiming a GPU output now is refused
+  with a named warning).
+- New capability bit: `RAEEN_CAP_GPU_FRAMES (1 << 4)` — "I can consume
+  VULKAN-kind frames". Shown in Settings ▸ Plugins as `GPU`.
+
+**The license boundary is identical to v1 and non-negotiable**: a proprietary
+implementation (e.g. an NVIDIA DLSS or Intel XeSS shim) is authored and hosted
+in a separate repository, obtained by the user, and dropped in here as a
+binary. Raeen ships none of it, fetches none of it, and this ABI stays
+vendor-neutral — an MIT-licensed FSR pass fills the same slot in-tree, which
+is what makes this an extension point rather than a copyleft-evasion device.
+
 ## Current limits
 
-- **Frames are CPU pixel buffers**, not GPU textures. Real hardware upscalers
-  (DLSS, FSR3, XeSS) run as GPU passes and want a `VkImage`; a GPU-handle ABI
-  (v2) is planned and depends on the GPU-side present path landing first.
+- **CPU-kind frames only for now** — the host does not yet set
+  `RAEEN_HOST_GPU_FRAMES`; v2 plugins receive CPU buffers through v2 types
+  until the GPU-resident present path lands (see
+  `docs/superpowers/plans/2026-07-27-gpu-resident-present.md`).
 - **`depth` and `motion` are always NULL.** The fields and capability bits exist
   so an MV-aware plugin can be written against a stable ABI now; PM4-side
-  extraction is the follow-up that populates them.
+  extraction is the follow-up that populates them — and it is the structural
+  advantage: an external overlay must guess motion, Raeen owns the command
+  stream and can eventually hand plugins the title's real motion vectors.
 - **`generated` frames are validated but not presented.** Frame-gen pacing is
   not implemented, so a frame generator can be developed and its output checked,
   but the extra frames are not yet scheduled for display.

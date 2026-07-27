@@ -55,6 +55,11 @@ pub struct Capabilities {
     /// owns the command stream can supply). Extraction from the PM4 stream is a
     /// follow-up; the flag lets an MV-aware plugin advertise the need now.
     pub wants_motion_vectors: bool,
+    /// Can consume GPU-resident (`VULKAN`-kind) frames via ABI v2. Purely
+    /// descriptive until the GPU-resident present path advertises
+    /// `RAEEN_HOST_GPU_FRAMES`; such plugins still receive CPU frames today
+    /// and may decline them.
+    pub gpu_frames: bool,
 }
 
 /// An optional auxiliary input plane (depth or motion vectors) accompanying the

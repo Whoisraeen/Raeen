@@ -234,6 +234,9 @@ pub struct Shell {
     /// Time of the most recent watcher event — the rescan debounce anchor,
     /// so a multi-file copy triggers one rescan at the end, not dozens.
     library_dirty_since: Option<std::time::Instant>,
+    /// egui's wgpu render state, captured on the first frame — the device/
+    /// queue the guest-frame native present path uploads through.
+    render_state: Option<eframe::egui_wgpu::RenderState>,
     /// Ids of launched titles, most-recent-first, deduplicated and capped —
     /// backs the Control Center's Switcher panel (spec §10).
     recent: Vec<String>,
@@ -424,6 +427,7 @@ impl Shell {
             library_watcher: None,
             library_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_dirty_since: None,
+            render_state: None,
         };
         shell.rebuild_library_watcher(ctx);
         shell
@@ -501,8 +505,16 @@ impl Shell {
     }
 
     /// Drive one frame: advance boot/animation state, route input, poll any
-    /// active session, and draw.
-    pub fn update(&mut self, ctx: &egui::Context) {
+    /// active session, and draw. `render_state` (when the backend is wgpu)
+    /// enables the zero-conversion guest-frame upload in [`present`].
+    pub fn update(
+        &mut self,
+        ctx: &egui::Context,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
+    ) {
+        if self.render_state.is_none() {
+            self.render_state = render_state.cloned();
+        }
         if let Screen::Boot(boot) = &self.screen {
             boot::draw(ctx, &self.theme, boot);
             if boot.is_done() {
@@ -1527,6 +1539,7 @@ impl Shell {
                     self.launcher.as_ref(),
                     &mut self.frame_view,
                     self.session_quit_hold.progress(),
+                    self.render_state.as_ref(),
                 );
                 return;
             }
@@ -2049,6 +2062,7 @@ fn background_textures_for(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_session_overlay(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -2056,6 +2070,7 @@ fn draw_session_overlay(
     launcher: &dyn GameLauncher,
     frame_view: &mut present::GameFrameView,
     quit_progress: f32,
+    render_state: Option<&eframe::egui_wgpu::RenderState>,
 ) {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -2071,7 +2086,7 @@ fn draw_session_overlay(
 
     // The title's own frames, when it has rendered any. Painted before the
     // status text so the text stays legible over a bright frame.
-    let presented = frame_view.paint(ui, screen, presented_frames);
+    let presented = frame_view.paint(ui, screen, presented_frames, render_state);
 
     // `session_detail` carries the engine's honest account of what actually
     // happened — a fault reason, or (for the real firmware launcher) a

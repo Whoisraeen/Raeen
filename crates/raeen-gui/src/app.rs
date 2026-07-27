@@ -82,12 +82,15 @@ impl RaeenApp {
 }
 
 impl eframe::App for RaeenApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Frame boundary for the opt-in puffin profiler (RAEEN_PROFILE=1);
         // a no-op branch when scopes are off.
         puffin::GlobalProfiler::lock().new_frame();
         puffin::profile_scope!("shell_update");
-        self.shell.update(ctx);
+        // The wgpu render state feeds the zero-conversion guest-frame present
+        // path (`shell::present`); `None` (non-wgpu backend) falls back to
+        // egui-managed textures.
+        self.shell.update(ctx, frame.wgpu_render_state());
     }
 }
 

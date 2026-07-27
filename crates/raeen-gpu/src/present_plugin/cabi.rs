@@ -215,6 +215,180 @@ pub struct RaeenPluginV1 {
 /// The entry point signature resolved from the loaded binary.
 pub type RaeenPluginEntryFn = unsafe extern "C" fn() -> *const RaeenPluginV1;
 
+// ─── ABI v2: GPU-capable frames ─────────────────────────────────────────────
+//
+// v2 exists so a plugin written TODAY keeps working unchanged when the
+// GPU-resident present path lands. Every frame carries a `kind`
+// discriminator: `CPU` (what Raeen delivers now — identical semantics to v1)
+// or `VULKAN` (live Vulkan handles, delivered once frames stay GPU-resident).
+// The host announces what it will deliver in [`RaeenHostContextV2`] at
+// `create`; a plugin that only supports one kind declines the other from
+// `process` (a declined frame is presented unchanged — never an error).
+//
+// The ABI stays strictly vendor-neutral: opaque Vulkan handles and a loader
+// hook, nothing specific to any upscaler product. The license boundary is
+// unchanged from v1 (see the module docs and `plugins/README.md`): Raeen
+// ships no proprietary plugin, fetches none, and the out-of-tree `.dll` is
+// the only shape closed code may take.
+
+/// ABI generation for [`RaeenPluginV2`].
+pub const RAEEN_PLUGIN_ABI_V2: u32 = 2;
+
+/// The v2 entry point (NUL-terminated for `dlsym`). A binary may export both
+/// `raeen_plugin_v1` and `raeen_plugin_v2`; when v2 is present it is
+/// authoritative and must be valid.
+pub const RAEEN_PLUGIN_ENTRY_V2: &[u8] = b"raeen_plugin_v2\0";
+
+/// Capability bit: the plugin can consume `RAEEN_FRAME_KIND_VULKAN` frames.
+pub const RAEEN_CAP_GPU_FRAMES: u32 = 1 << 4;
+
+/// Host flag: this Raeen will deliver `RAEEN_FRAME_KIND_VULKAN` frames.
+/// Currently never set — frames are CPU buffers until the GPU-resident
+/// present path lands; the flag is how that lands without an ABI break.
+pub const RAEEN_HOST_GPU_FRAMES: u32 = 1 << 0;
+
+/// `RaeenPresentFrameV2::kind`: `color`/`color_len` point at CPU pixels.
+pub const RAEEN_FRAME_KIND_CPU: u32 = 0;
+/// `RaeenPresentFrameV2::kind`: `color_image` carries live Vulkan handles.
+pub const RAEEN_FRAME_KIND_VULKAN: u32 = 1;
+
+/// Opaque Vulkan dispatch context handed to a v2 plugin at `create`. All
+/// fields are zero until the host sets [`RAEEN_HOST_GPU_FRAMES`]. Handles are
+/// `u64` so the header needs no Vulkan types; `get_instance_proc_addr` is a
+/// `PFN_vkGetInstanceProcAddr` the plugin may use to load everything else.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RaeenVulkanContext {
+    pub instance: u64,
+    pub physical_device: u64,
+    pub device: u64,
+    pub queue: u64,
+    pub queue_family: u32,
+    pub _reserved: u32,
+    pub get_instance_proc_addr: *const c_void,
+}
+
+impl RaeenVulkanContext {
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            instance: 0,
+            physical_device: 0,
+            device: 0,
+            queue: 0,
+            queue_family: 0,
+            _reserved: 0,
+            get_instance_proc_addr: std::ptr::null(),
+        }
+    }
+}
+
+/// One GPU-resident color image (valid only while `kind == VULKAN`).
+/// `vk_format`/`layout` are the raw `VkFormat`/`VkImageLayout` values.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RaeenVulkanImage {
+    pub image: u64,
+    pub image_view: u64,
+    pub vk_format: u32,
+    pub layout: u32,
+}
+
+impl RaeenVulkanImage {
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            image: 0,
+            image_view: 0,
+            vk_format: 0,
+            layout: 0,
+        }
+    }
+}
+
+/// What the host tells a v2 plugin at `create`. Valid only for the duration
+/// of the call — copy what you need. `struct_size` lets a plugin detect a
+/// newer host extending this struct.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RaeenHostContextV2 {
+    pub struct_size: u32,
+    /// `RAEEN_HOST_*` bits — what this host will deliver.
+    pub host_flags: u32,
+    pub vulkan: RaeenVulkanContext,
+}
+
+/// The v2 source frame. With `kind == CPU`, `color`/`color_len`/`depth`/
+/// `motion` have exactly the v1 semantics and `color_image` is zeroed; with
+/// `kind == VULKAN` the pointers are null and `color_image` is live.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RaeenPresentFrameV2 {
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_pixel: u32,
+    pub color: *const u8,
+    pub color_len: usize,
+    pub color_image: RaeenVulkanImage,
+    pub depth: *const RaeenAuxPlane,
+    pub motion: *const RaeenAuxPlane,
+    pub frame_index: u64,
+}
+
+/// The v2 output: the v1 CPU output plus a reserved GPU-produced image.
+/// `produced_kind` mirrors the frame kinds; the host reads `produced_image`
+/// only when it advertised [`RAEEN_HOST_GPU_FRAMES`] (never today).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RaeenPluginOutputV2 {
+    pub base: RaeenPluginOutput,
+    pub produced_kind: u32,
+    pub _reserved: u32,
+    pub produced_image: RaeenVulkanImage,
+}
+
+impl RaeenPluginOutputV2 {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            base: RaeenPluginOutput::empty(),
+            produced_kind: RAEEN_FRAME_KIND_CPU,
+            _reserved: 0,
+            produced_image: RaeenVulkanImage::zeroed(),
+        }
+    }
+}
+
+/// Create a v2 plugin instance. `host` is valid only during the call.
+pub type RaeenCreateV2Fn = unsafe extern "C" fn(*const RaeenHostContextV2) -> *mut c_void;
+/// Transform one v2 frame. [`RAEEN_OK`] on success; anything else declines.
+pub type RaeenProcessV2Fn = unsafe extern "C" fn(
+    *mut c_void,
+    *const RaeenPresentFrameV2,
+    *const RaeenPresentContext,
+    *mut RaeenPluginOutputV2,
+) -> i32;
+/// Free everything a successful v2 `process` allocated.
+pub type RaeenReleaseOutputV2Fn = unsafe extern "C" fn(*mut c_void, *mut RaeenPluginOutputV2);
+
+/// The vtable a plugin binary returns from `raeen_plugin_v2()`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RaeenPluginV2 {
+    pub abi_version: u32,
+    pub _reserved: u32,
+    pub create: RaeenCreateV2Fn,
+    pub destroy: RaeenDestroyFn,
+    pub name: RaeenNameFn,
+    pub capabilities: RaeenCapabilitiesFn,
+    pub process: RaeenProcessV2Fn,
+    pub release_output: RaeenReleaseOutputV2Fn,
+}
+
+/// The v2 entry point signature resolved from the loaded binary.
+pub type RaeenPluginEntryV2Fn = unsafe extern "C" fn() -> *const RaeenPluginV2;
+
 // ─── Load errors ────────────────────────────────────────────────────────────
 
 /// Why a candidate plugin binary was refused. Every variant names the file, so
@@ -259,12 +433,20 @@ pub struct DynamicPlugin {
     name: String,
     capabilities: Capabilities,
     /// Points into the loaded image; valid only while `_library` is alive.
-    vtable: *const RaeenPluginV1,
+    vtable: PluginVtable,
     instance: *mut c_void,
     source: PathBuf,
     /// `None` for a vtable supplied directly (tests, or a statically-known
     /// plugin); `Some` keeps a `dlopen`ed image alive.
     _library: Option<libloading::Library>,
+}
+
+/// Which ABI generation this plugin speaks. Both pointers alias into the
+/// loaded image and share `DynamicPlugin`'s lifetime rules.
+#[derive(Clone, Copy)]
+enum PluginVtable {
+    V1(*const RaeenPluginV1),
+    V2(*const RaeenPluginV2),
 }
 
 // SAFETY: every call into the vtable happens through `&mut self` (`process`) or
@@ -369,7 +551,81 @@ impl DynamicPlugin {
         Ok(Self {
             name,
             capabilities: capabilities_from_bits(bits),
-            vtable,
+            vtable: PluginVtable::V1(vtable),
+            instance,
+            source,
+            _library: library,
+        })
+    }
+
+    /// Adapt an already-resolved **v2** vtable, optionally keeping its
+    /// library alive. Same contract as [`Self::from_vtable`], plus: `create`
+    /// receives a [`RaeenHostContextV2`] valid only during the call. Today it
+    /// advertises no GPU frames (`host_flags == 0`, zeroed Vulkan context),
+    /// so a v2 plugin sees exactly v1's CPU-frame world through v2 types.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::from_vtable`], with `vtable` pointing at a live
+    /// [`RaeenPluginV2`].
+    pub unsafe fn from_vtable_v2(
+        vtable: *const RaeenPluginV2,
+        library: Option<libloading::Library>,
+        source: PathBuf,
+    ) -> Result<Self, LoadError> {
+        if vtable.is_null() {
+            return Err(LoadError::NullVtable { path: source });
+        }
+        // SAFETY: caller guarantees `vtable` points at a live `RaeenPluginV2`.
+        let vt = unsafe { *vtable };
+        if vt.abi_version != RAEEN_PLUGIN_ABI_V2 {
+            return Err(LoadError::AbiMismatch {
+                path: source,
+                found: vt.abi_version,
+            });
+        }
+
+        let host = RaeenHostContextV2 {
+            struct_size: std::mem::size_of::<RaeenHostContextV2>() as u32,
+            host_flags: 0, // no GPU-resident frames yet
+            vulkan: RaeenVulkanContext::zeroed(),
+        };
+        // SAFETY: ABI version matches; `host` is a live local for the call.
+        let instance = unsafe { (vt.create)(&host) };
+        if instance.is_null() {
+            return Err(LoadError::CreateFailed { path: source });
+        }
+
+        let mut buf = [0u8; MAX_NAME_BYTES];
+        // SAFETY: bounded buffer with its true capacity, as in v1.
+        let written = unsafe { (vt.name)(instance, buf.as_mut_ptr(), buf.len()) };
+        let bad = |reason: &'static str, instance: *mut c_void| {
+            // SAFETY: `instance` came from `create` and has not been destroyed.
+            unsafe { (vt.destroy)(instance) };
+            LoadError::BadName {
+                path: source.clone(),
+                reason,
+            }
+        };
+        if written == 0 {
+            return Err(bad("empty", instance));
+        }
+        if written > buf.len() {
+            return Err(bad("longer than the 128-byte limit", instance));
+        }
+        let name = match std::str::from_utf8(&buf[..written]) {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            Ok(_) => return Err(bad("blank", instance)),
+            Err(_) => return Err(bad("not valid UTF-8", instance)),
+        };
+
+        // SAFETY: instance is live; `capabilities` is a plain value return.
+        let bits = unsafe { (vt.capabilities)(instance) };
+
+        Ok(Self {
+            name,
+            capabilities: capabilities_from_bits(bits),
+            vtable: PluginVtable::V2(vtable),
             instance,
             source,
             _library: library,
@@ -379,15 +635,18 @@ impl DynamicPlugin {
 
 impl Drop for DynamicPlugin {
     fn drop(&mut self) {
-        if self.vtable.is_null() || self.instance.is_null() {
+        if self.instance.is_null() {
             return;
         }
-        // SAFETY: `vtable` was validated at construction and the library that
-        // backs it is still loaded — `_library` is a field, and fields drop only
-        // after this body returns.
+        // SAFETY: the vtable was validated at construction and the library
+        // that backs it is still loaded — `_library` is a field, and fields
+        // drop only after this body returns.
         unsafe {
-            let vt = *self.vtable;
-            (vt.destroy)(self.instance);
+            match self.vtable {
+                PluginVtable::V1(vt) if !vt.is_null() => ((*vt).destroy)(self.instance),
+                PluginVtable::V2(vt) if !vt.is_null() => ((*vt).destroy)(self.instance),
+                _ => {}
+            }
         }
         self.instance = std::ptr::null_mut();
     }
@@ -402,6 +661,7 @@ fn capabilities_from_bits(bits: u32) -> Capabilities {
         frame_gen: bits & RAEEN_CAP_FRAME_GEN != 0,
         wants_depth: bits & RAEEN_CAP_WANTS_DEPTH != 0,
         wants_motion_vectors: bits & RAEEN_CAP_WANTS_MOTION_VECTORS != 0,
+        gpu_frames: bits & RAEEN_CAP_GPU_FRAMES != 0,
     }
 }
 
@@ -420,6 +680,9 @@ pub fn capabilities_to_bits(caps: Capabilities) -> u32 {
     }
     if caps.wants_motion_vectors {
         bits |= RAEEN_CAP_WANTS_MOTION_VECTORS;
+    }
+    if caps.gpu_frames {
+        bits |= RAEEN_CAP_GPU_FRAMES;
     }
     bits
 }
@@ -504,9 +767,6 @@ impl PresentPlugin for DynamicPlugin {
     }
 
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput {
-        // SAFETY: validated at construction and the backing library is alive.
-        let vt = unsafe { *self.vtable };
-
         let depth = frame.depth.map(|p| RaeenAuxPlane {
             width: p.width,
             height: p.height,
@@ -524,33 +784,91 @@ impl PresentPlugin for DynamicPlugin {
             len: p.data.len(),
         });
 
-        let c_frame = RaeenPresentFrame {
-            width: frame.width,
-            height: frame.height,
-            bytes_per_pixel: frame.bytes_per_pixel,
-            _reserved: 0,
-            color: frame.color.as_ptr(),
-            color_len: frame.color.len(),
-            // `as_ref` borrows the local `Option`s, which outlive the call below.
-            depth: depth.as_ref().map_or(std::ptr::null(), |p| p),
-            motion: motion.as_ref().map_or(std::ptr::null(), |p| p),
-            frame_index: frame.frame_index,
-        };
         let c_ctx = RaeenPresentContext {
             output_scale: ctx.output_scale,
             hdr: u32::from(ctx.hdr),
         };
 
-        let mut out = RaeenPluginOutput::empty();
-        // SAFETY: all three pointers are to live locals that outlive the call,
-        // and `instance` came from `create` and has not been destroyed.
-        let rc = unsafe { (vt.process)(self.instance, &c_frame, &c_ctx, &mut out) };
+        // Raw versioned output, kept alive until the matching `release_output`
+        // below. Reading is done on `Copy` snapshots; ownership of every
+        // pointer inside stays with the plugin throughout.
+        enum RawOut {
+            V1(RaeenPluginOutput),
+            V2(RaeenPluginOutputV2),
+        }
+        let (rc, mut raw) = match self.vtable {
+            PluginVtable::V1(vtable) => {
+                // SAFETY: validated at construction; the library is alive.
+                let vt = unsafe { *vtable };
+                let c_frame = RaeenPresentFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    bytes_per_pixel: frame.bytes_per_pixel,
+                    _reserved: 0,
+                    color: frame.color.as_ptr(),
+                    color_len: frame.color.len(),
+                    // `as_ref` borrows the local `Option`s, which outlive the call.
+                    depth: depth.as_ref().map_or(std::ptr::null(), |p| p),
+                    motion: motion.as_ref().map_or(std::ptr::null(), |p| p),
+                    frame_index: frame.frame_index,
+                };
+                let mut out = RaeenPluginOutput::empty();
+                // SAFETY: all pointers are live locals outliving the call;
+                // `instance` came from `create` and is not destroyed.
+                let rc = unsafe { (vt.process)(self.instance, &c_frame, &c_ctx, &mut out) };
+                (rc, RawOut::V1(out))
+            }
+            PluginVtable::V2(vtable) => {
+                // SAFETY: validated at construction; the library is alive.
+                let vt = unsafe { *vtable };
+                // CPU-kind v2 frame: v1 semantics through v2 types (the host
+                // has not advertised GPU frames).
+                let c_frame = RaeenPresentFrameV2 {
+                    kind: RAEEN_FRAME_KIND_CPU,
+                    width: frame.width,
+                    height: frame.height,
+                    bytes_per_pixel: frame.bytes_per_pixel,
+                    color: frame.color.as_ptr(),
+                    color_len: frame.color.len(),
+                    color_image: RaeenVulkanImage::zeroed(),
+                    depth: depth.as_ref().map_or(std::ptr::null(), |p| p),
+                    motion: motion.as_ref().map_or(std::ptr::null(), |p| p),
+                    frame_index: frame.frame_index,
+                };
+                let mut out = RaeenPluginOutputV2::empty();
+                // SAFETY: as the v1 arm.
+                let rc = unsafe { (vt.process)(self.instance, &c_frame, &c_ctx, &mut out) };
+                (rc, RawOut::V2(out))
+            }
+        };
 
         if rc != RAEEN_OK {
             // A declined frame is normal (a temporal plugin warming up, an
             // unsupported format); present the source unchanged, no warning.
             return PluginOutput::identity(frame);
         }
+
+        // The CPU-output view both versions share. A v2 plugin claiming a
+        // GPU-produced frame while the host never advertised GPU frames is a
+        // contract violation — treat as malformed (identity + warning below).
+        let out = match &raw {
+            RawOut::V1(out) => *out,
+            RawOut::V2(out) => {
+                if out.produced_kind != RAEEN_FRAME_KIND_CPU {
+                    tracing::warn!(
+                        plugin = %self.name,
+                        source = %self.source.display(),
+                        produced_kind = out.produced_kind,
+                        "v2 plugin produced a GPU frame but this host never \
+                         advertised RAEEN_HOST_GPU_FRAMES — presenting the \
+                         source frame unchanged"
+                    );
+                    RaeenPluginOutput::empty()
+                } else {
+                    out.base
+                }
+            }
+        };
 
         let primary = copy_frame(&out.primary);
 
@@ -583,9 +901,20 @@ impl PresentPlugin for DynamicPlugin {
 
         // The plugin owns its allocations regardless of whether we accepted
         // them, so release before deciding what to return.
-        // SAFETY: `process` returned success, so `out` holds plugin-owned
-        // allocations it is responsible for freeing; `instance` is live.
-        unsafe { (vt.release_output)(self.instance, &mut out) };
+        // SAFETY: `process` returned success, so the raw output holds
+        // plugin-owned allocations it is responsible for freeing; `instance`
+        // is live, and the vtable/output versions match by construction.
+        unsafe {
+            match (self.vtable, &mut raw) {
+                (PluginVtable::V1(vtable), RawOut::V1(out)) => {
+                    ((*vtable).release_output)(self.instance, out);
+                }
+                (PluginVtable::V2(vtable), RawOut::V2(out)) => {
+                    ((*vtable).release_output)(self.instance, out);
+                }
+                _ => unreachable!("vtable and output versions always match"),
+            }
+        }
 
         match primary {
             Some(primary) => PluginOutput { primary, generated },
@@ -638,9 +967,30 @@ pub unsafe fn load_from_path(path: &Path) -> Result<DynamicPlugin, LoadError> {
         source,
     })?;
 
-    // Scoped so the `Symbol`'s borrow of `library` ends before `library` moves
-    // into the plugin below. (`Symbol` has no `Drop`, so the borrow is purely a
-    // lifetime; a block is the way to end it, not a `drop` call.)
+    // Version negotiation: a `raeen_plugin_v2` export is authoritative when
+    // present (a binary may export both for older Raeens); v1 remains fully
+    // supported for plugins that never need GPU frames.
+    //
+    // Scoped so each `Symbol`'s borrow of `library` ends before `library`
+    // moves into the plugin below. (`Symbol` has no `Drop`, so the borrow is
+    // purely a lifetime; a block is the way to end it, not a `drop` call.)
+    let vtable_v2 = {
+        // SAFETY: looked up by its documented name, used only in this scope
+        // while `library` is alive.
+        let entry: Result<libloading::Symbol<'_, RaeenPluginEntryV2Fn>, _> =
+            unsafe { library.get(RAEEN_PLUGIN_ENTRY_V2) };
+        match entry {
+            // SAFETY: `entry` resolved to the documented v2 entry point.
+            Ok(entry) => Some(unsafe { entry() }),
+            Err(_) => None,
+        }
+    };
+    if let Some(vtable) = vtable_v2 {
+        // SAFETY: `vtable` is whatever the plugin returned (null-checked
+        // inside); `library` moves in so the image outlives every use.
+        return unsafe { DynamicPlugin::from_vtable_v2(vtable, Some(library), path.to_path_buf()) };
+    }
+
     let vtable = {
         // SAFETY: the symbol is looked up by its documented name and used only
         // within this scope, while `library` is alive.
@@ -943,6 +1293,156 @@ mod tests {
         hdr: false,
     };
 
+    // ─── ABI v2 fake plugin ─────────────────────────────────────────────────
+    //
+    // A v2 tinter built from ordinary `extern "C"` fns, exactly like the v1
+    // fake above. `create` verifies the host context contract (non-null,
+    // sane size, no GPU frames advertised today).
+
+    unsafe extern "C" fn fake_create_v2(host: *const RaeenHostContextV2) -> *mut c_void {
+        if host.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `host` is valid for the duration of this call.
+        let host = unsafe { &*host };
+        if (host.struct_size as usize) < std::mem::size_of::<RaeenHostContextV2>()
+            || host.host_flags & RAEEN_HOST_GPU_FRAMES != 0
+        {
+            return std::ptr::null_mut();
+        }
+        LIVE.fetch_add(1, Ordering::SeqCst);
+        Box::into_raw(Box::new(FakeState { tint: 0xCD })).cast()
+    }
+
+    unsafe extern "C" fn fake_name_v2(_i: *mut c_void, buf: *mut u8, cap: usize) -> usize {
+        let name = b"fake-tint-v2";
+        if cap < name.len() {
+            return usize::MAX;
+        }
+        // SAFETY: `buf` has `cap >= name.len()` writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len()) };
+        name.len()
+    }
+
+    unsafe extern "C" fn fake_capabilities_v2(_i: *mut c_void) -> u32 {
+        RAEEN_CAP_UPSCALE | RAEEN_CAP_GPU_FRAMES
+    }
+
+    unsafe extern "C" fn fake_process_v2(
+        instance: *mut c_void,
+        frame: *const RaeenPresentFrameV2,
+        _ctx: *const RaeenPresentContext,
+        out: *mut RaeenPluginOutputV2,
+    ) -> i32 {
+        // SAFETY: Raeen passes live pointers for the duration of the call.
+        let (state, frame, out) = unsafe { (&*instance.cast::<FakeState>(), &*frame, &mut *out) };
+        // Today's host must deliver CPU frames with a zeroed image.
+        if frame.kind != RAEEN_FRAME_KIND_CPU || frame.color.is_null() {
+            return -1;
+        }
+        assert_eq!(frame.color_image.image, 0, "CPU frames carry no image");
+        // SAFETY: `color`/`color_len` describe a live buffer supplied by Raeen.
+        let src = unsafe { std::slice::from_raw_parts(frame.color, frame.color_len) };
+        let mut pixels = src.to_vec();
+        for px in pixels.chunks_mut(frame.bytes_per_pixel as usize) {
+            if let Some(first) = px.first_mut() {
+                *first = state.tint;
+            }
+        }
+        let len = pixels.len();
+        let ptr = Box::into_raw(pixels.into_boxed_slice()).cast::<u8>();
+        UNFREED.fetch_add(1, Ordering::SeqCst);
+        out.base.primary = RaeenPluginFrame {
+            width: frame.width,
+            height: frame.height,
+            bytes_per_pixel: frame.bytes_per_pixel,
+            _reserved: 0,
+            pixels: ptr,
+            pixels_len: len,
+        };
+        out.base.generated = std::ptr::null();
+        out.base.generated_count = 0;
+        out.produced_kind = RAEEN_FRAME_KIND_CPU;
+        RAEEN_OK
+    }
+
+    unsafe extern "C" fn fake_release_v2(_i: *mut c_void, out: *mut RaeenPluginOutputV2) {
+        // SAFETY: Raeen passes back exactly the output `fake_process_v2` filled.
+        let out = unsafe { &mut *out };
+        if out.base.primary.pixels.is_null() {
+            return;
+        }
+        // SAFETY: reconstitutes the boxed slice `fake_process_v2` leaked.
+        drop(unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                out.base.primary.pixels.cast_mut(),
+                out.base.primary.pixels_len,
+            ))
+        });
+        out.base.primary.pixels = std::ptr::null();
+        UNFREED.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn vtable_v2() -> RaeenPluginV2 {
+        RaeenPluginV2 {
+            abi_version: RAEEN_PLUGIN_ABI_V2,
+            _reserved: 0,
+            create: fake_create_v2,
+            destroy: fake_destroy,
+            name: fake_name_v2,
+            capabilities: fake_capabilities_v2,
+            process: fake_process_v2,
+            release_output: fake_release_v2,
+        }
+    }
+
+    fn load_v2(vt: &RaeenPluginV2) -> Result<DynamicPlugin, LoadError> {
+        // SAFETY: `vt` is a live local outliving the plugin in every caller,
+        // and its functions honour the v2 ABI contract.
+        unsafe { DynamicPlugin::from_vtable_v2(vt, None, PathBuf::from("test://vtable-v2")) }
+    }
+
+    #[test]
+    fn a_conforming_v2_plugin_round_trips_with_cpu_kind_frames() {
+        let vt = vtable_v2();
+        let mut plugin = load_v2(&vt).expect("a conforming v2 vtable must load");
+
+        assert_eq!(plugin.name(), "fake-tint-v2");
+        assert_eq!(
+            plugin.capabilities(),
+            Capabilities {
+                upscale: true,
+                gpu_frames: true,
+                ..Default::default()
+            },
+            "the v2 GPU-frames capability bit must survive the round trip"
+        );
+
+        let buf = vec![0x22u8; 2 * 2 * 4];
+        let before = UNFREED.load(Ordering::SeqCst);
+        let out = plugin.process(&source_frame(&buf), &CTX);
+        assert_eq!(out.primary.pixels.len(), 16);
+        for px in out.primary.pixels.chunks(4) {
+            assert_eq!(px[0], 0xCD, "the v2 transform must be visible");
+            assert_eq!(px[1], 0x22, "untouched bytes must survive the copy");
+        }
+        assert_eq!(
+            UNFREED.load(Ordering::SeqCst),
+            before,
+            "v2 output must be released back to the plugin"
+        );
+    }
+
+    #[test]
+    fn a_v2_abi_version_mismatch_is_refused_before_create() {
+        let mut vt = vtable_v2();
+        vt.abi_version = 7;
+        let live = LIVE.load(Ordering::SeqCst);
+        let err = load_v2(&vt).expect_err("wrong v2 version must refuse");
+        assert!(matches!(err, LoadError::AbiMismatch { found: 7, .. }));
+        assert_eq!(LIVE.load(Ordering::SeqCst), live, "no instance may leak");
+    }
+
     #[test]
     fn a_conforming_plugin_round_trips_through_the_c_abi() {
         let vt = vtable();
@@ -1112,6 +1612,7 @@ mod tests {
                 frame_gen: true,
                 wants_depth: true,
                 wants_motion_vectors: true,
+                gpu_frames: true,
             },
         ] {
             assert_eq!(capabilities_from_bits(capabilities_to_bits(caps)), caps);
