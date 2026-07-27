@@ -4808,3 +4808,44 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * Phase B (NOT started, next wall): PM4 compute-queue execution — ACBs reach
   hle_driver_submit_acb but only the graphics-queue CP path executes; then
   re-run GTA V to move the UD2 assert.
+
+## 2026-07-27 (worktree agent) — checklist item 10: `cargo xtask baseline` (run + diff)
+* baseline-run: complete in-tree; LIVE VALIDATION PENDING (needs real installed
+  games — do not delete scratch/run-baseline-parts.py until one live
+  `baseline run` matches its behavior). Native port of the python driver:
+  per-game child process via the PREBUILT target/release/raeen.exe (xtask
+  never builds the gui — that is the shared-target cargo deadlock the script
+  existed to avoid; missing binary = clear error, binary older than HEAD
+  commit = error unless --allow-stale), retry per game (--attempts, default
+  2), per-game part JSON + merged.json under
+  artifacts/compat/baseline-parts/<run-id>/, merge into
+  artifacts/compat/latest.json ONLY on full success (partial run exits
+  nonzero and never touches latest.json). Flags: --registry --output --exe
+  --timeout(180) --tier --profile(max-fps) --attempts --parts-dir
+  --allow-stale.
+* baseline-diff: `cargo xtask baseline diff <old.json> [new.json=latest.json]
+  [--strict]` — per-title stage changes (documented rank heuristic), exit-code
+  changes, flip/fps deltas, unresolved-NID count deltas + newly-missing /
+  newly-resolved NID lists (capped at 20 shown, exact counts), only-old/
+  only-new titles, cross-machine warning; --strict exits nonzero on any
+  regression (the AGC/stub-churn tripwire).
+* Schema: Evidence gains OPTIONAL `unresolved_nids` (Option<Vec<{library,
+  nid, function?}>>), harvested from the runtime's first-occurrence
+  "UNRESOLVED NID CALLED" tracing lines (ANSI-stripped token scan; nid_0x…
+  describe-fallbacks stored as anonymous). None = run predates harvesting
+  (old reports round-trip byte-identically, schema_version stays 1;
+  round-trip tested); Some(empty) = measured zero — diff refuses NID deltas
+  when either side is None instead of faking "all resolved". `compat run`
+  now harvests too (shared run_one); stage classification extracted to a
+  tested pure fn (timeout > exit-failure > flips precedence preserved).
+* Tests: xtask 25/25 green (18 new: classification 3, NID parsing 3, schema
+  round-trip 2, merge/publish gating 3, staleness 1, diff 5, render cap 1);
+  CLI smoke-tested headlessly (diff on synthetic reports incl. pre-harvest
+  old side; run's missing-exe and stale-exe errors). fmt green; clippy
+  `-p xtask --no-deps -- -D warnings` green (full `-p xtask` blocked only by
+  the pre-existing kyty-graphics is_multiple_of MSRV lint, item 13; clippy
+  itself NOT AppControl-blocked in this worktree).
+* FOLLOW-UP for main checkout (worktree isolation blocked the edit):
+  scratch/run-baseline-parts.py still needs its SUPERSEDED header pointing
+  at `cargo xtask baseline run`; keep the script until a live run validates
+  the port.

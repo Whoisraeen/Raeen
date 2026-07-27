@@ -1,10 +1,11 @@
+mod baseline;
 mod nids;
 mod schema;
 
 use anyhow::{Context, Result, anyhow, bail};
 use schema::{
     AcceptanceReport, AcceptanceResult, CompatResult, Evidence, GameRecord, Metrics,
-    ReferenceState, Registry, RunReport, SCHEMA_VERSION, Stage,
+    ReferenceState, Registry, RunReport, SCHEMA_VERSION,
 };
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
@@ -50,6 +51,10 @@ fn main() -> Result<()> {
         compat_compare(rest)
     } else if area == "refs" && command == "report" {
         refs_report(rest)
+    } else if area == "baseline" && command == "run" {
+        baseline::run(rest)
+    } else if area == "baseline" && command == "diff" {
+        baseline::diff(rest)
     } else if area == "nids" && command == "coverage" {
         nids::coverage(rest)
     } else if area == "acceptance" && command == "run" {
@@ -71,6 +76,10 @@ fn print_help() {
                           [--timeout SECONDS] [--tier all|nightly] [--profile max-fps]
   cargo xtask compat compare --baseline PATH [--current PATH]
   cargo xtask compat publish [--input PATH] [--output compat/COMPATIBILITY.md]
+  cargo xtask baseline run [--registry PATH] [--output PATH] [--exe PATH]
+                           [--timeout SECONDS] [--tier all|nightly] [--profile NAME]
+                           [--attempts N] [--parts-dir PATH] [--allow-stale]
+  cargo xtask baseline diff <old.json> [new.json] [--strict]
   cargo xtask refs report [--state compat/reference-state.json] [--output PATH] [--fetch]
   cargo xtask nids coverage [--registry PATH] [--eboot PATH] [--output PATH] [--full]
   cargo xtask acceptance run [--output PATH] [--timeout SECONDS]
@@ -480,15 +489,12 @@ fn run_one(
     let input_events = count_any(&text, &["pad event", "controller connected"]);
     let blocker = first_blocker(&text, &registry_roots_from_path(local_path));
     let blocker_signature = blocker.as_ref().map(|value| sha1_bytes(value.as_bytes()));
-    let stage = if timed_out {
-        Stage::TimedOut
-    } else if status.as_ref().is_some_and(|value| !value.success()) {
-        Stage::Crashed
-    } else if flip_events > 0 {
-        Stage::Rendering
-    } else {
-        Stage::Exited
-    };
+    let unresolved_nids = baseline::parse_unresolved_nids(&text);
+    let stage = baseline::classify_stage(
+        timed_out,
+        status.as_ref().map(std::process::ExitStatus::success),
+        flip_events,
+    );
     Ok(CompatResult {
         schema_version: SCHEMA_VERSION,
         measured_unix_ms: now_ms(),
@@ -516,6 +522,7 @@ fn run_one(
             blocker_signature,
             first_blocker: blocker,
             measured: true,
+            unresolved_nids: Some(unresolved_nids),
         },
     })
 }

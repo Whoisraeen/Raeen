@@ -25,7 +25,7 @@ pub struct Registry {
     pub games: Vec<GameRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Detected,
@@ -51,12 +51,32 @@ pub struct Metrics {
     pub observed_fps: Option<f64>,
 }
 
+/// One unresolved import the guest actually *called* during a run, harvested
+/// from the runtime's `UNRESOLVED NID CALLED` first-occurrence log lines.
+/// Static coverage (`nids coverage`) says what could be missing; this says
+/// what the title needed on this boot path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UnresolvedNid {
+    pub library: String,
+    pub nid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evidence {
     pub log_sha1: String,
     pub blocker_signature: Option<String>,
     pub first_blocker: Option<String>,
     pub measured: bool,
+    /// `None` = the run predates NID harvesting (field absent in the JSON);
+    /// `Some(empty)` = measured, and zero unresolved NIDs were called. The
+    /// distinction keeps `baseline diff` honest: it must never report "all
+    /// NIDs resolved" against a baseline that simply never measured them.
+    /// Additive and optional, so schema_version stays 1 and every existing
+    /// report round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_nids: Option<Vec<UnresolvedNid>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

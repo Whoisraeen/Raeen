@@ -184,9 +184,17 @@ top-down, update statuses in place, and keep it committed.**
   but a human-supervised run closes it.
 
 ### 10. Promote the baseline runner to `cargo xtask baseline`
-- [~] WAVE 2 IN PROGRESS (general agent, worktree, 2026-07-27).
-- [ ] Port `scratch/run-baseline-parts.py` (chunked per-game boot driver,
-  merges into `latest.json`) into xtask; add `baseline diff` between runs.
+- [~] CODE DONE 2026-07-27 (worktree agent; xtask 25/25 green, 18 new tests;
+  clippy/fmt green on the crate). `cargo xtask baseline run` (prebuilt-binary
+  only, staleness check, per-game retry, parts + merged.json, latest.json
+  only on full success) + `baseline diff <old> [new] [--strict]` (stage/
+  exit/flip/fps + unresolved-NID deltas with newly-missing/-resolved lists;
+  Evidence gains optional `unresolved_nids`, old reports round-trip).
+  REMAINING to close: (a) one LIVE `baseline run` against real installed
+  games to validate the port (then delete scratch/run-baseline-parts.py);
+  (b) add the SUPERSEDED header to the python script in the main checkout
+  (worktree isolation blocked that edit — exact text in the ledger session
+  entry).
 - **Why:** regression tripwire while AGC/stub work churns; feeds item 11.
 
 ### 11. Compatibility badges in the Shell library
