@@ -92,6 +92,10 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceAudioOut", "sceAudioOutOutput", hle_output);
     registry.register("libSceAudioOut", "sceAudioOutClose", hle_close);
     registry.register("libSceAudioOut", "sceAudioOutSetVolume", hle_ok);
+    // Pad-speaker mix level (measured GTA V import): Raeen routes no audio to
+    // a DualSense speaker, so the level is accepted and dropped — same
+    // accept-and-ignore contract as SetVolume above.
+    registry.register("libSceAudioOut", "sceAudioOutSetMixLevelPadSpk", hle_ok);
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {

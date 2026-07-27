@@ -1,3 +1,58 @@
+- TIER-B OFFLINE-SEMANTICS SERVICE-LIB BATCH (2026-07-27; agent worktree
+  branch, raeen-hle 463/463, raeen-firmware 125/125, fmt clean, clippy clean
+  on raeen-hle itself — the only `-D warnings` failure is the pre-existing
+  kyty-graphics `is_multiple_of` MSRV lint already on record):
+  * SCOPE: the measured non-AGC/non-Ampr unresolved surface from
+    `artifacts/compat/nid-coverage.json` + the GTA V blocker doc — ~134
+    functions across 30 libraries, every one with deliberate documented
+    offline semantics per the 2026-07-25 no-blanket-stubs policy. AGC (83) and
+    Ampr (46) remain Tier C; `_Ctype` (libc data object) remains out of scope.
+  * NpWebApi2 (+17): no user context can exist (CreateUserContext already
+    refuses), so request/context-keyed calls return the matching shadPS4-
+    cross-checked `*_NOT_FOUND` codes and push-channel creation refuses
+    NOT_SIGNED_IN. Nothing fabricates a PSN response.
+  * NpManager (+10) + NpAuth (+3): real request registry re-derived from
+    shadPS4's model — create returns a live id, checks complete it with
+    SIGNED_OUT (async returns OK, `sceNpPollAsync` then reports the offline
+    result immediately), abort/delete/not-found/INVALID_ID rules pinned by
+    tests. Premium events register and stay silent.
+  * libSceVoice (NEW module, 15): init OK, ports are real tracked handles,
+    output reads report 0 bytes (silence), writes accepted and dropped,
+    `GetPortInfo` writes the shadPS4-layout struct with nonzero frame_size.
+    Voice error codes are undocumented — generic kernel codes used and marked.
+  * AvPlayer (+10 in libsce_media.rs): `sceAvPlayerInitEx` now hands out a
+    REAL handle with honest lifecycle — AddSource/Start/Stop/Pause/Resume/
+    JumpToTime accepted, zero streams, IsActive stays false, GetVideoDataEx
+    no-frame => immediate EOS, so video waits terminate promptly. Decode is
+    explicitly future work (`register_incomplete`). Legacy `sceAvPlayerInit`
+    keeps its measured null-handle behavior.
+  * Dialogs: ImeDialog (NEW, 6 — completes instantly as USER_CANCELED, its
+    own None/Running/Finished enum, panel size nominal), WebBrowserDialog
+    (NEW, 6) and NpCommerceDialog (NEW, 7 — completes instantly as canceled,
+    never grants a purchase), PlayerInvitation/Selection dialog leftovers,
+    SystemService player dialog (param-init OK, Launch refuses PARAMETER).
+  * libsce_online_misc.rs (NEW, grouped): Remoteplay (DISCONNECT),
+    SharePlay/GameLiveStreaming handshakes, ContentDelete, ContentSearch
+    (empty library -> not-found; layouts undocumented), NpUtility bandwidth
+    test (SIGNED_OUT), NpGameIntent (no pending intent), VideoRecordingP
+    (disabled recorder refuses up front, stop/close OK, status 0; the
+    measured anonymous NID 0x8904ba0d4b4bc9b1 is register_nid-bound —
+    audited explicit-NID count 11 -> 12).
+  * Real implementations where cheap: `sceHttpUriEscape` (bounded RFC 3986
+    percent-encoder + size-query mode), `sceRtcGetTime_t` (datetime -> Unix
+    seconds via the existing tick math), `sceSaveDataSaveIconByPath` aliased
+    onto the real icon writer.
+  * Tail sweep: NpEntitlementAccess consume flow (+5, refuses SIGNED_OUT,
+    never fabricates a transaction id), Share Terminate/Permit/Prohibit (+3),
+    NetCtl GetResult/UnregisterCallback (+2) + `sceNetGetSockInfo`
+    (acknowledge-only, register_incomplete), NpUniversalDataSystem (+2),
+    NpTrophy2 GetGameInfo (NOT_FOUND, same rationale as GetTrophyInfo),
+    ContentExport FromFile[WithThumbnail] (+2), Coredump Unregister/
+    WriteUserData (+2), AudioOut SetMixLevelPadSpk (+1).
+  * HONEST STATUS: this closes the measured *resolution* gap for the
+    online/social/service tier — it is import evidence, not behavior proof.
+    GTA V's blocker remains the 83-NID AGC/ACB surface (Tier C, M2/M5 work).
+
 - GTA V LOAD + AUDIOOUT2 BLOCKER SLICE (2026-07-27; working tree at
   `b9c2daf+dirty`, no commit; pre-fix live trace `logs/raeen.log.1`):
   * FIX: `read`/`pread` no longer silently clamp a valid guest request to

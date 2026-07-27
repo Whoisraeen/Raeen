@@ -124,12 +124,71 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNgs2", "sceNgs2VoiceGetStateFlags", hle_ok);
 
     // libSceAvPlayer — video player (never becomes active; no frames).
+    //
+    // Two generations coexist here deliberately:
+    // * `sceAvPlayerInit` keeps its measured legacy behavior — a null handle,
+    //   which titles treat as "player unavailable" and skip FMV cleanly.
+    // * `sceAvPlayerInitEx` (GTA V's entry point) implements the honest
+    //   lifecycle: a REAL tracked handle, AddSource/Start/Stop/Pause/Resume
+    //   accepted, and playback that reports immediate end-of-stream —
+    //   `IsActive` false, `GetVideoDataEx`/`GetAudioData` no-frame, zero
+    //   streams. A title waiting on its background video finishes the wait
+    //   promptly instead of hanging; NO video is decoded (future work).
+    // Signatures cross-checked against shadPS4's GPL-2.0 `avplayer.cpp`
+    // (`sceAvPlayerInitEx(const AvPlayerInitDataEx*, AvPlayerHandle*)`);
+    // error codes from its `avplayer_error.h`.
     registry.register("libSceAvPlayer", "sceAvPlayerInit", hle_ok); // null handle → title skips FMV
     registry.register("libSceAvPlayer", "sceAvPlayerPostInit", hle_ok);
     registry.register("libSceAvPlayer", "sceAvPlayerIsActive", hle_ok); // 0 = inactive
     registry.register("libSceAvPlayer", "sceAvPlayerGetVideoDataEx", hle_ok); // no frame
     registry.register("libSceAvPlayer", "sceAvPlayerGetAudioData", hle_ok); // no frame
-    registry.register("libSceAvPlayer", "sceAvPlayerClose", hle_ok);
+    registry.register("libSceAvPlayer", "sceAvPlayerClose", hle_avplayer_close);
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerInitEx",
+        hle_avplayer_init_ex,
+        "real handle lifecycle but no media decode backend; playback reports immediate EOS",
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerAddSource",
+        hle_avplayer_add_source,
+        "source path accepted and logged; nothing is demuxed or decoded",
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerStart",
+        hle_avplayer_handle_op,
+        "start accepted; playback immediately reports end-of-stream (no frames)",
+    );
+    registry.register("libSceAvPlayer", "sceAvPlayerStop", hle_avplayer_handle_op);
+    registry.register("libSceAvPlayer", "sceAvPlayerPause", hle_avplayer_handle_op);
+    registry.register(
+        "libSceAvPlayer",
+        "sceAvPlayerResume",
+        hle_avplayer_handle_op,
+    );
+    registry.register(
+        "libSceAvPlayer",
+        "sceAvPlayerJumpToTime",
+        hle_avplayer_handle_op,
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerStreamCount",
+        hle_avplayer_stream_count,
+        "no demuxer: a valid player honestly reports zero streams",
+    );
+    registry.register(
+        "libSceAvPlayer",
+        "sceAvPlayerGetStreamInfo",
+        hle_avplayer_no_stream,
+    );
+    registry.register(
+        "libSceAvPlayer",
+        "sceAvPlayerEnableStream",
+        hle_avplayer_no_stream,
+    );
 
     // libSceUlt — user-level threads library init.
     registry.register("libSceUlt", "sceUltInitialize", hle_ok);
@@ -137,6 +196,108 @@ pub fn register(registry: &HleRegistry) {
 
 /// Benign success (`rax = 0`): idle/inactive/no-frame, per the reference.
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    OK
+}
+
+/// `ORBIS_AVPLAYER_ERROR_INVALID_PARAMS` (shadPS4 `avplayer_error.h`).
+const AVPLAYER_ERROR_INVALID_PARAMS: u64 = 0x806A_0001;
+
+/// Live AvPlayer handles created by `sceAvPlayerInitEx` (value = source
+/// added). Process-global like the other handle sources in this module.
+static AVPLAYER_HANDLES: std::sync::Mutex<Option<std::collections::HashMap<u64, bool>>> =
+    std::sync::Mutex::new(None);
+
+fn avplayer_handle_exists(handle: u64) -> bool {
+    AVPLAYER_HANDLES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|handles| handles.contains_key(&handle))
+}
+
+/// `sceAvPlayerInitEx(const AvPlayerInitDataEx *initData, AvPlayerHandle
+/// *handleOut)`: hand out a REAL tracked handle. Unlike the legacy
+/// `sceAvPlayerInit` (null handle → title skips FMV), GTA V drives this form
+/// and expects a working player object; the honest offline model is a live
+/// handle whose playback ends immediately (no decode backend).
+fn hle_avplayer_init_ex(ctx: &HleContext, args: &[u64]) -> u64 {
+    let init_data = args.first().copied().unwrap_or(0);
+    let handle_out = args.get(1).copied().unwrap_or(0);
+    if init_data == 0 || handle_out == 0 {
+        return AVPLAYER_ERROR_INVALID_PARAMS;
+    }
+    let handle = next_handle();
+    if !ctx.mem.write(handle_out, &handle.to_le_bytes()) {
+        return AVPLAYER_ERROR_INVALID_PARAMS;
+    }
+    AVPLAYER_HANDLES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(handle, false);
+    debug!("sceAvPlayerInitEx -> handle {handle:#x} (no decode backend; immediate EOS)");
+    OK
+}
+
+/// `sceAvPlayerAddSource(handle, const char *filename)`: accept and record the
+/// source on a live handle. The path is logged (bounded) for diagnostics;
+/// nothing is opened, demuxed, or decoded.
+fn hle_avplayer_add_source(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let filename = args.get(1).copied().unwrap_or(0);
+    if filename == 0 || !avplayer_handle_exists(handle) {
+        return AVPLAYER_ERROR_INVALID_PARAMS;
+    }
+    // Bounded best-effort read of the path for the log.
+    let mut buf = [0u8; 128];
+    let path = if ctx.mem.read(filename, &mut buf) {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    } else {
+        String::from("<unreadable>")
+    };
+    if let Some(handles) = AVPLAYER_HANDLES.lock().unwrap().as_mut() {
+        handles.insert(handle, true);
+    }
+    debug!("sceAvPlayerAddSource({handle:#x}, \"{path}\") -> OK (not decoded; immediate EOS)");
+    OK
+}
+
+/// `sceAvPlayerStart`/`Stop`/`Pause`/`Resume`/`JumpToTime(handle, ...)`:
+/// accepted on a live handle. Playback state never becomes active
+/// (`sceAvPlayerIsActive` stays false), so a title's video wait loop exits
+/// promptly — the "immediate EOS" model rather than a hang.
+fn hle_avplayer_handle_op(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    if !avplayer_handle_exists(handle) {
+        return AVPLAYER_ERROR_INVALID_PARAMS;
+    }
+    OK
+}
+
+/// `sceAvPlayerStreamCount(handle)`: with no demuxer there are honestly zero
+/// streams; an unknown handle is a parameter error.
+fn hle_avplayer_stream_count(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    if !avplayer_handle_exists(handle) {
+        return AVPLAYER_ERROR_INVALID_PARAMS;
+    }
+    0 // zero streams
+}
+
+/// `sceAvPlayerGetStreamInfo`/`sceAvPlayerEnableStream(handle, streamId, ..)`:
+/// zero streams exist, so any stream id is out of range.
+fn hle_avplayer_no_stream(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    AVPLAYER_ERROR_INVALID_PARAMS
+}
+
+/// `sceAvPlayerClose(handle)`: release the handle when it is one of ours; the
+/// legacy null-handle flow (from `sceAvPlayerInit`) closes successfully too.
+fn hle_avplayer_close(_ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    if let Some(handles) = AVPLAYER_HANDLES.lock().unwrap().as_mut() {
+        handles.remove(&handle);
+    }
     OK
 }
 
@@ -509,6 +670,82 @@ mod tests {
             hle_ngs2_create_out2(&ctx, &[0, 0, 0]),
             NGS2_ERROR_INVALID_OUT_ADDRESS
         );
+    }
+
+    /// The InitEx lifecycle: a real handle is created, AddSource/Start are
+    /// accepted, the player honestly reports zero streams and never becomes
+    /// active (immediate EOS — a video wait loop exits promptly), and Close
+    /// releases the handle.
+    #[test]
+    fn avplayer_init_ex_lifecycle_reports_immediate_eos() {
+        let (kernel, mem, alloc) = ctx_env_big();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Null init data or out-pointer is refused.
+        assert_eq!(
+            hle_avplayer_init_ex(&ctx, &[0, 0x100]),
+            AVPLAYER_ERROR_INVALID_PARAMS
+        );
+        assert_eq!(
+            hle_avplayer_init_ex(&ctx, &[0x200, 0]),
+            AVPLAYER_ERROR_INVALID_PARAMS
+        );
+
+        assert_eq!(hle_avplayer_init_ex(&ctx, &[0x200, 0x100]), OK);
+        let mut h = [0u8; 8];
+        assert!(mem.read(0x100, &mut h));
+        let handle = u64::from_le_bytes(h);
+        assert_ne!(handle, 0, "a real handle was handed out");
+
+        // AddSource with a readable path succeeds on the live handle.
+        assert!(mem.write(0x300, b"/app0/movies/intro.mp4\0"));
+        assert_eq!(hle_avplayer_add_source(&ctx, &[handle, 0x300]), OK);
+        // ... and is refused on a bogus handle.
+        assert_eq!(
+            hle_avplayer_add_source(&ctx, &[handle + 999, 0x300]),
+            AVPLAYER_ERROR_INVALID_PARAMS
+        );
+
+        // Start/Pause/Resume/Stop/JumpToTime accepted; zero streams reported.
+        assert_eq!(hle_avplayer_handle_op(&ctx, &[handle]), OK);
+        assert_eq!(hle_avplayer_stream_count(&ctx, &[handle]), 0);
+        assert_eq!(
+            hle_avplayer_no_stream(&ctx, &[handle, 0, 0x400]),
+            AVPLAYER_ERROR_INVALID_PARAMS,
+            "no stream exists to describe/enable"
+        );
+        // IsActive stays false (hle_ok = 0) — the immediate-EOS contract.
+        assert_eq!(hle_ok(&ctx, &[handle]), 0);
+
+        // Close releases the handle; subsequent ops see an invalid handle.
+        assert_eq!(hle_avplayer_close(&ctx, &[handle]), OK);
+        assert_eq!(
+            hle_avplayer_handle_op(&ctx, &[handle]),
+            AVPLAYER_ERROR_INVALID_PARAMS
+        );
+    }
+
+    /// Every measured GTA V libSceAvPlayer import resolves.
+    #[test]
+    fn measured_avplayer_imports_are_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceAvPlayerInitEx",
+            "sceAvPlayerAddSource",
+            "sceAvPlayerStart",
+            "sceAvPlayerStop",
+            "sceAvPlayerPause",
+            "sceAvPlayerResume",
+            "sceAvPlayerJumpToTime",
+            "sceAvPlayerStreamCount",
+            "sceAvPlayerGetStreamInfo",
+            "sceAvPlayerEnableStream",
+        ] {
+            assert!(
+                registry.is_implemented("libSceAvPlayer", name),
+                "{name} must be registered"
+            );
+        }
     }
 
     #[test]

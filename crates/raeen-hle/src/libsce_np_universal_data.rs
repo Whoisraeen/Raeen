@@ -101,9 +101,20 @@ pub fn register(registry: &HleRegistry) {
         "sceNpUniversalDataSystemEventPropertyObjectSetUInt32",
         "sceNpUniversalDataSystemEventPropertyObjectSetUInt64",
         "sceNpUniversalDataSystemEventPropertyObjectSetBool",
+        // Array-scalar variant (measured GTA V import): the float payload
+        // travels in XMM0, so the integer slice carries only the object
+        // pointer — the same validation shape as the scalar family.
+        "sceNpUniversalDataSystemEventPropertyArraySetFloat32",
     ] {
         registry.register("libSceNpUniversalDataSystem", name, hle_property_set_scalar);
     }
+    // `sceNpUniversalDataSystemAbortHandle(handle)`: nothing asynchronous ever
+    // runs in this no-backend telemetry sink, so there is no work to abort.
+    registry.register(
+        "libSceNpUniversalDataSystem",
+        "sceNpUniversalDataSystemAbortHandle",
+        |_, _| OK,
+    );
     // Lifecycle bookkeeping a no-backend implementation can simply accept.
     registry.register(
         "libSceNpUniversalDataSystem",

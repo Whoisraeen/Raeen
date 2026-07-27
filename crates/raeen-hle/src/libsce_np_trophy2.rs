@@ -64,6 +64,13 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNpTrophy2", "sceNpTrophy2GetTrophyInfo", |_, _| {
         SCE_ERROR_NOT_FOUND
     });
+    // `sceNpTrophy2GetGameInfo(context, handle, details*, data*)`: same
+    // rationale as GetTrophyInfo above — `SceNpTrophy2GameDetails`/`GameData`
+    // layouts are unconfirmed, and zeroed "details" would read as real data
+    // (empty title, 0 trophy groups). NOT_FOUND degrades along a tested path.
+    registry.register("libSceNpTrophy2", "sceNpTrophy2GetGameInfo", |_, _| {
+        SCE_ERROR_NOT_FOUND
+    });
 }
 
 /// Write the current `next` id (int32, little-endian) to `out_address`, then —

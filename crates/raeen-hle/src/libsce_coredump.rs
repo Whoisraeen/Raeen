@@ -20,6 +20,47 @@ pub fn register(registry: &HleRegistry) {
         "sceCoredumpRegisterCoredumpHandler",
         hle_register_handler,
     );
+    registry.register(
+        "libSceCoredump",
+        "sceCoredumpUnregisterCoredumpHandler",
+        hle_unregister_handler,
+    );
+    registry.register(
+        "libSceCoredump",
+        "sceCoredumpWriteUserData",
+        hle_write_user_data,
+    );
+}
+
+/// `sceCoredumpUnregisterCoredumpHandler()`: clear the recorded handler.
+fn hle_unregister_handler(ctx: &HleContext, _args: &[u64]) -> u64 {
+    ctx.kernel.coredump_handler.store(0, Ordering::Relaxed);
+    ctx.kernel
+        .coredump_handler_context
+        .store(0, Ordering::Relaxed);
+    OK
+}
+
+/// `sceCoredumpWriteUserData(const void *data, size_t size)`: called from
+/// inside a title's coredump handler to append its crash annotation to the
+/// dump. Raeen produces no Sony-format coredump file, so the data is
+/// validated (readable guest range) and accepted without being persisted —
+/// the crash path must not fail inside the handler.
+fn hle_write_user_data(ctx: &HleContext, args: &[u64]) -> u64 {
+    let data = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    if data == 0 {
+        return OK; // nothing to write; benign inside a crash handler
+    }
+    // Probe the first byte only — validating the claimed span byte-by-byte
+    // inside a crash path buys nothing, and the data is not persisted.
+    let mut probe = [0u8; 1];
+    let readable = ctx.mem.read(data, &mut probe);
+    tracing::debug!(
+        "sceCoredumpWriteUserData(data={data:#x}, size={size}) -> accepted (not persisted; \
+         readable={readable})"
+    );
+    OK
 }
 
 /// `sceCoredumpRegisterCoredumpHandler(handler, context, ...)`: records the
