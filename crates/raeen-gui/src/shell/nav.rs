@@ -109,6 +109,10 @@ pub enum NavAction {
     ActivateGameOption {
         row: usize,
     },
+    /// Back was pressed at the top level (Home, nothing overlaid). The caller
+    /// leaves fullscreen if it is in it, so the window chrome comes back and
+    /// the app can be closed normally; in a window it is the exit gesture.
+    LeaveShell,
 }
 
 /// Which Home rail tab is active (spec §10 SM2: Games shows the library,
@@ -371,7 +375,13 @@ impl NavState {
                 self.cc_index = 0;
                 NavAction::OpenControlCenter
             }
-            NavInput::Back => NavAction::None,
+            // Back at the top level is the way OUT of the Shell. Fullscreen is
+            // borderless with no decorations, so without this there is no
+            // close button, no title bar, and nothing Esc can do — the app is
+            // a trap (reported from a real session). The caller decides what
+            // "leave" means: drop out of fullscreen if we are in it, otherwise
+            // it is the user's explicit exit gesture.
+            NavInput::Back => NavAction::LeaveShell,
             NavInput::Tab => {
                 self.set_tab(self.tab.toggled());
                 NavAction::SwitchTab(self.tab)
@@ -659,6 +669,53 @@ mod tests {
             assert_eq!(nav.rail_index, case.expect_index, "case: {}", case.name);
             assert_eq!(nav.mode, NavMode::Home, "case: {}", case.name);
         }
+    }
+
+    /// Back at the top level must report [`NavAction::LeaveShell`], and must
+    /// NOT do so while an overlay owns input — otherwise Esc would drop the
+    /// user out of fullscreen (or quit) instead of closing the Control
+    /// Center / Settings / Game Options they actually meant to leave.
+    ///
+    /// Regression guard for a real trap: fullscreen is borderless, so with
+    /// Back a no-op at Home there was no close button, no title bar, and no
+    /// key that did anything — the app could only be left via an
+    /// undiscoverable Control Center path or by killing the process.
+    #[test]
+    fn back_leaves_the_shell_only_at_the_top_level() {
+        let mut nav = NavState::with_cc_options(9, 11, vec![0; 11])
+            .with_settings(Some(8), vec![4])
+            .with_game_options(5);
+
+        // Top level: Back is the way out.
+        assert_eq!(nav.apply(NavInput::Back), NavAction::LeaveShell);
+        assert_eq!(nav.mode, NavMode::Home, "leaving is the caller's job");
+
+        // Control Center overlaid: Back closes it, and does NOT leave.
+        nav.apply(NavInput::Guide);
+        assert_eq!(nav.mode, NavMode::ControlCenter);
+        assert_eq!(nav.apply(NavInput::Back), NavAction::CloseControlCenter);
+
+        // Settings open: Back closes Settings, and does NOT leave.
+        nav.rail_index = 8;
+        assert_eq!(nav.apply(NavInput::Confirm), NavAction::OpenSettings);
+        assert_eq!(nav.apply(NavInput::Back), NavAction::CloseSettings);
+
+        // Game Options open: Back closes the overlay, and does NOT leave.
+        nav.rail_index = 2;
+        assert_eq!(
+            nav.apply(NavInput::Options),
+            NavAction::OpenGameOptions { index: 2 }
+        );
+        assert_eq!(nav.apply(NavInput::Back), NavAction::CloseGameOptions);
+
+        // Back at the pill row returns to the rail rather than leaving.
+        nav.apply(NavInput::Up);
+        assert_eq!(nav.mode, NavMode::Pills);
+        assert_eq!(nav.apply(NavInput::Back), NavAction::None);
+        assert_eq!(nav.mode, NavMode::Home);
+
+        // ...and now that we are back at the top level, Back leaves again.
+        assert_eq!(nav.apply(NavInput::Back), NavAction::LeaveShell);
     }
 
     #[test]

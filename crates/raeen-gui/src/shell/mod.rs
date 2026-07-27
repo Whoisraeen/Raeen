@@ -638,6 +638,7 @@ impl Shell {
                 NavAction::ActivateSetting { section, row } => {
                     self.apply_setting_activate(ctx, section, row)
                 }
+                NavAction::LeaveShell => self.leave_shell(ctx),
                 NavAction::OpenControlCenter
                 | NavAction::CloseControlCenter
                 | NavAction::SwitchTab(_)
@@ -667,6 +668,29 @@ impl Shell {
             },
         };
         self.sound_pack.play(sound);
+    }
+
+    /// Back at the top level: leave fullscreen so the window chrome (and its
+    /// close button) come back. In a normal window there is nothing to leave,
+    /// so this is the user's exit gesture and the app closes.
+    ///
+    /// Fullscreen is borderless with no decorations, so before this existed
+    /// there was no close button, no title bar, and no key that did anything
+    /// at Home — the only way out was Control Center ▸ Power ▸ Turn Off, which
+    /// is not discoverable, or killing the process.
+    fn leave_shell(&mut self, ctx: &egui::Context) {
+        if self.config.general.fullscreen {
+            tracing::info!("Back at Home — leaving fullscreen");
+            self.toasts
+                .info("Left fullscreen — press Esc again to quit, F11 to go back");
+            // Reuse the Settings ▸ Video ▸ Fullscreen path so the config bit,
+            // the viewport command, and the restored window geometry all stay
+            // in one place instead of drifting.
+            self.apply_setting_adjust(ctx, settings::SECTION_VIDEO, 1, 1);
+        } else {
+            tracing::info!("Back at Home in a window — closing Raeen");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     /// Confirm on a Media-tab tile (spec §10 SM2). There is no media
@@ -1599,6 +1623,7 @@ impl Shell {
                 self.hero_bg_from.as_ref(),
                 self.hero_bg_to.as_ref(),
                 self.config.input.controller_icon_style,
+                self.config.general.fullscreen,
             );
             clicked_home_tile = home_response.clicked_tile;
             clicked_gear = home_response.gear_clicked;

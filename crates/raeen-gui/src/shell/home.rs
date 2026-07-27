@@ -87,6 +87,9 @@ pub fn draw(
     bg_from: Option<&egui::TextureHandle>,
     bg_to: Option<&egui::TextureHandle>,
     controller_icons: ControllerIconStyle,
+    // Whether the Shell is borderless-fullscreen — decides whether the hint
+    // bar's Back entry reads "Exit fullscreen" or "Quit".
+    fullscreen: bool,
 ) -> HomeResponse {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
@@ -151,7 +154,7 @@ pub fn draw(
         meta_cache,
         ledgers,
     );
-    draw_bottom_bar(&painter, theme, screen, controller_icons);
+    draw_bottom_bar(&painter, theme, screen, controller_icons, fullscreen);
 
     // The focus ring pulses and the clock ticks even when nothing else is
     // animating, so keep the screen gently alive.
@@ -820,6 +823,7 @@ fn draw_bottom_bar(
     theme: &Theme,
     screen: Rect,
     controller_icons: ControllerIconStyle,
+    fullscreen: bool,
 ) {
     let margin = theme.metrics.content_padding_x;
     let y = screen.bottom() - theme.metrics.content_padding_bottom;
@@ -829,9 +833,18 @@ fn draw_bottom_bar(
     // Only hints for actions that exist: Play (Confirm) and Options. The
     // old Search hint had no search overlay behind it, and the decorative
     // chat/capture glyphs reported nothing.
+    // Back's meaning at Home is "leave" (see `Shell::leave_shell`), and in
+    // fullscreen that is the ONLY visible way out — borderless means no close
+    // button — so it must be stated, not discovered.
+    let leave_label = if fullscreen {
+        "Exit fullscreen"
+    } else {
+        "Quit"
+    };
     let entries = [
         (Some(Glyph::Cross), controller_icons.confirm(), "Play"),
         (Some(Glyph::Menu), "", "Options"),
+        (Some(Glyph::Power), controller_icons.back(), leave_label),
     ];
     let mut x = screen.left() + margin + circle_r;
     for (glyph, button_label, label) in entries {
