@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let bytes = fs::read(Path::new(&path))?;
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
         return Err(format!("shader length {} is not dword-aligned", bytes.len()).into());
     }
     let words: Vec<u32> = bytes

@@ -7,6 +7,9 @@
 //! failing draw. Update intentionally with `cargo insta review` (or
 //! `INSTA_UPDATE=always cargo test -p raeen-gpu --test pm4_snapshot`).
 
+// The snapshot deliberately pins the deprecated M2 fixture builder's encoding
+// for as long as the fixture exists; drop the allow when the fixture goes.
+#[allow(deprecated)]
 use raeen_gpu::{ScissorHalf, build_cp_draw_dcb, build_m2_draw_dcb};
 
 /// Words formatted one-per-line in hex so snapshot diffs point at the exact
@@ -21,6 +24,7 @@ fn hex_words(words: &[u32]) -> String {
 }
 
 #[test]
+#[allow(deprecated)] // pins the deprecated fixture's bytes until it is removed
 fn m2_draw_dcb_encoding_is_pinned() {
     insta::assert_snapshot!(hex_words(&build_m2_draw_dcb()));
 }
