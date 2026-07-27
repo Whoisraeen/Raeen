@@ -64,7 +64,8 @@ top-down, update statuses in place, and keep it committed.**
     packets). MEASURED: GTA V render-path unresolved **83 → 0**; total 265 →
     88 (all online/dialog/input = item 3 territory). Attribution updated
     (THIRD_PARTY_NOTICES: KytyPS5 + Mesa; reference-port-ledger).
-  - [ ] **B. Compute queue in the PM4 processor.** Phase B plan (from A):
+  - [~] **B. Compute queue in the PM4 processor.** WAVE 2 IN PROGRESS
+    (gpu-pipeline agent, worktree, 2026-07-27). Phase B plan (from A):
     (1) execute submitted ACBs — port KytyPS5 `GraphicsRunSubmitCompute`
     incl. the 5-DW ACB descriptor indirection (magic 0x5533ccaa) in
     `submit_acb`; (2) graphics↔compute ordering — port
@@ -73,8 +74,9 @@ top-down, update statuses in place, and keep it committed.**
     the cross-queue label latch in `raeen-gpu/src/agc_exec.rs`; (3)
     queue-indexed execution context for DISPATCH/ACQUIRE_MEM/RELEASE_MEM/
     WAIT/COND_EXEC arms already encoded in `kyty-graphics/src/run.rs`.
-  - [ ] **C. `libSceAmpr` (46 NIDs)** — async memory prefetch; honest
-    semantics (likely synchronous completion) after A/B.
+  - [~] **C. `libSceAmpr` (46 NIDs)** — WAVE 2 IN PROGRESS (hle-stubber
+    agent, bundled with the abort/exit noreturn fix, 2026-07-27). Honest
+    semantics (likely synchronous completion).
   - [ ] **D. Re-measure GTA V** stop point; update
     `docs/gta5-blocker-analysis-2026-07-27.md`.
 - **Why:** One structural capability (async compute) unblocks the whole AAA
@@ -121,9 +123,10 @@ top-down, update statuses in place, and keep it committed.**
   with shadPS4 values. Empty dir: 0x200 once, then 0. Verified-not-assumed
   list in the ledger. Post-merge: raeen-hle 445, kernel 43+2, runtime
   77+47+1 green.
-- [ ] NEW (residual risk from the audit): `hle_abort` and `hle_exit` still
+- [~] NEW (residual risk from the audit): `hle_abort` and `hle_exit` still
   log-and-return-0 — same noreturn hazard when a title's fatal path uses
-  `abort()`. Route both through the same `request_exit` unwind.
+  `abort()`. Route both through the same `request_exit` unwind. WAVE 2 IN
+  PROGRESS (hle-stubber agent, bundled with item 2C Ampr, 2026-07-27).
 - [ ] Re-test Until Dawn live: expect it past /app0/deepfiles now; capture the
   next stop point if any.
 - [ ] Dragon Ball: worker threads deref a count (rax=2 → 0x20) as a list
@@ -181,6 +184,7 @@ top-down, update statuses in place, and keep it committed.**
   but a human-supervised run closes it.
 
 ### 10. Promote the baseline runner to `cargo xtask baseline`
+- [~] WAVE 2 IN PROGRESS (general agent, worktree, 2026-07-27).
 - [ ] Port `scratch/run-baseline-parts.py` (chunked per-game boot driver,
   merges into `latest.json`) into xtask; add `baseline diff` between runs.
 - **Why:** regression tripwire while AGC/stub work churns; feeds item 11.
@@ -193,6 +197,7 @@ top-down, update statuses in place, and keep it committed.**
   storage next to per-game config.
 
 ### 12. Symbolized / actionable crash report view
+- [~] WAVE 2 IN PROGRESS (shell-ui agent, worktree, 2026-07-27).
 - [ ] Pair `logs/crashes/*.dmp` (minidumper already wired) with guest context
   we already have: faulting module+offset, last N HLE/NID calls, unresolved-NID
   inventory, GPU state summary → one shareable report file + Shell view.
@@ -200,8 +205,10 @@ top-down, update statuses in place, and keep it committed.**
   (d87765a crash reporting groundwork).
 
 ### 13. Clippy debt: kyty-graphics recompile.rs (~91 clippy-1.97 lints)
-- [ ] Fix; verify via CI (local clippy is AppControl-blocked). Keep `-D
-  warnings` green.
+- [~] WAVE 2 IN PROGRESS (general agent, worktree, 2026-07-27). Includes the
+  `is_multiple_of` MSRV lint at analysis.rs:3195 flagged by the ACB agent.
+  Note: wave-1 agents ran clippy successfully in worktrees, so AppControl may
+  only block some exes — try locally, CI remains the gate of record.
 
 ---
 
