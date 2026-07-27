@@ -40,6 +40,81 @@ fn display_epoch(local_epoch: u64, remote: Option<&raeen_gpu::frame_ipc::RemoteF
     remote.map_or(local_epoch, |frame| frame.epoch | REMOTE_EPOCH_BIT)
 }
 
+/// Rolling window of per-frame times backing the performance HUD. Sized so a
+/// 60 FPS title keeps ~2 seconds of history — long enough for "worst" to catch
+/// a hitch, short enough that recovery is visible quickly.
+const FRAME_STAT_WINDOW: usize = 120;
+
+/// Per-frame time statistics derived from published-frame epochs (the same
+/// signal that refreshes the texture — it only advances when the GPU worker
+/// publishes a COMPLETE frame, so this measures what the title actually
+/// delivered, not egui's repaint cadence). Pure and clock-injected, so it is
+/// unit-testable; no puffin, no profiler — always available.
+#[derive(Default)]
+struct FrameTimeStats {
+    /// Wall-clock + epoch of the previous observation.
+    last: Option<(Instant, u64)>,
+    /// Per-frame milliseconds, oldest first, capped at [`FRAME_STAT_WINDOW`].
+    samples: std::collections::VecDeque<f32>,
+}
+
+impl FrameTimeStats {
+    /// Feed one observation of the display epoch. Multiple frames published
+    /// between observations (the Shell repaints slower than the title renders)
+    /// share the elapsed time evenly — each contributes one window sample, so
+    /// the window stays frame-weighted, not observation-weighted.
+    fn observe(&mut self, now: Instant, epoch: u64) {
+        let Some((last_at, last_epoch)) = self.last else {
+            self.last = Some((now, epoch));
+            return;
+        };
+        if epoch == last_epoch {
+            return;
+        }
+        // A source flip (local splash ↔ remote runner, the REMOTE_EPOCH_BIT)
+        // or a counter reset (new process) is not a frame delta — rebaseline
+        // instead of turning it into a bogus sample.
+        if (epoch ^ last_epoch) & REMOTE_EPOCH_BIT != 0 || epoch < last_epoch {
+            self.samples.clear();
+            self.last = Some((now, epoch));
+            return;
+        }
+        let frames = epoch - last_epoch;
+        let per_frame_ms =
+            now.saturating_duration_since(last_at).as_secs_f32() * 1000.0 / frames as f32;
+        for _ in 0..frames.min(FRAME_STAT_WINDOW as u64) {
+            if self.samples.len() == FRAME_STAT_WINDOW {
+                self.samples.pop_front();
+            }
+            self.samples.push_back(per_frame_ms);
+        }
+        self.last = Some((now, epoch));
+    }
+
+    /// Mean frame time over the window, in milliseconds.
+    fn avg_ms(&self) -> Option<f32> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        Some(self.samples.iter().sum::<f32>() / self.samples.len() as f32)
+    }
+
+    /// Worst (longest) frame time over the window, in milliseconds.
+    fn worst_ms(&self) -> Option<f32> {
+        self.samples.iter().copied().reduce(f32::max)
+    }
+
+    /// Frames per second implied by the window's mean frame time.
+    fn fps(&self) -> Option<f32> {
+        self.avg_ms().filter(|ms| *ms > 0.0).map(|ms| 1000.0 / ms)
+    }
+
+    fn reset(&mut self) {
+        self.last = None;
+        self.samples.clear();
+    }
+}
+
 #[derive(Default)]
 struct PresentedFrameRate {
     baseline: Option<(Instant, u64)>,
@@ -127,6 +202,9 @@ pub(crate) struct GameFrameView {
     /// when it is published.
     shown_at_epoch: u64,
     frame_rate: PresentedFrameRate,
+    /// Rolling frame-time window over published-frame epochs — feeds the
+    /// performance HUD (Settings ▸ Advanced ▸ Performance HUD / F3).
+    frame_stats: FrameTimeStats,
     present_timing: Option<raeen_gpu::PresentTiming>,
 }
 
@@ -241,6 +319,7 @@ impl GameFrameView {
         // advances only when a COMPLETE frame is published, so the texture only
         // ever receives whole, finished frames — never a half-read one.
         let epoch = display_epoch(session.present_epoch(), remote.as_ref());
+        self.frame_stats.observe(Instant::now(), epoch);
         if epoch != self.shown_at_epoch || self.texture.is_none() {
             // Deliberately does NOT `wait_idle()`: submission is asynchronous,
             // and blocking the UI thread until the GPU drained is exactly the
@@ -352,6 +431,76 @@ impl GameFrameView {
         );
     }
 
+    /// The performance HUD (Settings ▸ Advanced ▸ Performance HUD, or F3): a
+    /// superset of [`Self::paint_fps`] — epoch-derived FPS plus rolling
+    /// avg/worst frame time, the flip-count rate, and the always-available
+    /// present timing counters. Painter + explicit rects in the same top-right
+    /// corner slot as the plain badge (only one of the two is drawn per frame),
+    /// semi-transparent so the game stays visible beneath it. Works without
+    /// puffin/RAEEN_PROFILE — everything here comes from `PresentTiming` and
+    /// the published-frame epochs.
+    pub(crate) fn paint_perf_hud(&self, ui: &egui::Ui, bounds: egui::Rect) {
+        let panel = egui::Rect::from_min_size(
+            egui::pos2(bounds.right() - 372.0, bounds.top() + 12.0),
+            egui::vec2(360.0, 96.0),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(
+            panel,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(8, 11, 18, 210),
+        );
+        let headline = match (
+            self.frame_stats.fps(),
+            self.frame_stats.avg_ms(),
+            self.frame_stats.worst_ms(),
+        ) {
+            (Some(fps), Some(avg), Some(worst)) => {
+                format!("{fps:.0} FPS   avg {avg:.1} ms   worst {worst:.1} ms")
+            }
+            _ => "-- FPS   no published frames yet".to_string(),
+        };
+        let timing = self.present_timing.unwrap_or_default();
+        painter.text(
+            egui::pos2(panel.left() + 12.0, panel.top() + 10.0),
+            egui::Align2::LEFT_TOP,
+            headline,
+            egui::FontId::monospace(15.0),
+            egui::Color32::WHITE,
+        );
+        painter.text(
+            egui::pos2(panel.left() + 12.0, panel.top() + 36.0),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "flips {}   upload {:.2} ms",
+                self.frame_rate.label(),
+                timing.egui_upload_us as f64 / 1000.0,
+            ),
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_gray(205),
+        );
+        painter.text(
+            egui::pos2(panel.left() + 12.0, panel.top() + 58.0),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "drain {:.1}  fence {:.1}  read {:.1}  sRGB {:.1} ms",
+                timing.worker_drain_us as f64 / 1000.0,
+                timing.fence_wait_us as f64 / 1000.0,
+                timing.readback_us as f64 / 1000.0,
+                timing.srgb_encode_us as f64 / 1000.0,
+            ),
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_gray(205),
+        );
+        painter.text(
+            egui::pos2(panel.left() + 12.0, panel.bottom() - 8.0),
+            egui::Align2::LEFT_BOTTOM,
+            "F3 hides this HUD",
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_gray(140),
+        );
+    }
+
     /// Drop the frame when a session ends, so the next launch cannot open on the
     /// previous title's last frame.
     pub(crate) fn clear(&mut self) {
@@ -364,6 +513,7 @@ impl GameFrameView {
         self.displayed = None;
         self.shown_at_epoch = 0;
         self.frame_rate.reset();
+        self.frame_stats.reset();
         self.present_timing = None;
     }
 }
@@ -463,6 +613,88 @@ mod tests {
             display_epoch(2, Some(&remote)),
             REMOTE_EPOCH_BIT | remote.epoch
         );
+    }
+
+    #[test]
+    fn frame_time_stats_measure_avg_and_worst_per_published_frame() {
+        let start = Instant::now();
+        let mut stats = FrameTimeStats::default();
+        stats.observe(start, 10);
+        // Baseline only — no sample yet.
+        assert_eq!(stats.avg_ms(), None);
+        assert_eq!(stats.fps(), None);
+        // One frame published 16 ms later.
+        stats.observe(start + Duration::from_millis(16), 11);
+        // Then a hitch: one frame that took 48 ms.
+        stats.observe(start + Duration::from_millis(64), 12);
+        let avg = stats.avg_ms().expect("two samples");
+        let worst = stats.worst_ms().expect("two samples");
+        assert!((avg - 32.0).abs() < 0.5, "avg was {avg}");
+        assert!((worst - 48.0).abs() < 0.5, "worst was {worst}");
+        let fps = stats.fps().expect("fps from avg");
+        assert!((fps - 1000.0 / 32.0).abs() < 0.5, "fps was {fps}");
+    }
+
+    #[test]
+    fn frame_time_stats_share_elapsed_time_across_skipped_epochs() {
+        // The Shell repaints slower than the title publishes: 4 frames landed
+        // in one 64 ms observation → four 16 ms samples, not one 64 ms one.
+        let start = Instant::now();
+        let mut stats = FrameTimeStats::default();
+        stats.observe(start, 100);
+        stats.observe(start + Duration::from_millis(64), 104);
+        assert_eq!(stats.samples.len(), 4);
+        let avg = stats.avg_ms().expect("samples");
+        assert!((avg - 16.0).abs() < 0.5, "avg was {avg}");
+    }
+
+    #[test]
+    fn frame_time_stats_window_is_capped_and_rolls() {
+        let start = Instant::now();
+        let mut stats = FrameTimeStats::default();
+        stats.observe(start, 0);
+        // A slow frame first, then far more fast frames than the window holds:
+        // the slow sample must roll out, taking "worst" down with it.
+        stats.observe(start + Duration::from_millis(100), 1);
+        let mut now = start + Duration::from_millis(100);
+        for i in 0..(FRAME_STAT_WINDOW as u64 + 8) {
+            now += Duration::from_millis(10);
+            stats.observe(now, 2 + i);
+        }
+        assert_eq!(stats.samples.len(), FRAME_STAT_WINDOW);
+        let worst = stats.worst_ms().expect("full window");
+        assert!(worst < 11.0, "slow sample should have rolled out: {worst}");
+    }
+
+    #[test]
+    fn frame_time_stats_rebaseline_on_source_flip_and_counter_reset() {
+        let start = Instant::now();
+        let mut stats = FrameTimeStats::default();
+        stats.observe(start, 5);
+        stats.observe(start + Duration::from_millis(16), 6);
+        assert!(stats.avg_ms().is_some());
+        // Local → remote source flip (the high bit): not a frame delta.
+        stats.observe(start + Duration::from_millis(32), REMOTE_EPOCH_BIT | 2);
+        assert_eq!(stats.avg_ms(), None);
+        stats.observe(start + Duration::from_millis(48), REMOTE_EPOCH_BIT | 3);
+        assert!(stats.avg_ms().is_some());
+        // A lower epoch (new/reset process) also rebaselines instead of
+        // wrapping into a huge bogus delta.
+        stats.observe(start + Duration::from_millis(64), REMOTE_EPOCH_BIT | 1);
+        assert_eq!(stats.avg_ms(), None);
+    }
+
+    #[test]
+    fn frame_time_stats_reset_clears_everything() {
+        let start = Instant::now();
+        let mut stats = FrameTimeStats::default();
+        stats.observe(start, 1);
+        stats.observe(start + Duration::from_millis(16), 2);
+        assert!(stats.avg_ms().is_some());
+        stats.reset();
+        assert_eq!(stats.avg_ms(), None);
+        assert_eq!(stats.worst_ms(), None);
+        assert!(stats.last.is_none());
     }
 
     #[test]

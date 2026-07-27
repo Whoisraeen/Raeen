@@ -85,8 +85,10 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Same filesystem-hostile-character policy as the per-game store.
-fn sanitize_id(id: &str) -> String {
+/// Same filesystem-hostile-character policy as the per-game store. Also used
+/// by the screenshot writer, so a screenshot file name can never smuggle path
+/// separators from a library id.
+pub(crate) fn sanitize_id(id: &str) -> String {
     let cleaned: String = id
         .trim()
         .chars()

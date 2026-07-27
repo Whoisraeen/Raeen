@@ -61,6 +61,11 @@ pub const SECTION_PLUGINS: usize = 6;
 pub const SECTION_SYSTEM: usize = 7;
 pub const SECTION_ADVANCED: usize = 8;
 
+/// Advanced-section row index of the Performance HUD toggle — named so the
+/// F3 hotkey in `shell/mod.rs` and the row drawn in [`draw_debug`] cannot
+/// drift apart.
+pub const ADVANCED_ROW_PERF_HUD: usize = 8;
+
 /// The sidebar glyph for each section, in `SETTINGS_SECTION_NAMES` order.
 fn section_glyph(section: usize) -> Glyph {
     match section {
@@ -101,7 +106,7 @@ pub fn settings_row_counts(game_folder_count: usize, plugin_count: usize) -> Vec
         2,
         plugin_count + PLUGIN_ACTION_ROWS,
         2,
-        8,
+        9,
     ]
 }
 
@@ -824,10 +829,17 @@ fn draw_debug(ui: &mut egui::Ui, rows: &mut Rows, config: &EmulatorConfig) {
         "Stall Dump",
         on_off(config.debug.stall_dump).to_string(),
     );
+    rows.row(
+        ui,
+        ADVANCED_ROW_PERF_HUD,
+        "Performance HUD (F3)",
+        on_off(config.general.perf_hud).to_string(),
+    );
     rows.hint(
         ui,
         "Developer diagnostics. Logging is live; the dumps and traces apply on the next launch. \
-         A RAEEN_* variable set in the environment before starting Raeen overrides its toggle here.",
+         A RAEEN_* variable set in the environment before starting Raeen overrides its toggle here. \
+         The Performance HUD overlays FPS / frame time / present timing while a game runs.",
     );
 }
 
@@ -881,7 +893,9 @@ mod tests {
         assert_eq!(counts[SECTION_KEY_PROVIDER], 1);
         assert_eq!(counts[SECTION_THEME], 2); // Theme + Wallpaper
         assert_eq!(counts[SECTION_SYSTEM], 2); // version + updater action
-        assert_eq!(counts[SECTION_ADVANCED], 8);
+        assert_eq!(counts[SECTION_ADVANCED], 9); // + Performance HUD
+        // The named HUD row is the section's last row.
+        assert_eq!(ADVANCED_ROW_PERF_HUD, counts[SECTION_ADVANCED] - 1);
     }
 
     #[test]

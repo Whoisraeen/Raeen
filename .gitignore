@@ -99,3 +99,7 @@ scratch/
 # Session ledger — per-game play-session records written at runtime
 # (e.g. session_ledger/ASTRO.BOT.json); machine-local user data, never commit.
 session_ledger/
+
+# Screenshots captured with F12 / the pad Create button — frames of the
+# user's own (possibly proprietary) titles; machine-local, never commit.
+screenshots/

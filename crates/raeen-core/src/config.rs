@@ -52,6 +52,9 @@ pub struct GeneralConfig {
     /// `confirm.wav`, `back.wav`, `launch.wav` (all optional), or `"off"`
     /// for a silent shell.
     pub sound_pack: String,
+    /// Show the in-session performance HUD overlay (FPS, frame time,
+    /// upload/present timing). Toggled in Settings ▸ Advanced or with F3.
+    pub perf_hud: bool,
 }
 
 impl Default for GeneralConfig {
@@ -64,6 +67,7 @@ impl Default for GeneralConfig {
             selected_theme: "default".to_string(),
             wallpaper: "off".to_string(),
             sound_pack: "off".to_string(),
+            perf_hud: false,
         }
     }
 }
@@ -330,6 +334,19 @@ mod tests {
             config.input.controller_icon_style,
             ControllerIconStyle::PlayStation
         );
+    }
+
+    #[test]
+    fn old_config_defaults_perf_hud_off_and_round_trips() {
+        // A config written before the HUD existed must load with it off.
+        let config: EmulatorConfig = toml::from_str("[general]\nvsync = true\n").unwrap();
+        assert!(!config.general.perf_hud);
+        // And the toggle persists through a save/load cycle.
+        let mut config = EmulatorConfig::default();
+        config.general.perf_hud = true;
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: EmulatorConfig = toml::from_str(&encoded).unwrap();
+        assert!(decoded.general.perf_hud);
     }
 
     #[test]
