@@ -82,6 +82,33 @@ Claude `/goal` (≤200 chars):
 - **Mesa delta — NO AMD CHANGE.** `3e2d851..780727e` contains no files under
   `src/amd`; AddrLib/register/PM4 source used by Raeen is unchanged.
 
+### GTA V AGC Phase A batch 2026-07-27 (KytyPS5 `src/libs/agc.cpp` + Mesa PM4 facts)
+
+- **The full measured 83-NID `libSceAgc` gap (docs/gta5-blocker-analysis-2026-07-27.md)
+  is now registered** in `crates/raeen-hle/src/libsce_agc.rs`; a coverage
+  re-run against the live registry reports **zero unresolved render-path
+  imports** for PPSA04264 (remaining 88 unresolved are online/dialog/input
+  surfaces). Three tiers, honestly labeled:
+  - **KytyPS5 ports (DONE):** `CbBranch` (replacing the wrong Jump-alias
+    model), `DcbRewind` (+ACB alias), workload active/complete markers,
+    `DcbDrawIndexMultiInstanced`, `UpdatePrimState`,
+    `GetDataPacketPayloadRange`, UCONFIG range/direct register writers, the
+    CondExec/Rewind/Branch/QueueEndOfPipeAction/WaitRegMem/DmaData packet-patch
+    family, ACB aliases (Jump/Rewind/SetFlip/SetMarker/
+    WaitUntilSafeForRendering), and the `*GetSize` byte family pinned to
+    Kyty's Gen5 emitters or this file's own writers.
+  - **Architectural PM4 sizes (DONE, mesa-cited):** AtomicMem (36),
+    CondWrite (36), PrimeUtcl2 (20; emitted as a size-consistent NOP hint),
+    occlusion/predication/SET_BASE probes (16).
+  - **Honest-error surface (registered-incomplete, logs loudly, never
+    guesses):** `Dcb/AcbAtomicMem`, `Dcb/AcbMemSemaphore`, `CbCondWrite`,
+    `DcbSetIndexIndirectArgs`, `GetDefaultCxStateFlat`, `SetNop`,
+    `GetGsOversubscription`, `SetAmmSemaphoreMemory`, `GetSemaphoreLabel` —
+    packet shapes/signatures absent from every license-compatible reference.
+- Phase B (not started here): PM4 **compute-queue execution** — the ACB
+  stream currently reaches `hle_driver_submit_acb` but the command processor
+  executes only the graphics-queue path.
+
 ### Phase 1 live-import batch 2026-07-25
 
 - **SharpEmu `74a5198`, `2272b9b`, `d3600c9` re-audit — DONE.** The required

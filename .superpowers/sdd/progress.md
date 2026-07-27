@@ -4644,3 +4644,24 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   explicitly NOT an M5 claim.
 * Earlier in-world hang did NOT reproduce post-fix; task reframed from
   "fix deadlock" to "re-verify over a longer session before investing".
+
+## 2026-07-27 (worktree agent) — GTA V AGC wall Phase A: GetSize family + ACB builders
+* libsce_agc Phase A batch: all 83 measured-missing libSceAgc NIDs
+  (docs/gta5-blocker-analysis-2026-07-27.md) registered — 63 real
+  (KytyPS5 agc.cpp ports, this-file writer-pinned GetSizes, mesa-cited
+  architectural PM4 sizes), 11 honest-error (register_incomplete, loud log,
+  never a guessed packet: Dcb/AcbAtomicMem, Dcb/AcbMemSemaphore, CbCondWrite,
+  DcbSetIndexIndirectArgs, GetDefaultCxStateFlat, SetNop,
+  GetGsOversubscription, SetAmmSemaphoreMemory, GetSemaphoreLabel).
+* CbBranch UPGRADED from a wrong Jump-alias to the faithful KytyPS5 14-DWORD
+  conditional chain (w1KFAHVqpaU binds GraphicsCbBranch upstream); paired
+  BranchPatchSetCompareAddress distinguishes the 14dw chain from the 4dw jump.
+* MEASURED: cargo xtask nids coverage re-run vs live registry — PPSA04264
+  render-path unresolved 83 -> 0 (graphics block: 60/60 resolved); total
+  unresolved 265 -> 88, all online/dialog/input (stub tier, doc step 3).
+* Tests: raeen-hle 459/459 green (12 new Phase A tests incl. registry
+  resolution sweep), kyty-graphics 477/477 green, fmt clean; clippy blocked
+  only by pre-existing kyty-graphics is_multiple_of MSRV lint (untouched).
+* Phase B (NOT started, next wall): PM4 compute-queue execution — ACBs reach
+  hle_driver_submit_acb but only the graphics-queue CP path executes; then
+  re-run GTA V to move the UD2 assert.

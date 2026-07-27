@@ -81,8 +81,15 @@ SOFTWARE.
   path. GTA V's Gen5 AGC fixed packet sizes, direct Cx/Sh/Uc register writers,
   and DCB/ACB conditional-execution packet layout are behaviorally
   re-implemented from `src/libs/agc.cpp`; SharpEmu independently confirms the
-  by-value `{u32 offset, u32 value}` direct-register ABI. No C++ is vendored or
-  compiled into Raeen.
+  by-value `{u32 offset, u32 value}` direct-register ABI. The GTA V Phase A
+  AGC batch (`crates/raeen-hle/src/libsce_agc.rs`, 2026-07-27) extends this to
+  further `src/libs/agc.cpp` behaviors: the 14-DWORD `CbBranch` conditional
+  chain, `DcbRewind`, the 18/12-DWORD workload active/complete markers,
+  `DcbDrawIndexMultiInstanced`, `UpdatePrimState` (with
+  `GraphicsPrimitiveTypeToGsOut`), `GetDataPacketPayloadRange`, the
+  CondExec/QueueEndOfPipeAction/WaitRegMem/DmaData packet-patch family, and
+  the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. No C++ is
+  vendored or compiled into Raeen.
 
 ---
 
@@ -232,6 +239,12 @@ attribution as that license requires.
   machine-pinned source for later clean-room AddrLib tiling work. No Mesa code
   or tables have been copied into Raeen in this phase. Any later transcription
   must cite the exact source file/revision and preserve its MIT attribution.
+  Separately, the GTA V Phase A AGC batch (2026-07-27) uses Mesa as the
+  factual reference for architectural PM4 packet identities and sizes —
+  `src/amd/common/sid.h` opcodes (`PKT3_ATOMIC_MEM`, `PKT3_COND_WRITE`,
+  `PKT3_PRIME_UTCL2`, `PKT3_MEM_SEMAPHORE`) and the 9-DWORD ATOMIC_MEM shape
+  from `ac_cmdbuf_cp.c` — cited in `crates/raeen-hle/src/libsce_agc.rs` doc
+  comments; these are hardware-interface facts, and no Mesa code was copied.
 
 ---
 
