@@ -385,7 +385,7 @@ fn lock_core(
     let current = ctx.guest_threads.current_thread();
     let spin_start = std::time::Instant::now();
     let mut reported = false;
-    let Some(state) = ctx
+    let Some(shared) = ctx
         .kernel
         .pthread_mutexes
         .get(&key)
@@ -393,8 +393,13 @@ fn lock_core(
     else {
         return EINVAL;
     };
+    // Parked waiting, not spinning: the guard is held across the condvar
+    // wait, which releases it while parked and reacquires on wake. The old
+    // `yield_now()` spin loop burned a full host core per blocked guest
+    // thread — Minecraft's seven in-game "Streaming Pool" workers spinning on
+    // one mutex starved the owner itself down to 4 FPS.
+    let mut state = shared.state.lock();
     loop {
-        let mut state = state.lock();
         if state.owner == current {
             return match state.ty {
                 MUTEX_RECURSIVE => {
@@ -459,8 +464,11 @@ fn lock_core(
                 "scePthreadMutexLock stuck >3s — deadlock; naming the holder"
             );
         }
-        drop(state);
-        std::thread::yield_now();
+        // Bounded so process termination and deadlines are observed even if
+        // no unlock ever notifies; a wake races are re-checked by the loop.
+        let _ = shared
+            .unlocked
+            .wait_for(&mut state, std::time::Duration::from_millis(10));
     }
 }
 
@@ -473,7 +481,7 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(key) = resolve_key(ctx, mutex_addr) else {
         return EINVAL;
     };
-    let Some(state) = ctx
+    let Some(shared) = ctx
         .kernel
         .pthread_mutexes
         .get(&key)
@@ -481,7 +489,7 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     else {
         return EINVAL;
     };
-    let mut state = state.lock();
+    let mut state = shared.state.lock();
     let lenient = matches!(state.ty, MUTEX_NORMAL | MUTEX_ADAPTIVE);
     if state.recursion <= 0 {
         return if lenient { OK } else { EINVAL };
@@ -492,6 +500,11 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     state.recursion -= 1;
     if state.recursion == 0 {
         state.owner = 0;
+        // Hand the lock to one parked waiter. The bounded 10 ms re-check in
+        // `lock_core` covers any wake/steal race, so one notify suffices
+        // without a thundering herd.
+        drop(state);
+        shared.unlocked.notify_one();
     }
     OK
 }
@@ -571,7 +584,7 @@ const RWLOCK_OBJECT_SIZE: u64 = 0x100;
 /// Resolve the rwlock state key for a guest `pthread_rwlock_t` address.
 fn resolve_rwlock_key(ctx: &HleContext, addr: u64) -> Option<u64> {
     if let Some(state) = ctx.kernel.pthread_rwlocks.get(&addr) {
-        return Some(state.lock().key);
+        return Some(state.state.lock().key);
     }
     let mut buf = [0u8; 8];
     if ctx.mem.read(addr, &mut buf) {
@@ -579,7 +592,7 @@ fn resolve_rwlock_key(ctx: &HleContext, addr: u64) -> Option<u64> {
         if handle != 0
             && let Some(state) = ctx.kernel.pthread_rwlocks.get(&handle)
         {
-            return Some(state.lock().key);
+            return Some(state.state.lock().key);
         }
     }
     None
@@ -697,7 +710,7 @@ fn rwlock_rdlock_deadline(
     }
     let key = resolve_or_create_rwlock(ctx, addr);
     let current = ctx.guest_threads.current_thread();
-    let Some(state) = ctx
+    let Some(shared) = ctx
         .kernel
         .pthread_rwlocks
         .get(&key)
@@ -705,8 +718,9 @@ fn rwlock_rdlock_deadline(
     else {
         return EINVAL;
     };
+    // Parked, not spinning — see the note in `lock_core`.
+    let mut state = shared.state.lock();
     loop {
-        let mut state = state.lock();
         if state.writer == 0 || state.writer == current {
             state.readers += 1;
             drop(state);
@@ -725,8 +739,9 @@ fn rwlock_rdlock_deadline(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        drop(state);
-        std::thread::yield_now();
+        let _ = shared
+            .released
+            .wait_for(&mut state, std::time::Duration::from_millis(10));
     }
 }
 
@@ -755,7 +770,7 @@ fn rwlock_wrlock_deadline(
     }
     let key = resolve_or_create_rwlock(ctx, addr);
     let current = ctx.guest_threads.current_thread();
-    let Some(state) = ctx
+    let Some(shared) = ctx
         .kernel
         .pthread_rwlocks
         .get(&key)
@@ -763,8 +778,9 @@ fn rwlock_wrlock_deadline(
     else {
         return EINVAL;
     };
+    // Parked, not spinning — see the note in `lock_core`.
+    let mut state = shared.state.lock();
     loop {
-        let mut state = state.lock();
         if state.writer == current {
             state.writer_recursion += 1;
             return OK;
@@ -780,8 +796,9 @@ fn rwlock_wrlock_deadline(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        drop(state);
-        std::thread::yield_now();
+        let _ = shared
+            .released
+            .wait_for(&mut state, std::time::Duration::from_millis(10));
     }
 }
 
@@ -841,15 +858,21 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
         if drained {
             ctx.kernel.pthread_rwlock_read_holds.remove(&(current, key));
         }
-        if let Some(state) = ctx
+        if let Some(shared) = ctx
             .kernel
             .pthread_rwlocks
             .get(&key)
             .map(|entry| Arc::clone(entry.value()))
         {
-            let mut state = state.lock();
+            let mut state = shared.state.lock();
             if state.readers > 0 {
                 state.readers -= 1;
+            }
+            let drained = state.readers == 0;
+            drop(state);
+            if drained {
+                // Last reader out: a parked writer can take it now.
+                shared.released.notify_all();
             }
         }
         return OK;
@@ -858,7 +881,7 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     // No read hold: release the write hold (recursion first). A stray or
     // duplicated unlock from a thread that holds neither is rejected (EPERM)
     // rather than letting a writer in behind a live reader's back.
-    let Some(state) = ctx
+    let Some(shared) = ctx
         .kernel
         .pthread_rwlocks
         .get(&key)
@@ -866,11 +889,18 @@ fn hle_rwlock_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     else {
         return EINVAL;
     };
-    let mut state = state.lock();
+    let mut state = shared.state.lock();
     if state.writer == current && state.writer_recursion > 0 {
         state.writer_recursion -= 1;
-        if state.writer_recursion == 0 {
+        let released = state.writer_recursion == 0;
+        if released {
             state.writer = 0;
+        }
+        drop(state);
+        if released {
+            // Writers are exclusive but readers are not — wake everyone and
+            // let the loops re-check.
+            shared.released.notify_all();
         }
         return OK;
     }
@@ -966,15 +996,30 @@ mod tests {
         // After locking, the (only) thread owns it with recursion 1.
         let key = resolve_key(&ctx, mutex).unwrap();
         assert_eq!(
-            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            kernel
+                .pthread_mutexes
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .recursion,
             1
         );
         assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
         assert_eq!(
-            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            kernel
+                .pthread_mutexes
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .recursion,
             0
         );
-        assert_eq!(kernel.pthread_mutexes.get(&key).unwrap().lock().owner, 0);
+        assert_eq!(
+            kernel.pthread_mutexes.get(&key).unwrap().state.lock().owner,
+            0
+        );
         // Unlocking an already-free normal mutex is lenient (OK).
         assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
     }
@@ -1044,14 +1089,26 @@ mod tests {
         assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
         let key = resolve_key(&ctx, mutex).unwrap();
         assert_eq!(
-            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            kernel
+                .pthread_mutexes
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .recursion,
             3
         );
         for _ in 0..3 {
             assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
         }
         assert_eq!(
-            kernel.pthread_mutexes.get(&key).unwrap().lock().recursion,
+            kernel
+                .pthread_mutexes
+                .get(&key)
+                .unwrap()
+                .state
+                .lock()
+                .recursion,
             0
         );
     }
@@ -1111,7 +1168,7 @@ mod tests {
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
         {
             let state = kernel.pthread_rwlocks.get(&key).unwrap();
-            let mut state = state.lock();
+            let mut state = state.state.lock();
             state.writer = 99;
             state.writer_recursion = 1;
         }
@@ -1144,10 +1201,10 @@ mod tests {
         assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_rdlock(&ctx, &[rw]), OK);
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().lock().readers, 2);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers, 2);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().lock().readers, 0);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers, 0);
         // Unlocking with nothing held → EPERM.
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
     }
@@ -1189,14 +1246,18 @@ mod tests {
         let key = resolve_rwlock_key(&ctx, rw).unwrap();
         {
             let s = kernel.pthread_rwlocks.get(&key).unwrap();
-            let s = s.lock();
+            let s = s.state.lock();
             assert_eq!(s.writer, CURRENT_THREAD);
             assert_eq!(s.writer_recursion, 2);
         }
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), OK);
         let s = kernel.pthread_rwlocks.get(&key).unwrap();
-        assert_eq!(s.lock().writer, 0, "write hold released at recursion 0");
+        assert_eq!(
+            s.state.lock().writer,
+            0,
+            "write hold released at recursion 0"
+        );
     }
 
     #[test]
@@ -1230,13 +1291,13 @@ mod tests {
         // exactly the state its own `Rdlock` would leave: shared count bumped
         // and a per-thread depth recorded.
         const OTHER: u64 = 99;
-        kernel.pthread_rwlocks.get(&key).unwrap().lock().readers = 1;
+        kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers = 1;
         kernel.pthread_rwlock_read_holds.insert((OTHER, key), 1);
 
         // The test thread holds nothing, so its unlock is rejected outright and
         // touches neither the shared count nor thread 99's per-thread hold.
         assert_eq!(hle_rwlock_unlock(&ctx, &[rw]), EPERM);
-        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().lock().readers, 1);
+        assert_eq!(kernel.pthread_rwlocks.get(&key).unwrap().state.lock().readers, 1);
         assert_eq!(
             *kernel.pthread_rwlock_read_holds.get(&(OTHER, key)).unwrap(),
             1

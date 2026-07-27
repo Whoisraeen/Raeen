@@ -4472,7 +4472,15 @@ fn hle_pthread_once(ctx: &HleContext, args: &[u64]) -> u64 {
                     );
                     logged_wait = true;
                 }
-                std::thread::yield_now();
+                // Back off instead of spinning. The initializer runs on
+                // ANOTHER guest thread, so a bare `yield_now` here burns a
+                // full host core racing the very thread it waits on — the
+                // same starvation the pthread mutex/rwlock waits just traded
+                // for parked waits. There is no condvar to park on (the flag
+                // lives in guest memory and is polled), so a short sleep is
+                // the honest equivalent: `once` initializers are rare and
+                // short, and 200us is invisible next to one.
+                std::thread::sleep(std::time::Duration::from_micros(200));
             }
             Some(ONCE_UNINITIALIZED) => {
                 match ctx.mem.atomic_compare_exchange_u32(

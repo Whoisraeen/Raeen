@@ -221,12 +221,12 @@ pub struct OrbisKernel {
     /// address and its allocated opaque handle (both map to the same logical
     /// mutex). Manipulated by the HLE `pthread_sync` module — per-process
     /// state, so it lives here rather than in a global.
-    pub pthread_mutexes: DashMap<u64, Arc<parking_lot::Mutex<PthreadMutex>>>,
+    pub pthread_mutexes: DashMap<u64, Arc<PthreadMutexShared>>,
     /// Guest pthread mutex-attribute type, keyed by the attr object address.
     pub pthread_mutex_attrs: DashMap<u64, i32>,
     /// Guest pthread read-write lock state, keyed by both the guest
     /// `pthread_rwlock_t` address and its allocated handle.
-    pub pthread_rwlocks: DashMap<u64, Arc<parking_lot::Mutex<PthreadRwlock>>>,
+    pub pthread_rwlocks: DashMap<u64, Arc<PthreadRwlockShared>>,
     /// Per-`(guest thread id, rwlock key)` read-hold recursion depth.
     /// [`PthreadRwlock::readers`] is a single shared count that cannot say
     /// *which* thread holds a read; without that, a stray or duplicated
@@ -684,15 +684,47 @@ pub struct PthreadRwlock {
     pub writer_recursion: i32,
 }
 
+/// One guest rwlock's shared state plus the host condvar its HLE waiters
+/// park on — the rwlock counterpart of [`PthreadMutexShared`], for the same
+/// reason: a spinning waiter burns a full host core that the lock's own owner
+/// needs to make progress. Notified whenever a writer releases or the last
+/// reader drains.
+pub struct PthreadRwlockShared {
+    pub state: parking_lot::Mutex<PthreadRwlock>,
+    pub released: parking_lot::Condvar,
+}
+
 impl PthreadRwlock {
     /// Create one shared state object for a guest rwlock and all its aliases.
-    pub fn shared(key: u64) -> Arc<parking_lot::Mutex<Self>> {
-        Arc::new(parking_lot::Mutex::new(Self {
-            key,
-            readers: 0,
-            writer: 0,
-            writer_recursion: 0,
-        }))
+    pub fn shared(key: u64) -> Arc<PthreadRwlockShared> {
+        Arc::new(PthreadRwlockShared {
+            state: parking_lot::Mutex::new(Self {
+                key,
+                readers: 0,
+                writer: 0,
+                writer_recursion: 0,
+            }),
+            released: parking_lot::Condvar::new(),
+        })
+    }
+
+    /// Test-only: a shared rwlock pre-seeded with reader/writer state.
+    #[cfg(test)]
+    pub(crate) fn shared_for_test(
+        key: u64,
+        readers: i32,
+        writer: u64,
+        writer_recursion: i32,
+    ) -> Arc<PthreadRwlockShared> {
+        Arc::new(PthreadRwlockShared {
+            state: parking_lot::Mutex::new(Self {
+                key,
+                readers,
+                writer,
+                writer_recursion,
+            }),
+            released: parking_lot::Condvar::new(),
+        })
     }
 }
 
@@ -731,15 +763,43 @@ pub struct PthreadMutex {
     pub recursion: i32,
 }
 
+/// One guest mutex's shared state plus the host condvar its HLE waiters park
+/// on. Before this existed, every blocked guest thread spun on
+/// `yield_now()` at full host-CPU — measured on Minecraft's in-game
+/// "Streaming Pool" workers, where 7 spinning waiters starved the very owner
+/// they were waiting for (4 FPS in-world). `unlocked` is notified whenever
+/// ownership clears, including owner-death recovery.
+pub struct PthreadMutexShared {
+    pub state: parking_lot::Mutex<PthreadMutex>,
+    pub unlocked: parking_lot::Condvar,
+}
+
 impl PthreadMutex {
     /// Create the single shared state object that every guest-visible alias of
     /// this mutex must reference.
-    pub fn shared(ty: i32) -> Arc<parking_lot::Mutex<Self>> {
-        Arc::new(parking_lot::Mutex::new(Self {
-            ty,
-            owner: 0,
-            recursion: 0,
-        }))
+    pub fn shared(ty: i32) -> Arc<PthreadMutexShared> {
+        Arc::new(PthreadMutexShared {
+            state: parking_lot::Mutex::new(Self {
+                ty,
+                owner: 0,
+                recursion: 0,
+            }),
+            unlocked: parking_lot::Condvar::new(),
+        })
+    }
+
+    /// Test-only: a shared mutex pre-seeded with an owner/recursion, for the
+    /// owner-death recovery tests.
+    #[cfg(test)]
+    pub(crate) fn shared_for_test(ty: i32, owner: u64, recursion: i32) -> Arc<PthreadMutexShared> {
+        Arc::new(PthreadMutexShared {
+            state: parking_lot::Mutex::new(Self {
+                ty,
+                owner,
+                recursion,
+            }),
+            unlocked: parking_lot::Condvar::new(),
+        })
     }
 }
 
@@ -990,15 +1050,18 @@ impl OrbisKernel {
         let mut released = 0;
         let mut visited = HashSet::new();
         for entry in &self.pthread_mutexes {
-            let state = entry.value();
-            if !visited.insert(Arc::as_ptr(state) as usize) {
+            let shared = entry.value();
+            if !visited.insert(Arc::as_ptr(shared) as usize) {
                 continue;
             }
-            let mut state = state.lock();
+            let mut state = shared.state.lock();
             if state.owner == thread {
                 state.owner = 0;
                 state.recursion = 0;
                 released += 1;
+                // Wake every parked waiter — the lock they were waiting for
+                // just became available via owner death.
+                shared.unlocked.notify_all();
             }
         }
         released
@@ -1027,15 +1090,17 @@ impl OrbisKernel {
 
         let mut visited = HashSet::new();
         for entry in &self.pthread_mutexes {
-            let state = entry.value();
-            if !visited.insert(Arc::as_ptr(state) as usize) {
+            let shared = entry.value();
+            if !visited.insert(Arc::as_ptr(shared) as usize) {
                 continue;
             }
-            let mut state = state.lock();
+            let mut state = shared.state.lock();
             if state.owner == thread {
                 state.owner = 0;
                 state.recursion = 0;
                 summary.mutexes += 1;
+                // Owner died holding this — wake the parked waiters.
+                shared.unlocked.notify_all();
             }
         }
 
@@ -1059,23 +1124,33 @@ impl OrbisKernel {
                 .get(&rwlock_key)
                 .map(|entry| Arc::clone(entry.value()))
             {
-                let mut rw = rw.lock();
-                rw.readers = rw.readers.saturating_sub(depth as i32).max(0);
+                let mut state = rw.state.lock();
+                state.readers = state.readers.saturating_sub(depth as i32).max(0);
+                let drained = state.readers == 0;
+                drop(state);
+                if drained {
+                    // Last reader gone via owner death — a parked writer can
+                    // now proceed.
+                    rw.released.notify_all();
+                }
             }
             summary.rwlock_read_holds += 1;
         }
 
         let mut visited = HashSet::new();
         for entry in &self.pthread_rwlocks {
-            let state = entry.value();
-            if !visited.insert(Arc::as_ptr(state) as usize) {
+            let shared = entry.value();
+            if !visited.insert(Arc::as_ptr(shared) as usize) {
                 continue;
             }
-            let mut state = state.lock();
+            let mut state = shared.state.lock();
             if state.writer == thread {
                 state.writer = 0;
                 state.writer_recursion = 0;
                 summary.rwlock_writers += 1;
+                drop(state);
+                // Writer died holding it — wake every parked reader/writer.
+                shared.released.notify_all();
             }
         }
 
@@ -1852,30 +1927,15 @@ mod subsystem_resource_tests {
         let live = 9u64;
 
         // Two mutexes held by the dead thread, one held by a live thread.
-        kernel.pthread_mutexes.insert(
-            0x1000,
-            Arc::new(parking_lot::Mutex::new(PthreadMutex {
-                ty: 3,
-                owner: dead,
-                recursion: 1,
-            })),
-        );
-        kernel.pthread_mutexes.insert(
-            0x1008,
-            Arc::new(parking_lot::Mutex::new(PthreadMutex {
-                ty: 2,
-                owner: dead,
-                recursion: 3,
-            })),
-        );
-        kernel.pthread_mutexes.insert(
-            0x1010,
-            Arc::new(parking_lot::Mutex::new(PthreadMutex {
-                ty: 3,
-                owner: live,
-                recursion: 1,
-            })),
-        );
+        kernel
+            .pthread_mutexes
+            .insert(0x1000, PthreadMutex::shared_for_test(3, dead, 1));
+        kernel
+            .pthread_mutexes
+            .insert(0x1008, PthreadMutex::shared_for_test(2, dead, 3));
+        kernel
+            .pthread_mutexes
+            .insert(0x1010, PthreadMutex::shared_for_test(3, live, 1));
         // The pointer slot and opaque handle are two keys for one logical
         // mutex. Cleanup must release and count that shared object once.
         let dead_mutex_alias = {
@@ -1887,24 +1947,12 @@ mod subsystem_resource_tests {
         // One rwlock write-owned by the dead thread; one read-shared: the dead
         // thread holds 2 read recursions, the live thread holds 1 — reader count
         // is the shared sum (3).
-        kernel.pthread_rwlocks.insert(
-            0x2000,
-            Arc::new(parking_lot::Mutex::new(PthreadRwlock {
-                key: 0x2000,
-                readers: 0,
-                writer: dead,
-                writer_recursion: 2,
-            })),
-        );
-        kernel.pthread_rwlocks.insert(
-            0x2008,
-            Arc::new(parking_lot::Mutex::new(PthreadRwlock {
-                key: 0x2008,
-                readers: 3,
-                writer: 0,
-                writer_recursion: 0,
-            })),
-        );
+        kernel
+            .pthread_rwlocks
+            .insert(0x2000, PthreadRwlock::shared_for_test(0x2000, 0, dead, 2));
+        kernel
+            .pthread_rwlocks
+            .insert(0x2008, PthreadRwlock::shared_for_test(0x2008, 3, 0, 0));
         let dead_rwlock_alias = {
             let entry = kernel.pthread_rwlocks.get(&0x2000).unwrap();
             Arc::clone(entry.value())
@@ -1920,31 +1968,77 @@ mod subsystem_resource_tests {
         assert!(summary.any());
 
         // Dead thread's mutexes are cleared; the live thread's is untouched.
-        assert_eq!(kernel.pthread_mutexes.get(&0x1000).unwrap().lock().owner, 0);
         assert_eq!(
             kernel
                 .pthread_mutexes
                 .get(&0x1000)
                 .unwrap()
+                .state
+                .lock()
+                .owner,
+            0
+        );
+        assert_eq!(
+            kernel
+                .pthread_mutexes
+                .get(&0x1000)
+                .unwrap()
+                .state
                 .lock()
                 .recursion,
             0
         );
-        assert_eq!(kernel.pthread_mutexes.get(&0x1008).unwrap().lock().owner, 0);
-        assert_eq!(kernel.pthread_mutexes.get(&0x1100).unwrap().lock().owner, 0);
         assert_eq!(
-            kernel.pthread_mutexes.get(&0x1010).unwrap().lock().owner,
+            kernel
+                .pthread_mutexes
+                .get(&0x1008)
+                .unwrap()
+                .state
+                .lock()
+                .owner,
+            0
+        );
+        assert_eq!(
+            kernel
+                .pthread_mutexes
+                .get(&0x1100)
+                .unwrap()
+                .state
+                .lock()
+                .owner,
+            0
+        );
+        assert_eq!(
+            kernel
+                .pthread_mutexes
+                .get(&0x1010)
+                .unwrap()
+                .state
+                .lock()
+                .owner,
             live
         );
 
         // The write lock is released; the read-shared lock loses the dead
         // thread's 2 holds (3 -> 1) and keeps the live thread's hold.
         assert_eq!(
-            kernel.pthread_rwlocks.get(&0x2000).unwrap().lock().writer,
+            kernel
+                .pthread_rwlocks
+                .get(&0x2000)
+                .unwrap()
+                .state
+                .lock()
+                .writer,
             0
         );
         assert_eq!(
-            kernel.pthread_rwlocks.get(&0x2100).unwrap().lock().writer,
+            kernel
+                .pthread_rwlocks
+                .get(&0x2100)
+                .unwrap()
+                .state
+                .lock()
+                .writer,
             0
         );
         assert_eq!(
@@ -1952,12 +2046,19 @@ mod subsystem_resource_tests {
                 .pthread_rwlocks
                 .get(&0x2000)
                 .unwrap()
+                .state
                 .lock()
                 .writer_recursion,
             0
         );
         assert_eq!(
-            kernel.pthread_rwlocks.get(&0x2008).unwrap().lock().readers,
+            kernel
+                .pthread_rwlocks
+                .get(&0x2008)
+                .unwrap()
+                .state
+                .lock()
+                .readers,
             1
         );
         assert!(
