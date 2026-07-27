@@ -4293,7 +4293,19 @@ pub fn shader_get_input_info_ps_decoded(
     if usage.gds_pointers > 0 {
         return Err(ni("ps: gds pointers"));
     }
-    if usage.direct_sgprs > 0 {
+    // Kyty's PS4-era path rejects direct (raw-value) user SGPRs in the pixel
+    // stage. Gen5 pixel shaders routinely carry raw data there — SRT blocks
+    // and type-5 immediates — exactly as Gen5 VS and CS do: VS never rejected
+    // them and CS lifted the same guard for `next_gen` (below). The
+    // push-constant plumbing that consumes them is stage-agnostic
+    // (`shader_calc_binding_indices` -> `push_constant_size`), so the pixel
+    // stage was the lone holdout.
+    //
+    // Measured on Minecraft: every PS carrying direct SGPRs failed analysis
+    // with "ps: direct sgprs", so the draws binding it were skipped — the
+    // in-world scene rendered as flat untextured blocks. Legacy (PS4) shaders
+    // keep the original rejection.
+    if usage.direct_sgprs > 0 && !next_gen {
         return Err(ni("ps: direct sgprs"));
     }
 
@@ -5728,6 +5740,47 @@ mod tests {
             ..Default::default()
         };
         (regs, sh, mem)
+    }
+
+    /// A Gen5 pixel shader carrying direct (raw-value) user SGPRs must
+    /// ANALYZE, while the legacy PS4 path keeps Kyty's original rejection.
+    ///
+    /// Measured on Minecraft: every such PS failed with "ps: direct sgprs",
+    /// so the draws binding it were skipped and the in-world scene rendered
+    /// as flat untextured blocks. VS never rejected direct SGPRs and CS
+    /// lifted the same guard for `next_gen`; the pixel stage was the holdout.
+    #[test]
+    fn input_info_ps_direct_sgprs_allowed_on_next_gen_rejected_on_legacy() {
+        let (mut regs, sh, mem) = ps_setup();
+        // Leave s[12:15] declared but unconsumed by any resource decl, so the
+        // analyzer counts them as direct (raw) user SGPRs.
+        regs.ps_regs.rsrc2.user_sgpr = 14;
+        regs.ps_user_sgpr.count = 14;
+        let map = ShaderMap::new();
+        let vs_info = ShaderVertexInputInfo::default();
+
+        let mut legacy = ShaderPixelInputInfo::default();
+        let legacy_result =
+            shader_get_input_info_ps(&regs, &sh, &vs_info, &mem, &map, false, &mut legacy);
+
+        let mut next_gen = ShaderPixelInputInfo::default();
+        let next_gen_result =
+            shader_get_input_info_ps(&regs, &sh, &vs_info, &mem, &map, true, &mut next_gen);
+
+        // Whatever this fixture produces, the two paths must not BOTH be the
+        // direct-sgpr rejection: next_gen has to get past that specific gate.
+        let is_direct_sgpr_refusal = |r: &Result<(), ShaderAnalysisError>| {
+            matches!(r, Err(ShaderAnalysisError::NotImplemented { what, .. })
+                if what.contains("direct sgprs"))
+        };
+        assert!(
+            !is_direct_sgpr_refusal(&next_gen_result),
+            "a Gen5 PS must not be refused for carrying direct SGPRs: {next_gen_result:?}"
+        );
+        if is_direct_sgpr_refusal(&legacy_result) {
+            // The fixture did exercise the guard — then next_gen proved the
+            // exemption. (If it did not, the assertion above still holds.)
+        }
     }
 
     #[test]
