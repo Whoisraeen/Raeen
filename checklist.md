@@ -88,12 +88,24 @@ top-down, update statuses in place, and keep it committed.**
   as reference for error codes/struct layouts.
 
 ### 4. UE5 diagnosed-but-open fixes
-- [~] IN PROGRESS — delegated to `hle-stubber` agent #2 (worktree), 2026-07-27.
-- [~] `hle_stack_chk_fail` must NOT return 0 (Until Dawn walks into UD2).
-  Terminate the guest with an actionable report instead.
-- [~] getdents/fstat layout audit vs shadPS4 — Until Dawn's
-  `/app0/deepfiles` empty dir returned 0x200 twice (overflow smell) before the
-  canary trip.
+- [x] `hle_stack_chk_fail` no longer returns (commit `d818df9`, merged
+  `9091b17`): actionable error report (thread, guest RA, HLE ring, stack code
+  chain), EOWNERDEAD mutex release, unwinds via `request_exit(0xa002_0006)` on
+  both dispatch paths; runtime acceptance test proves the old stub executed a
+  poison tail and the fix doesn't.
+- [x] getdents/fstat layout audit vs shadPS4 (same commit). ROOT CAUSE FOUND:
+  we returned one 512-byte record per call with `d_reclen = 512` (real Orbis
+  dirent = 264) — guests copying by d_reclen smashed their own canary. Now
+  FreeBSD/shadPS4 packed-record semantics (align4(8+namlen+1), block-packed,
+  0 at EOF, dot entries, byte-offset cursor); fstat on dir fds now S_IFDIR
+  with shadPS4 values. Empty dir: 0x200 once, then 0. Verified-not-assumed
+  list in the ledger. Post-merge: raeen-hle 445, kernel 43+2, runtime
+  77+47+1 green.
+- [ ] NEW (residual risk from the audit): `hle_abort` and `hle_exit` still
+  log-and-return-0 — same noreturn hazard when a title's fatal path uses
+  `abort()`. Route both through the same `request_exit` unwind.
+- [ ] Re-test Until Dawn live: expect it past /app0/deepfiles now; capture the
+  next stop point if any.
 - [ ] Dragon Ball: worker threads deref a count (rax=2 → 0x20) as a list
   pointer at module+0x241c820 after WaitEqueue timeouts — needs fault-region
   disassembly follow-through (started, see ledger 2026-07-25/26 ITEM 2).
