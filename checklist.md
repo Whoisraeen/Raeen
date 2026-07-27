@@ -83,7 +83,19 @@ top-down, update statuses in place, and keep it committed.**
   (run.rs, gen5), `reference/kyty` + `reference/kytyps5` (study/port, MIT).
 
 ### 3. Tier-B offline stubs for online/social/service libs
-- [~] IN PROGRESS — delegated to `hle-stubber` agent (worktree), 2026-07-27.
+- [x] DONE 2026-07-27 (commit `f88a39b`, merged; raeen-hle 481 green
+  post-merge with ACB + UE5 batches). ~134 functions: NpWebApi2 (+17,
+  context-not-found/not-signed-in), Voice (15, real port handles, silence),
+  NpManager/NpAuth (+13, async completes immediately SIGNED_OUT), AvPlayer
+  (+10, real handle, immediate EOS so video waits never hang; decode =
+  explicit future work), dialogs (24: Ime USER_CANCELED, WebBrowser,
+  NpCommerce — no purchase ever granted), online misc (34: remoteplay/
+  shareplay/streaming/content/VideoRecordingP incl. 1 anonymous NID), tail
+  sweep (19 incl. real `sceHttpUriEscape` + `sceRtcGetTime_t`). Partial
+  behavior uses `register_incomplete` so coverage tooling can't mistake
+  resolved for working. Http2 needed nothing (already covered — measured).
+- **Measured after items 2A+3:** remaining unresolved surface is essentially
+  Tier C: 46 `libSceAmpr` + `_Ctype` (the 83 AGC are now registered).
 - **What:** Honest *offline* semantics (policy already in ledger 2026-07-25:
   no blanket zero-stubs that poison the blocker signal). Targets by measured
   demand: `libSceNpWebApi2` (17), `libSceVoice` (15), `libSceNpManager` (10),
@@ -264,4 +276,12 @@ top-down, update statuses in place, and keep it committed.**
 - **2026-07-27 (Fable 5):** Checklist created. Delegated in parallel
   (worktree-isolated agents): item 1 → milestone-driver, item 2A →
   gpu-pipeline, item 3 → hle-stubber, item 4 → hle-stubber, items 15+18 →
-  shell-ui. Integration + status updates to follow as agents land.
+  shell-ui. **All five landed and merged same day**: M5 CLOSED (`f56132f`),
+  ACB phase A (`d19261b`, GTA V render-path unresolved 83→0), Tier-B batch
+  (`f88a39b`, ~134 fns), UE5 root-cause fixes (`d818df9`, d_reclen=512 canary
+  smash found), perf HUD + screenshots (`c6f4ed6`). Item 20 (updater) found
+  already done by a parallel Codex session. Full workspace suite green after
+  all merges (55 suites, 0 failures; one transient shared-target/ build race
+  with the parallel session, passed on retry). NEXT highest-value: item 2B
+  (compute-queue execution) + live re-measure of GTA V and Until Dawn, item
+  4's abort/exit noreturn fix, live-verify pass for HUD/screenshots.
