@@ -4644,3 +4644,22 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   explicitly NOT an M5 claim.
 * Earlier in-world hang did NOT reproduce post-fix; task reframed from
   "fix deadlock" to "re-verify over a longer session before investing".
+
+## 2026-07-27 (M5 evaluation, worktree) — M5 MET on the recorded evidence
+* M5: **MET**. Acceptance artifact: `docs/m5-acceptance-minecraft.md`. No new
+  runtime evidence was produced — the record evaluates the committed
+  2026-07-27 iron run (M4 record + ledger + d21e727) against the M5 clauses:
+  named 3D title (Minecraft Bedrock PS5), recognizable frames (in-world
+  textured 3D terrain + HUD, 56 FPS), shader MVP for that title (Gen5
+  analysis -> SPIR-V -> Vulkan; decisive fix d21e727 "ps: direct sgprs").
+* Same-title reasoning recorded in the doc: the gate names no title and gates
+  capability, not a per-title quota; GTA V (docs/gta5-blocker-analysis) cited
+  as a supporting-but-not-gate-bearing second 3D data point.
+* In-tree, retail-free evidence re-run in this worktree:
+  `cargo test -p kyty-graphics` 477/477 green, including
+  input_info_ps_direct_sgprs_allowed_on_next_gen_rejected_on_legacy and the
+  full_chain_{vs,ps}_gcn_bytes_to_validated_spirv SPIR-V chain tests.
+* Known issues documented per gate: recognizable-not-correct (skipped PM4
+  context regs, MRT1-7/fast-clear unimplemented), MVP scoped to Minecraft's
+  shaders, no soak/perf/playability claim, synthetic pad input, evidence not
+  re-run live for this record.
