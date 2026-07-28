@@ -1261,6 +1261,90 @@ mod tests {
         }
     }
 
+    /// The 2 B/element mode-27 row checked against an INDEPENDENT
+    /// re-derivation of the equation — not this file's own tables.
+    ///
+    /// The round-trip tests above tile with the inverse of the same table, so
+    /// they are self-consistent even if a table row were transcribed wrong; and
+    /// the known-answer pins cover the 4 B/element row only. This mask table is
+    /// ported verbatim from SharpEmu's `GnmTilingDetileTests.cs`
+    /// (`RbPlus64KRenderX2Bpp`, #483 / commit 1f3963c, GPL-2.0-or-later), which
+    /// re-derived it straight from AMD AddrLib's
+    /// `GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO` — an independent source for the
+    /// same equation. A tiled buffer laid out by this table must detile into
+    /// ascending element indices byte-for-byte.
+    #[test]
+    fn sw_64kb_r_x_2bpp_matches_an_independent_re_derivation() {
+        // (x_mask, y_mask) per output bit, 64 KiB RB+ R_X at 2 B/element.
+        const REFERENCE: [(u32, u32); 16] = [
+            (0, 0),
+            (1 << 0, 0),
+            (1 << 1, 0),
+            (1 << 2, 0),
+            (0, 1 << 0),
+            (0, 1 << 1),
+            (0, 1 << 2),
+            (1 << 3, 0),
+            (1 << 7, (1 << 4) | (1 << 7)),
+            (1 << 4, 1 << 4),
+            (1 << 6, 1 << 5),
+            (1 << 5, 1 << 6),
+            (0, 1 << 3),
+            (1 << 6, 0),
+            (1 << 7, 1 << 7),
+            (1 << 8, 1 << 6),
+        ];
+        fn reference_offset(x: u32, y: u32) -> u64 {
+            let mut offset = 0u64;
+            for (bit, (x_mask, y_mask)) in REFERENCE.iter().enumerate() {
+                let parity = ((x & x_mask).count_ones() + (y & y_mask).count_ones()) & 1;
+                offset |= u64::from(parity) << bit;
+            }
+            offset
+        }
+
+        const BLOCK_BYTES: u64 = 65536;
+        let bpp_log2 = 1u32; // 2 bytes/element
+        // 32768 elements/block: 15 bits split 8/7, x favored → 256x128. The
+        // independent derivation assumes this split; a disagreement here would
+        // invalidate the layout below, so pin it first.
+        const BLOCK_W: u32 = 256;
+        const BLOCK_H: u32 = 128;
+        assert_eq!(
+            block_dimensions(BLOCK_BYTES as u32, bpp_log2),
+            (BLOCK_W, BLOCK_H)
+        );
+
+        // 384x200 exercises partial blocks; 768x512 exercises a 3x4 block grid
+        // (and the u16 element index deliberately wraps — same on both sides).
+        for (w, h) in [(384u32, 200u32), (768, 512)] {
+            let blocks_per_row = u64::from(w.div_ceil(BLOCK_W));
+            let tiled_len = tiled_byte_count_for_mode(27, w, h, bpp_log2)
+                .expect("mode 27 at 2 B/el is supported");
+            let mut tiled = vec![0u8; tiled_len as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let block_index =
+                        u64::from(y / BLOCK_H) * blocks_per_row + u64::from(x / BLOCK_W);
+                    let src = (block_index * BLOCK_BYTES + reference_offset(x, y)) as usize;
+                    let index = (y * w + x) as u16;
+                    tiled[src] = index as u8;
+                    tiled[src + 1] = (index >> 8) as u8;
+                }
+            }
+
+            let linear = detile_64kb(27, &tiled, w, h, bpp_log2).expect("mode 27 detiles");
+            assert_eq!(linear.len(), (w * h * 2) as usize);
+            for i in 0..(w * h) as usize {
+                let value = u16::from_le_bytes([linear[i * 2], linear[i * 2 + 1]]);
+                assert_eq!(
+                    value, i as u16,
+                    "element {i} of {w}x{h} must come back in ascending order"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sw_64kb_r_x_tile_then_detile_is_identity() {
         // 4 B/el, wider than one block so the block grid + XOR bits engage.
