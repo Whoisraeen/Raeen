@@ -86,8 +86,12 @@ top-down, update statuses in place, and keep it committed.**
     dropped/counters unmodeled/map window unmapped — KytyPS5 does the same,
     but ours are tagged so coverage keeps naming them). MEASURED via local
     `xtask nids coverage` re-run: libSceAmpr unresolved **46 → 0**.
-  - [ ] **D. Re-measure GTA V** stop point; update
-    `docs/gta5-blocker-analysis-2026-07-27.md`.
+  - [x] **D. RE-MEASURED 2026-07-28** (live `cargo xtask baseline run`,
+    build 9c7cc30): **zero unresolved NIDs**; early UD2 assert GONE; stage
+    `timed_out` (survives the full 180 s window) with **4 flip events**.
+    New first blocker: a real guest `__stack_chk_fail` on thread 31, properly
+    caught by the noreturn handler. Blocker doc updated with the re-measure
+    section. Next: hunt the canary smash (same family as Until Dawn's).
 - **Why:** One structural capability (async compute) unblocks the whole AAA
   class, not just GTA V.
 - **Where:** `crates/raeen-hle/src/libsce_agc.rs`, `crates/kyty-graphics/`
@@ -141,8 +145,12 @@ top-down, update statuses in place, and keep it committed.**
   + `request_exit(status)` carrying the guest's own status (defense-in-depth
   behind the VEH terminating-function intercept). Runtime poison-tail
   acceptance tests for both (execute.rs, 49 green) + 2 hle unit tests.
-- [ ] Re-test Until Dawn live: expect it past /app0/deepfiles now; capture the
-  next stop point if any.
+- [x] Re-tested Until Dawn live (2026-07-28 baseline run): still exits at
+  ~6.7 s — the canary smash PERSISTS post-dirent-fix (so getdents was a bug
+  but not this title's trigger, or another overflow path remains). Now
+  properly reported with an actionable signature (`ad605ab2…`) instead of a
+  silent UD2 walk. Follow-up folded into the canary hunt (item 22 / GTA V
+  shares the same failure family).
 - [ ] Dragon Ball: worker threads deref a count (rax=2 → 0x20) as a list
   pointer at module+0x241c820 after WaitEqueue timeouts — needs fault-region
   disassembly follow-through (started, see ledger 2026-07-25/26 ITEM 2).
@@ -198,16 +206,18 @@ top-down, update statuses in place, and keep it committed.**
   but a human-supervised run closes it.
 
 ### 10. Promote the baseline runner to `cargo xtask baseline`
-- [~] CODE DONE 2026-07-27 (worktree agent; xtask 25/25 green, 18 new tests;
+- [x] CODE DONE 2026-07-27 (worktree agent; xtask 25/25 green, 18 new tests;
   clippy/fmt green on the crate). `cargo xtask baseline run` (prebuilt-binary
   only, staleness check, per-game retry, parts + merged.json, latest.json
   only on full success) + `baseline diff <old> [new] [--strict]` (stage/
   exit/flip/fps + unresolved-NID deltas with newly-missing/-resolved lists;
   Evidence gains optional `unresolved_nids`, old reports round-trip).
-  Merged to main (commit `c065b11`); 25/25 green post-merge. SUPERSEDED
-  header added to scratch/run-baseline-parts.py (main session, 2026-07-27).
-  REMAINING to close: one LIVE `baseline run` against real installed games
-  to validate the port (then delete scratch/run-baseline-parts.py).
+  Merged to main (commit `c065b11`); 25/25 green post-merge. LIVE RUN
+  VALIDATED 2026-07-28: full 9-title sweep completed (exit 0, latest.json
+  replaced, per-title NID harvesting worked — all titles now report 0
+  unresolved); `baseline diff` produced the regression report that caught
+  the ASTRO.BOT crash (item 22). python script deleted per plan. Item fully
+  closed; change status to [x].
 - **Why:** regression tripwire while AGC/stub work churns; feeds item 11.
 
 ### 11. Compatibility badges in the Shell library
@@ -305,6 +315,22 @@ top-down, update statuses in place, and keep it committed.**
   GitHub release; `api.github.com/repos/Whoisraeen/Raeen/releases` returns
   404 (private repo or no releases). Unit coverage (parse/swap-script) is
   green; verify e2e when the first public release is published.
+
+### 22. NEW (2026-07-28): baseline-diff catches — canary hunt + ASTRO.BOT crash
+- [ ] **Canary smash hunt (GTA V thread 31 + Until Dawn ~6.7 s):** both titles
+  now die on a real guest `__stack_chk_fail` with actionable reports. The
+  getdents d_reclen overflow is fixed, so another guest-visible struct/size
+  mismatch remains (hunt the same way: audit the syscalls in the pre-canary
+  log window against shadPS4 layouts). This is now GTA V's top blocker.
+- [ ] **ASTRO.BOT regression (TimedOut → Crashed 0xC0000409):** ACB Phase B
+  made previously-dropped descriptor-form compute submissions execute; ASTRO
+  now reaches 20 shader errors (`storage_texture_dim_format: mixed storage
+  image dims/formats in one shader (Three vs Two, Rgba16f)`) and then a HOST
+  fail-fast (STATUS_STACK_BUFFER_OVERRUN) after 83 s — that's OUR bug, not
+  the guest's: (a) support or gracefully refuse mixed-dim storage images in
+  one shader; (b) find the host-side buffer overrun in the new dispatch path.
+- **Note:** Minecraft FPS in this run (65.6 vs 72.2) was measured while five
+  agent worktree builds were running — contaminated, not a regression signal.
 
 ### 21. Video clip capture (stretch, after 18)
 - [ ] Rolling ring of recent frames → mp4 on hotkey. Only after screenshot +

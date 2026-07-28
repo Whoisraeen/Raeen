@@ -95,3 +95,25 @@ amount of planning substitutes for re-running after each step.
 **Do not treat this document as a promise of playability.** It is a map of
 the first wall, produced so the next attempt starts from evidence instead of
 from a launch.
+
+---
+
+## Re-measure 2026-07-28 (post ACB/Ampr/Tier-B wave, build 9c7cc30)
+
+The 83-NID AGC gap, 46-NID Ampr gap, and ~188 online/dialog NIDs are all
+resolved — **zero unresolved NIDs** in this run. The early UD2 assert is gone.
+
+- **Stage: `timed_out`** — the title now survives the full 180 s window
+  (was: early self-assert). **4 flip events** presented; ~25 s CPU over 183 s
+  wall; 1.06 GB peak working set.
+- **New first blocker:** `__stack_chk_fail` on thread 31 — a real guest stack
+  canary smash, now caught and reported by the noreturn handler (d818df9)
+  instead of walking into UD2. Only that thread terminates; the process keeps
+  running. Blocker signature `e86038e1…` (see `artifacts/compat/latest.json`).
+- **Next work:** find what smashes the canary (same family as the Until Dawn
+  canary, which also persists post-dirent-fix — possibly a shared libc/kernel
+  struct-size mismatch on another syscall surface, hunted the same way the
+  getdents one was).
+
+Scope statement, not a playability promise — but the wall moved: from "needs
+131 GPU entry points" to "one canary-smash bug plus shader breadth."
