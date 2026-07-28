@@ -283,6 +283,47 @@ impl std::fmt::Display for FaultKind {
     }
 }
 
+/// Which x86 divide-error (`#DE`) condition Windows reported for a faulting
+/// `div`/`idiv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivideFault {
+    /// `EXCEPTION_INT_DIVIDE_BY_ZERO` (`0xC000_0094`) — the divisor was zero.
+    ByZero,
+    /// `EXCEPTION_INT_OVERFLOW` (`0xC000_0095`) — an `idiv` whose quotient does
+    /// not fit the destination register (`INT_MIN / -1`). A different cause but
+    /// the *same instruction and the same trap*, so it is classified here rather
+    /// than left to fall through unreported.
+    Overflow,
+}
+
+impl std::fmt::Display for DivideFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DivideFault::ByZero => f.write_str("divide by zero"),
+            DivideFault::Overflow => f.write_str("quotient overflow"),
+        }
+    }
+}
+
+/// Whose code was executing when a fault was delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultOrigin {
+    /// The faulting instruction is in the guest arena — the title's own code.
+    Guest,
+    /// The faulting instruction is below the arena — emulator (or dependency)
+    /// code. Our bug.
+    Host,
+}
+
+impl std::fmt::Display for FaultOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FaultOrigin::Guest => f.write_str("guest"),
+            FaultOrigin::Host => f.write_str("HOST"),
+        }
+    }
+}
+
 impl RuntimeError {
     /// Decode `EXCEPTION_RECORD.ExceptionInformation[0]` into a [`FaultKind`].
     pub(crate) fn fault_kind(v: u64) -> FaultKind {
@@ -385,6 +426,45 @@ pub enum RuntimeError {
         access: u64,
         /// How it was touching it (never `Execute` — see the type docs).
         kind: FaultKind,
+        /// `library::function` of the HLE call in flight, if any.
+        hle: Option<String>,
+    },
+    /// An x86 divide-error trap (`#DE`): a `div`/`idiv` executed with a zero
+    /// divisor, or an `idiv` whose quotient overflowed.
+    ///
+    /// # Why this is its own outcome
+    ///
+    /// The VEH used to service only `ACCESS_VIOLATION`, `ILLEGAL_INSTRUCTION`
+    /// and `BREAKPOINT`; every other exception took `EXCEPTION_CONTINUE_SEARCH`.
+    /// With no other handler installed, a `#DE` therefore killed the whole
+    /// process with `STATUS_INTEGER_DIVIDE_BY_ZERO` (`0xC000_0094`) and **no log
+    /// line at all** — measured on A Plague Tale Requiem, which died at 40.8 s
+    /// with zero errors logged and nothing to name the site. Unhandled meant
+    /// invisible by construction.
+    ///
+    /// Classified rather than merely logged, because the two origins want
+    /// opposite responses. A [`FaultOrigin::Guest`] `#DE` is very often *our*
+    /// fault at one remove: an HLE stub handed the title a zero (a grain, sample
+    /// rate, stride, element size, tick frequency) and the title divided by it —
+    /// so the recent-HLE-call trace printed alongside is the actionable part. A
+    /// [`FaultOrigin::Host`] `#DE` cannot come from safe Rust integer division
+    /// (rustc emits an explicit zero check and panics instead), so it points at
+    /// a C/C++ dependency or inline assembly.
+    ///
+    /// `hle` names the HLE call in flight, filled in after recovery for the same
+    /// reason as [`Self::HostFaulted`]'s: the VEH must not allocate.
+    #[error(
+        "{origin} integer-divide fault at rip {rip:#x} ({cause}){}",
+        match hle { Some(name) => format!(" during {name}"), None => String::new() }
+    )]
+    IntegerDivideFault {
+        /// The faulting `div`/`idiv` instruction's address.
+        rip: u64,
+        /// Zero divisor, or quotient overflow.
+        cause: DivideFault,
+        /// Guest code or emulator code — decided by whether `rip` is in the
+        /// guest arena.
+        origin: FaultOrigin,
         /// `library::function` of the HLE call in flight, if any.
         hle: Option<String>,
     },

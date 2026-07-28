@@ -480,6 +480,189 @@ fn pthread_once_runs_its_guest_initializer_before_returning() {
     assert_eq!(RESULT_OFF, 0x88);
 }
 
+/// `sceKernelRaiseException` acceptance test: a guest that installs an
+/// exception handler and raises `SIGUSR1` at itself must have that **guest
+/// handler actually execute**, with the FreeBSD signal ABI, before the raising
+/// code observes its effect.
+///
+/// # What this replaces
+///
+/// `Raise` used to log `"guest handler is registered but asynchronous delivery
+/// is not implemented; acknowledging"` and return `SCE_OK`. That is the measured
+/// first blocker for Subnautica Below Zero, which timed out at 180 s having
+/// burned 1.4 s of CPU and produced zero flips: `SIGUSR1` (30) is what a managed
+/// runtime's stop-the-world collector raises to suspend a thread, so
+/// acknowledging without delivering leaves the collector waiting forever for a
+/// suspension that never happens.
+///
+/// # The fixture
+///
+/// Entry: `mov edi,30; lea rsi,[handler]; call [InstallExceptionHandler]` then
+/// `mov edi,1 (self); mov esi,30; call [RaiseException]`, and finally returns
+/// the marker word the handler is supposed to have written.
+///
+/// Handler (real guest code, entered through the runtime's synchronous
+/// guest-callback path): starts from its `signum` argument, then *validates the
+/// machine context it was handed* — `or eax,0x100` only if `uctx->uc_mcontext
+/// .mc_len == sizeof(mcontext_t)`, and `or eax,0x200` only if `mc_rip` is
+/// non-zero — before storing the result.
+///
+/// So the single returned value proves four things at once: the handler ran, it
+/// received the right signal number, `arg1` is a real `ucontext_t` and not a
+/// stray pointer, and it describes the interrupted guest instruction.
+#[test]
+fn raise_exception_runs_the_installed_guest_handler_with_a_real_ucontext() {
+    const HANDLER_OFF: usize = 0x80;
+    const MARKER_OFF: usize = 0x100;
+    const SLOT_INSTALL: usize = 0x110;
+    const SLOT_RAISE: usize = 0x118;
+    /// `offsetof(ucontext_t, uc_mcontext.mc_len)` — 0x40 + 0xC8.
+    const MC_LEN_AT: u32 = 0x108;
+    /// `offsetof(ucontext_t, uc_mcontext.mc_rip)` — 0x40 + 0xA0.
+    const MC_RIP_AT: u32 = 0xE0;
+    /// `sizeof(mcontext_t)` the handler checks `mc_len` against.
+    const MCONTEXT_LEN: u32 = 0x480;
+    const SIGUSR1: u32 = 30;
+    /// Set by the handler when `mc_len` was correct.
+    const SAW_MCONTEXT_LEN: u64 = 0x100;
+    /// Set by the handler when `mc_rip` named a real instruction.
+    const SAW_MCONTEXT_RIP: u64 = 0x200;
+
+    let mut image = vec![0u8; 0x200];
+
+    // ---- entry ---------------------------------------------------------
+    // mov edi, 30                            (signum)
+    image[0x00..0x05].copy_from_slice(&[0xBF, 0x1E, 0x00, 0x00, 0x00]);
+    // lea rsi, [rip + handler]
+    image[0x05..0x08].copy_from_slice(&[0x48, 0x8D, 0x35]);
+    image[0x08..0x0C].copy_from_slice(&((HANDLER_OFF as i32) - 0x0C).to_le_bytes());
+    // call qword ptr [rip + install_slot]
+    image[0x0C..0x0E].copy_from_slice(&[0xFF, 0x15]);
+    image[0x0E..0x12].copy_from_slice(&((SLOT_INSTALL as i32) - 0x12).to_le_bytes());
+    // mov edi, 1                             (target thread = the main thread)
+    image[0x12..0x17].copy_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+    // mov esi, 30                            (signum)
+    image[0x17..0x1C].copy_from_slice(&[0xBE, 0x1E, 0x00, 0x00, 0x00]);
+    // call qword ptr [rip + raise_slot]
+    image[0x1C..0x1E].copy_from_slice(&[0xFF, 0x15]);
+    image[0x1E..0x22].copy_from_slice(&((SLOT_RAISE as i32) - 0x22).to_le_bytes());
+    // mov eax, dword ptr [rip + marker] ; ret
+    image[0x22..0x24].copy_from_slice(&[0x8B, 0x05]);
+    image[0x24..0x28].copy_from_slice(&((MARKER_OFF as i32) - 0x28).to_le_bytes());
+    image[0x28] = 0xC3;
+
+    // ---- handler: void handler(int signum, ucontext_t *uctx) -----------
+    let mut off = HANDLER_OFF;
+    // mov eax, edi                           (start from the delivered signum)
+    image[off..off + 2].copy_from_slice(&[0x89, 0xF8]);
+    off += 2;
+    // mov rdx, qword ptr [rsi + mc_len]
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x96]);
+    image[off + 3..off + 7].copy_from_slice(&MC_LEN_AT.to_le_bytes());
+    off += 7;
+    // cmp rdx, sizeof(mcontext_t)
+    image[off..off + 3].copy_from_slice(&[0x48, 0x81, 0xFA]);
+    image[off + 3..off + 7].copy_from_slice(&MCONTEXT_LEN.to_le_bytes());
+    off += 7;
+    // jne +5   (skip the `or`)
+    image[off..off + 2].copy_from_slice(&[0x75, 0x05]);
+    off += 2;
+    // or eax, SAW_MCONTEXT_LEN
+    image[off] = 0x0D;
+    image[off + 1..off + 5].copy_from_slice(&(SAW_MCONTEXT_LEN as u32).to_le_bytes());
+    off += 5;
+    // mov rcx, qword ptr [rsi + mc_rip]
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x8E]);
+    image[off + 3..off + 7].copy_from_slice(&MC_RIP_AT.to_le_bytes());
+    off += 7;
+    // test rcx, rcx ; je +5
+    image[off..off + 5].copy_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x05]);
+    off += 5;
+    // or eax, SAW_MCONTEXT_RIP
+    image[off] = 0x0D;
+    image[off + 1..off + 5].copy_from_slice(&(SAW_MCONTEXT_RIP as u32).to_le_bytes());
+    off += 5;
+    // mov dword ptr [rip + marker], eax ; ret
+    image[off..off + 2].copy_from_slice(&[0x89, 0x05]);
+    let after = off as i32 + 6;
+    image[off + 2..off + 6].copy_from_slice(&((MARKER_OFF as i32) - after).to_le_bytes());
+    off += 6;
+    image[off] = 0xC3;
+    assert!(
+        off < MARKER_OFF,
+        "the handler must not overlap the marker word"
+    );
+
+    image[SLOT_INSTALL..SLOT_INSTALL + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    image[SLOT_RAISE..SLOT_RAISE + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + 8).to_le_bytes());
+
+    let hle = HleRegistry::new();
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libkernel".to_string(),
+                function: "sceKernelInstallExceptionHandler".to_string(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libkernel".to_string(),
+                function: "sceKernelRaiseException".to_string(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+        ],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    let kernel = OrbisKernel::new();
+    let before = raeen_hle::exception::delivered_count();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("the raise and its handler must both complete");
+
+    assert_ne!(
+        result, 0,
+        "the guest handler never ran: `sceKernelRaiseException` acknowledged without delivering"
+    );
+    assert_eq!(
+        result & 0xFF,
+        u64::from(SIGUSR1),
+        "the handler must receive the raised Orbis signal number as arg0"
+    );
+    assert_eq!(
+        result & SAW_MCONTEXT_LEN,
+        SAW_MCONTEXT_LEN,
+        "arg1 must point at a real ucontext_t: mc_len must be sizeof(mcontext_t)"
+    );
+    assert_eq!(
+        result & SAW_MCONTEXT_RIP,
+        SAW_MCONTEXT_RIP,
+        "the machine context must name the interrupted guest instruction (mc_rip != 0)"
+    );
+
+    assert_eq!(
+        raeen_hle::exception::delivered_count(),
+        before + 1,
+        "exactly one delivery must be counted"
+    );
+    assert!(
+        kernel.pending_exceptions.is_empty(),
+        "a delivered exception must not stay queued"
+    );
+    assert!(
+        kernel.exception_delivery_active.is_empty(),
+        "the delivering mark must be released"
+    );
+}
+
 fn emit_indirect_call(image: &mut [u8], off: &mut usize, slot: usize) {
     let after = *off as i64 + 6;
     let disp = (slot as i64 - after) as i32;
@@ -1199,6 +1382,157 @@ fn more_than_six_args_is_rejected() {
     let args = [1u64, 2, 3, 4, 5, 6, 7];
     let err = execute_linked(&linked, &hle, &kernel, 0, &args).unwrap_err();
     assert_eq!(err, RuntimeError::TooManyArgs);
+}
+
+/// A guest `div` by zero is an x86 divide-error trap (`#DE`), which Windows
+/// delivers as `EXCEPTION_INT_DIVIDE_BY_ZERO` (`0xC000_0094`) — **not** an
+/// access violation. The VEH used to service only access violations, illegal
+/// instructions and breakpoints and pass everything else on with
+/// `EXCEPTION_CONTINUE_SEARCH`, so with no other handler installed this killed
+/// the entire process with exit code `0xC000_0094` and *no log line at all*.
+///
+/// That is the measured A Plague Tale Requiem signature: `crashed` at 40.8 s,
+/// exit `-1073741676` (= `0xC000_0094`), zero flips, zero unresolved NIDs, and
+/// no ERROR line before it. Unhandled meant invisible by construction.
+///
+/// The entry is `xor ecx,ecx; xor edx,edx; mov eax,1; div ecx; ret`, so the
+/// divisor is provably zero and the faulting instruction's address is known
+/// exactly. The run must come back as `Err(IntegerDivideFault { .. })` naming
+/// the `div`, and the test process must survive to run more guest code.
+#[test]
+fn guest_divide_by_zero_is_classified_instead_of_killing_the_process() {
+    const ENTRY_OFF: usize = 0x0;
+    // xor ecx,ecx (2) | xor edx,edx (2) | mov eax,1 (5) | div ecx (2) | ret (1)
+    const DIVIDE_AT: u64 = 2 + 2 + 5;
+    #[rustfmt::skip]
+    const CODE: [u8; 12] = [
+        0x31, 0xC9,                         // xor ecx, ecx   -> divisor = 0
+        0x31, 0xD2,                         // xor edx, edx   -> clear dividend high
+        0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1
+        0xF7, 0xF1,                         // div ecx        -> #DE
+        0xC3,                               // ret            (never reached)
+    ];
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    image[ENTRY_OFF..ENTRY_OFF + CODE.len()].copy_from_slice(&CODE);
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &hle, &kernel, ENTRY_OFF as u64, &[]).unwrap_err();
+    match err {
+        RuntimeError::IntegerDivideFault {
+            rip,
+            cause,
+            origin,
+            hle: _,
+        } => {
+            assert_eq!(
+                rip,
+                GUEST_ARENA_BASE + ENTRY_OFF as u64 + DIVIDE_AT,
+                "the report must name the faulting `div`, not the entry or the return"
+            );
+            assert_eq!(cause, raeen_runtime::DivideFault::ByZero);
+            assert_eq!(
+                origin,
+                raeen_runtime::FaultOrigin::Guest,
+                "a fault at a guest-arena address is the title's instruction, not ours"
+            );
+        }
+        other => panic!("expected Err(IntegerDivideFault {{ .. }}), got {other:?}"),
+    }
+
+    // The process survived and the VEH/ACTIVE_CONTEXT state was fully torn down
+    // and re-armed: prove it by running ordinary guest code on this same thread
+    // right after the recovered trap.
+    let mut ok_image = vec![0u8; 0x100];
+    // mov eax, 7 ; ret
+    ok_image[..6].copy_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3]);
+    let ok = LinkedModule {
+        image: ok_image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+    assert_eq!(
+        execute_linked(&ok, &HleRegistry::new(), &OrbisKernel::new(), 0, &[]).unwrap(),
+        7,
+        "the runtime must still be usable after recovering a divide-error trap"
+    );
+}
+
+/// The other `#DE` cause: `idiv` with `INT_MIN / -1`, whose quotient does not
+/// fit the destination. Windows reports it as `EXCEPTION_INT_OVERFLOW`
+/// (`0xC000_0095`) — a different code but the same instruction and the same
+/// silent-process-death signature, so it must classify too rather than fall
+/// through to `EXCEPTION_CONTINUE_SEARCH`.
+#[test]
+fn guest_idiv_quotient_overflow_is_classified_as_a_divide_fault() {
+    // mov eax,imm32 (5) | cdq (1) | mov ecx,imm32 (5)
+    const DIVIDE_AT: u64 = 5 + 1 + 5;
+    #[rustfmt::skip]
+    const CODE: [u8; 14] = [
+        0xB8, 0x00, 0x00, 0x00, 0x80,       // mov eax, 0x80000000  (INT_MIN)
+        0x99,                               // cdq                  (sign-extend)
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,       // mov ecx, -1
+        0xF7, 0xF9,                         // idiv ecx             -> #DE
+        0xC3,                               // ret                  (never reached)
+    ];
+    let mut image = vec![0u8; 0x100];
+    image[..CODE.len()].copy_from_slice(&CODE);
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: Vec::<HleTrampoline>::new(),
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &HleRegistry::new(), &kernel, 0, &[]).unwrap_err();
+    match err {
+        RuntimeError::IntegerDivideFault {
+            rip, cause, origin, ..
+        } => {
+            assert_eq!(
+                rip,
+                GUEST_ARENA_BASE + DIVIDE_AT,
+                "the report must name the faulting `idiv`"
+            );
+            assert_eq!(cause, raeen_runtime::DivideFault::Overflow);
+            assert_eq!(origin, raeen_runtime::FaultOrigin::Guest);
+        }
+        other => panic!("expected Err(IntegerDivideFault {{ .. }}), got {other:?}"),
+    }
 }
 
 /// RT1a acceptance test (design doc §7/§8's "genuine fault -> `Faulted`, not

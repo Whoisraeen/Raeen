@@ -4864,6 +4864,7 @@ mod tests {
             caller_return_addr: 0,
             caller_rsp: 0,
             float_args: [0; 8],
+            caller_gprs: None,
         };
 
         let ret = hle_stack_chk_fail(&ctx, &[]);
@@ -4963,6 +4964,7 @@ mod tests {
             caller_return_addr: 0,
             caller_rsp: 0,
             float_args: [0; 8],
+            caller_gprs: None,
         }
     }
 

@@ -4286,12 +4286,11 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 fn exception_signal_allowed(signum: i32) -> bool {
-    matches!(signum, 1 | 4 | 8 | 10 | 11 | 30)
+    crate::exception::signal_allowed(signum)
 }
 
-/// Install/remove preserve process-visible handler state. The native runtime
-/// does not yet inject an asynchronous guest callback, so Raise acknowledges a
-/// valid request and logs when delivery would have been required.
+/// Install/remove keep the process-visible handler table; `Raise` queues real
+/// delivery to the target thread (see the [`crate::exception`] module).
 fn hle_install_exception_handler(ctx: &HleContext, args: &[u64]) -> u64 {
     const SCE_KERNEL_ERROR_EAGAIN: u64 = 0x8002_000B;
     let signum = args.first().copied().unwrap_or(u64::MAX) as i32;
@@ -4317,18 +4316,50 @@ fn hle_remove_exception_handler(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceKernelRaiseException(thread, signum)`: raise `signum` at a named guest
+/// thread, running the process handler installed for it.
+///
+/// Queues the exception against the target thread rather than calling the
+/// handler here. A guest signal handler must execute on the *target* thread's
+/// own stack and TLS — the raising thread cannot run it — so delivery happens at
+/// that thread's next HLE safe point. For a self-raise the safe point is this
+/// very call, so the handler runs as soon as this returns. See
+/// [`crate::exception`] for the full model and the honest list of what delivery
+/// does not yet reproduce.
+///
+/// `thread` is a `ScePthread`, which in this runtime *is* the guest thread id
+/// (`GuestThreads::create` reports the same value it writes back), so it needs
+/// no translation.
 fn hle_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
     let target_thread = args.first().copied().unwrap_or(0);
     let signum = args.get(1).copied().unwrap_or(u64::MAX) as i32;
     if target_thread == 0 || !(0..128).contains(&signum) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    if let Some(handler) = ctx.kernel.exception_handlers.get(&signum) {
-        warn!(
+    // No handler for this signal is not an error: the kernel accepts the raise
+    // and there is simply no user callback to run.
+    let Some(handler) = ctx.kernel.exception_handlers.get(&signum).map(|h| *h) else {
+        debug!(
             target_thread = format_args!("{target_thread:#x}"),
+            signum, "sceKernelRaiseException: no handler installed for this signal"
+        );
+        return SCE_OK;
+    };
+    let raised_by = ctx.guest_threads.current_thread();
+    let replaced = ctx.kernel.queue_pending_exception(
+        target_thread,
+        raeen_kernel::PendingException {
             signum,
-            handler = format_args!("{:#x}", *handler),
-            "sceKernelRaiseException: guest handler is registered but asynchronous delivery is not implemented; acknowledging"
+            handler,
+            raised_by,
+        },
+    );
+    if replaced {
+        // Not fatal, but worth naming: the target has not reached a safe point
+        // since the previous raise, so that one is superseded and never runs.
+        debug!(
+            target_thread = format_args!("{target_thread:#x}"),
+            signum, "sceKernelRaiseException superseded an undelivered raise"
         );
     }
     SCE_OK

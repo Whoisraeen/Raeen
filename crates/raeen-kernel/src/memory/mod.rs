@@ -329,8 +329,19 @@ impl VirtualMemoryManager {
     }
 }
 
-/// Align a value up to the given alignment.
+/// Align `value` up to `alignment`, which **must** be a non-zero power of two.
+///
+/// The mask form silently produces garbage for a non-power-of-two, and
+/// `alignment == 0` underflows `alignment - 1` to `u64::MAX` (wrapping in
+/// release, panicking in debug). Every caller today passes the
+/// [`raeen_core::PS5_PAGE_SIZE`] constant, so this cannot fire — the assertion
+/// exists so the day a *guest-supplied* alignment is threaded through here it
+/// fails loudly in tests instead of corrupting a mapping in a retail run.
 fn align_up(value: u64, alignment: u64) -> u64 {
+    debug_assert!(
+        alignment.is_power_of_two(),
+        "align_up alignment must be a non-zero power of two, got {alignment}"
+    );
     (value + alignment - 1) & !(alignment - 1)
 }
 

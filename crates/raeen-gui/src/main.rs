@@ -101,6 +101,23 @@ fn write_runner_crash_report(
             ),
             None,
         ),
+        // A `div`/`idiv` trap. `rip` is an instruction address exactly like
+        // `Faulted::addr`, so it resolves to a module + offset the same way —
+        // which is the whole actionable content of a guest divide-by-zero.
+        raeen_runtime::RuntimeError::IntegerDivideFault {
+            rip, cause, origin, ..
+        } => (
+            format!("{origin} integer-divide fault at {rip:#x} ({cause})"),
+            match crash_report::locate_fault(
+                &linked.image,
+                &dep_offset_pairs(deps),
+                raeen_runtime::GUEST_ARENA_BASE,
+                *rip,
+            ) {
+                crash_report::FaultLocation::Site(site) => Some(site),
+                _ => None,
+            },
+        ),
         other => (format!("Runtime error: {other:?}"), None),
     };
 

@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, Register};
 use windows_sys::Win32::Foundation::{
     CloseHandle, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
+    EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_INT_OVERFLOW,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, CONTEXT, CONTEXT_ALL_AMD64, EXCEPTION_CONTINUE_EXECUTION,
@@ -1188,6 +1189,12 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
             caller_return_addr,
             caller_rsp: guest_bridge_rsp + 8,
             float_args: [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7],
+            // No CONTEXT exists on this path: the direct bridge arrives by a
+            // plain `call`, not a trap, and only the argument registers were
+            // preserved. `trampoline::direct_dispatchable` lists exactly the
+            // imports that never re-enter guest code, so nothing dispatched
+            // here can need a machine context (see `HleContext::caller_gprs`).
+            caller_gprs: None,
         };
         ctx.active_hle
             .set(Some((index, args[..6].try_into().unwrap())));
@@ -1608,6 +1615,46 @@ pub(crate) unsafe fn run(
                      flight — this is a Raeen bug, not a guest fault. The guest run was \
                      abandoned at its recovery point; host frames below the fault were \
                      discarded without unwinding."
+                );
+                log_call_trace(&ctx, trampolines, &err);
+                return Err(err);
+            }
+            // A divide-error trap. The VEH could only record addresses; name the
+            // HLE call in flight here (allocation and logging are safe now) and
+            // say plainly what died, because until this arm existed the whole
+            // process vanished with exit code `0xC000_0094` and an empty log.
+            if let RuntimeError::IntegerDivideFault {
+                rip,
+                cause,
+                origin,
+                hle,
+            } = &mut err
+            {
+                *hle = ctx
+                    .active_hle
+                    .get()
+                    .and_then(|(idx, _)| trampolines.get(idx as usize))
+                    .map(|t| format!("{}::{}", t.library, t.function));
+                let guidance = match origin {
+                    crate::FaultOrigin::Guest => {
+                        "guest code divided by a value that was zero. Very often that zero came \
+                         FROM US: an HLE stub returning 0 (or leaving an out-parameter \
+                         untouched) for a grain size, sample rate, stride, element size, or \
+                         frequency the title then divides by. The recent-HLE-call trace below \
+                         is the place to look."
+                    }
+                    crate::FaultOrigin::Host => {
+                        "emulator code took a divide-error trap. This cannot come from safe \
+                         Rust integer division (rustc emits an explicit zero check and panics \
+                         instead), so it is a C/C++ dependency or inline assembly."
+                    }
+                };
+                tracing::error!(
+                    rip = format_args!("{rip:#x}"),
+                    cause = format_args!("{cause}"),
+                    origin = format_args!("{origin}"),
+                    hle = hle.as_deref().unwrap_or("<none>"),
+                    "INTEGER DIVIDE FAULT: {guidance}"
                 );
                 log_call_trace(&ctx, trampolines, &err);
                 return Err(err);
@@ -2275,7 +2322,16 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let is_access_violation = record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
     let is_illegal_instruction = record.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION;
     let is_breakpoint = record.ExceptionCode == EXCEPTION_BREAKPOINT;
-    if !is_access_violation && !is_illegal_instruction && !is_breakpoint {
+    // An x86 divide-error trap (`#DE`). Not handling this used to mean a `div`
+    // by zero anywhere — guest or host — took `EXCEPTION_CONTINUE_SEARCH` and
+    // killed the process with `0xC000_0094` and no log line whatsoever. See
+    // `RuntimeError::IntegerDivideFault`.
+    let divide_fault = match record.ExceptionCode {
+        EXCEPTION_INT_DIVIDE_BY_ZERO => Some(crate::DivideFault::ByZero),
+        EXCEPTION_INT_OVERFLOW => Some(crate::DivideFault::Overflow),
+        _ => None,
+    };
+    if !is_access_violation && !is_illegal_instruction && !is_breakpoint && divide_fault.is_none() {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -2315,6 +2371,73 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     // a host thread could leave locks and Rust frames corrupted.
     if ctx.process_is_terminating() {
         ctx.exited.set(true);
+        *context = unsafe { *ctx.recovery_ctx };
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // An x86 divide-error trap. There is nothing to emulate and nothing to
+    // retry — resuming the same instruction would re-fault forever — so the
+    // only useful response is the one a genuine guest fault already gets:
+    // record what happened, roll back abandoned callback completions, snapshot
+    // the registers, and recover through `run`'s pre-entry context. That turns
+    // a silent `0xC000_0094` process kill into a report naming the instruction,
+    // its bytes (which encode the divisor register), the register file, and the
+    // HLE call in flight. See `RuntimeError::IntegerDivideFault`.
+    if let Some(cause) = divide_fault {
+        // SAFETY: `ctx.mem` outlives the guarded call, per `ActiveContext`.
+        let mem = unsafe { &*ctx.mem };
+        // Same test the illegal-instruction arm uses: guest code lives at or
+        // above the arena base, emulator code below it.
+        let origin = if fault_addr >= crate::GUEST_ARENA_BASE {
+            crate::FaultOrigin::Guest
+        } else {
+            crate::FaultOrigin::Host
+        };
+        ctx.error.set(Some(RuntimeError::IntegerDivideFault {
+            rip: fault_addr,
+            cause,
+            origin,
+            hle: None,
+        }));
+        // Frames OUT of the cell first, writes second: each `atomic_store_u32`
+        // targets a guest-controlled address and may fault straight back into
+        // this handler. See `ActiveContext::callback_frames`.
+        for frame in ctx.take_callback_frames_innermost_first() {
+            if let Some(completion) = frame.completion {
+                let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
+            }
+        }
+        let mut bytes = [0u8; 16];
+        // Host code is not in guest memory, so a host `#DE`'s bytes read back
+        // as unreadable rather than as whatever `read` left in the buffer.
+        let bytes_read = origin == crate::FaultOrigin::Guest && mem.read(fault_addr, &mut bytes);
+        if !bytes_read {
+            bytes = [0u8; 16];
+        }
+        ctx.fault_snapshot.set(Some(FaultSnapshot {
+            rip: context.Rip,
+            rsp: context.Rsp,
+            rbp: context.Rbp,
+            rax: context.Rax,
+            rbx: context.Rbx,
+            rcx: context.Rcx,
+            rdx: context.Rdx,
+            rsi: context.Rsi,
+            rdi: context.Rdi,
+            r8: context.R8,
+            r9: context.R9,
+            r10: context.R10,
+            r11: context.R11,
+            r12: context.R12,
+            r13: context.R13,
+            r14: context.R14,
+            r15: context.R15,
+            bytes,
+            bytes_read,
+        }));
+        // SAFETY: identical invariant to every other recovery in this handler —
+        // `recovery_ctx` points at `run`'s still-live stack snapshot on this
+        // same synchronously-faulting thread, and CONTEXT is Copy.
         *context = unsafe { *ctx.recovery_ctx };
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -3097,6 +3220,39 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 caller_return_addr,
                 caller_rsp: context.Rsp,
                 float_args,
+                // The interrupted guest thread's full integer register file.
+                // The argument slice covers only RDI/RSI/RDX/RCX/R8/R9; an HLE
+                // function that must hand the guest a *machine context* — the
+                // `ucontext_t` an Orbis exception handler receives — needs the
+                // callee-saved set too, above all RBP, which a managed
+                // runtime's collector unwinds the suspended thread through.
+                caller_gprs: Some(raeen_hle::GuestGpRegs {
+                    rdi: context.Rdi,
+                    rsi: context.Rsi,
+                    rdx: context.Rdx,
+                    rcx: context.Rcx,
+                    r8: context.R8,
+                    r9: context.R9,
+                    rax: context.Rax,
+                    rbx: context.Rbx,
+                    rbp: context.Rbp,
+                    r10: context.R10,
+                    r11: context.R11,
+                    r12: context.R12,
+                    r13: context.R13,
+                    r14: context.R14,
+                    r15: context.R15,
+                    rflags: u64::from(context.EFlags),
+                    // The guest's TCB. `guest_fsbase` is the value this run
+                    // installed; `tls_active` is false on a CPU without
+                    // FSGSBASE or a module without `PT_TLS`, and 0 is then the
+                    // honest answer rather than a stale base.
+                    fsbase: if ctx.tls_active.get() {
+                        ctx.guest_fsbase.get()
+                    } else {
+                        0
+                    },
+                }),
             };
             ctx.active_hle
                 .set(Some((idx, args[..6].try_into().unwrap())));

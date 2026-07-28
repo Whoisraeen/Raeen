@@ -21,6 +21,7 @@
 //! | libSceSaveData.sprx | Stub | raeen-kernel (VFS) |
 //! | libSceSysmodule.sprx | Partial | Module registry |
 
+pub mod exception;
 pub(crate) mod fmt;
 pub mod kernel_aio;
 pub mod kernel_equeue;
@@ -688,6 +689,48 @@ pub struct HleContext<'a> {
     /// `f64::from_bits(bits)` for a `double`. Zeroed in tests and on any path
     /// that has no register context.
     pub float_args: [u64; 8],
+    /// The interrupted guest thread's **complete** integer register file at
+    /// this trap, when the dispatch path captured one.
+    ///
+    /// The `&[u64]` argument slice only carries the six SysV argument
+    /// registers; this additionally carries the callee-saved set
+    /// (`rbx/rbp/r12..r15`), `rax/r10/r11`, `rflags`, and the FS base. Needed
+    /// wherever the guest must be handed a *machine context* rather than
+    /// arguments — the `ucontext_t` an Orbis exception handler receives (see
+    /// the `exception` module), which a managed runtime's stop-the-world
+    /// collector unwinds through `rbp`.
+    ///
+    /// `None` on paths with no CONTEXT to read: the direct leaf gateway (whose
+    /// imports never re-enter guest code) and unit-test doubles.
+    pub caller_gprs: Option<GuestGpRegs>,
+}
+
+/// A guest thread's integer register file at an HLE trap, in the order the
+/// Orbis (FreeBSD amd64) `mcontext_t` lays them out.
+///
+/// Field-per-register rather than an array so a mis-ordered store cannot
+/// silently swap two registers in a machine context handed back to the guest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs, clippy::missing_docs_in_private_items)]
+pub struct GuestGpRegs {
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rflags: u64,
+    /// The guest's FS base (its TCB), or 0 when the run has no FSGSBASE TLS.
+    pub fsbase: u64,
 }
 
 impl HleContext<'_> {
@@ -997,6 +1040,20 @@ impl HleRegistry {
                 ctx.caller_return_addr,
                 format!("return={result:#x}"),
             );
+            // Every HLE dispatch is a **safe point** for asynchronous Orbis
+            // exception delivery: the guest is stopped at a known instruction
+            // boundary on its own stack, with its register file captured, and
+            // the runtime can synchronously re-enter guest code from here.
+            //
+            // After the handler body, not before: the import has completed and
+            // holds no HLE-internal lock, so a guest signal handler that blocks
+            // (a stop-the-world collector parking until resume — the whole point
+            // of the signal) cannot wedge the kernel state this call was using.
+            //
+            // Costs one relaxed atomic load when nothing was raised, which is
+            // every call of every run in which no title raises. See the
+            // `exception` module.
+            crate::exception::deliver_pending(ctx);
             Some(result)
         } else {
             warn!("HLE: unimplemented function {}", key);
@@ -1290,6 +1347,7 @@ pub(crate) fn test_ctx_with_gpu<'a>(
         caller_return_addr: 0,
         caller_rsp: 0,
         float_args: [0; 8],
+        caller_gprs: None,
     }
 }
 

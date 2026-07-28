@@ -765,6 +765,23 @@ impl FirmwareLauncher {
                         "Called an unresolved import (trampoline {a:#x})"
                     ))
                 }
+                // An x86 divide-error trap. Named explicitly because the
+                // `{e:?}` fallback below reads as an internal error, while this
+                // one has a concrete meaning the log can be searched on — and
+                // because until the VEH classified it, this outcome did not
+                // exist at all: the process simply vanished with exit code
+                // 0xC0000094 and no report.
+                Err(raeen_runtime::RuntimeError::IntegerDivideFault {
+                    rip,
+                    cause,
+                    origin,
+                    hle,
+                }) => SessionOutcome::Faulted(format!(
+                    "{origin} integer-divide fault at {rip:#x} ({cause}){} — see the log for the \
+                     register dump and recent HLE calls",
+                    hle.as_deref()
+                        .map_or_else(String::new, |name| format!(" during {name}"))
+                )),
                 Err(e) => SessionOutcome::Faulted(format!("Runtime error: {e:?}")),
             }
         }

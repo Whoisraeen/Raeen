@@ -150,6 +150,27 @@ pub struct AmprGatherScatterState {
     pub next_file_offset: u64,
 }
 
+/// One Orbis exception (signal) raised at a guest thread and awaiting delivery
+/// to the process handler installed for `signum`.
+///
+/// Recorded by `sceKernelRaiseException` when the target is another thread, and
+/// consumed at that thread's next HLE safe point — the only place the runtime
+/// can legally re-enter guest code on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingException {
+    /// Orbis signal number (`sceKernelRaiseException`'s second argument;
+    /// SIGUSR1 = 30 is the one titles actually raise — it is what Unity's
+    /// stop-the-world collector uses to suspend a thread).
+    pub signum: i32,
+    /// The guest handler address installed for `signum` at raise time. Latched
+    /// here rather than re-read at delivery so a concurrent
+    /// `sceKernelRemoveExceptionHandler` cannot turn a queued raise into a
+    /// jump through a stale slot.
+    pub handler: u64,
+    /// The guest thread that raised it. Diagnostic only.
+    pub raised_by: u64,
+}
+
 /// The emulated PS5 kernel state.
 ///
 /// Holds all kernel-level state: memory map, file descriptors,
@@ -317,6 +338,37 @@ pub struct OrbisKernel {
     /// Delivery is a runtime concern; keeping the registration in process
     /// state still gives install/remove/raise coherent ABI behavior.
     pub exception_handlers: DashMap<i32, u64>,
+    /// Orbis exceptions raised with `sceKernelRaiseException` at a thread that
+    /// is **not** the caller, awaiting delivery at that thread's next HLE
+    /// safe point. Keyed by target guest thread id.
+    ///
+    /// One slot per thread, newest wins: a raise is a level, not a queue —
+    /// the guest handler for a repeated signal runs once per observation, and
+    /// an unbounded backlog would let a stop-the-world collector that raises
+    /// each cycle accumulate deliveries it no longer wants.
+    ///
+    /// Cross-thread rather than immediate because a guest signal handler must
+    /// run *on the target thread's own stack*: hijacking a running host worker
+    /// from outside is exactly the corruption `raeen-runtime`'s cooperative
+    /// exit model avoids. See `raeen-hle`'s `exception` module.
+    pub pending_exceptions: DashMap<u64, PendingException>,
+    /// `pending_exceptions.len()`, cached as a relaxed atomic.
+    ///
+    /// Every HLE call consults the pending set (the safe point is the dispatch
+    /// boundary), and `DashMap::is_empty` locks every shard to sum lengths —
+    /// unacceptable on that path. Reads of this counter are the fast "nothing
+    /// to deliver" answer; only a non-zero value pays for a map lookup.
+    pending_exception_count: std::sync::atomic::AtomicUsize,
+    /// Threads currently executing a guest exception handler. Delivery is a
+    /// re-entrant path (the handler makes HLE calls, each of which is another
+    /// safe point), so a thread inside its handler must not be handed the
+    /// next signal until it returns.
+    pub exception_delivery_active: DashMap<u64, ()>,
+    /// Per-thread guest scratch for the `ucontext_t` handed to an exception
+    /// handler, keyed by guest thread id. Allocated once per thread on first
+    /// delivery and reused: a handler receives a pointer to it and must not
+    /// see it recycled underneath a concurrent delivery on another thread.
+    pub exception_contexts: DashMap<u64, u64>,
     /// Kernel event flags, keyed by handle.
     pub kernel_event_flags: DashMap<u64, EventFlag>,
     /// Next event-flag handle to hand out.
@@ -1652,6 +1704,88 @@ impl OrbisKernel {
         released
     }
 
+    /// Record an Orbis exception raised at `target` for delivery at that
+    /// thread's next HLE safe point, returning whether it replaced an
+    /// already-queued (undelivered) one.
+    ///
+    /// Newest wins — see [`OrbisKernel::pending_exceptions`].
+    pub fn queue_pending_exception(&self, target: u64, pending: PendingException) -> bool {
+        let replaced = self.pending_exceptions.insert(target, pending).is_some();
+        self.sync_pending_exception_count();
+        replaced
+    }
+
+    /// Whether any thread has an exception awaiting delivery.
+    ///
+    /// The fast path every HLE dispatch takes: one relaxed atomic load, no map
+    /// locking. See [`OrbisKernel::pending_exception_count`].
+    pub fn has_pending_exceptions(&self) -> bool {
+        self.pending_exception_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
+    /// Claim the exception queued for `thread`, if any, marking the thread as
+    /// *delivering* so a nested safe point inside the handler does not claim
+    /// the next one.
+    ///
+    /// Returns `None` when nothing is queued **or** when this thread is already
+    /// inside a handler. The caller must pair a `Some` with
+    /// [`OrbisKernel::finish_exception_delivery`] or
+    /// [`OrbisKernel::requeue_pending_exception`].
+    pub fn claim_pending_exception(&self, thread: u64) -> Option<PendingException> {
+        if !self.has_pending_exceptions() {
+            return None;
+        }
+        if self.exception_delivery_active.contains_key(&thread) {
+            return None;
+        }
+        let pending = self.pending_exceptions.remove(&thread)?.1;
+        self.sync_pending_exception_count();
+        self.exception_delivery_active.insert(thread, ());
+        Some(pending)
+    }
+
+    /// Release the delivering mark [`OrbisKernel::claim_pending_exception`]
+    /// took. Idempotent.
+    pub fn finish_exception_delivery(&self, thread: u64) {
+        self.exception_delivery_active.remove(&thread);
+    }
+
+    /// Put a claimed exception back because delivery could not be attempted
+    /// (no guest-callback capability on this dispatch path), and clear the
+    /// delivering mark.
+    ///
+    /// Requeues only if nothing newer arrived in the meantime — a fresher raise
+    /// supersedes the one we failed to deliver.
+    pub fn requeue_pending_exception(&self, thread: u64, pending: PendingException) {
+        self.pending_exceptions.entry(thread).or_insert(pending);
+        self.sync_pending_exception_count();
+        self.exception_delivery_active.remove(&thread);
+    }
+
+    /// Drop every trace of `thread` from the exception machinery, returning
+    /// whether an undelivered exception was discarded.
+    ///
+    /// Called on thread exit: an exception raised at a thread that then dies has
+    /// nowhere to be delivered, and leaving the entry behind would keep
+    /// [`OrbisKernel::has_pending_exceptions`] permanently true — turning the
+    /// per-call fast path into a map lookup for the rest of the run.
+    pub fn discard_pending_exception(&self, thread: u64) -> bool {
+        let discarded = self.pending_exceptions.remove(&thread).is_some();
+        self.sync_pending_exception_count();
+        self.exception_delivery_active.remove(&thread);
+        self.exception_contexts.remove(&thread);
+        discarded
+    }
+
+    fn sync_pending_exception_count(&self) {
+        self.pending_exception_count.store(
+            self.pending_exceptions.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Release EVERY lock a dying `thread` held — mutex ownership, rwlock
     /// write-ownership, and rwlock read holds — returning how many of each were
     /// freed. Superset of [`release_mutexes_owned_by`].
@@ -1822,6 +1956,10 @@ impl OrbisKernel {
             pthread_condattr_clocks: DashMap::new(),
             pthread_attrs: DashMap::new(),
             exception_handlers: DashMap::new(),
+            pending_exceptions: DashMap::new(),
+            pending_exception_count: std::sync::atomic::AtomicUsize::new(0),
+            exception_delivery_active: DashMap::new(),
+            exception_contexts: DashMap::new(),
             kernel_event_flags: DashMap::new(),
             kernel_event_flag_next: std::sync::atomic::AtomicU64::new(1),
             kernel_event_flag_live: std::sync::atomic::AtomicU32::new(0),

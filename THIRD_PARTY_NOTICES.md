@@ -154,6 +154,19 @@ SOFTWARE.
   because this generator has no per-body `NoContraction` decoration hook.
   The type-driven 3D-image `volume` flag in `crates/raeen-gpu/src/vulkan/`
   and `draw_translate.rs` completes the host half of PR #587 (`5228335`).
+- **Exception-delivery model 2026-07-28**
+  (`docs/sharpemu-port/loading-blockers.md`): the queue-at-raise /
+  deliver-at-the-target's-next-HLE-boundary model in
+  `crates/raeen-hle/src/exception.rs` follows the design conclusion in
+  SharpEmu's `Cpu/Native/DirectExecutionBackend.cs`
+  (`TryRaiseGuestException`, `DeliverPendingGuestExceptionAtSafePoint`,
+  `TryWriteGuestExceptionContext`) and `Libs/Kernel/KernelExceptionCompatExports.cs`
+  — a raise must not be run on the raising thread, and the target's HLE boundary
+  is where that thread is safely paused. The single-slot newest-wins pending
+  entry, the per-thread "already delivering" guard, and the 0x500-byte
+  `ucontext_t` written at a per-thread scratch address are the same shape.
+  Raeen's implementation is original Rust over `OrbisKernel` state and
+  `raeen-runtime`'s `call_guest`; no C# is copied.
 - **How Raeen uses it:** A second-opinion reference alongside Kyty for PS5
   module loading (eboot/PRX/sysmodule chains), kernel-surface structure
   (Fiber, AMPR, PlayGo), VideoOut/AGC bring-up, and **native host controller
@@ -315,6 +328,17 @@ re-implementations are license-compatible; this notice preserves attribution.
   bound target; resolve/decompress passes are named skips. The packed
   CLEAR_WORD splat is Raeen's own simplification (shadPS4 unpacks per format
   for `vkCmdClearColorImage`); no C++ is copied.
+
+  The 2026-07-28 Orbis exception-delivery work in
+  `crates/raeen-hle/src/exception.rs` is a Rust re-implementation informed by
+  shadPS4's `core/libraries/kernel/threads/exception.cpp`/`.h`: the handler ABI
+  (`void handler(int signum, ucontext_t *)`), the Orbis-allowed signal set, and
+  the FreeBSD amd64 `Ucontext`/`Mcontext` field offsets that Raeen's layout
+  constants are pinned against by test. shadPS4 delivers on Windows through a
+  special user APC (`NtQueueApcThreadEx`) rewriting the target thread's
+  `PCONTEXT`; Raeen instead queues the raise and delivers at the target thread's
+  next HLE safe point through its own `call_guest` re-entry, so no C++ and no
+  delivery mechanism is copied.
 
   **Data incorporated in-tree:** `crates/raeen-firmware/src/dynlib/nid_names.txt`
   is derived from shadPS4's `src/core/aerolib/aerolib.inl` — a generated table

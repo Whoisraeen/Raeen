@@ -706,6 +706,18 @@ impl GuestThreadScheduler for GuestProcessHandle {
                         "guest worker exited still holding sync state; released it so waiters can proceed"
                     );
                 }
+                // An exception raised at a thread that then exits has nowhere to
+                // be delivered. Discard it — and, just as importantly, keep the
+                // pending set empty, because a stale entry would leave
+                // `has_pending_exceptions` true forever and turn every later HLE
+                // call's one-atomic fast path into a map lookup.
+                if process.kernel.discard_pending_exception(handle) {
+                    tracing::warn!(
+                        guest_thread = handle,
+                        "guest worker exited with an undelivered sceKernelRaiseException; \
+                         discarded (the raiser's wait for it will not be satisfied)"
+                    );
+                }
                 process
                     .kernel
                     .pthread_tls_values
