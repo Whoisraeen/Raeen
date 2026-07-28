@@ -805,3 +805,131 @@ regression`. Always check for a later revert before porting a commit.
   ASTRO.BOT.
 - [ ] Periodic re-fetch of `reference/sharpemu` and re-sweep of new commits
   (upstream lands several per day).
+
+## SWEEP RESULTS — wave 1 (2026-07-28)
+
+### Landed on `main` and pushed
+
+- **`7c220d8` — two AudioOut2 out-buffer overruns that smash the guest stack
+  canary.** Ported from SharpEmu #532 (see the revert note below). This is the
+  strongest candidate yet for the GTA V thread-31 / Until Dawn canary aborts:
+  - `sceAudioOut2ContextGetQueueLevel` wrote **8 bytes into a 32-bit out slot**
+    that callers stack-allocate, zeroing the 4 bytes above it. SharpEmu
+    documents the identical defect landing on a canary at `[rbp-0x10]` from an
+    out at `[rbp-0x14]`, aborting the audio thread.
+  - `sceAudioOut2GetSpeakerInfo` wrote **0x40 bytes into a 0x20-byte struct**,
+    overrunning the caller's next param block; field layout also had channels
+    transposed with a device count. Now `u32 channels`, `u32 rate`,
+    `u16 connected`.
+  - Both tests now pin the guard bytes on each side, so a regression fails
+    instead of silently corrupting guest stacks. raeen-hle 525 → 526.
+- **`f5c53bf` — two sync bugs found by an audit of Raeen's own primitives:**
+  - `pthread_rwlock_tryrdlock` / `trywrlock` were registered to the
+    **blocking** bodies, so a guest probing a contended rwlock parked instead
+    of receiving `EBUSY` — a hang exactly where it asked for a fast negative.
+    The SCE spellings were correct, which hid it. A registration test now
+    compares function pointers.
+  - `scePthreadYield` / `pthread_yield` / `sched_yield` returned **without
+    yielding**, turning a guest's yield-based backoff into a busy-wait that can
+    starve the thread it waits on.
+
+### Landed on `integration/sharpemu-sweep` (NOT yet on main — see blocker)
+
+- **`cbbbd08` — GFX10 mip-chain: mip 0 was read from the wrong address**
+  (SharpEmu #470). On GFX10 an AddrLib chain is stored smallest-first, so mip 0
+  sits at the END of the allocation; every `MAX_MIP > 0` texture was decoding
+  the mip tail at mip 0's extent. Worked example (512x512 RGBA8, SW_64KB_S,
+  MAX_MIP=9): the read was **393,216 bytes early at 4x the extent per axis**.
+  Array layers of a mipped surface also stride by the chain slice, not mip 0's
+  grid. New pure functions `base_mip_placement` / `detile_mip_tail_base` /
+  `block_element_dimensions` in `texture/tiling.rs`; `max_mip()` had **zero
+  callers** before this. `note_mip_view_base_level` now also fires for
+  `max_mip > 0` (the common `base_level == 0` mipped case that previously took
+  wrong bytes with no warning at all). Escape hatch `RAEEN_NO_MIP_CHAIN=1`.
+  Also fixed in passing: a latent panic where the CUBE per-face fallback
+  detiled at texel extents into an element-sized slice (16x-too-long buffer for
+  a BC cube). raeen-gpu **338** green.
+  - Verdicts on four related commits: #473 logical width/height and #649 host
+    cached guest buffer = ALREADY-HAVE; #447 write-generation refresh and #550
+    GuestImageWriteTracker = applicable but out of scope (both need real
+    page-write tracking with runtime/VEH cooperation — that is one joint task,
+    recorded as a follow-up).
+  - NOT verified against a retail title: an A/B with `RAEEN_NO_MIP_CHAIN=1` on
+    Minecraft/GTA V is the remaining verification and the main regression risk.
+
+### BLOCKER on final integration (not a code problem)
+
+`main`'s working tree carries **uncommitted work from the user's parallel Codex
+session** — `crates/kyty-graphics/src/shader/{parse,recompile,types}.rs` plus
+`crates/raeen-gpu/src/draw_translate.rs` (~306 insertions). That session is
+working the SAME ASTRO device-loss problem (adding named per-program
+quarantines for validation-clean compute dispatches that reset the Windows
+Vulkan device). Merging the mip fix into main would overwrite `draw_translate.rs`,
+so it was merged to `integration/sharpemu-sweep` instead. **Resolution: once the
+Codex work is committed, merge `integration/sharpemu-sweep` into main.** Do not
+stash or discard that session's edits.
+
+### Critical process findings for any future SharpEmu port
+
+1. **The revert trap is real and two-layered.** `6db095e` "revert: restore
+   state before huge regression" DID wipe `e13cb28` (#532) — verified by an
+   empty `git diff e13cb28~1 6db095e` over the audio files and matching
+   deletion counts. Then `db4339f` (#650) re-applied the whole batch. So:
+   **always port from the live tip `92e3abe`**, never from a lone commit. The
+   tip has ~641 further lines of evolution in `AudioOut2Exports.cs` alone.
+2. **Worktree rooting.** Running `cd` into `reference/sharpemu` in the session
+   shell caused subsequently-spawned worktree agents to be rooted in the
+   SharpEmu clone (nested `.git` shadowed the outer repo), so they could not
+   write Rust at all. Always `cd` back to the repo root before spawning agents,
+   and have each agent verify `git rev-parse --show-toplevel` first.
+3. **Agents must not edit `checklist.md` / `.superpowers/sdd/progress.md`** —
+   every parallel agent editing them produced merge conflicts. They write
+   `docs/sharpemu-port/<cluster>.md` instead; the main session owns both shared
+   docs. This worked cleanly.
+
+### The generalizable rule set extracted from #532 (apply to all HLE out-writes)
+
+1. Write EXACTLY the ABI struct size — never rounded up or generous.
+2. Write EXACTLY the ABI field width (u64 into a u32 out clobbers 4 bytes).
+3. NEVER derive a write length from guest registers (SharpEmu observed r8/r9
+   arriving polluted with GetSize leftovers).
+4. Classify the out-pointer: bulk-initialize heap objects only; for STACK outs
+   write the minimal form or skip.
+5. The same out can legitimately have two shapes (heap `{size,align}` vs stack
+   size-only).
+6. Don't write "reserved"/secondary out slots — usually adjacent caller locals.
+7. Don't page-align a returned object size a guest may use as an alloca/VLA
+   length.
+Raeen can enforce 4 better than the reference: `HleContext` already carries
+`caller_rsp`, so stack-residency is a real test, not SharpEmu's `0x7FF0…`
+address-range heuristic. (In flight.)
+
+### Audit findings queued as work (from read-only mapping of Raeen itself)
+
+- **VEH access-violation arm has no RIP-range check** (the illegal-instruction
+  arm has one), so a host-side bug inside a Rust HLE handler is laundered as
+  "guest fault at 0x7ff…". In flight.
+- **`RefCell` borrowed across a faultable guest write inside the VEH**
+  (`callback_frames.borrow_mut()` while `atomic_store_u32` writes a
+  guest-controlled address) → a re-entrant fault panics with `BorrowMutError`
+  **inside a vectored exception handler**. Every other `ActiveContext` field is
+  deliberately `Cell` for exactly this reason. Plausible source of ASTRO's
+  `0xC0000409`. In flight.
+- **Abandoned-lock recovery runs only on `result.is_err()`** — a thread exiting
+  via `scePthreadExit` or cooperative termination skips lock release entirely;
+  and the release covers only mutexes + rwlocks, never kernel semaphores,
+  condvars or event flags. In flight.
+- **`sceKernelSyncOnAddressWait`/`Wake` are stubs** — Wait is an unconditional
+  10 ms sleep that never reads the watched word; Wake is a no-op. This is the
+  futex primitive engine titles spin on. In flight (SharpEmu #422).
+- **pthread mutex unlock is barging, not handoff** — `owner = 0` then
+  `notify_one()` after dropping the guard, so arrivals can steal ahead of the
+  woken waiter; wake order is not FIFO. In flight (SharpEmu #439).
+- **Semaphores + event flags/equeue share ONE process-wide condvar with
+  `notify_all()`** → a wake storms every unrelated waiter in the process. Not
+  yet assigned.
+- **Vulkan: one device-wide cache mutex is held across fence waits**, and
+  `agc_exec` holds three session mutexes across a GPU fence — so present,
+  screenshot and the HUD all block for a full fence duration. Not yet assigned.
+- `PthreadCond` holds the tree's only true FIFO per-waiter queue; it is the
+  structure to generalize for the futex and mutex handoff work.
