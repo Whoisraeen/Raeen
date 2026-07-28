@@ -301,10 +301,31 @@ top-down, update statuses in place, and keep it committed.**
   no-session info toast on Home.
 
 ### 19. DualSense passthrough
-- [ ] Rumble first (gilrs ff or hidapi), then haptics/adaptive triggers via
-  DualSense output reports. Un-reserve the Settings toggle ("DualSense
-  Features" currently labeled reserved — see 2026-07-27 settings-backend
-  audit).
+- [x] RUMBLE DONE 2026-07-28 (worktree agent): guest → host → hardware.
+  `scePadSetVibration` implemented for real (2-byte `{large, small}` param,
+  shadPS4/SharpEmu-checked) → `OrbisKernel::set_pad_rumble` (seq bumps every
+  call) → frame-IPC rumble word at header offset 104 (child → Shell, reverse
+  of the pad channel; no VERSION bump — lives in zeroed padding, degrades to
+  no-rumble across mismatched builds) → Shell `RumbleRouter`
+  (`raeen_input::rumble`) → hardware. Output path is **direct HID output
+  reports for the DualSense** (SharpEmu port in `hid.rs`: USB 0x02 / BT 0x31
+  + CRC-32, dedicated writer thread, second device handle) **+
+  `XInputSetState`** for Xbox-class pads — NOT gilrs ff (gilrs's Windows
+  backend is XInput anyway; direct calls avoid the effect-object lifecycle
+  and cover the raw-HID DualSense gilrs never sees). Settings ▸ Controllers ▸
+  DualSense Features un-reserved: ON routes vibration, OFF drops it, applies
+  live, persists. Safety: motors stop when the session ends/quits, and a 5 s
+  no-refresh auto-stop covers a guest that never clears (real firmware +
+  shadPS4 persist indefinitely; titles refresh far more often, and every
+  scePadSetVibration call — same values or not — refreshes the deadline).
+  Tests: rumble router/wire 6, HID output reports 3, HLE SetVibration 2,
+  frame-IPC round-trip 1, config persistence 1.
+- [ ] LIVE VERIFY pending (needs the user's controller): launch a rumbling
+  title with a DualSense over USB, then BT, then an Xbox pad; toggle
+  DualSense Features OFF mid-rumble (must stop); quit to Shell mid-rumble
+  (must stop).
+- [ ] Haptics / adaptive triggers / lightbar via full DualSense output
+  reports = later (scePadSetTriggerEffect is still validate-and-ack).
 
 ### 20. Auto-updater
 - [x] LANDED VIA PARALLEL SESSION (Codex, commit `0e77a65` lineage):

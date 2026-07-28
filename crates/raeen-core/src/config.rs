@@ -151,7 +151,9 @@ impl Default for AudioConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputConfig {
-    /// Enable DualSense-specific features (haptics, adaptive triggers).
+    /// Enable DualSense-specific features. Today this gates game vibration
+    /// (rumble) passthrough to the physical controller — DualSense HID output
+    /// reports or XInput — with advanced haptics / adaptive triggers to come.
     pub dualsense_features: bool,
     /// Controller deadzone (0.0 - 1.0).
     pub deadzone: f32,
@@ -347,6 +349,23 @@ mod tests {
         let encoded = toml::to_string(&config).unwrap();
         let decoded: EmulatorConfig = toml::from_str(&encoded).unwrap();
         assert!(decoded.general.perf_hud);
+    }
+
+    /// Settings ▸ Controllers ▸ DualSense Features (the vibration/rumble
+    /// routing gate) persists like every other setting: ON by default, an
+    /// explicit OFF survives a save/load cycle, and a config written before
+    /// the toggle existed defaults it ON.
+    #[test]
+    fn dualsense_features_defaults_on_and_round_trips() {
+        assert!(EmulatorConfig::default().input.dualsense_features);
+        let old: EmulatorConfig = toml::from_str("[input]\ndeadzone = 0.2\n").unwrap();
+        assert!(old.input.dualsense_features);
+
+        let mut config = EmulatorConfig::default();
+        config.input.dualsense_features = false;
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: EmulatorConfig = toml::from_str(&encoded).unwrap();
+        assert!(!decoded.input.dualsense_features);
     }
 
     #[test]

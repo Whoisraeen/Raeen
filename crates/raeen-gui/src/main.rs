@@ -1093,6 +1093,7 @@ fn main() -> anyhow::Result<()> {
         // direct runner launches without the Shell bridge.
         if std::env::var_os("RAEEN_RUNNER_CHILD").is_some() {
             let input_kernel = std::sync::Arc::clone(&kernel);
+            let rumble_enabled = runner_config.input.dualsense_features;
             let input_script = std::env::var("RAEEN_INPUT_SCRIPT")
                 .ok()
                 .map(|spec| raeen_input::InputScript::parse(&spec))
@@ -1113,6 +1114,13 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     let mut last_buttons = None;
+                    // Guest → host rumble return path. With the Shell bridge
+                    // the child only forwards the encoded word — the Shell
+                    // owns hardware delivery, its Settings gate, and the
+                    // safety auto-stop. Direct (bridgeless) runs drive the
+                    // child's own native pads through the same router rules.
+                    let mut last_rumble_motors: Option<(u8, u8)> = None;
+                    let mut rumble_router = raeen_input::rumble::RumbleRouter::new();
                     loop {
                         let scripted = input_script
                             .as_ref()
@@ -1148,6 +1156,41 @@ fn main() -> anyhow::Result<()> {
                             last_buttons = Some(buttons);
                         }
                         input_kernel.set_pad_state(encoded);
+                        // Rumble return path (see the declaration above).
+                        let (rumble_seq, large, small) = input_kernel.pad_rumble();
+                        if let Some(input) = shared_input.as_ref() {
+                            // Log motor-value changes only — the sequence
+                            // bumps on every guest keep-alive call.
+                            if rumble_seq != 0 && last_rumble_motors != Some((large, small)) {
+                                tracing::info!(
+                                    large,
+                                    small,
+                                    "guest vibration forwarded to the Shell"
+                                );
+                                last_rumble_motors = Some((large, small));
+                            }
+                            input.publish_rumble_word(raeen_input::rumble::encode_word(
+                                rumble_seq,
+                                raeen_input::rumble::RumbleState::new(large, small),
+                            ));
+                        } else if let Some(pads) = pads.as_ref() {
+                            let source = (rumble_seq != 0).then(|| {
+                                (
+                                    rumble_seq,
+                                    raeen_input::rumble::RumbleState::new(large, small),
+                                )
+                            });
+                            if let Some(command) =
+                                rumble_router.update(started.elapsed(), source, rumble_enabled)
+                            {
+                                tracing::info!(
+                                    large = command.large,
+                                    small = command.small,
+                                    "guest vibration routed to controller (direct runner)"
+                                );
+                                pads.set_rumble(command.large, command.small);
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(4));
                     }
                 })?;

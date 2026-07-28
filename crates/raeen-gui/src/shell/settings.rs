@@ -705,8 +705,10 @@ fn draw_input(ui: &mut egui::Ui, rows: &mut Rows, config: &EmulatorConfig) {
     );
     rows.hint(
         ui,
-        "Deadzone and Icon Style apply immediately. DualSense Features (adaptive triggers, \
-         haptics, lightbar) is reserved and has no effect yet.",
+        "All three apply immediately. DualSense Features On routes game vibration (rumble) to \
+         your controller — DualSense over USB/Bluetooth or an XInput pad; Off drops it. \
+         Vibration stops automatically when a session ends or the game stops refreshing it. \
+         Advanced haptics and adaptive triggers are still to come.",
     );
 }
 

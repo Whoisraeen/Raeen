@@ -132,7 +132,11 @@ SOFTWARE.
   (Fiber, AMPR, PlayGo), VideoOut/AGC bring-up, and **native host controller
   input** (XInput + raw-HID DualSense — `Host/Windows/WindowsXInputReader.cs`,
   `WindowsDualSenseReader.cs`, `WindowsHidNative.cs`, `Host/HostGamepadState.cs`,
-  re-implemented as `crates/raeen-input/src/{xinput,hid,native}.rs`). The
+  re-implemented as `crates/raeen-input/src/{xinput,hid,native}.rs`; the
+  DualSense **rumble output** path — `BuildOutputReportLocked`'s USB `0x02` /
+  Bluetooth `0x31`+CRC-32 framing and the second write-side device handle —
+  is likewise re-implemented in `hid.rs` `build_output_report`/`write_loop`,
+  rumble-only subset, lightbar/player-LED bytes left untouched). The
   APR/AMPR async file-I/O path is also a SharpEmu port:
   `Ampr/AmprExports.cs` (`AprCommandBufferReadFile` eager read,
   `TryReadFileToGuestMemory` positional read-exact loop + host-handle cache,
