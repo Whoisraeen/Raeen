@@ -719,3 +719,89 @@ GPL-2.0-compatible).
 | `mp4`, `symphonia` (license-verify first) | MIT / mixed | 25 |
 | `blake3` | CC0/Apache-2.0 | shader-cache/content hashing (bench vs sha1 first) |
 | cargo-deny, cargo-nextest, cargo-llvm-cov, cargo-machete | tools, MIT/Apache | 27, 28, 32 |
+
+---
+
+# SHARPEMU FULL-HISTORY PORT SWEEP (started 2026-07-28)
+
+Goal: sweep every SharpEmu commit for validated GPU + game-loading fixes and
+port what unblocks Raeen's rendering and loading.
+
+**Source:** `reference/sharpemu` (C#, **GPL-2.0 — license-compatible with this
+GPL-2.0-only tree**; attribute every port in `THIRD_PARTY_NOTICES.md` +
+`docs/reference-port-ledger.md`). Re-fetched 2026-07-28: **109 commits total**
+across all refs; history begins at PR #395 (repo was restarted there), newest
+`92e3abe` (v0.0.3). Branch `pr-587` holds only a duplicate of `5228335`.
+Date range 2026-07-18 → 2026-07-28 — extremely active upstream, so **re-fetch
+and re-sweep periodically**.
+
+**Process rule learned:** porting agents must NOT edit `checklist.md` or
+`.superpowers/sdd/progress.md` (every parallel agent editing them caused merge
+conflicts). Each writes `docs/sharpemu-port/<cluster>.md` instead; the main
+session owns the two shared docs.
+
+**Revert trap:** SharpEmu contains `6db095e revert: restore state before huge
+regression`. Always check for a later revert before porting a commit.
+
+## Two upstream commits that map EXACTLY onto Raeen's open blockers
+
+1. **`e13cb28` #532 "harden AudioOut2 stack out-buffer writes against canary
+   smash"** — *"Titles that stack-allocate AudioOut2 outs next to the frame
+   canary were corrupted by oversized or mistyped HLE writes."* This is
+   precisely Raeen's #1 blocker class (GTA V thread 31 + Until Dawn both die on
+   `__stack_chk_fail`), and the same bug shape as the `d_reclen=512` overflow
+   Raeen already found (commit `d818df9`). → cluster A.
+2. **`5228335` #587 "support Gen5 flat memory and 3D images"** — *"treat MIMG
+   DIM=2 as Dim3D and transport depth through AGC and Vulkan so Z slices no
+   longer collapse into a single 2D plane."* This is exactly the ASTRO.BOT
+   failure (`storage_texture_dim_format: mixed storage image dims/formats in
+   one shader (Three vs Two, Rgba16f)`). → cluster D.
+
+## Cluster assignments (7 parallel worktree agents, 2026-07-28)
+
+| Cluster | Theme | Key commits |
+|---------|-------|-------------|
+| **A** | Canary / HLE out-buffer discipline + systematic out-pointer audit | e13cb28 #532, bb3318a #461, 956da76 #567, 007bf6f #546 (cross-check ours), bc51cc2 #444, 4bb1af9 #480, e01092a #478, 9ff60ab #437 |
+| **B** | Gen5 shader + AGC correctness (ASTRO 3D images, VOP3P) | 5228335 #587, 3574a3b #466, 472fc96 #460, 3005bab #420, 20eda44 #465, 5f97031 #514, 8e1e89c #545, f9d9213 #556, 8e5a0bf #558, 74a5198 #535, a709ccc #395 |
+| **C** | GTA V + UE5 boot unblockers | a1cbff8 #454 (NID BHouLQzh0X0 + **doubled static TLS reservation**), db4339f #650, daaeb62 #406, 90c72eb #451, 73e8821 #439, 2764aaa #542 (ctype tables → our `_Ctype` gap), d7bd814 #565, 336286e #414, 0c467e8 #450 |
+| **D** | Memory mapping + loader robustness | 8f94562 #608, 6aa78bb #493, fc9e3ff #474, 33be88b #458, d7f6e3f #433 (MapDirectMemory2), 2379e89 #489, e56e74f #432 (space-in-path launch) |
+| **E** | Texture / detile / present correctness | 6ee445f #470 (GFX10 mip-0 offset), 25d741b #471 (array layers), 1f3963c #483 (exact-XOR swizzle), 224a36e #476, 0ae785c #475 (padded row pitch), ac883e4 #473, 327018e #448 (linear→sRGB at present), 04557fd #447, 82ab181 #550, 99004a3 #649, a158960 #592, 5b602c0 #620, db9b204 #468 |
+| **F** | Sync / semaphore / stalls + ASTRO stack | 96fde57 #528 (**VEH/TBB** — systemic risk for our VEH dispatch), 2a4da8c #504, e1a3b92 #621, 09bd4f0 #422 (SyncOnAddressWait/Wake), a60bfc9 #424, 5d7d8e0 #426, a030cb5 #410, 5a08a9b #564 |
+| **G** | CPU instruction emulation (host-compat) | 8ef5a54 #449 (**emulate AMD-only Zen 2 instructions in software** — critical because Raeen runs guest code NATIVELY: any instruction the user's CPU lacks = #UD = dead title), ada67a1 #482 |
+
+## Deliberately NOT ported (with reasons)
+
+- **GUI/Avalonia/SDL** (b4cc5f8 #666, 18708aa #400, cab001f #415, 0f224ec #430,
+  184e24f #453, 2b6bd5a #670): SharpEmu is C#/Avalonia; Raeen's Shell is egui.
+- **Metal backend** (9415395 #283): Raeen is Vulkan/Windows-first; Metal is
+  explicitly "later" per CLAUDE.md.
+- **Bink2 via FFmpeg** (f704586 #527, 4191a9e #554, 912883d #543): pulls an
+  FFmpeg dependency/binary — conflicts with the no-proprietary-blobs and
+  license-hygiene rules. Revisit only with a license-clean pure-Rust decoder
+  (see round-2 item 25, which deliberately does audio-only).
+- **Their CI / README / version bumps / dotnet lockfiles / debugger tests /
+  aerolib script** (3334707, d151e15, 21f964a, 6133313, d991e32, e7ea186,
+  71e5912, 8779c96, 2bda253, 6dda658, 105c58b, 85dc98d, 0981260, 93829e3,
+  0b83b34, 4682e64, 8cd4624): infrastructure, not behavior.
+- **Low marginal value — already covered by Raeen's Tier-B batch + Ampr work**
+  (bab965e #413 Random, 9be6f85 #492 Font, eb47d75 #510 Ampr write-address,
+  eb1195e #534 APR resolve, 3ebfc56 #438 PlayGo chunks, d3600c9 #526 /
+  2272b9b #547 Ajm, 26c5029 #605 AudioOutOutputs, 9d187de #456 AvPlayer,
+  4c8c67a #481 ASTRO stubs, dce7c87 #469 AGC unregister, 559b7f0 #541 Voice
+  QoS, 7a108c6 #560 GameService, eb252af #559 / 8dd3172 #549 notice-skip,
+  7b95016 #536 RemotePlay, 4c37e64 #503 NpWebApi2 filter, 2ced3af #398
+  AppContent): Raeen already registered ~134 Tier-B functions + all 46 Ampr
+  NIDs and measures **zero unresolved NIDs** on every installed title. Sweep
+  these opportunistically later for *semantic* divergences, not coverage.
+
+## Status
+
+- [~] Seven cluster agents launched 2026-07-28; each commits on its own
+  worktree branch and writes `docs/sharpemu-port/<cluster>.md`. Main session
+  merges, verifies (workspace tests + clippy gate), and records outcomes here.
+- [ ] After merge: live re-measure via `cargo xtask baseline run` +
+  `baseline diff` against `artifacts/compat/pre-wave-baseline-20260727.json`
+  to prove (or disprove) that the ported fixes move GTA V / Until Dawn /
+  ASTRO.BOT.
+- [ ] Periodic re-fetch of `reference/sharpemu` and re-sweep of new commits
+  (upstream lands several per day).
