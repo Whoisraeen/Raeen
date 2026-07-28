@@ -547,6 +547,12 @@ pub trait GuestThreadScheduler {
     fn create(&self, thread_out: u64, attr: u64, entry: u64, arg: u64) -> u64;
     fn join(&self, thread: u64, retval_out: u64) -> u64;
     fn detach(&self, thread: u64) -> u64;
+    /// Apply an Orbis scheduling priority to a live guest thread when the host
+    /// runtime supports it. Bookkeeping remains the HLE layer's authority;
+    /// `false` only means no live host thread accepted the update.
+    fn set_priority(&self, _thread: u64, _priority: i32) -> bool {
+        false
+    }
     fn request_exit(&self, retval: u64) -> bool;
     fn current_thread(&self) -> u64;
     /// Mark the whole guest process as terminating with `code`.

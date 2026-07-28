@@ -285,8 +285,9 @@ top-down, update statuses in place, and keep it committed.**
   `sceVideoOutSubmitFlip` lines (log tailed incrementally); process-tree
   CPU/mem via sysinfo. FAILS on: no epoch advance > stall limit (armed after
   first advance; boot has its own budget), the pthread_sync
-  `scePthreadMutexLock stuck >3s — deadlock` warning (mutex/owner parsed),
-  or exit before deadline — prints frozen-window timestamps + 80-line log
+  `scePthreadMutexLock waiting >30s with one owner — probable deadlock`
+  warning (mutex/owner parsed), or exit before deadline — prints
+  frozen-window timestamps + 80-line log
   tail, writes `artifacts/soak/<run-id>/report.txt`, exits nonzero. Success
   prints min/avg/max window FPS, overall flips/s, worst stall, peak mem,
   avg/peak CPU. Synthetic input EXISTS and is wired: `--input` forwards a
@@ -295,13 +296,57 @@ top-down, update statuses in place, and keep it committed.**
   snapshot holds forever, so `…:ls_up` walks for the rest of the soak).
   `--input none` (default) still catches frozen frames/deadlocks but only on
   the boot/idle path — reduced coverage, stated in the report.
-- [ ] LIVE: `cargo build --release -p raeen-gui` then
-  `cargo xtask soak --game minecraft --minutes 30` (add `--input` for
-  in-world coverage). Human-supervised run closes this.
-- [ ] Re-verify the in-world hang that did NOT reproduce post-fix (mutex
-  `0x1019a1d48c0` / `0x1019a1d32e0`); if it recurs, instrument holder call
-  path via `RAEEN_TRACE_HLE` + owner name. (The soak fails loudly on that
-  exact warning line now.)
+- [~] LIVE FAILED 2026-07-28 on release `2e4bdcae8a9a+dirty`:
+  `artifacts/soak/soak-1785237272190/report.txt`. Scripted input reached the
+  selected world, mounted its savedata, opened the Bedrock database, and
+  logged `Player connected.` Frame time was 12.1-16.5 ms in the healthy
+  pre-connect windows, but the flip high-water then froze at 7104 for 10.1 s
+  (2m19.9s -> 2m30.0s), so the harness correctly failed after 2m30.9s of the
+  planned 30 minutes. No guest fault, Vulkan device loss, panic, or
+  pthread-sync deadlock warning was observed. Diagnose and fix this
+  post-connect stall, then repeat
+  `cargo xtask soak --game minecraft --minutes 30 --input <script>`;
+  only a complete clean run closes this item.
+- [~] CURRENT MEASURED WALL 2026-07-28, release
+  `2e4bdcae8a9a+dirty`: visible Shell verification found the deterministic
+  saved-world path is `Cross, Down, Down, Cross` (the prior script left focus
+  on `Create New`). It produced a real in-world frame, but only **2 FPS**.
+  Production A/B report `artifacts/soak/soak-1785245319976/report.txt`:
+  4m01s, 7,904 flips, 33.6 flips/s overall, 21.2s worst frozen window,
+  1,413 MiB peak RAM, zero probable-deadlock warnings. The HUD showed
+  presentation under 6ms while six streaming workers repeatedly waited
+  9–28s on one title mutex. The full 30-minute/10-second-threshold gate is
+  still red.
+- [x] Re-verified the old in-world "hang" family. It recurs at ASLR-varying
+  mutex addresses, but ownership rotates and every measured waiter eventually
+  acquires. `pthread_sync` now labels >3s waits as **long contention**, reports
+  recovery time/owner changes, and reserves **probable deadlock** for one
+  unchanged owner observed for 30s. `raeen-hle` 528/528 and `xtask` 55/55
+  tests pass. This closes the diagnostic wording, not the performance gate.
+- [x] Implemented SharpEmu-style **FIFO direct mutex handoff** in the real
+  multithreaded path. Unlock/owner-death grants exactly the oldest private
+  waiter under the state lock; arrivals cannot barge, and cancellation cannot
+  leave a stale head. Kernel ordering/cancellation regressions and HLE parked
+  wait diagnostics pass. Measured control
+  `soak-1785245319976` (33.6 flips/s, 21.2s stall) versus FIFO
+  `soak-1785252399276` (57.4 flips/s, 10.9s stall): a real improvement, but
+  still 0.9s outside the strict gate.
+- [x] Ruled out three tempting but false fixes with measured A/B evidence:
+  the executable HLE gateway sustains 2.804M direct calls/s with zero VEH
+  dispatches; a 16-page lazy-commit batch regressed 10.8s/1,873 MiB to
+  11.1s/1,909 MiB; and the SharpEmu/KytyPS5 host-priority bridge cannot help
+  these workers because every one requests Orbis priority 700 (normal).
+  Demand batching and host priority remain opt-in; neither became production
+  default.
+- [~] PRECISE REMAINDER: `soak-1785254960045` proved six Streaming Pool
+  waiters spend 19.5–29.0s behind one stable owner that is executing guest
+  code, not nested in HLE; handoff drains the queue in about 2ms afterward.
+  `soak-1785255755223` reproduced an 18.8s frozen window under relaxed
+  diagnostics (5,120 flips, 43.9 flips/s, 1,946 MiB, zero deadlocks) and
+  sampled the owner at `module+0x8dc58ca`. Mutex state now records the guest
+  call site that acquired the lock. The next run must use that provenance to
+  shorten the title streaming critical section, then pass the unchanged
+  30-minute / 10-second gate. Item 9 and Phase 2 remain open until it does.
 
 ### 10. Promote the baseline runner to `cargo xtask baseline`
 - [x] CODE DONE 2026-07-27 (worktree agent; xtask 25/25 green, 18 new tests;
@@ -426,9 +471,14 @@ top-down, update statuses in place, and keep it committed.**
 ## P3 — Features / differentiators
 
 ### 17. Local trophy store
-- [ ] Back `sceNpTrophy2*` with a real local unlock store (per-title, per-user
-  JSON/SQLite under savedata-like host map) + Shell trophies page. Serves
-  Tier-B necessity AND user delight.
+- [x] **DONE 2026-07-28** (merged as `7cb6bdb`, integration fix
+  `b95f769`). `sceNpTrophy2*` and the UDS unlock path persist an idempotent,
+  timestamped per-title JSON ledger next to (never inside) the title save
+  root. The Shell polls it for unlock toasts and exposes count/last-unlock in
+  Game Options. Retail trophy definitions remain honestly unavailable without
+  encrypted title data, so the UI never invents names/grades or a false total.
+  Verification: five `raeen-core` persistence/flag-layout tests, the Shell
+  trophy-summary test, and the current 527-test HLE suite are green.
 
 ### 18. Screenshot hotkey
 - [x] CODE DONE 2026-07-27 (commit `c6f4ed6`, merged `8a31528`). F12 anywhere +
@@ -481,11 +531,19 @@ top-down, update statuses in place, and keep it committed.**
   green; verify e2e when the first public release is published.
 
 ### 22. NEW (2026-07-28): baseline-diff catches — canary hunt + ASTRO.BOT crash
-- [ ] **Canary smash hunt (GTA V thread 31 + Until Dawn ~6.7 s):** both titles
-  now die on a real guest `__stack_chk_fail` with actionable reports. The
-  getdents d_reclen overflow is fixed, so another guest-visible struct/size
-  mismatch remains (hunt the same way: audit the syscalls in the pre-canary
-  log window against shadPS4 layouts). This is now GTA V's top blocker.
+- [x] **Canary smash hunt resolved 2026-07-28** (`2e4bdcae8a9a+dirty`,
+  release). GTA V's thread-31 abort disappeared after the bounded AudioOut2
+  fixes (183.2 s, 160 flips). Until Dawn's independent abort was then traced
+  to `sceKernelAioInitializeParam`: the real one-argument ABI was implemented
+  as `(param, size)`, so stale `RSI=0x88` zeroed 136 bytes from the title's
+  0x3c-byte stack local and erased `[rbp-0x30]`. The fixed-size 0x3c write now
+  matches SharpEmu's Gen4/Gen5 layout and the title's immediately-following
+  `InitializeImpl(param, 0x3c)`. Exact guard regression plus all 527
+  `raeen-hle` and 81 `raeen-runtime` lib tests pass. Live proof
+  `until-aio-abi-fix-60s-20260728.json`: 60.1 s TimedOut, 1.58 GB peak RAM,
+  no `__stack_chk_fail`, crash, unresolved called NID, or first blocker. This
+  closes the canary defect, not rendering: Until Dawn still produces zero
+  flips and its new measured wall is a steady-state mutex hot loop.
 - [x] **ASTRO.BOT regression fixed 2026-07-28** (`94910987be57+dirty`,
   release): mixed `(Dim, format)` sampled/storage arrays are split into
   matching Vulkan descriptor arrays, and exact compute slices/lifetimes are
@@ -574,21 +632,41 @@ GPL-2.0-compatible).
 ## R2-P0 — Engine critical path
 
 ### 23. Shader `exp mrt1-7` recompiler extension
-- [ ] The MRT pipeline side landed (item 16) but the shader recompiler still
-  handles only MRT0 exports — real-title MRT output needs exp targets
-  0x01–0x07 declared as `%outColor1..7`. Named by the item-16 agent as THE
-  follow-up on the GTA V-class critical path.
+- [x] **DONE 2026-07-28 (`2e4bdcae8a9a+dirty`).** EXP targets 0x00–0x07
+  retain their raw target, share the established compressed/uncompressed
+  operand lowering, validate the matching `SPI_SHADER_EX_FORMAT` slot, and
+  write distinct `%outColor` / `%outColor1..7` variables at Vulkan Locations
+  0–7. MRT0 may correctly carry `done=0` when a later MRT terminates the
+  export sequence. A generated MRT0+MRT1 fixture assembles and passes Naga
+  validation with two distinct stores. Full `kyty-graphics` 494/494 and the
+  two Vulkan `raeen-gpu --test mrt_targets` iron tests pass.
 - **Where:** `crates/kyty-graphics/src/shader/parse.rs` (exp target decode),
   `recompile.rs` + `spirv.rs` (per-target output variables + writes).
 - **Acceptance:** fixture shader exporting to mrt0+mrt1 → validated SPIR-V
   with two outputs; iron test via `tests/mrt_targets.rs` extension.
 
 ### 24. Hardware-watchpoint canary hunter (unblocks item 22a)
-- [ ] The GTA V/Until Dawn canary smashes need to be caught IN THE ACT: arm
+- [x] **DONE 2026-07-28 (`2e4bdcae8a9a+dirty`).** The GTA V/Until Dawn canary smashes
+  can be caught IN THE ACT: arm
   x64 debug registers (DR0–DR3, write-watch on the canary slot / smashed
   region) on guest threads via SetThreadContext, report the smashing RIP +
   HLE context through the existing fault path. Env: `RAEEN_WATCH_ADDR=0x...`
   (+ optional auto-arm on `fs:0x28` canary of the faulting thread).
+- **Current evidence (2026-07-28):** `RAEEN_WATCH_ADDR`,
+  `RAEEN_WATCH_PTR_ADDR`, `RAEEN_WATCH_CANARY_AFTER_HLE`, and
+  `RAEEN_WATCH_CANARY_FRAME_DEPTH` arm DR0/DR7 through the VEH context,
+  attribute the HLE boundary, and emit bounded writer candidates plus
+  surrounding disassembly. Until Dawn proved the selected parent slot was
+  already zero immediately after the bad initializer, which led directly to
+  item 22's ABI fix. Four focused tests and all 81 runtime lib tests pass.
+  DR7 now includes x64's fixed bit 10 (Windows normalizes it to `0x90401`).
+  A controlled native-guest acceptance now calls a VEH-dispatched HLE import,
+  arms `DR0/DR7`, writes `0x123456789abcdef0` to the selected guest word,
+  receives and consumes the expected `EXCEPTION_SINGLE_STEP` with `DR6.B0`,
+  resumes at the following instruction, and returns the written value. The
+  monotonic diagnostic hit counter makes that complete path machine-checkable.
+  Exact opt-in acceptance and the full runtime suite pass: 81 lib tests,
+  56 integration tests (+1 manual benchmark ignored), and the M3 fixture.
 - **Why:** turns the two remaining title blockers from log-forensics into a
   one-run diagnosis. Also generally useful forever.
 - **Where:** `crates/raeen-runtime` (thread context, VEH single-step arm),
@@ -627,10 +705,13 @@ GPL-2.0-compatible).
   deleting them.
 
 ### 29. Fix the vblank flake properly
-- [ ] `consecutive_vblank_waits_land_one_period_apart` depends on wall-clock
-  timing and fails under load (three separate agents hit it tonight).
-  Inject a mock/monotonic test clock into the vblank source instead.
-  (`crates/raeen-hle/src/libsce_video_out.rs`.)
+- [x] **DONE 2026-07-28 (`2e4bdcae8a9a+dirty`).**
+  `consecutive_vblank_waits_land_one_period_apart` no longer depends on
+  wall-clock timing or Windows scheduling load. The absolute-edge scheduler
+  accepts a `VblankClock`; production supplies the same monotonic
+  `Instant`/high-resolution wait implementation, while the test supplies a
+  deterministic manual clock and pins consecutive deadlines at exactly
+  `period` and `2*period`. Full `raeen-hle` suite: 527/527 green.
 
 ### 30. Diagnostics bundle (one-click bug report)
 - [ ] Settings ▸ System ▸ "Export Diagnostics": zip (crate `zip`, MIT) the
@@ -650,10 +731,14 @@ GPL-2.0-compatible).
 ## R2-P2 — Performance
 
 ### 33. mimalloc global allocator (measured evaluation)
-- [ ] Windows heap is a known cost on allocation-heavy paths. Add `mimalloc`
-  (MIT) behind a cargo feature, benchmark boot time + in-world FPS +
-  shader-translate time on Minecraft before/after (perf HUD + criterion),
-  adopt only with numbers.
+- [x] EVALUATED AND REJECTED 2026-07-28 on
+  `2e4bdcae8a9a+dirty`. A temporary MIT-licensed `mimalloc` Cargo feature was
+  compiled and run against the same saved world and 11-event replay, then
+  removed after the A/B regressed. Default allocator
+  (`soak-1785245319976`): 33.6 flips/s, 21.2s worst stall, 1,413 MiB peak,
+  495% average CPU. mimalloc (`soak-1785245593561`): 32.5 flips/s, 40.2s
+  worst stall, 2,252 MiB peak, 497% average CPU. It shortened the first
+  world-open interval (14.4s → 12.1s) but lost the complete run. Do not adopt.
 
 ### 34. Precise frame pacing with spin_sleep
 - [ ] The frame limiter's sleep granularity on Windows is timer-quantum

@@ -5425,3 +5425,241 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   theme-derived colors). fmt green; clippy -p raeen-gui --all-targets clean.
 * NOT live-verified (agent worktree: no display/games) — verify-skill steps
   handed to the main session.
+
+## 2026-07-28 — Checklist item 22b: ASTRO.BOT host fail-fast root-caused and fixed
+
+* Build/evidence identity: release `94910987be57+dirty`. All captures remain
+  ignored under `artifacts/diagnostics/astro-gates-20260728/`; no title bytes
+  or absolute paths were added to git.
+* Controlled A/B with every captured title compute shader suppressed narrowed
+  the validation-clean Vulkan loss from six pixel shaders to one:
+  `0x500652400`. Skipping only neighboring PS `0x500650e00` still lost the
+  device; skipping only `0x500652400` stayed alive for 45 s. The reciprocal
+  pair and half-set runs are recorded as
+  `ab-skip-draw-{half-a,half-b,b1,b2-pair,650e-only,6524-only}-45.json`.
+* A fresh raw+SPIR-V capture (`ps_500652400_332.bin`,
+  `ps_500652400.spv`) passed `spirv-val --target-env vulkan1.2`, but
+  disassembly exposed the semantic fault: `%3` is `StorageBuffer[1]`, while
+  its scalar-load helper used constant `40856176 == 0x026f6a70` as the
+  descriptor-array index. That value is the low guest address dword of the
+  EUD-loaded V#, not a Vulkan descriptor index. The AMD device reset was
+  therefore a host translation bug despite structurally valid SPIR-V.
+* Root cause: PS analysis runs `shader_capture_runtime_scalar_loads` after
+  recovering EUD resources. The generic live-user-pointer pass captured
+  `s_load_dwordx4 ... s[28:29], 0x20` into
+  `embedded_constant_loads`; `sload_dword_extended` checks that table before
+  its EUD mapper, so the raw V# dwords pre-empted the mapped push-constant
+  descriptor whose dword 0 is rewritten to compact index 0.
+* Fix: `shader_capture_runtime_scalar_loads` excludes the exact recovered EUD
+  base. PC-relative constants still use their dedicated proof pass, and
+  non-EUD live user pointers (Minecraft's SRT texture path) are unchanged.
+  TDD: the exact `0x026f6a70` regression failed before the guard, then passed;
+  `runtime_scalar_load_replaces_placeholder_texture_and_survives_embedded_pass`
+  and `astro_extended_storage_buffer_below_s16_recompiles` also pass.
+* Live proof:
+  - controlled, no graphics skip:
+    `validation-eud-descriptor-rewrite-fix-controlled-45.json` — 45.5 s,
+    shader translated/submitted, at least 5 present records, no device loss,
+    VUID, fastfail, or stack overrun;
+  - production defaults:
+    `validation-eud-descriptor-rewrite-fix-production-60.json` — 60.6 s,
+    9 measured flips, peak working set 2,837,430,272 B, no device loss, VUID,
+    fastfail, `0xC0000409`, or `STATUS_STACK_BUFFER_OVERRUN`.
+* Honest remainder: ASTRO is not declared playable or visually correct.
+  Several shader parser gaps remain, and five exact compute shapes are still
+  quarantined. This result closes checklist 22b's host-crash regression only.
+
+## 2026-07-28 — Until Dawn canary root cause and live fix
+
+* Build/evidence identity: release `2e4bdcae8a9a+dirty`; measured report
+  `artifacts/diagnostics/until-aio-abi-fix-60s-20260728.json`.
+* A full HLE trace reduced the old 4.8 s `__stack_chk_fail` to
+  `sceKernelAioInitializeParam` / `InitializeImpl`, sysmodule/app-content, and
+  the directory helper. Runtime disassembly proved the failing parent saved
+  `[__stack_chk_guard]` at `[rbp-0x30]`, then called
+  `sceKernelAioInitializeParam(&param)` with `param = rbp-0x6c`.
+* Root cause: Raeen incorrectly modeled the one-argument initializer as
+  `(param, size)` and interpreted stale `RSI=0x88` as a write length. It
+  therefore zeroed `[rbp-0x6c, rbp+0x1c)`, including the canary. SharpEmu's
+  independently-derived Gen4/Gen5 ABI fixes the block at 0x3c bytes; Until
+  Dawn independently passes that exact size to the immediately-following
+  `InitializeImpl(param, 0x3c)`.
+* Fix: initialize exactly 0x3c bytes and ignore non-argument register state.
+  The regression poisons the adjacent 16 bytes and proves the measured
+  `RSI=0x88` cannot touch them. All 527 `raeen-hle` and 81 `raeen-runtime`
+  library tests pass.
+* Live result: Until Dawn changed from `Exited` at ~4.8 s with
+  `__stack_chk_fail` to `TimedOut` at 60.1 s, 44.3 s sampled CPU, 1.58 GB peak
+  working set, zero flips, and no first blocker, crash, called unresolved NID,
+  or canary failure. Its new wall is a steady-state mutex hot loop
+  (~8.8 million lock/unlock/self calls in the post-30 s window), not rendering.
+* The reusable DR0/DR7 canary diagnostic is implemented with explicit,
+  indirect-GOT, HLE-boundary, and frame-depth modes. It identified that the
+  protected slot was already zero after the initializer. Its pure encoding,
+  parsing, and frame-walk tests are green; retain checklist item 24 as `[~]`
+  until a controlled guest write proves the live DR6.B0 single-step path.
+
+## 2026-07-28 — Checklist item 23: MRT1–7 shader exports
+
+* Pixel EXP targets 0x00–0x07 now retain the raw MRT index independently of
+  their shared operand format. Both compressed FP16 and uncompressed 32-bit
+  forms validate the corresponding `target_output_mode[index]` and store to
+  Vulkan fragment locations 0–7 (`%outColor`, `%outColor1..7`).
+* The parser no longer requires `done=1` on every colour export: MRT0 may be a
+  non-final export when MRT1 follows, while the final MRT carries `done`.
+  The established channel-mask defaults remain unchanged per target.
+* Acceptance fixture: one generated pixel shader exports full RGBA to MRT0
+  and MRT1; its SPIR-V declares distinct Locations 0/1, stores each EXP to the
+  matching variable, assembles, and passes Naga validation.
+* Verification: all 494 `kyty-graphics` library tests and both real Vulkan
+  `raeen-gpu --test mrt_targets` attachment/write-mask tests pass. This closes
+  shader translation for MRT1–7; it does not claim a title now renders.
+## 2026-07-28 — Hardware write-watch acceptance closes checklist item 24
+
+* Added a retail-free native-guest fixture for the full Windows hardware
+  watchpoint path, not merely the DR7 encoder. With
+  `RAEEN_WATCH_ADDR=0x100000000080`, the fixture traps through an HLE import,
+  arms an aligned 8-byte write watch, writes a known value, and proves the VEH
+  consumed `EXCEPTION_SINGLE_STEP` with `DR6.B0` before resuming the guest.
+* `guest_watchpoint_hit_count()` is a monotonic diagnostic counter used by the
+  acceptance to distinguish a real hardware trap from an ordinary successful
+  store. The exact opt-in test passed, then the complete `raeen-runtime` suite
+  passed: 81 library tests, 56 integration tests (one manual benchmark
+  ignored), and the M3 interactive fixture.
+* This closes the diagnostic mechanism. It does not claim another title fix;
+  the Until Dawn AIO overwrite it helped identify was fixed separately.
+
+## 2026-07-28 — Deterministic vblank schedule test closes checklist item 29
+
+* Extracted the absolute-edge calculation behind `sceVideoOutWaitVblank` into
+  a clock-injected scheduler. Production still uses the process-wide monotonic
+  `Instant`, high-resolution Windows waitable timer, and bounded final spin;
+  there is no pacing behavior change.
+* The formerly flaky consecutive-waits test now uses a manual clock and proves
+  the chosen deadlines are exactly one and two periods after the epoch. Host
+  load can no longer create a false early/late failure.
+* TDD evidence: the new test failed before the clock seam existed, then passed;
+  all 527 `raeen-hle` library tests and crate formatting are green.
+
+## 2026-07-28 — Minecraft soak gate catches a post-connect frame stall
+
+* Build/evidence identity: release `2e4bdcae8a9a+dirty`; clean report
+  `artifacts/soak/soak-1785237272190/report.txt`. The earlier
+  `soak-1785237022369` attempt is discarded because a concurrent compile
+  contaminated the measurement.
+* Scripted input reached the selected world. The title mounted
+  `BedrockWorldQHe3erDCKLk@P1`, opened the Bedrock database, created and
+  released a snapshot, and logged `Player connected.` This proves the failure
+  is after world selection and storage mount rather than boot navigation.
+* Before the freeze, worker windows were commonly 12.1-16.5 ms/frame
+  (approximately 60-82 FPS over those windows). The flip high-water then
+  stopped at 7104: last advance 2m19.9s, failure after a 10.1 s frozen window,
+  and 11.1 s worst observed stall. The harness terminated at 2m30.9s of the
+  planned 30 minutes. Overall rate was 49.1 flips/s, with 1831 MiB peak
+  process-tree memory.
+* There was no guest fault, Vulkan device loss, panic, stack/canary failure,
+  or `scePthreadMutexLock stuck` warning. The last post-render activity was
+  `Player connected.`, savedata snapshot/commit work, and user-settings mount
+  changes. This is a real failed acceptance gate, not a completed soak.
+* Next diagnostic: reproduce with the existing stall/thread-RIP dump enabled
+  and a wider diagnostic-only stall allowance. Do not loosen the 10 s
+  acceptance threshold or mark checklist item 9 complete until the blocking
+  call is identified, fixed, and the full 30-minute run passes.
+
+## 2026-07-28 — Minecraft world-entry profiling and allocator A/B
+
+* Build/evidence identity: release `2e4bdcae8a9a+dirty`. All retail inputs and
+  captures remain machine-local and ignored.
+* Fixed a real texture-bind CPU hot path in
+  `raeen-gpu::draw_translate::guest_sample_hash`: large 4–32 MiB textures used
+  1,024–8,192 separate 64-byte guest reads. It now samples 64 evenly spaced,
+  size-scaled windows plus the tail, preserving approximately 1/64 coverage
+  with at most 65 validated reads. Profile
+  `artifacts/minecraft-window-hash-profile-20260728-073258.out.log` measured
+  deep bindings at 126–208 µs instead of 1,783 µs (88–93% lower). The exact
+  long-term invalidation fix is still page-dirty tracking. All 286
+  `raeen-gpu` unit tests and its integration tests passed.
+* Corrected the pthread diagnostic contract. A >3s wait is now reported as
+  long contention; acquisition logs `wait_ms` and owner changes. Only one
+  unchanged owner observed for 30s is a probable deadlock. The soak harness
+  fails immediately only on that latter marker; rotating/recovering ownership
+  remains visible and the frame-stall gate still fails it. Verification:
+  `raeen-hle` 528/528 and `xtask` 55/55 tests passed.
+* Visible Shell verification found why the old replay became nondeterministic:
+  after entering Play, focus starts on the Worlds tab, then moves to
+  `Create New`, then the first saved-world row. The deterministic saved-world
+  sequence is therefore `Cross, Down, Down, Cross`. It logged `Opening level`,
+  `Player connected`, and produced a recognizable in-world frame. The frame
+  was only 2 FPS and still had incomplete/incorrect terrain textures.
+* Presentation is ruled out for this wall: the in-world HUD showed roughly
+  0.0 ms drain, 0.4 ms fence, 0.3 ms readback, and 5.3 ms Shell upload.
+  Six Streaming Pool workers instead formed repeated 9–28s convoys on one
+  normal title mutex. Ownership rotated and all waiters recovered.
+  `artifacts/soak/soak-1785245319976/report.txt` (production diagnostics):
+  4m01s, 7,904 flips, 33.6 flips/s overall, 21.2s worst frozen window,
+  1,413 MiB peak RAM, zero probable-deadlock warnings. This remains a failed
+  10-second acceptance gate and does not close checklist item 9 or Phase 2.
+* `RAEEN_STALL_DUMP=1 RAEEN_TIME_HLE=1` reproduced the same family in
+  `soak-1785244552713`: a 25.5s stable-owner hold, followed by a different
+  owner. Samples caught the owner in Windows heap allocate/free paths and,
+  in one sample, inside `scePthreadRwlockRdlock`. This justified checklist
+  item 33's allocator experiment, not an allocator conclusion by itself.
+* The controlled `mimalloc` experiment was negative and was fully removed.
+  Default (`soak-1785245319976`): 33.6 flips/s, 21.2s worst stall, 1,413 MiB
+  peak, 495% average CPU. mimalloc (`soak-1785245593561`): 32.5 flips/s,
+  40.2s worst stall, 2,252 MiB peak, 497% average CPU. Although first world
+  open improved from 14.4s to 12.1s and the first convoy from 27.8s to 18.3s,
+  the complete run regressed. Per "adopt only with numbers", Raeen keeps the
+  standard allocator and checklist item 33 is closed as evaluated/rejected.
+
+## 2026-07-28 — Minecraft FIFO handoff and world-transition A/B
+
+* Build/evidence identity: release `2e4bdcae8a9a+dirty`. Retail inputs and
+  captures remain machine-local and ignored.
+* Replaced mutex barging with a SharpEmu-derived, Raeen-native FIFO of private
+  waiter signals. Unlock and owner-death recovery transfer ownership under the
+  state lock and wake exactly the selected head; timeout/termination removes a
+  waiter without leaving a stale queue entry. Two kernel regressions pin
+  ordering, single-wake behavior, cancellation, and acquisition provenance.
+* The direct executable HLE gateway is not the wall. Its one-million-call
+  release benchmark completed in 356.615 ms: 2,804,143 calls/s, 1,000,000
+  direct dispatches, and zero VEH dispatches. The previously observed
+  microsecond-per-call result was instrumentation distortion.
+* Production A/B improved materially but did not pass the strict gate:
+  `soak-1785245319976` (pre-FIFO control) produced 7,904 flips at 33.6 flips/s
+  with a 21.2 s worst stall; `soak-1785252399276` (FIFO) produced 5,376 flips
+  at 57.4 flips/s with a 10.9 s worst stall. The latter missed the 10-second
+  acceptance threshold by 0.9 s, so the optimization stays but item 9 remains
+  open.
+* Healthy in-world windows after transition sustained approximately 93–101
+  flips/s. Presentation remained under 6 ms and fence wait was not dominant.
+  Scripted analog input changed the complete 12-byte pad snapshot at 105 s,
+  proving the gameplay input path rather than only digital buttons.
+* A bounded 16-page lazy-commit experiment was rejected as the production
+  default. `soak-1785254288899` (16 pages) measured 11.1 s worst stall and
+  1,909 MiB peak RAM; `soak-1785254400759` (one page) measured 10.8 s and
+  1,873 MiB. The bounded algorithm and regression remain available through
+  `RAEEN_DEMAND_COMMIT_BATCH_PAGES`, while the measured-safe default stays one
+  page.
+* Precise parked-wait diagnostics proved the six streaming waiters were all
+  behind one normal mutex and one stable owner. `owner_wait=<guest code>` at
+  every warning means the owner was not recursively blocked inside another
+  HLE wait. A relaxed diagnostic run,
+  `soak-1785254960045`, recovered after 19.5–29.0 s waits and then drained the
+  FIFO in roughly 2 ms; no probable deadlock occurred.
+* Implemented the live Windows thread-priority bridge using SharpEmu's
+  `<=478` high / `>=733` low bands, independently confirmed by KytyPS5. It is
+  opt-in because every Minecraft streaming/server worker requested priority
+  700 (normal), and `soak-1785255443436` still stalled for 10.8 s. This A/B
+  provides no basis for enabling it by default.
+* A 120-second `RAEEN_STALL_DUMP=1` diagnostic
+  (`soak-1785255755223`) survived under a relaxed 30-second threshold but
+  measured an 18.8 s frozen window, 5,120 flips, 43.9 flips/s overall, 1,946
+  MiB peak RAM, and zero deadlock warnings. The stable owner was sampled both
+  in runtime/Windows wait machinery and at guest `module+0x8dc58ca`; this is a
+  title streaming critical section, not the scanout/present path. Mutex state
+  now retains the guest return address that acquired ownership so the next
+  reproduction names the critical-section entry.
+* Honest status: the 30-minute / strict 10-second soak is still red. Phase 2
+  and checklist item 9 remain open; no Phase 3 bulk work is authorized by the
+  ordered workflow yet.

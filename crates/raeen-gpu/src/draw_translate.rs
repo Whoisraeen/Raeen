@@ -46,13 +46,39 @@ use kyty_graphics::shader::{
 };
 use kyty_graphics::spirv_asm;
 
-/// One captured ASTRO.BOT compute program is validation-clean but
-/// reproducibly poisons the Windows Vulkan device after submission. Keep the
-/// production path alive with an exact, named quarantine while its
-/// exec-mask/reloop semantics are audited. The address + dispatch shape is
+/// Captured ASTRO.BOT compute programs which are validation-clean but
+/// reproducibly poison the Windows Vulkan device after submission. Keep the
+/// production path alive with exact, named quarantines while their
+/// exec-mask/reloop semantics are audited. Address + dispatch shape is
 /// deliberately narrower than a generic "large compute" heuristic.
-const fn is_known_device_loss_compute(cs_addr: u64, groups: [u32; 3]) -> bool {
-    cs_addr == 0x5005_3c700 && groups[0] == 64 && groups[1] == 64 && groups[2] == 1
+const fn known_device_loss_compute_reason(cs_addr: u64, groups: [u32; 3]) -> Option<&'static str> {
+    if cs_addr == 0x5074_0a700 && groups[0] == 192 && groups[1] == 1 && groups[2] == 1 {
+        return Some(
+            "ASTRO scene root pass is independently required to reproduce the validation-clean device-loss chain",
+        );
+    }
+    if cs_addr == 0x555f_4f500 && groups[0] == 192 && groups[1] == 1 && groups[2] == 1 {
+        return Some(
+            "ASTRO scene root pass is independently required to reproduce the validation-clean device-loss chain",
+        );
+    }
+    if cs_addr == 0x5006_c5f00
+        && ((groups[0] == 120 && groups[1] == 68 && groups[2] == 1)
+            || (groups[0] == 60 && groups[1] == 34 && groups[2] == 1))
+    {
+        return Some(
+            "ASTRO scene downsample pass is independently required to reproduce the validation-clean device-loss chain",
+        );
+    }
+    if cs_addr == 0x5005_3c700 && groups[0] == 64 && groups[1] == 64 && groups[2] == 1 {
+        return Some("standalone 64x64x1 dispatch resets the Windows Vulkan device");
+    }
+    if cs_addr == 0x5005_64500 && groups[0] == 6 && groups[1] == 4 && groups[2] == 8 {
+        return Some(
+            "3D volume-consumer pass poisons the next frame after the 0x500545d00 producer",
+        );
+    }
+    None
 }
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,12 +129,17 @@ fn shader_addr_selected(variable: &str, vs: u64, ps: u64) -> bool {
     let env = crate::diagnostics::gpu_env();
     let raw = match variable {
         "RAEEN_TRACE_SHADER_ADDR" => env.trace_shader_addr.as_deref(),
+        "RAEEN_SKIP_SHADER_ADDR" => env.skip_shader_addr.as_deref(),
         "RAEEN_SOLID_PS_ADDR" => env.solid_ps_addr.as_deref(),
         _ => None,
     };
     let Some(raw) = raw else {
         return false;
     };
+    shader_addr_list_contains(raw, vs, ps)
+}
+
+fn shader_addr_list_contains(raw: &str, vs: u64, ps: u64) -> bool {
     raw.split(',').any(|part| {
         let part = part.trim();
         let digits = part
@@ -1361,11 +1392,12 @@ fn texture_vk_format(
 
 /// Sparse sample-hash of a guest byte range for the persistent-texture cache
 /// (stage D): FNV-1a over the range length, tile mode, 64 evenly-strided
-/// 64-byte chunks, and the final 64 bytes — ~4 KiB of guest reads regardless of
-/// texture size (a whole-range hash for ranges up to 4 KiB). Never returns 0
-/// (0 is the "no hash / not cacheable" sentinel), and returns `None` when the
-/// guest range is not readable — the caller then decodes uncached and produces
-/// its own named error if the range is truly bad.
+/// windows, and the final 64 bytes. Each window grows with the surface so the
+/// total sample is about 1/64th of large textures (capped at 512 KiB), while
+/// ranges up to 4 KiB are hashed in full. Never returns 0 (0 is the "no hash /
+/// not cacheable" sentinel), and returns `None` when the guest range is not
+/// readable — the caller then decodes uncached and produces its own named error
+/// if the range is truly bad.
 ///
 /// ## Staleness window (documented, deliberate)
 ///
@@ -1411,23 +1443,27 @@ fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
         // Minecraft's world-creation page: W/S/E/D/P/N/H/Y/b/f/g/w/x all
         // absent while C/G/M and most lowercase rendered).
         //
-        // Sample ~1/64th of the surface, bounded so the cost stays far below
-        // a full re-decode: a 4 MiB atlas now probes 64 KiB across 1024
-        // windows (16x the linear density, 64x the byte coverage) and a
-        // 16 MiB one is capped at 512 KiB. Still probabilistic — the exact
-        // fix is write-tracking the guest pages (Tier 5 page-dirty tracking)
-        // — but it moves a routine miss to an unlikely one.
+        // Sample ~1/64th of the surface, bounded so the cost stays far below a
+        // full re-decode. Keep a fixed 64-window count and widen each window:
+        // the previous 64-byte windows multiplied into 1,024 reads for a 4 MiB
+        // atlas and 8,192 reads at the 512 KiB cap. Every tiny read allocated,
+        // validated, and locked the guest arena, dominating Minecraft's world
+        // draws despite hashing the same total bytes. A 4 MiB atlas now probes
+        // 64 KiB as 64 x 1 KiB windows; a capped surface uses 64 x 8 KiB.
+        // Coverage remains probabilistic — the exact fix is write-tracking the
+        // guest pages (Tier 5 page-dirty tracking) — but no longer scales host
+        // call count with texture size.
         const MIN_SAMPLED: u64 = CHUNKS * CHUNK_BYTES; // 4 KiB floor
         const MAX_SAMPLED: u64 = 512 * 1024;
         let sampled = (len / 64).clamp(MIN_SAMPLED, MAX_SAMPLED);
-        let chunks = (sampled / CHUNK_BYTES).max(CHUNKS);
-        let stride = (len / chunks).max(CHUNK_BYTES);
-        for i in 0..chunks {
+        let window_bytes = (sampled / CHUNKS).max(CHUNK_BYTES);
+        let stride = (len / CHUNKS).max(window_bytes);
+        for i in 0..CHUNKS {
             let offset = i * stride;
             if offset >= len {
                 break;
             }
-            let size = CHUNK_BYTES.min(len - offset);
+            let size = window_bytes.min(len - offset);
             let bytes =
                 read_guest_bytes_unaligned(base + offset, size, "texture sample-hash").ok()?;
             h = mix(h, &bytes);
@@ -3980,7 +4016,6 @@ impl OffscreenDrawSink<'_> {
             return Ok(());
         }
         self.texture_sample_hashes.clear();
-
         // An empty render-target filter fences the ordered batch and publishes
         // compute SSBO/UAV outputs without paying to read unrelated colour
         // targets back. Storage-image outputs are returned and become valid
@@ -4061,6 +4096,24 @@ impl OffscreenDrawSink<'_> {
         // draw pipeline creation.
         if ucfg.prim_type == prim::NONE {
             debug!("draw consumed: VGT_PRIMITIVE_TYPE NONE");
+            return Ok(());
+        }
+        let vs_addr = if sh.vs.vs_regs.data_addr != 0 {
+            sh.vs.vs_regs.data_addr
+        } else {
+            sh.vs.es_regs.data_addr
+        };
+        let ps_addr = sh.ps.ps_regs.data_addr;
+        if shader_addr_selected("RAEEN_SKIP_SHADER_ADDR", vs_addr, ps_addr) {
+            let reason = format!("RAEEN_SKIP_SHADER_ADDR: vs={vs_addr:#x} ps={ps_addr:#x}");
+            self.draw_skips += 1;
+            self.last_draw_skip_reason = Some(reason.clone());
+            debug!(
+                vs_addr = format_args!("{vs_addr:#x}"),
+                ps_addr = format_args!("{ps_addr:#x}"),
+                reason,
+                "translated graphics draw skipped by RAEEN_SKIP_SHADER_ADDR"
+            );
             return Ok(());
         }
         let resolve_timer = crate::vulkan::offscreen::StageTimer::start(
@@ -4185,12 +4238,6 @@ impl OffscreenDrawSink<'_> {
         // NGG exposes its vertex program through the ES register block; the
         // legacy VS block remains zero. Report the effective shader address so
         // a layered-texture trace can be matched to the correct SPIR-V dump.
-        let vs_addr = if sh.vs.vs_regs.data_addr != 0 {
-            sh.vs.vs_regs.data_addr
-        } else {
-            sh.vs.es_regs.data_addr
-        };
-        let ps_addr = sh.ps.ps_regs.data_addr;
         let trace_textures = crate::diagnostics::gpu_env().trace_textures;
         let vertex_head = if trace_textures {
             state
@@ -4256,10 +4303,12 @@ impl OffscreenDrawSink<'_> {
         if crate::diagnostics::gpu_env().trace_draws {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
-            if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 64 {
                 let ps = &shaders.ps_info.bind;
                 let vs = &shaders.vs_info.bind;
                 tracing::warn!(
+                    vs_addr = format_args!("{vs_addr:#x}"),
+                    ps_addr = format_args!("{ps_addr:#x}"),
                     prim = ucfg.prim_type,
                     verts = state.vertex_count,
                     target_base = format_args!("{rt_base:#x}"),
@@ -4806,16 +4855,17 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 return Ok(());
             }
         }
-        if is_known_device_loss_compute(cs.cs_regs.data_addr, groups)
+        if let Some(quarantine_reason) =
+            known_device_loss_compute_reason(cs.cs_regs.data_addr, groups)
             && !crate::diagnostics::gpu_env().allow_known_device_loss_cs
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static QUARANTINED: AtomicU64 = AtomicU64::new(0);
             let occurrence = QUARANTINED.fetch_add(1, Ordering::Relaxed) + 1;
             let reason = format!(
-                "known-device-loss compute quarantined at {:#x} (64x64x1); \
+                "known-device-loss compute quarantined at {:#x} ({}x{}x{}): {}; \
                  RAEEN_ALLOW_KNOWN_DEVICE_LOSS_CS=1 restores it for diagnostics",
-                cs.cs_regs.data_addr
+                cs.cs_regs.data_addr, groups[0], groups[1], groups[2], quarantine_reason,
             );
             self.dispatch_skips += 1;
             self.last_dispatch_skip_reason = Some(reason.clone());
@@ -5256,9 +5306,27 @@ mod tests {
 
     #[test]
     fn astrobot_device_loss_quarantine_is_exact() {
-        assert!(is_known_device_loss_compute(0x5005_3c700, [64, 64, 1]));
-        assert!(!is_known_device_loss_compute(0x5005_3c700, [64, 63, 1]));
-        assert!(!is_known_device_loss_compute(0x5005_3c701, [64, 64, 1]));
+        assert!(known_device_loss_compute_reason(0x5074_0a700, [192, 1, 1]).is_some());
+        assert!(known_device_loss_compute_reason(0x555f_4f500, [192, 1, 1]).is_some());
+        assert!(known_device_loss_compute_reason(0x5006_c5f00, [120, 68, 1]).is_some());
+        assert!(known_device_loss_compute_reason(0x5006_c5f00, [60, 34, 1]).is_some());
+        assert!(known_device_loss_compute_reason(0x5005_3c700, [64, 64, 1]).is_some());
+        assert!(known_device_loss_compute_reason(0x5005_64500, [6, 4, 8]).is_some());
+        assert!(known_device_loss_compute_reason(0x5074_0a700, [191, 1, 1]).is_none());
+        assert!(known_device_loss_compute_reason(0x555f_4f500, [192, 2, 1]).is_none());
+        assert!(known_device_loss_compute_reason(0x5006_c5f00, [120, 67, 1]).is_none());
+        assert!(known_device_loss_compute_reason(0x5006_c5f00, [60, 34, 2]).is_none());
+        assert!(known_device_loss_compute_reason(0x5005_3c700, [64, 63, 1]).is_none());
+        assert!(known_device_loss_compute_reason(0x5005_64500, [6, 4, 7]).is_none());
+        assert!(known_device_loss_compute_reason(0x5005_3c701, [64, 64, 1]).is_none());
+    }
+
+    #[test]
+    fn shader_address_filter_matches_either_stage_and_ignores_bad_tokens() {
+        let raw = "garbage, 0x500640200, 50063f500";
+        assert!(shader_addr_list_contains(raw, 0x5006_3f500, 0));
+        assert!(shader_addr_list_contains(raw, 0, 0x5006_40200));
+        assert!(!shader_addr_list_contains(raw, 0x5000_00000, 0x5000_01000));
     }
 
     #[test]
@@ -6859,6 +6927,28 @@ mod tests {
             "distinct GFX10 swizzles must not share a cached decode"
         );
         assert_eq!(swizzle_rx, repeat, "the same layout stays cacheable");
+    }
+
+    #[test]
+    fn large_texture_hash_samples_inside_each_scaled_window() {
+        let mut bytes = vec![0x5au8; 4 * 1024 * 1024];
+        let base = bytes.as_ptr() as u64;
+        let first = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            guest_sample_hash(base, bytes.len() as u64, 27).unwrap()
+        });
+
+        // A 4 MiB surface has a 64 KiB sample budget. The scalable sampler
+        // must cover more than the first 64 bytes of each of its 64 windows;
+        // this models a small atlas update that the old 1,024 tiny reads
+        // happened to miss between probes.
+        bytes[512] ^= 0xff;
+        let changed = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            guest_sample_hash(base, bytes.len() as u64, 27).unwrap()
+        });
+        assert_ne!(
+            first, changed,
+            "a write inside a scaled sample window must invalidate the texture hash"
+        );
     }
 
     #[test]

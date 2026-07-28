@@ -417,67 +417,18 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     }
 
-    // A missing file is ENOENT *unless* the guest passed O_CREAT (then the VFS
-    // creates it). O_CREAT is bit 0x200 in the Orbis/BSD flag set.
+    // Let the VFS perform the one authoritative resolve+open. The old path
+    // resolved here to preflight existence and then `VfsSubsystem::open`
+    // resolved the same path again. Commercial titles issue thousands of
+    // successful asset opens while holding their own streaming locks, so that
+    // duplicate sandbox walk/canonicalization turned world transitions into
+    // multi-second mutex convoys.
+    //
+    // A missing file is ENOENT unless the guest passed O_CREAT (the VFS creates
+    // it). O_CREAT is bit 0x200 in the Orbis/BSD flag set.
     const O_CREAT: i32 = 0x200;
     let creating = flags & O_CREAT != 0;
     let built_in_device = matches!(path.as_str(), "/dev/random" | "/dev/urandom");
-    let resolved = if built_in_device {
-        None
-    } else {
-        ctx.kernel.filesystem.resolve_path(&path)
-    };
-    match resolved {
-        Some(host) if host.exists() || creating => {}
-        Some(host) => {
-            // Font-file fallback. The title reads its fonts with its OWN
-            // OpenType renderer and null-dereferences if an open fails, yet it
-            // references font variants / PS5 system fonts it does not ship
-            // (e.g. FuturaStd-Medium, SIE-ShinGoPr6N, HeiseiMaruGo). Substitute
-            // a shipped sibling font so the renderer parses valid tables
-            // (codepoints the substitute lacks are handled by the title's own
-            // cmap-miss path) instead of faulting on a null font object. Only
-            // triggers on a genuinely-missing font whose directory ships another.
-            if !creating
-                && let Some(fb_name) = font_fallback_sibling(&host)
-                && let Some(slash) = path.rfind('/')
-            {
-                let fb_path = format!("{}/{fb_name}", &path[..slash]);
-                warn!("open: '{path}' missing — substituting shipped font '{fb_path}'");
-                return match ctx.services.open(&fb_path, flags, mode) {
-                    Ok(fd) => fd as u64,
-                    Err(e) => {
-                        warn!("open: font substitute '{fb_path}' failed: {e} — ENOENT");
-                        FILE_ENOENT
-                    }
-                };
-            }
-            // A missing file on open without O_CREAT is a NORMAL, guest-handled
-            // condition — titles probe for many optional cache/save files (e.g.
-            // Minecraft's Bedrock premium_cache / savedata, 653×/run). The guest
-            // gets ENOENT and copes; a genuinely-required missing file surfaces as
-            // a guest-visible failure elsewhere. Keep it at debug so it stops
-            // drowning the log.
-            debug!(
-                "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",
-                host.display()
-            );
-            if trace_file_io(ctx) || std::env::var_os("RAEEN_TRACE_MISSING_FILES").is_some() {
-                info!(
-                    elapsed_ms = ctx.kernel.uptime().as_millis(),
-                    host = %host.display(),
-                    "file trace: missing path='{path}' flags={flags:#x} mode={mode:#o} -> ENOENT"
-                );
-            }
-            return FILE_ENOENT;
-        }
-        None if path == "/" && !creating => {}
-        None if !built_in_device => {
-            warn!("open: '{path}' matches no VFS mount — ENOENT");
-            return FILE_ENOENT;
-        }
-        None => {}
-    }
 
     match ctx.services.open(&path, flags, mode) {
         Ok(fd) => {
@@ -498,6 +449,70 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
             fd as u64
         }
         Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let trace_missing =
+                    trace_file_io(ctx) || std::env::var_os("RAEEN_TRACE_MISSING_FILES").is_some();
+                let is_font = std::path::Path::new(&path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "otf" | "ttf" | "ttc"
+                        )
+                    });
+                // Resolve a failed path a second time only for the two
+                // diagnostics that need its host spelling: font substitution
+                // and explicit file tracing. Ordinary optional-file probes
+                // retain the single VFS sandbox walk above.
+                let host = (!built_in_device && (is_font || trace_missing))
+                    .then(|| ctx.kernel.filesystem.resolve_path(&path))
+                    .flatten();
+
+                // Font-file fallback. The title reads its fonts with its OWN
+                // OpenType renderer and null-dereferences if an open fails, yet
+                // references variants/system fonts it does not ship. Substitute
+                // a shipped sibling so the renderer still parses valid tables.
+                if !creating
+                    && let Some(host) = host.as_deref()
+                    && let Some(fb_name) = font_fallback_sibling(host)
+                    && let Some(slash) = path.rfind('/')
+                {
+                    let fb_path = format!("{}/{fb_name}", &path[..slash]);
+                    warn!("open: '{path}' missing — substituting shipped font '{fb_path}'");
+                    return match ctx.services.open(&fb_path, flags, mode) {
+                        Ok(fd) => fd as u64,
+                        Err(error) => {
+                            warn!("open: font substitute '{fb_path}' failed: {error} — ENOENT");
+                            FILE_ENOENT
+                        }
+                    };
+                }
+
+                // Missing optional files are normal guest-handled probes. Keep
+                // production logging quiet; the opt-in trace retains the full
+                // guest/host path pair used by compatibility diagnostics.
+                if let Some(host) = host {
+                    debug!(
+                        "open: '{path}' → '{}' does not exist (no O_CREAT) — ENOENT",
+                        host.display()
+                    );
+                    if trace_missing {
+                        info!(
+                            elapsed_ms = ctx.kernel.uptime().as_millis(),
+                            host = %host.display(),
+                            "file trace: missing path='{path}' flags={flags:#x} mode={mode:#o} -> ENOENT"
+                        );
+                    }
+                } else {
+                    debug!("open: '{path}' does not exist — ENOENT");
+                    if e.to_string().contains("path is not mounted") {
+                        warn!("open: '{path}' matches no VFS mount — ENOENT");
+                    }
+                }
+                return FILE_ENOENT;
+            }
+
             // Map the host error to the matching errno instead of calling every
             // failure ENOENT. An out-of-memory open — the eager whole-file
             // buffer failing under host commit pressure — reported as "file not
@@ -888,20 +903,24 @@ fn hle_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
-/// `sceKernelAioInitializeParam(param, size)`: the AIO scheduler parameter
+/// Fixed size of the `sceKernelAioInitializeParam(param)` scheduler parameter
 /// block, done **synchronously** (mission's measured call: Dragon Ball hits
 /// this right after its engine allocator comes up). There is no async AIO
 /// backend yet — the honest model is "the init succeeded; requests complete
 /// immediately when they arrive". Zero the block (a clean, defined default)
 /// rather than leaving guest garbage the title might read back as a schedule.
+const AIO_INIT_PARAM_SIZE: usize = 0x3c;
+
+/// The ABI takes only `param`; `args[1]` is stale register state. SharpEmu's
+/// independently-derived Gen4/Gen5 layout fixes the block at 0x3c bytes, which
+/// matches the size Until Dawn immediately passes to `InitializeImpl`.
 fn hle_aio_initialize_param(ctx: &HleContext, args: &[u64]) -> u64 {
     let param = args.first().copied().unwrap_or(0);
-    let size = usize::try_from(args.get(1).copied().unwrap_or(0)).unwrap_or(0);
-    debug!("sceKernelAioInitializeParam(param={param:#x}, size={size:#x})");
-    if param == 0 || size == 0 || size > 0x10000 {
+    debug!("sceKernelAioInitializeParam(param={param:#x})");
+    if param == 0 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    let bytes = vec![0u8; size];
+    let bytes = [0u8; AIO_INIT_PARAM_SIZE];
     if !ctx.mem.write(param, &bytes) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
@@ -4871,6 +4890,43 @@ mod tests {
     fn write_tls_index(mem: &crate::TestMemory, at: u64, module_id: u64, offset: u64) {
         assert!(mem.write(at, &module_id.to_le_bytes()));
         assert!(mem.write(at + 8, &offset.to_le_bytes()));
+    }
+
+    #[test]
+    fn aio_initialize_param_ignores_stale_rsi_and_preserves_frame_guard() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let param = 0x100;
+        let guard = param + AIO_INIT_PARAM_SIZE as u64;
+
+        assert!(mem.write(param, &[0xAA; AIO_INIT_PARAM_SIZE]));
+        assert!(mem.write(guard, &[0xCC; 16]));
+        assert_eq!(
+            hle_aio_initialize_param(&ctx, &[param, 0x88]),
+            SCE_OK,
+            "the measured stale RSI is not an ABI size argument"
+        );
+
+        let mut initialized = [0xFF; AIO_INIT_PARAM_SIZE];
+        assert!(mem.read(param, &mut initialized));
+        assert_eq!(initialized, [0; AIO_INIT_PARAM_SIZE]);
+        let mut guard_bytes = [0; 16];
+        assert!(mem.read(guard, &mut guard_bytes));
+        assert_eq!(
+            guard_bytes, [0xCC; 16],
+            "fixed-size init must not erase the adjacent stack canary"
+        );
+
+        assert_eq!(
+            hle_aio_initialize_param(&ctx, &[0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(
+            hle_aio_initialize_param(&ctx, &[0x1000 - 8]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
     }
 
     /// DirectMemoryQuery reports the recorded allocation containing (or, with

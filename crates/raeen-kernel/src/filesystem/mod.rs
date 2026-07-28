@@ -22,6 +22,39 @@ struct MountPoint {
     ps5_prefix: String,
     /// Host directory this maps to.
     host_path: PathBuf,
+    /// Canonical mount identity captured when the mapping is installed.
+    ///
+    /// Resolving every asset used to canonicalize this unchanged root again.
+    /// Minecraft probes thousands of optional resource-pack paths while
+    /// holding a title streaming mutex, so the redundant host syscall was a
+    /// measurable load-time multiplier. The candidate/deepest-existing path
+    /// is still canonicalized on every access and compared with this identity,
+    /// preserving the fail-closed reparse-point boundary.
+    canonical_root: Option<PathBuf>,
+}
+
+impl MountPoint {
+    fn new(ps5_prefix: String, host_path: PathBuf) -> Self {
+        let canonical_root = canonicalize_mount_root(&host_path);
+        Self {
+            ps5_prefix,
+            host_path,
+            canonical_root,
+        }
+    }
+
+    fn set_host_path(&mut self, host_path: PathBuf) {
+        self.canonical_root = canonicalize_mount_root(&host_path);
+        self.host_path = host_path;
+    }
+}
+
+fn canonicalize_mount_root(host_path: &Path) -> Option<PathBuf> {
+    if host_path.as_os_str().is_empty() {
+        None
+    } else {
+        std::fs::canonicalize(host_path).ok()
+    }
 }
 
 /// Orbis/BSD `open` flags (the subset the VFS honors). Values match the
@@ -234,12 +267,9 @@ impl VirtualFileSystem {
         debug!("VFS mount: '{}' -> '{}'", prefix, host_path);
         let mut mounts = self.mounts.write();
         if let Some(existing) = mounts.iter_mut().find(|mount| mount.ps5_prefix == prefix) {
-            existing.host_path = PathBuf::from(host_path);
+            existing.set_host_path(PathBuf::from(host_path));
         } else {
-            mounts.push(MountPoint {
-                ps5_prefix: prefix,
-                host_path: PathBuf::from(host_path),
-            });
+            mounts.push(MountPoint::new(prefix, PathBuf::from(host_path)));
             mounts.sort_by_key(|mount| std::cmp::Reverse(mount.ps5_prefix.len()));
         }
     }
@@ -249,7 +279,7 @@ impl VirtualFileSystem {
         let mut mounts = self.mounts.write();
         for mount in mounts.iter_mut() {
             if mount.ps5_prefix == "/app0" {
-                mount.host_path = path.to_path_buf();
+                mount.set_host_path(path.to_path_buf());
                 info!("VFS: /app0/ -> {}", path.display());
                 return;
             }
@@ -261,7 +291,7 @@ impl VirtualFileSystem {
         let mut mounts = self.mounts.write();
         for mount in mounts.iter_mut() {
             if mount.ps5_prefix == "/temp0" {
-                mount.host_path = path.to_path_buf();
+                mount.set_host_path(path.to_path_buf());
                 info!("VFS: /temp0/ -> {}", path.display());
                 return;
             }
@@ -380,7 +410,7 @@ impl VirtualFileSystem {
         let root = normalize_mount_root(guest_root);
         let mut mounts = self.mounts.write();
         if let Some(mount) = mounts.iter_mut().find(|mount| mount.ps5_prefix == root) {
-            mount.host_path = path.to_path_buf();
+            mount.set_host_path(path.to_path_buf());
             info!("VFS: {root}/ -> {}", path.display());
             return;
         }
@@ -403,7 +433,12 @@ impl VirtualFileSystem {
                 .is_some_and(|suffix| suffix.starts_with('/'));
             if exact_root || under_root {
                 let relative = ps5_path[mount.ps5_prefix.len()..].trim_start_matches('/');
-                return combine_within_mount(&mount.host_path, ps5_path, relative);
+                return combine_within_mount(
+                    &mount.host_path,
+                    mount.canonical_root.as_deref(),
+                    ps5_path,
+                    relative,
+                );
             }
         }
         None
@@ -607,6 +642,13 @@ impl VirtualFileSystem {
 
         let exists = host_path.exists();
         let is_directory = host_path.is_dir();
+        if !exists && !create {
+            debug!("VFS: file not found on host: {}", host_path.display());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} does not exist", host_path.display()),
+            ));
+        }
         if is_directory && writable {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -661,12 +703,9 @@ impl VirtualFileSystem {
             None
         } else if exists && !truncate {
             Some(std::fs::read(&host_path)?)
-        } else if exists || create {
+        } else {
             // Truncated existing file, or a new file being created: start empty.
             Some(Vec::new())
-        } else {
-            debug!("VFS: file not found on host: {}", host_path.display());
-            None
         };
 
         // O_CREAT of a missing file: ensure the parent dir exists so the
@@ -1327,13 +1366,19 @@ const MAX_HOST_NAME_LEN: usize = 255;
 /// 1. Sanitize each segment — refuse `..` (traversal), any absolute segment, any
 ///    segment containing `:` (drive/ADS qualifier), and NUL/over-long names.
 ///    After this the assembled path is lexically contained *by construction*.
-/// 2. Walk each already-existing component from the root down and refuse
-///    symlinks/reparse points; components that do not exist yet (an `O_CREAT`
-///    target and its parents) carry no link to follow and are skipped.
-/// 3. Canonicalize the deepest existing ancestor and ASSERT it stays under the
-///    canonicalized mount root — this resolves Windows junctions that a plain
-///    symlink check misses, and fails closed on any canonicalization error.
-fn combine_within_mount(mount_root: &Path, ps5_path: &str, relative: &str) -> Option<PathBuf> {
+/// 2. Refuse a final symlink explicitly, including a dangling one that
+///    `canonicalize` cannot resolve. This keeps `O_CREAT` from following a
+///    dangling file link outside the sandbox.
+/// 3. Canonicalize the candidate or its nearest existing ancestor and ASSERT it
+///    stays under the canonical mount identity. This resolves every existing
+///    intermediate symlink/junction in one host operation and fails closed on
+///    errors other than a genuinely-missing tail.
+fn combine_within_mount(
+    mount_root: &Path,
+    cached_canonical_root: Option<&Path>,
+    ps5_path: &str,
+    relative: &str,
+) -> Option<PathBuf> {
     // A mount with an empty host root (the stubbed `/dev`, `/proc`) has no
     // backing directory. Building a candidate from an empty root produces a
     // CWD-relative host path AND skips the canonical-containment assertion
@@ -1380,51 +1425,79 @@ fn combine_within_mount(mount_root: &Path, ps5_path: &str, relative: &str) -> Op
         candidate.push(segment);
     }
 
-    // --- 2. Reparse/symlink walk over the existing prefix. ---
-    let mut walked = mount_root.to_path_buf();
-    let mut deepest_existing = mount_root.to_path_buf();
-    let mut tail_missing = false;
-    for segment in &segments {
-        walked.push(segment);
-        if tail_missing {
-            continue;
+    // --- 2. Final-component symlink check. ---
+    // `canonicalize` returns NotFound for a dangling symlink. If this is an
+    // O_CREAT target, treating it as an ordinary missing tail would let the
+    // subsequent host open follow the link. One metadata lookup on the exact
+    // candidate closes that case without walking every component.
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            warn!("VFS resolve: refusing symlink/reparse target in guest path '{ps5_path}'");
+            return None;
         }
-        match std::fs::symlink_metadata(&walked) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                warn!("VFS resolve: refusing symlink/reparse component in guest path '{ps5_path}'");
-                return None;
-            }
-            Ok(_) => deepest_existing = walked.clone(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => tail_missing = true,
-            Err(err) => {
-                warn!(
-                    "VFS resolve: unreadable component in guest path '{ps5_path}' ({err}); denying"
-                );
-                return None;
-            }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!("VFS resolve: unreadable target in guest path '{ps5_path}' ({err}); denying");
+            return None;
         }
     }
 
     // --- 3. Canonical containment assertion. ---
-    // If the mount root itself cannot be canonicalized it does not yet exist on
-    // the host (nothing under it exists either, so the walk above found no link
-    // to follow); the lexical containment from step 1 stands and there is
-    // nothing further to resolve. If it DOES exist, canonicalize the deepest
-    // existing ancestor — which resolves any junction the symlink check missed —
-    // and require the real on-disk location to stay under the root.
-    if let Ok(canonical_root) = std::fs::canonicalize(mount_root) {
-        match std::fs::canonicalize(&deepest_existing) {
-            Ok(real) if real.starts_with(&canonical_root) => {}
-            Ok(_) => {
-                warn!("VFS resolve: guest path '{ps5_path}' resolves outside its mount; denying");
-                return None;
-            }
-            Err(err) => {
-                warn!(
-                    "VFS resolve: cannot verify containment of guest path '{ps5_path}' ({err}); \
-                     denying"
-                );
-                return None;
+    // Mount mappings normally point at existing roots, whose canonical identity
+    // was cached when installed. A root that did not exist then is re-checked
+    // here so a later-created directory gains the same containment guard.
+    let discovered_root = cached_canonical_root
+        .is_none()
+        .then(|| canonicalize_mount_root(mount_root))
+        .flatten();
+    let canonical_root = cached_canonical_root.or(discovered_root.as_deref());
+
+    if let Some(canonical_root) = canonical_root {
+        let mut probe = candidate.as_path();
+        loop {
+            match std::fs::canonicalize(probe) {
+                Ok(real) if real.starts_with(&canonical_root) => break,
+                Ok(_) => {
+                    warn!(
+                        "VFS resolve: guest path '{ps5_path}' resolves outside its mount; denying"
+                    );
+                    return None;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // A missing O_CREAT/optional-file tail has nothing to
+                    // resolve. Climb until an existing parent can prove that
+                    // the complete existing prefix stays inside the mount.
+                    if probe == mount_root {
+                        warn!(
+                            "VFS resolve: mount root disappeared while resolving guest path \
+                             '{ps5_path}'; denying"
+                        );
+                        return None;
+                    }
+                    let Some(parent) = probe.parent() else {
+                        warn!(
+                            "VFS resolve: cannot verify containment of guest path '{ps5_path}'; \
+                             denying"
+                        );
+                        return None;
+                    };
+                    if !parent.starts_with(mount_root) {
+                        warn!(
+                            "VFS resolve: guest path '{ps5_path}' escaped while checking its \
+                             existing prefix; denying"
+                        );
+                        return None;
+                    }
+                    probe = parent;
+                }
+                Err(err) => {
+                    warn!(
+                        "VFS resolve: cannot verify containment of guest path '{ps5_path}' \
+                         ({err}); denying"
+                    );
+                    return None;
+                }
             }
         }
     }
@@ -1467,6 +1540,26 @@ mod tests {
         let fd2 = vfs.open("/app0/save.bin", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.read(fd2, 8).unwrap(), b"SAVEDATA");
         vfs.close(fd2).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_read_only_open_returns_not_found_without_allocating_fd() {
+        use open_flags::O_RDONLY;
+        let dir = temp_dir("missing-open");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        let error = vfs
+            .open("/app0/does-not-exist.bin", O_RDONLY, 0)
+            .expect_err("a missing file without O_CREAT must not become an empty descriptor");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            *vfs.next_fd.read(),
+            3,
+            "a failed open must not consume a guest descriptor"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2179,6 +2272,35 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(download);
         let _ = std::fs::remove_dir_all(savedata);
+    }
+
+    #[test]
+    fn mount_updates_refresh_the_cached_canonical_root() {
+        let first = temp_dir("canonical-root-first");
+        let second = temp_dir("canonical-root-second");
+        let vfs = VirtualFileSystem::new();
+
+        vfs.set_game_directory(&first);
+        let cached_first = vfs
+            .mounts
+            .read()
+            .iter()
+            .find(|mount| mount.ps5_prefix == "/app0")
+            .and_then(|mount| mount.canonical_root.clone());
+        assert_eq!(cached_first, std::fs::canonicalize(&first).ok());
+
+        vfs.set_game_directory(&second);
+        let cached_second = vfs
+            .mounts
+            .read()
+            .iter()
+            .find(|mount| mount.ps5_prefix == "/app0")
+            .and_then(|mount| mount.canonical_root.clone());
+        assert_eq!(cached_second, std::fs::canonicalize(&second).ok());
+        assert_ne!(cached_first, cached_second);
+
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
     }
 
     #[test]

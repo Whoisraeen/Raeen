@@ -200,10 +200,10 @@ pub struct OrbisKernel {
     /// defaulting to `PthreadAttr::default().sched_policy` when never set.
     pub thread_sched_policies: DashMap<u64, i32>,
     /// Host (OS) thread handle for each guest thread id, recorded as the thread
-    /// starts. Purely diagnostic: it lets a sampler suspend a guest thread and
-    /// read its RIP, which is the ONLY way to see where a title is stuck when it
-    /// spins in its own code and makes no HLE calls (the call ring goes blank).
-    /// On Windows these are duplicated `HANDLE`s owned for the process lifetime.
+    /// starts. It lets diagnostics sample a title stuck between HLE calls and,
+    /// under the runtime's A/B gate, lets `scePthreadSetprio` update the live
+    /// host scheduler rather than only its readback bookkeeping. On Windows
+    /// these are duplicated `HANDLE`s owned for the thread lifetime.
     pub host_thread_handles: DashMap<u64, u64>,
     /// Per-guest-thread ring of the most recent HLE `library::function` calls,
     /// keyed by guest thread id. Populated only when diagnostics ask for it
@@ -819,7 +819,7 @@ impl LockReleaseSummary {
 /// slot and an opaque handle for the same object. Ported from SharpEmu's
 /// `PthreadMutexState` (GPL-2.0). See the `raeen-hle` `pthread_sync` module for
 /// the state machine.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct PthreadMutex {
     /// Mutex type: 1 = error-check, 2 = recursive, 3 = normal, 4 = adaptive.
     pub ty: i32,
@@ -827,17 +827,30 @@ pub struct PthreadMutex {
     pub owner: u64,
     /// Lock recursion count (0 = unlocked).
     pub recursion: i32,
+    /// Guest return address of the lock call that acquired ownership.
+    ///
+    /// Diagnostic only: a long-contention report can now identify the start
+    /// of the critical section instead of sampling an arbitrary instruction
+    /// several seconds later. Zero means unavailable or unlocked.
+    pub owner_acquire_site: u64,
+    /// Threads blocked on this mutex, oldest first.
+    waiters: std::collections::VecDeque<PthreadMutexWaiter>,
 }
 
-/// One guest mutex's shared state plus the host condvar its HLE waiters park
-/// on. Before this existed, every blocked guest thread spun on
+#[derive(Debug)]
+struct PthreadMutexWaiter {
+    signal: Arc<PthreadCondWaiter>,
+    acquire_site: u64,
+}
+
+/// One guest mutex's shared state and FIFO of private waiter signals.
+/// Before host-backed parking existed, every blocked guest thread spun on
 /// `yield_now()` at full host-CPU — measured on Minecraft's in-game
 /// "Streaming Pool" workers, where 7 spinning waiters starved the very owner
-/// they were waiting for (4 FPS in-world). `unlocked` is notified whenever
-/// ownership clears, including owner-death recovery.
+/// they were waiting for (4 FPS in-world). Direct FIFO handoff now transfers
+/// ownership under `state` and wakes only the selected waiter.
 pub struct PthreadMutexShared {
     pub state: parking_lot::Mutex<PthreadMutex>,
-    pub unlocked: parking_lot::Condvar,
 }
 
 impl PthreadMutex {
@@ -849,8 +862,9 @@ impl PthreadMutex {
                 ty,
                 owner: 0,
                 recursion: 0,
+                owner_acquire_site: 0,
+                waiters: std::collections::VecDeque::new(),
             }),
-            unlocked: parking_lot::Condvar::new(),
         })
     }
 
@@ -863,9 +877,71 @@ impl PthreadMutex {
                 ty,
                 owner,
                 recursion,
+                owner_acquire_site: 0,
+                waiters: std::collections::VecDeque::new(),
             }),
-            unlocked: parking_lot::Condvar::new(),
         })
+    }
+
+    /// Join the acquisition FIFO. A previous entry for the same guest thread
+    /// is stale because one thread cannot wait on two acquisitions at once.
+    #[must_use]
+    pub fn enqueue_waiter(
+        &mut self,
+        thread: u64,
+        acquire_site: u64,
+    ) -> Arc<PthreadCondWaiter> {
+        if thread != 0 {
+            self.waiters
+                .retain(|waiter| waiter.signal.thread != thread);
+        }
+        let waiter = Arc::new(PthreadCondWaiter::new(thread));
+        self.waiters.push_back(PthreadMutexWaiter {
+            signal: Arc::clone(&waiter),
+            acquire_site,
+        });
+        waiter
+    }
+
+    /// Remove a waiter that timed out or is terminating. `false` means a
+    /// concurrent handoff already dequeued it, so the caller owns the mutex.
+    pub fn cancel_waiter(&mut self, waiter: &Arc<PthreadCondWaiter>) -> bool {
+        let Some(position) = self
+            .waiters
+            .iter()
+            .position(|candidate| Arc::ptr_eq(&candidate.signal, waiter))
+        else {
+            return false;
+        };
+        self.waiters.remove(position);
+        true
+    }
+
+    /// Transfer a free mutex directly to the oldest waiter and wake only it.
+    ///
+    /// Ported from SharpEmu's GPL-2.0 `TryGrantMutexWaiterLocked` behavior.
+    /// Ownership changes while the state lock is held, preventing arrivals
+    /// from barging ahead of the selected waiter.
+    pub fn try_grant_head(&mut self) -> Option<u64> {
+        if self.owner != 0 {
+            return None;
+        }
+        let waiter = self.waiters.pop_front()?;
+        self.owner = waiter.signal.thread;
+        self.recursion = 1;
+        self.owner_acquire_site = waiter.acquire_site;
+        waiter.signal.wake();
+        Some(waiter.signal.thread)
+    }
+
+    #[must_use]
+    pub fn has_waiters(&self) -> bool {
+        !self.waiters.is_empty()
+    }
+
+    #[must_use]
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.len()
     }
 }
 
@@ -1034,6 +1110,61 @@ mod pthread_cond_wait_queue_tests {
     }
 }
 
+#[cfg(test)]
+mod pthread_mutex_handoff_tests {
+    use super::PthreadMutex;
+
+    const MUTEX_NORMAL: i32 = 3;
+
+    #[test]
+    fn release_hands_ownership_to_the_head_waiter_and_wakes_only_it() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+
+        let first = state.enqueue_waiter(0x201, 0x1000_0201);
+        let second = state.enqueue_waiter(0x202, 0x1000_0202);
+        assert_eq!(state.waiter_count(), 2);
+        assert_eq!(state.try_grant_head(), None);
+
+        state.owner = 0;
+        state.recursion = 0;
+        assert_eq!(state.try_grant_head(), Some(0x201));
+        assert_eq!(state.owner, 0x201);
+        assert_eq!(state.recursion, 1);
+        assert_eq!(
+            state.owner_acquire_site, 0x1000_0201,
+            "direct handoff must retain the selected waiter's guest call site"
+        );
+        assert!(first.is_signaled());
+        assert!(!second.is_signaled());
+        assert_eq!(state.waiter_count(), 1);
+    }
+
+    #[test]
+    fn cancelling_or_reenqueuing_cannot_leave_a_stale_fifo_head() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+
+        let timed_out = state.enqueue_waiter(0x201, 0x1000_0201);
+        let stale = state.enqueue_waiter(0x202, 0x1000_dead);
+        let live = state.enqueue_waiter(0x202, 0x1000_0202);
+        assert!(state.cancel_waiter(&timed_out));
+        assert_eq!(state.waiter_count(), 1);
+
+        state.owner = 0;
+        state.recursion = 0;
+        assert_eq!(state.try_grant_head(), Some(0x202));
+        assert!(!timed_out.is_signaled());
+        assert!(!stale.is_signaled());
+        assert!(live.is_signaled());
+        assert_eq!(state.owner_acquire_site, 0x1000_0202);
+    }
+}
+
 /// Runtime-rebased ELF metadata used by `sceKernelGetModuleInfoForUnwind`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnwindModuleInfo {
@@ -1124,10 +1255,11 @@ impl OrbisKernel {
             if state.owner == thread {
                 state.owner = 0;
                 state.recursion = 0;
+                state.owner_acquire_site = 0;
                 released += 1;
                 // Wake every parked waiter — the lock they were waiting for
                 // just became available via owner death.
-                shared.unlocked.notify_all();
+                state.try_grant_head();
             }
         }
         released
@@ -1164,9 +1296,10 @@ impl OrbisKernel {
             if state.owner == thread {
                 state.owner = 0;
                 state.recursion = 0;
+                state.owner_acquire_site = 0;
                 summary.mutexes += 1;
                 // Owner died holding this — wake the parked waiters.
-                shared.unlocked.notify_all();
+                state.try_grant_head();
             }
         }
 

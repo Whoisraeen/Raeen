@@ -3409,6 +3409,9 @@ impl<'a> Spirv<'a> {
         let header_str = match self.code.get_type() {
             ShaderType::Pixel => {
                 vars.push("%outColor".to_string());
+                for i in 1..=7 {
+                    vars.push(format!("%outColor{i}"));
+                }
                 if let Some(info) = self.ps_input_info {
                     for i in 0..info.input_num {
                         vars.push(format!("%attr{i}"));
@@ -3496,6 +3499,13 @@ impl<'a> Spirv<'a> {
         const PIXEL_ANNOTATIONS: &str = r#"
                ; Annotations
                OpDecorate %outColor Location 0
+               OpDecorate %outColor1 Location 1
+               OpDecorate %outColor2 Location 2
+               OpDecorate %outColor3 Location 3
+               OpDecorate %outColor4 Location 4
+               OpDecorate %outColor5 Location 5
+               OpDecorate %outColor6 Location 6
+               OpDecorate %outColor7 Location 7
                <Variables>
 "#;
         const VERTEX_ANNOTATIONS: &str = r#"
@@ -4030,6 +4040,13 @@ impl<'a> Spirv<'a> {
         const PIXEL_VARIABLES: &str = r#"
               ;Variables
    %outColor = OpVariable %_ptr_Output_v4float Output
+  %outColor1 = OpVariable %_ptr_Output_v4float Output
+  %outColor2 = OpVariable %_ptr_Output_v4float Output
+  %outColor3 = OpVariable %_ptr_Output_v4float Output
+  %outColor4 = OpVariable %_ptr_Output_v4float Output
+  %outColor5 = OpVariable %_ptr_Output_v4float Output
+  %outColor6 = OpVariable %_ptr_Output_v4float Output
+  %outColor7 = OpVariable %_ptr_Output_v4float Output
                <Variables>
 "#;
         const VERTEX_VARIABLES: &str = r#"

@@ -9,8 +9,9 @@
 //! reports `EDEADLK` on self-relock, and normal/adaptive mutexes are lenient.
 //!
 //! Ownership uses the runtime's current guest-thread handle. Contended locks
-//! wait cooperatively on the host and re-check process termination; they never
-//! transfer ownership from another guest thread.
+//! park cooperatively on private host wait objects and re-check process
+//! termination. Unlock transfers ownership directly to the FIFO head while
+//! holding the state lock, preventing a new arrival from barging ahead.
 
 use crate::{HleContext, HleFunction, HleRegistry};
 use raeen_kernel::{PthreadMutex, PthreadRwlock};
@@ -61,6 +62,37 @@ const MUTEX_ADAPTIVE: i32 = 4;
 
 #[cfg(test)]
 const CURRENT_THREAD: u64 = 1;
+
+/// Publish only genuinely parked calls to the existing in-flight diagnostic
+/// map. Dispatch-wide HLE timing is intentionally opt-in because formatting
+/// and indexing every import distorts the hot path; a contended lock is rare
+/// enough to record unconditionally and is exactly what a stall report needs.
+struct InFlightWait<'a> {
+    calls: &'a dashmap::DashMap<u64, String>,
+    thread: u64,
+    previous: Option<String>,
+}
+
+impl<'a> InFlightWait<'a> {
+    fn new(calls: &'a dashmap::DashMap<u64, String>, thread: u64, description: String) -> Self {
+        let previous = calls.insert(thread, description);
+        Self {
+            calls,
+            thread,
+            previous,
+        }
+    }
+}
+
+impl Drop for InFlightWait<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.calls.insert(self.thread, previous);
+        } else {
+            self.calls.remove(&self.thread);
+        }
+    }
+}
 
 /// Size of the opaque mutex object handed to the guest.
 const MUTEX_OBJECT_SIZE: u64 = 0x100;
@@ -332,6 +364,102 @@ fn hle_mutex_timedlock(ctx: &HleContext, args: &[u64]) -> u64 {
     lock_core(ctx, mutex, false, Some(deadline))
 }
 
+const MUTEX_CONTENTION_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+const MUTEX_DEADLOCK_STABLE_OWNER_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutexWaitDiagnostic {
+    LongContention,
+    ProbableDeadlock,
+}
+
+/// Classify one wait without equating ordinary lock contention with deadlock.
+///
+/// Minecraft's streaming pool can keep a waiter parked for several seconds
+/// while ownership rotates through workers. That is a convoy: slow, but still
+/// making progress. A probable deadlock requires one continuously observed
+/// owner for a much longer interval.
+fn classify_mutex_wait(
+    total_wait: std::time::Duration,
+    stable_owner_wait: std::time::Duration,
+    reported_contention: bool,
+    reported_deadlock: bool,
+) -> Option<MutexWaitDiagnostic> {
+    if !reported_deadlock && stable_owner_wait >= MUTEX_DEADLOCK_STABLE_OWNER_AFTER {
+        Some(MutexWaitDiagnostic::ProbableDeadlock)
+    } else if !reported_contention && total_wait >= MUTEX_CONTENTION_WARN_AFTER {
+        Some(MutexWaitDiagnostic::LongContention)
+    } else {
+        None
+    }
+}
+
+/// Sample the current instruction pointer of one guest thread for a rare
+/// long-contention diagnostic. The handle is duplicated while its DashMap
+/// guard is held, then the owner is suspended only for GetThreadContext and
+/// resumed before any formatting, symbol lookup, or logging can run.
+#[cfg(windows)]
+fn sample_guest_thread_rip(kernel: &raeen_kernel::OrbisKernel, thread: u64) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, ResumeThread, SuspendThread};
+
+    const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
+
+    #[repr(align(16))]
+    struct Aligned(CONTEXT);
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut duplicate = std::ptr::null_mut();
+    {
+        let source = kernel.host_thread_handles.get(&thread)?;
+        let ok = unsafe {
+            DuplicateHandle(
+                process,
+                *source.value() as *mut _,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+    }
+
+    let handle = duplicate;
+    let rip = unsafe {
+        if SuspendThread(handle) == u32::MAX {
+            CloseHandle(handle);
+            return None;
+        }
+        let mut context: Aligned = std::mem::zeroed();
+        context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+        let rip = (GetThreadContext(handle, &mut context.0) != 0).then_some(context.0.Rip);
+        ResumeThread(handle);
+        CloseHandle(handle);
+        rip
+    };
+    rip
+}
+
+#[cfg(not(windows))]
+fn sample_guest_thread_rip(_kernel: &raeen_kernel::OrbisKernel, _thread: u64) -> Option<u64> {
+    None
+}
+
+fn format_guest_thread_site(kernel: &raeen_kernel::OrbisKernel, thread: u64) -> String {
+    let Some(rip) = sample_guest_thread_rip(kernel, thread) else {
+        return "<unavailable>".to_owned();
+    };
+    kernel.unwind_module_for_addr(rip).map_or_else(
+        || format!("{rip:#x}"),
+        |module| format!("{}+{:#x}", module.name, rip - module.start),
+    )
+}
+
 /// The lock state machine. With one active guest thread, a mutex either is
 /// free (acquire it) or is already held by this thread (per-type re-lock
 /// behavior). A missing mutex is created implicitly (guest static
@@ -389,7 +517,6 @@ fn lock_core(
 
     let current = ctx.guest_threads.current_thread();
     let spin_start = std::time::Instant::now();
-    let mut reported = false;
     let Some(shared) = ctx
         .kernel
         .pthread_mutexes
@@ -403,8 +530,8 @@ fn lock_core(
     // `yield_now()` spin loop burned a full host core per blocked guest
     // thread — Minecraft's seven in-game "Streaming Pool" workers spinning on
     // one mutex starved the owner itself down to 4 FPS.
-    let mut state = shared.state.lock();
-    loop {
+    let (waiter, mut last_owner) = {
+        let mut state = shared.state.lock();
         if state.owner == current {
             return match state.ty {
                 MUTEX_RECURSIVE => {
@@ -415,8 +542,6 @@ fn lock_core(
                     if try_only {
                         EBUSY
                     } else {
-                        // Normal self-relock is undefined; preserve the prior
-                        // lenient recursion behavior for compatibility.
                         state.recursion += 1;
                         OK
                     }
@@ -430,9 +555,10 @@ fn lock_core(
                 }
             };
         }
-        if state.owner == 0 {
+        if state.owner == 0 && !state.has_waiters() {
             state.owner = current;
             state.recursion = 1;
+            state.owner_acquire_site = ctx.caller_return_addr;
             return OK;
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
@@ -441,13 +567,71 @@ fn lock_core(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        // A lock that never lands is a deadlock, and this loop would spin on it
-        // forever in silence. Name it once: which mutex, who holds it, and what
-        // that holder is called. (Measured: Minecraft's MAIN THREAD sits here
-        // for the whole run, which is what stalls boot at the loading screen.)
-        if !reported && spin_start.elapsed() >= std::time::Duration::from_secs(3) {
-            reported = true;
-            let owner = state.owner;
+        let waiter = state.enqueue_waiter(current, ctx.caller_return_addr);
+        if state.try_grant_head() == Some(current) {
+            return OK;
+        }
+        (waiter, state.owner)
+    };
+    let mut owner_since = std::time::Instant::now();
+    let mut owner_changes = 0u64;
+    let mut reported_contention = false;
+    let mut reported_deadlock = false;
+    let _in_flight_wait = InFlightWait::new(
+        &ctx.kernel.in_flight_hle,
+        current,
+        format!("libkernel::scePthreadMutexLock(waiting mutex={key:#x})"),
+    );
+    loop {
+        if waiter.wait_for_signal(std::time::Duration::from_millis(10)) {
+            if reported_contention {
+                tracing::info!(
+                    mutex = format_args!("{key:#x}"),
+                    waiter = current,
+                    wait_ms = spin_start.elapsed().as_millis(),
+                    owner_changes,
+                    "scePthreadMutexLock acquired after long contention"
+                );
+            }
+            return OK;
+        }
+        if ctx.guest_threads.process_is_terminating() {
+            return abandon_mutex_wait(&shared, &waiter, EBUSY);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return abandon_mutex_wait(&shared, &waiter, ETIMEDOUT);
+        }
+
+        let (owner, owner_acquire_site, ty, recursion, queued) = {
+            let state = shared.state.lock();
+            (
+                state.owner,
+                state.owner_acquire_site,
+                state.ty,
+                state.recursion,
+                state.waiter_count(),
+            )
+        };
+        let now = std::time::Instant::now();
+        if owner != 0 && owner != last_owner {
+            if last_owner != 0 {
+                owner_changes += 1;
+            }
+            last_owner = owner;
+            owner_since = now;
+        }
+        // Name long waits, but do not call every >3 s wait a deadlock.
+        // Minecraft's streaming lock has measured rotating owners: a convoy
+        // that eventually acquires. Only one owner observed continuously for
+        // 30 s is elevated to the soak harness's probable-deadlock signal.
+        let total_wait = spin_start.elapsed();
+        let stable_owner_wait = owner_since.elapsed();
+        if let Some(diagnostic) = classify_mutex_wait(
+            total_wait,
+            stable_owner_wait,
+            reported_contention,
+            reported_deadlock,
+        ) {
             let owner_name = ctx
                 .kernel
                 .thread_names
@@ -458,23 +642,89 @@ fn lock_core(
                 .thread_names
                 .get(&current)
                 .map_or_else(|| "<unnamed>".to_owned(), |n| n.clone());
-            tracing::warn!(
-                mutex = format_args!("{key:#x}"),
-                waiter = current,
-                waiter_name = %self_name,
-                owner,
-                owner_name = %owner_name,
-                ty = state.ty,
-                recursion = state.recursion,
-                "scePthreadMutexLock stuck >3s — deadlock; naming the holder"
-            );
+            let owner_site = format_guest_thread_site(ctx.kernel, owner);
+            let owner_acquired_at = ctx
+                .kernel
+                .unwind_module_for_addr(owner_acquire_site)
+                .map_or_else(
+                    || {
+                        if owner_acquire_site == 0 {
+                            "<unavailable>".to_owned()
+                        } else {
+                            format!("{owner_acquire_site:#x}")
+                        }
+                    },
+                    |module| {
+                        format!(
+                            "{}+{:#x}",
+                            module.name,
+                            owner_acquire_site - module.start
+                        )
+                    },
+                );
+            let owner_wait = ctx
+                .kernel
+                .in_flight_hle
+                .get(&owner)
+                .map_or_else(|| "<guest code>".to_owned(), |entry| entry.clone());
+            match diagnostic {
+                MutexWaitDiagnostic::LongContention => {
+                    reported_contention = true;
+                    tracing::warn!(
+                        mutex = format_args!("{key:#x}"),
+                        waiter = current,
+                        waiter_name = %self_name,
+                        owner,
+                        owner_name = %owner_name,
+                        owner_acquired_at = %owner_acquired_at,
+                        owner_site = %owner_site,
+                        owner_wait = %owner_wait,
+                        ty,
+                        recursion,
+                        queued,
+                        owner_changes,
+                        "scePthreadMutexLock waiting >3s — long contention"
+                    );
+                }
+                MutexWaitDiagnostic::ProbableDeadlock => {
+                    reported_deadlock = true;
+                    tracing::error!(
+                        mutex = format_args!("{key:#x}"),
+                        waiter = current,
+                        waiter_name = %self_name,
+                        owner,
+                        owner_name = %owner_name,
+                        owner_acquired_at = %owner_acquired_at,
+                        owner_site = %owner_site,
+                        owner_wait = %owner_wait,
+                        ty,
+                        recursion,
+                        queued,
+                        owner_changes,
+                        owner_stable_ms = stable_owner_wait.as_millis(),
+                        "scePthreadMutexLock waiting >30s with one owner — probable deadlock"
+                    );
+                }
+            }
         }
         // Bounded so process termination and deadlines are observed even if
         // no unlock ever notifies; a wake races are re-checked by the loop.
-        let _ = shared
-            .unlocked
-            .wait_for(&mut state, std::time::Duration::from_millis(10));
     }
+}
+
+/// Leave the acquisition FIFO after timeout or termination. If the direct
+/// handoff already dequeued this waiter, it owns the mutex and reports success.
+fn abandon_mutex_wait(
+    shared: &raeen_kernel::PthreadMutexShared,
+    waiter: &Arc<raeen_kernel::PthreadCondWaiter>,
+    give_up: u64,
+) -> u64 {
+    let mut state = shared.state.lock();
+    if !state.cancel_waiter(waiter) {
+        return OK;
+    }
+    state.try_grant_head();
+    give_up
 }
 
 /// `scePthreadMutexUnlock(mutex)`: drop one recursion level, releasing at zero.
@@ -505,11 +755,11 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     state.recursion -= 1;
     if state.recursion == 0 {
         state.owner = 0;
-        // Hand the lock to one parked waiter. The bounded 10 ms re-check in
-        // `lock_core` covers any wake/steal race, so one notify suffices
-        // without a thundering herd.
-        drop(state);
-        shared.unlocked.notify_one();
+        state.owner_acquire_site = 0;
+        // Transfer ownership under the state lock and wake exactly the FIFO
+        // head. Clearing then notifying allowed arrivals to barge ahead of the
+        // selected waiter, starving Minecraft's streaming workers.
+        state.try_grant_head();
     }
     OK
 }
@@ -936,6 +1186,69 @@ mod tests {
         let mem = crate::TestMemory::new(0x4000);
         let alloc = crate::TestAllocator::new(0x1000); // objects live at 0x1000+
         (kernel, mem, alloc)
+    }
+
+    #[test]
+    fn mutex_wait_diagnostic_distinguishes_contention_from_a_stable_owner() {
+        use std::time::Duration;
+
+        assert_eq!(
+            classify_mutex_wait(Duration::from_secs(3), Duration::from_secs(3), false, false,),
+            Some(MutexWaitDiagnostic::LongContention),
+        );
+        assert_eq!(
+            classify_mutex_wait(
+                Duration::from_secs(29),
+                Duration::from_secs(29),
+                true,
+                false,
+            ),
+            None,
+        );
+        assert_eq!(
+            classify_mutex_wait(
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                true,
+                false,
+            ),
+            Some(MutexWaitDiagnostic::ProbableDeadlock),
+        );
+        assert_eq!(
+            classify_mutex_wait(Duration::from_secs(60), Duration::from_secs(2), true, false,),
+            None,
+            "a waiter that observed a recent owner change is in a convoy, not a deadlock",
+        );
+    }
+
+    #[test]
+    fn parked_wait_diagnostic_restores_the_dispatch_entry() {
+        let calls = dashmap::DashMap::new();
+        calls.insert(7, "libkernel::outer".to_owned());
+        {
+            let _wait = InFlightWait::new(
+                &calls,
+                7,
+                "libkernel::scePthreadMutexLock(waiting mutex=0x1234)".to_owned(),
+            );
+            assert_eq!(
+                calls.get(&7).as_deref().map(String::as_str),
+                Some("libkernel::scePthreadMutexLock(waiting mutex=0x1234)")
+            );
+        }
+        assert_eq!(
+            calls.get(&7).as_deref().map(String::as_str),
+            Some("libkernel::outer")
+        );
+
+        {
+            let _wait = InFlightWait::new(&calls, 8, "libkernel::scePthreadMutexLock".to_owned());
+            assert!(calls.contains_key(&8));
+        }
+        assert!(
+            !calls.contains_key(&8),
+            "a wait with no outer timed call must remove its temporary entry"
+        );
     }
 
     #[test]
