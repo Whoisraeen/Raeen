@@ -265,6 +265,39 @@ fn hle_trigger_user_event_inner(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `sceKernelWaitEqueue(eq, events, num, out_count, timeout)`: deliver up to
 /// `num` pending events (edge-clearing them) as `SceKernelEvent` structs, and
 /// write the delivered count. No pending events → timeout.
+/// How long a single host park may last: the internal slice, never overshooting
+/// the caller's own deadline.
+///
+/// A NULL guest timeout (`deadline == None`) always parks a full slice — it is
+/// an indefinite wait, and the slice exists only so process teardown is noticed
+/// promptly. A finite deadline parks `min(remaining, slice)` so the wait neither
+/// overshoots the interval the guest asked for nor blocks past teardown.
+///
+/// Pure so the slice/deadline arithmetic is testable against a synthetic clock:
+/// the wall-clock version of this test raced under parallel load.
+fn equeue_park_slice(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    slice: std::time::Duration,
+) -> std::time::Duration {
+    deadline.map_or(slice, |dl| dl.saturating_duration_since(now).min(slice))
+}
+
+/// Whether a park that timed out is the **guest's** timeout, or merely an
+/// internal slice expiring.
+///
+/// This is the whole contract the equeue wait had to be corrected to honour.
+/// Returning `true` for a slice expiry is exactly the old bug: Dragon Ball's AGC
+/// workers took a fabricated `ETIMEDOUT` after 50 ms and entered the title's
+/// fatal-reporting path before their first submission. So:
+///
+/// * NULL timeout — **never** a guest timeout, however many slices elapse; and
+/// * finite timeout — a guest timeout only once the real deadline has arrived,
+///   not at the first internal slice boundary.
+fn equeue_deadline_reached(deadline: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    deadline.is_some_and(|dl| now >= dl)
+}
+
 fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     let eq = args.first().copied().unwrap_or(0);
     let events_ptr = args.get(1).copied().unwrap_or(0);
@@ -346,10 +379,7 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
             }
         };
 
-        let wait = deadline.map_or(wait_slice, |dl| {
-            dl.saturating_duration_since(std::time::Instant::now())
-                .min(wait_slice)
-        });
+        let wait = equeue_park_slice(deadline, std::time::Instant::now(), wait_slice);
         let outcome = ctx.services.wait_until(
             WaitKey {
                 class: "kernel-equeue",
@@ -370,7 +400,7 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
             return OK;
         }
         if outcome == WaitOutcome::TimedOut
-            && deadline.is_some_and(|dl| std::time::Instant::now() >= dl)
+            && equeue_deadline_reached(deadline, std::time::Instant::now())
         {
             break;
         }
@@ -591,59 +621,110 @@ mod tests {
         assert_eq!(u32::from_le_bytes(cnt), 0);
     }
 
-    /// A NULL timeout is an indefinite wait, not a 50 ms timeout. Dragon
-    /// Ball's AGC workers use this exact shape; the old single-slice
-    /// implementation returned ETIMEDOUT and sent every worker into the
-    /// title's fatal-reporting path before its first submission.
+    /// A NULL timeout is an indefinite wait, not a 50 ms timeout, and a finite
+    /// timeout is the caller's interval — not the internal slice. Dragon Ball's
+    /// AGC workers use both shapes; the old single-slice implementation returned
+    /// ETIMEDOUT at 50 ms and sent every worker into the title's fatal-reporting
+    /// path before its first submission.
+    ///
+    /// Driven against a **synthetic clock** rather than real elapsed time. The
+    /// previous versions of these two tests spawned a producer that slept 80 ms
+    /// and asserted a 200 ms guest deadline had not expired; under a full
+    /// parallel `cargo test --workspace` the producer could miss its slot and
+    /// the deadline would pass first, so they failed under load and passed in
+    /// isolation. The property being protected is arithmetic, not timing, so it
+    /// is tested as arithmetic — which also makes it exhaustive rather than
+    /// probabilistic.
     #[test]
-    fn null_timeout_waits_past_internal_slice_until_event_arrives() {
-        let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
-        let mem = crate::TestMemory::new(0x400);
-        let alloc = crate::TestAllocator::new(0);
-        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
-        let eq = create(&ctx);
-        assert_eq!(hle_add_user_event(&ctx, &[eq, 0x20]), OK);
+    fn an_internal_slice_expiry_is_never_reported_as_the_guests_timeout() {
+        use std::time::{Duration, Instant};
+        const SLICE: Duration = Duration::from_millis(50);
+        let t0 = Instant::now();
 
-        let producer = std::thread::spawn({
-            let kernel = std::sync::Arc::clone(&kernel);
-            move || {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                let mem = crate::TestMemory::new(0x100);
-                let alloc = crate::TestAllocator::new(0);
-                let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
-                assert_eq!(hle_trigger_user_event(&ctx, &[eq, 0x20, 0xCAFE]), OK);
-            }
-        });
+        // NULL timeout: parks a full slice, forever, and no number of elapsed
+        // slices ever becomes a guest timeout.
+        assert_eq!(equeue_park_slice(None, t0, SLICE), SLICE);
+        for slices in [1u32, 2, 100, 10_000] {
+            let later = t0 + SLICE * slices;
+            assert_eq!(
+                equeue_park_slice(None, later, SLICE),
+                SLICE,
+                "a NULL timeout must keep parking full slices"
+            );
+            assert!(
+                !equeue_deadline_reached(None, later),
+                "a NULL timeout must never report a guest timeout ({slices} slices in)"
+            );
+        }
 
-        let started = std::time::Instant::now();
+        // Finite 200 ms deadline vs a 50 ms slice — the exact shape that used to
+        // race. It parks in slices and stays un-expired across each of the first
+        // three boundaries.
+        let deadline = t0 + Duration::from_millis(200);
+        for slices in 0..3u32 {
+            let now = t0 + SLICE * slices;
+            assert_eq!(
+                equeue_park_slice(Some(deadline), now, SLICE),
+                SLICE,
+                "a 200 ms deadline must park a full 50 ms slice at boundary {slices}"
+            );
+            assert!(
+                !equeue_deadline_reached(Some(deadline), now),
+                "slice {slices} of a 200 ms deadline must not be a guest timeout"
+            );
+        }
+
+        // The last park is clamped to what remains, never overshooting the
+        // interval the guest asked for...
         assert_eq!(
-            hle_wait(&ctx, &[eq, 0x200, 1, 0x1F0, 0]),
-            OK,
-            "NULL timeout must remain blocked until a producer signals"
+            equeue_park_slice(Some(deadline), t0 + Duration::from_millis(180), SLICE),
+            Duration::from_millis(20),
+            "the final park must not overshoot the caller's deadline"
         );
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(75),
-            "wait returned at the internal 50 ms slice instead of the 80 ms event"
+        // ...and only the real deadline ends the wait.
+        assert!(!equeue_deadline_reached(
+            Some(deadline),
+            t0 + Duration::from_millis(199)
+        ));
+        assert!(equeue_deadline_reached(Some(deadline), deadline));
+        assert!(equeue_deadline_reached(
+            Some(deadline),
+            t0 + Duration::from_millis(201)
+        ));
+        assert_eq!(
+            equeue_park_slice(Some(deadline), t0 + Duration::from_millis(201), SLICE),
+            Duration::ZERO,
+            "past the deadline there is nothing left to park"
         );
-        producer.join().unwrap();
-        assert_eq!(hle_get_event_id(&ctx, &[0x200]), 0x20);
-        assert_eq!(hle_get_event_user_data(&ctx, &[0x200]), 0xCAFE);
+
+        // A deadline shorter than one slice is honoured as-is, not rounded up.
+        let short = t0 + Duration::from_millis(5);
+        assert_eq!(
+            equeue_park_slice(Some(short), t0, SLICE),
+            Duration::from_millis(5)
+        );
     }
 
+    /// End-to-end: a producer on another thread wakes a parked waiter and the
+    /// event's id and payload arrive intact.
+    ///
+    /// No sleeps and no elapsed-time assertion. The guest deadline is
+    /// deliberately enormous (30 s) so no scheduling delay this test could ever
+    /// see can expire it — the slice/deadline arithmetic itself is covered
+    /// exhaustively above.
     #[test]
-    fn finite_timeout_longer_than_internal_slice_waits_for_event() {
+    fn a_producer_thread_wakes_a_parked_equeue_waiter() {
         let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
         let mem = crate::TestMemory::new(0x400);
         let alloc = crate::TestAllocator::new(0);
         let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
         let eq = create(&ctx);
         assert_eq!(hle_add_user_event(&ctx, &[eq, 0x21]), OK);
-        assert!(mem.write(0x120, &200_000u32.to_le_bytes()));
+        assert!(mem.write(0x120, &30_000_000u32.to_le_bytes()));
 
         let producer = std::thread::spawn({
             let kernel = std::sync::Arc::clone(&kernel);
             move || {
-                std::thread::sleep(std::time::Duration::from_millis(80));
                 let mem = crate::TestMemory::new(0x100);
                 let alloc = crate::TestAllocator::new(0);
                 let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
@@ -654,7 +735,7 @@ mod tests {
         assert_eq!(
             hle_wait(&ctx, &[eq, 0x200, 1, 0x1F0, 0x120]),
             OK,
-            "a finite guest deadline must not expire at an internal host slice"
+            "the waiter must receive the producer's event"
         );
         producer.join().unwrap();
         assert_eq!(hle_get_event_id(&ctx, &[0x200]), 0x21);
