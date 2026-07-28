@@ -10,9 +10,7 @@
 //! are drop-in replacements for [`NearestUpscale`]; they implement the same
 //! trait and read the same [`PresentContext`](super::PresentContext).
 
-use super::{
-    Capabilities, PluginOutput, PresentContext, PresentFrame, PresentPlugin, cabi_v3,
-};
+use super::{Capabilities, PluginOutput, PresentContext, PresentFrame, PresentPlugin, cabi_v3};
 use ash::vk::{self, Handle};
 use std::ffi::c_void;
 
@@ -145,10 +143,7 @@ impl PresentPlugin for VulkanBlitUpscale {
         Some(requirements)
     }
 
-    fn initialize_gpu_v3(
-        &mut self,
-        host: &cabi_v3::RaeenVulkanHostV3,
-    ) -> Result<(), String> {
+    fn initialize_gpu_v3(&mut self, host: &cabi_v3::RaeenVulkanHostV3) -> Result<(), String> {
         if host.device == 0 || host.get_device_proc_addr.is_null() {
             return Err("gpu-blit received an incomplete Vulkan host".to_owned());
         }

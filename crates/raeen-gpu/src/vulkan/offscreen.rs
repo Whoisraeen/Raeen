@@ -11,8 +11,8 @@
 //! Presentation to a real swapchain is a separate, later concern.
 
 use super::cache::{
-    BlendKey, DepthPipelineKey, DepthTargetKey, DepthTargetLayout, DrawCaches, GraphicsPipelineKey,
-    GpuPresentKey, PendingDrawResources, PersistentDepthTarget, PersistentTarget,
+    BlendKey, DepthPipelineKey, DepthTargetKey, DepthTargetLayout, DrawCaches, GpuPresentKey,
+    GraphicsPipelineKey, PendingDrawResources, PersistentDepthTarget, PersistentTarget,
     PersistentTexture, StencilKey, TargetContent, TargetKey, TargetLayout, TextureKey,
 };
 use super::instance::VulkanDevice;
@@ -35,6 +35,7 @@ use tracing::debug;
 /// never written (all zeroes) or a mis-sized copy cannot masquerade as a
 /// correct clear.
 pub const CLEAR_COLOR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+static GPU_PLUGIN_FRAME_INDEX: AtomicU64 = AtomicU64::new(0);
 
 /// Triangle vertices in Vulkan normalized device coordinates (`x, y, z, w`).
 ///
@@ -1407,6 +1408,15 @@ pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImag
     flush_deferred_draws_filtered(dev, None)
 }
 
+/// Flush native targets plus any successfully produced ABI-v3 presentation
+/// images. Native pixels remain the guest framebuffer authority; plugin images
+/// are display-only.
+pub fn flush_deferred_draws_with_gpu_plugins(
+    dev: &VulkanDevice,
+) -> Result<(Vec<(u64, RenderedImage)>, Vec<(u64, RenderedImage)>), GpuError> {
+    flush_deferred_draws_filtered_timed(dev, None).map(|flush| (flush.images, flush.plugin_images))
+}
+
 /// [`flush_deferred_draws`] with the readback optionally restricted to a
 /// small set of guest base addresses (stage C item 2: at a flip, only the
 /// flipped/presented target's pixels are needed on the CPU).
@@ -1578,7 +1588,14 @@ fn record_and_read_flush(
     pending: &[PendingDrawResources],
     already_submitted: usize,
     touched: &[TargetKey],
-) -> Result<(Vec<(u64, RenderedImage)>, DeferredFlushTiming), GpuError> {
+) -> Result<
+    (
+        Vec<(u64, RenderedImage)>,
+        Vec<(u64, RenderedImage)>,
+        DeferredFlushTiming,
+    ),
+    GpuError,
+> {
     let device = dev.device();
     let live: Vec<(TargetKey, PersistentTarget, u32)> = touched
         .iter()
@@ -1603,8 +1620,48 @@ fn record_and_read_flush(
     // resets it.
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
         .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkBeginCommandBuffer: {e}")))?;
+    let gpu_request = crate::present_plugin::active_gpu_v3_request().filter(|request| {
+        // Temporal plugins fail closed until the renderer supplies trustworthy
+        // depth/motion resources. Spatial ABI-v3 plugins can exercise the GPU
+        // path today without fabricating either input.
+        !request.capabilities.wants_depth && !request.capabilities.wants_motion_vectors
+    });
+    let plugin_sync = gpu_request.and_then(|_| dev.next_plugin_timeline());
+    let mut plugin_readbacks = Vec::new();
     for (key, target, _) in &live {
-        if let Some(transition) = colour_target_readback_transition(target.layout) {
+        let plugin_target = gpu_request.and_then(|request| {
+            let scale = request.output_scale.clamp(0.5, 8.0);
+            let width = ((key.width as f32 * scale).round() as u32).clamp(1, 16_384);
+            let height = ((key.height as f32 * scale).round() as u32).clamp(1, 16_384);
+            let plugin_key = GpuPresentKey {
+                source_base: key.base,
+                width,
+                height,
+                format: key.format,
+            };
+            match caches.gpu_present_target(
+                dev,
+                plugin_key,
+                readback_bpp(vk::Format::from_raw(key.format)).ok()?,
+            ) {
+                Ok(output) => Some((plugin_key, output)),
+                Err(error) => {
+                    tracing::warn!(
+                        target = format_args!("{:#x}", key.base),
+                        %error,
+                        "GPU plugin output allocation failed; using native readback"
+                    );
+                    None
+                }
+            }
+        });
+
+        let target_layout = if plugin_target.is_some() {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        };
+        if let Some(transition) = colour_target_flush_transition(target.layout, target_layout) {
             let barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(transition.old_layout)
                 .new_layout(transition.new_layout)
@@ -1628,6 +1685,234 @@ fn record_and_read_flush(
                     command_buffer,
                     transition.src_stage,
                     transition.dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        }
+
+        if let (Some((plugin_key, output_target)), Some((semaphore, wait_value, signal_value))) =
+            (plugin_target, plugin_sync)
+        {
+            if output_target.layout != vk::ImageLayout::GENERAL {
+                let (src_access, src_stage) = match output_target.layout {
+                    vk::ImageLayout::UNDEFINED => (
+                        vk::AccessFlags::empty(),
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                    ),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    ),
+                    _ => (
+                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                    ),
+                };
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(output_target.layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(src_access)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(output_target.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                // SAFETY: output image is host-owned, live, and not referenced
+                // by another in-flight flush (the prior flush fence completed).
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        src_stage,
+                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier],
+                    );
+                }
+            }
+            let resource_flags = crate::present_plugin::cabi_v3::RAEEN_V3_RESOURCE_BORROWED
+                | crate::present_plugin::cabi_v3::RAEEN_V3_RESOURCE_HOST_OWNS_LAYOUT;
+            let frame_index = GPU_PLUGIN_FRAME_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
+            let identity = [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ];
+            let frame = crate::present_plugin::cabi_v3::RaeenPresentFrameV3 {
+                struct_size: std::mem::size_of::<crate::present_plugin::cabi_v3::RaeenPresentFrameV3>(
+                ) as u32,
+                _reserved: 0,
+                frame_index,
+                command_buffer: command_buffer.as_raw(),
+                color: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3 {
+                    image: target.image.as_raw(),
+                    image_view: target.view.as_raw(),
+                    device_memory: target.memory.as_raw(),
+                    vk_format: key.format as u32,
+                    layout: vk::ImageLayout::GENERAL.as_raw() as u32,
+                    width: key.width,
+                    height: key.height,
+                    queue_family: dev.queue_family_index(),
+                    flags: resource_flags,
+                },
+                depth: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent(),
+                motion_vectors: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent(),
+                exposure: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent(),
+                output: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3 {
+                    image: output_target.image.as_raw(),
+                    image_view: output_target.view.as_raw(),
+                    device_memory: output_target.memory.as_raw(),
+                    vk_format: key.format as u32,
+                    layout: vk::ImageLayout::GENERAL.as_raw() as u32,
+                    width: plugin_key.width,
+                    height: plugin_key.height,
+                    queue_family: dev.queue_family_index(),
+                    flags: resource_flags,
+                },
+                render_rect: crate::present_plugin::cabi_v3::RaeenRectV3 {
+                    x: 0,
+                    y: 0,
+                    width: key.width,
+                    height: key.height,
+                },
+                output_rect: crate::present_plugin::cabi_v3::RaeenRectV3 {
+                    x: 0,
+                    y: 0,
+                    width: plugin_key.width,
+                    height: plugin_key.height,
+                },
+                temporal: crate::present_plugin::cabi_v3::RaeenTemporalDataV3 {
+                    flags: 0,
+                    _reserved: 0,
+                    jitter_x: 0.0,
+                    jitter_y: 0.0,
+                    motion_vector_scale_x: 1.0,
+                    motion_vector_scale_y: 1.0,
+                    exposure_scale: 1.0,
+                    pre_exposure: 1.0,
+                    near_plane: 0.1,
+                    far_plane: 1_000.0,
+                    frame_time_ms: 0.0,
+                    camera_view_to_clip: identity,
+                    camera_clip_to_view: identity,
+                    camera_clip_to_previous_clip: identity,
+                    camera_previous_clip_to_clip: identity,
+                },
+                sync: crate::present_plugin::cabi_v3::RaeenFrameSyncV3 {
+                    wait_semaphore: semaphore.as_raw(),
+                    wait_value,
+                    signal_semaphore: semaphore.as_raw(),
+                    signal_value,
+                },
+            };
+            let mut plugin_output = crate::present_plugin::cabi_v3::RaeenPluginOutputV3::empty();
+            let status = crate::present_plugin::process_active_gpu_v3(&frame, &mut plugin_output);
+            if status == crate::present_plugin::cabi_v3::RAEEN_V3_OK {
+                if plugin_output.output_layout != vk::ImageLayout::GENERAL.as_raw() as u32 {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "GPU plugin returned unsupported output layout {} (must remain GENERAL)",
+                        plugin_output.output_layout
+                    )));
+                }
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(output_target.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                // SAFETY: plugin returned success after recording into this
+                // command buffer and promised to leave output in GENERAL.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier],
+                    );
+                }
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: plugin_key.width,
+                        height: plugin_key.height,
+                        depth: 1,
+                    });
+                // SAFETY: output is TRANSFER_SRC and its readback buffer was
+                // allocated for the complete tightly-packed image.
+                unsafe {
+                    device.cmd_copy_image_to_buffer(
+                        command_buffer,
+                        output_target.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        output_target.readback_buffer,
+                        &[region],
+                    );
+                }
+                caches.mark_gpu_present_layout(&plugin_key, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                plugin_readbacks.push((
+                    *key,
+                    plugin_key,
+                    output_target,
+                    readback_bpp(vk::Format::from_raw(key.format))?,
+                ));
+            } else {
+                caches.mark_gpu_present_layout(&plugin_key, vk::ImageLayout::GENERAL);
+            }
+        }
+
+        if plugin_target.is_some() {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: target is in GENERAL after the transition above.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
@@ -1698,13 +1983,36 @@ fn record_and_read_flush(
         device
             .end_command_buffer(command_buffer)
             .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkEndCommandBuffer: {e}")))?;
-        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        device
-            .queue_submit(dev.queue(), &[submit], fence)
-            .map_err(|e| {
-                dev.note_vk_error(e);
-                GpuError::VulkanInitFailed(format!("flush vkQueueSubmit: {e}"))
-            })?;
+        if let Some((semaphore, wait_value, signal_value)) = plugin_sync {
+            let wait_semaphores = [semaphore];
+            let signal_semaphores = [semaphore];
+            let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let wait_values = [wait_value];
+            let signal_values = [signal_value];
+            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&wait_values)
+                .signal_semaphore_values(&signal_values);
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&command_buffers)
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .signal_semaphores(&signal_semaphores)
+                .push_next(&mut timeline);
+            device
+                .queue_submit(dev.queue(), &[submit], fence)
+                .map_err(|e| {
+                    dev.note_vk_error(e);
+                    GpuError::VulkanInitFailed(format!("flush vkQueueSubmit: {e}"))
+                })?;
+        } else {
+            let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+            device
+                .queue_submit(dev.queue(), &[submit], fence)
+                .map_err(|e| {
+                    dev.note_vk_error(e);
+                    GpuError::VulkanInitFailed(format!("flush vkQueueSubmit: {e}"))
+                })?;
+        }
         device
             .wait_for_fences(&[fence], true, u64::MAX)
             .map_err(|e| {
@@ -1754,8 +2062,45 @@ fn record_and_read_flush(
             },
         ));
     }
+    let mut plugin_images = Vec::with_capacity(plugin_readbacks.len());
+    for (source_key, plugin_key, target, bpp) in plugin_readbacks {
+        let size = (plugin_key.width as usize)
+            .saturating_mul(plugin_key.height as usize)
+            .saturating_mul(bpp as usize);
+        // SAFETY: the flush fence covers the plugin output copy and this
+        // host-visible allocation was sized for the complete output.
+        let ptr = unsafe {
+            device.map_memory(
+                target.readback_memory,
+                0,
+                size as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|e| GpuError::VulkanInitFailed(format!("GPU plugin readback map: {e}")))?;
+        // SAFETY: same fence-complete mapping contract as the native readback.
+        let pixels = unsafe {
+            readback_to_vec_fallible(
+                device,
+                target.readback_memory,
+                ptr,
+                size,
+                "GPU plugin output readback",
+            )?
+        };
+        plugin_images.push((
+            source_key.base,
+            RenderedImage {
+                width: plugin_key.width,
+                height: plugin_key.height,
+                pixels,
+                bytes_per_pixel: bpp,
+            },
+        ));
+    }
     Ok((
         images,
+        plugin_images,
         DeferredFlushTiming {
             fence_wait_us,
             readback_us: readback_at.elapsed().as_micros() as u64,
@@ -1889,6 +2234,37 @@ fn colour_target_readback_transition(layout: TargetLayout) -> Option<ImageTransi
         }),
         TargetLayout::TransferSrc | TargetLayout::Undefined => None,
     }
+}
+
+fn colour_target_flush_transition(
+    layout: TargetLayout,
+    destination: vk::ImageLayout,
+) -> Option<ImageTransition> {
+    if destination == vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+        return colour_target_readback_transition(layout);
+    }
+    debug_assert_eq!(destination, vk::ImageLayout::GENERAL);
+    let (old_layout, src_access, src_stage) = match layout {
+        TargetLayout::Undefined => return None,
+        TargetLayout::TransferSrc => (
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+        ),
+        TargetLayout::ColorAttachment => (
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ),
+    };
+    Some(ImageTransition {
+        old_layout,
+        new_layout: vk::ImageLayout::GENERAL,
+        src_access,
+        dst_access: vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+        src_stage,
+        dst_stage: vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+    })
 }
 
 /// The pipeline stage a sampled image must become visible to, for the shader

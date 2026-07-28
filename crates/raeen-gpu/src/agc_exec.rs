@@ -362,6 +362,10 @@ pub struct AgcGpuSession {
     /// draws compose into a frame across DCBs instead of each starting from
     /// a cleared attachment.
     framebuffers: Mutex<std::collections::HashMap<u64, Arc<RenderedImage>>>,
+    /// ABI-v3 GPU-plugin results keyed by the native render-target base.
+    /// Presentation may use these, but they never replace native framebuffer
+    /// pixels used to seed later guest draws.
+    gpu_present_overrides: Mutex<std::collections::HashMap<u64, Arc<RenderedImage>>>,
     /// Guest display-buffer address the title last flipped to
     /// (`sceVideoOutSubmitFlip` → `present_scanout`). When set and a render
     /// target with this base exists, it — not the last-drawn target — is what
@@ -726,6 +730,7 @@ impl AgcGpuSession {
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
             shader_skip_count: Mutex::new(0),
             framebuffers: Mutex::new(std::collections::HashMap::new()),
+            gpu_present_overrides: Mutex::new(std::collections::HashMap::new()),
             scanout_address: Mutex::new(None),
             scanout_descriptor: Mutex::new(None),
             last_compute_shader: Mutex::new(None),
@@ -817,6 +822,16 @@ impl AgcGpuSession {
         // selected this returns the same `Arc`, so the "every presented frame is
         // COMPLETE" invariant and the default present cost are both unchanged.
         let presented = crate::present_plugin::apply_to_image(presented);
+        self.publish_completed_frame(presented);
+    }
+
+    /// Publish a frame already processed by the active ABI-v3 GPU plugin.
+    /// Re-running its CPU compatibility entry would duplicate the upscale.
+    fn publish_gpu_frame(&self, presented: Arc<RenderedImage>) {
+        self.publish_completed_frame(presented);
+    }
+
+    fn publish_completed_frame(&self, presented: Arc<RenderedImage>) {
         if let Some(publisher) = &self.frame_publisher {
             publisher.publish(&presented, self.present_timing());
         }
@@ -871,6 +886,7 @@ impl AgcGpuSession {
         *self.splash.lock() = splash;
         *self.last_image.lock() = None;
         self.framebuffers.lock().clear();
+        self.gpu_present_overrides.lock().clear();
         *self.scanout_address.lock() = None;
         *self.draw_count.lock() = 0;
         // Drop stale flip-time snapshots from the previous title so they can
@@ -1288,16 +1304,26 @@ impl AgcGpuSession {
             let guard = self.backend.lock();
             if let Some(device) = guard.as_ref().and_then(|b| b.device()) {
                 let mut framebuffers = self.framebuffers.lock();
-                let insert_all = |fb: &mut std::collections::HashMap<u64, Arc<RenderedImage>>,
-                                  flushed: Vec<(u64, RenderedImage)>,
-                                  drawn: &mut bool| {
-                    for (base, img) in flushed {
-                        if Some(base) == address {
-                            *drawn = true;
+                let mut gpu_overrides = self.gpu_present_overrides.lock();
+                let insert_all =
+                    |fb: &mut std::collections::HashMap<u64, Arc<RenderedImage>>,
+                     overrides: &mut std::collections::HashMap<u64, Arc<RenderedImage>>,
+                     native: Vec<(u64, RenderedImage)>,
+                     plugin: Vec<(u64, RenderedImage)>,
+                     drawn: &mut bool| {
+                        for (base, img) in native {
+                            if Some(base) == address {
+                                *drawn = true;
+                            }
+                            overrides.remove(&base);
+                            fb.insert(base, Arc::new(img));
                         }
-                        fb.insert(base, Arc::new(img));
-                    }
-                };
+                        overrides.extend(
+                            plugin
+                                .into_iter()
+                                .map(|(base, image)| (base, Arc::new(image))),
+                        );
+                    };
                 // The all-targets dump needs every target's CPU pixels, so it
                 // forces a full readback; otherwise a flip reads back ONLY the
                 // flipped target plus the remembered fallback target — every
@@ -1333,7 +1359,13 @@ impl AgcGpuSession {
                             .store(flushed.timing.fence_wait_us, Ordering::Relaxed);
                         self.present_readback_us
                             .store(flushed.timing.readback_us, Ordering::Relaxed);
-                        insert_all(&mut framebuffers, flushed.images, &mut flip_target_drawn);
+                        insert_all(
+                            &mut framebuffers,
+                            &mut gpu_overrides,
+                            flushed.images,
+                            flushed.plugin_images,
+                            &mut flip_target_drawn,
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, "deferred-draw flush failed — presenting the last flushed frame");
@@ -1381,7 +1413,9 @@ impl AgcGpuSession {
                                         .fetch_add(flushed.timing.readback_us, Ordering::Relaxed);
                                     insert_all(
                                         &mut framebuffers,
+                                        &mut gpu_overrides,
                                         flushed.images,
+                                        flushed.plugin_images,
                                         &mut flip_target_drawn,
                                     );
                                 }
@@ -1652,6 +1686,17 @@ impl AgcGpuSession {
         let Some(presented) = presented else {
             return;
         };
+        let gpu_base = if flip_address_hit {
+            Some(address)
+        } else if guest_preferred {
+            None
+        } else {
+            fallback_base
+        };
+        let gpu_presented =
+            gpu_base.and_then(|base| self.gpu_present_overrides.lock().get(&base).cloned());
+        let gpu_processed = gpu_presented.is_some();
+        let presented = gpu_presented.unwrap_or(presented);
         // sRGB-encode an HDR float target (SharpEmu #448) to the RGBA8 the Shell
         // surface presents; already-8-bit frames pass through unchanged.
         // Move into the `Arc` once; the store below is then a refcount bump, not
@@ -1664,7 +1709,11 @@ impl AgcGpuSession {
         };
         self.present_srgb_encode_us
             .fetch_add(encode_at.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.publish_frame(Arc::clone(&presented));
+        if gpu_processed {
+            self.publish_gpu_frame(Arc::clone(&presented));
+        } else {
+            self.publish_frame(Arc::clone(&presented));
+        }
         if flip_address_hit || guest_hit {
             // The title flipped to a buffer it really drew into (a GPU-drawn
             // target, or CPU-drawn pixels read straight from the flip address):

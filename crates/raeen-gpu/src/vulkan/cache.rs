@@ -1906,11 +1906,7 @@ impl DrawCaches {
         Ok(target)
     }
 
-    pub(crate) fn mark_gpu_present_layout(
-        &mut self,
-        key: &GpuPresentKey,
-        layout: vk::ImageLayout,
-    ) {
+    pub(crate) fn mark_gpu_present_layout(&mut self, key: &GpuPresentKey, layout: vk::ImageLayout) {
         if let Some(target) = self.gpu_present_targets.get_mut(key) {
             target.layout = layout;
         }
