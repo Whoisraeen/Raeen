@@ -1090,6 +1090,28 @@ fn main() -> anyhow::Result<()> {
             runner_config.graphics.shader_cache,
             runner_config.paths.shader_cache_dir.clone(),
         );
+        // The isolated runner owns the guest Vulkan device and executes the
+        // present path. Loading plugins only in the Shell made them visible in
+        // Settings but left the process that can actually run a GPU pass with
+        // an empty registry. Load and select them here before guest execution;
+        // the Vulkan backend is lazy, so a future pre-device requirements pass
+        // can negotiate extensions and queues before `vkCreateDevice`.
+        #[cfg(feature = "upscale-plugins")]
+        raeen_upscale::register_all();
+        // SAFETY: identical explicit user-controlled native-code boundary as
+        // the Shell startup scan below. Raeen ships and fetches no binaries
+        // from this directory.
+        let loaded_plugins = unsafe {
+            raeen_gpu::AgcGpuSession::load_present_plugins_from(std::path::Path::new("plugins"))
+        };
+        if !loaded_plugins.is_empty() {
+            tracing::info!(
+                count = loaded_plugins.len(),
+                plugins = ?loaded_plugins,
+                "runner loaded user-supplied present plugins"
+            );
+        }
+        shell::apply_present_plugin(&runner_config.graphics);
         raeen_audio::output::set_volume(runner_config.audio.volume);
         raeen_audio::output::set_enabled(runner_config.audio.enabled);
         raeen_audio::output::init();

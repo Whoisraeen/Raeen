@@ -271,21 +271,47 @@ Restart Raeen. The plugin appears in **Settings ▸ Plugins** by the name it
 reported. Refusals are logged with the reason and the filename — check the log
 if yours does not appear.
 
-### Package files
+### Package directories
 
-Raeen currently loads platform shared libraries directly; it does **not**
-execute or install ZIP files. The supported distribution artifact today is:
+Raeen loads a bare platform shared library directly, or a directory containing
+`raeen-plugin.json`. A manifest package is the recommended shape when the
+adapter has runtime dependencies:
 
 ```text
-raeen_example_plugin.dll       Windows
-libraeen_example_plugin.so     Linux
-libraeen_example_plugin.dylib  macOS
+plugins/my-upscaler/
+├── raeen-plugin.json
+├── bin/
+│   └── raeen_my_upscaler.dll
+├── runtime/
+│   └── dependency.dll
+└── licenses/
+    └── dependency-license.txt
 ```
 
-A future `.raeen-plugin` archive can wrap a manifest, binaries, licenses, and
-checksums, but it must be validated and extracted before the existing loader
-loads its platform library. Renaming a ZIP or placing one in `plugins/` will
-not load it. Keep package installation separate from the stable C ABI.
+```json
+{
+  "schema_version": 1,
+  "id": "example.my-upscaler",
+  "entrypoints": {
+    "windows-x86_64": "bin/raeen_my_upscaler.dll",
+    "linux-x86_64": "bin/libraeen_my_upscaler.so"
+  }
+}
+```
+
+When a directory has a manifest, Raeen loads only the declared entrypoint and
+does not recursively treat dependency DLLs as plugins. Entrypoints must be
+normalized relative paths, cannot contain `..`, cannot be symlinks, and must
+have the current platform's library extension. Manifests are limited to 64 KiB
+and reject unknown fields.
+
+Directories without a manifest retain developer-friendly recursive discovery:
+at most four nested directories and 256 candidate libraries per scan, with
+directory symlinks skipped.
+
+Raeen does **not** execute a ZIP directly. A future `.raeen-plugin` archive may
+wrap this directory layout, but an installer must validate and extract it
+before the native loader runs.
 
 ## In-tree Rust plugins
 
@@ -338,6 +364,34 @@ const RaeenPluginV2 *raeen_plugin_v2(void);   // abi_version == 2
   with a named warning).
 - New capability bit: `RAEEN_CAP_GPU_FRAMES (1 << 4)` — "I can consume
   VULKAN-kind frames". Shown in Settings ▸ Plugins as `GPU`.
+
+## ABI v3 — temporal Vulkan passes
+
+ABI v2 remains the CPU compatibility interface. Temporal GPU plugins should
+also export `raeen_plugin_v3`; its complete C header is
+[`docs/examples/raeen-plugin-v3.h`](../docs/examples/raeen-plugin-v3.h).
+
+V3 adds the pieces that cannot be safely inferred from a finished CPU image:
+
+- bounded pre-device Vulkan extension and queue requirements;
+- host-owned color, depth, motion, exposure, and output images;
+- a host-owned recording command buffer (the plugin never submits Raeen's
+  queue);
+- timeline-semaphore wait/signal values;
+- render and output subrects;
+- jitter, motion-vector scale, exposure, camera matrices, depth convention,
+  frame time, and an explicit history-reset flag.
+
+Every image is borrowed only for the duration of `process`; the plugin must not
+destroy it or retain its handles. Raeen validates sizes, subrects, finite
+temporal values, resource flags, and advancing synchronization before calling
+foreign code. Unknown required capabilities are refused rather than guessed.
+
+The runner loads and selects plugins before its lazy Vulkan device is created.
+If the selected plugin exports v3, its declared instance/device extensions are
+checked and enabled during Vulkan initialization. Requests the current host
+cannot own safely (extra queues or optical-flow queues) fail closed with a
+named initialization error.
 
 **The license boundary is identical to v1 and non-negotiable**: a proprietary
 implementation (e.g. an NVIDIA DLSS or Intel XeSS shim) is authored and hosted

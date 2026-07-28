@@ -50,6 +50,27 @@ cargo build --release
 Copy the resulting `.dll`, `.so`, or `.dylib` from `target/release/` into
 Raeen's `plugins/` directory.
 
+If the plugin has adjacent runtime libraries, use a manifest package so Raeen
+does not mistake dependencies for plugin entrypoints:
+
+```text
+plugins/my-plugin/
+├── raeen-plugin.json
+├── raeen_my_plugin.dll
+└── runtime/
+    └── dependency.dll
+```
+
+```json
+{
+  "schema_version": 1,
+  "id": "example.my-plugin",
+  "entrypoints": {
+    "windows-x86_64": "raeen_my_plugin.dll"
+  }
+}
+```
+
 ## ABI choice
 
 - ABI v1 is sufficient for CPU-pixel spatial filters and upscalers.
