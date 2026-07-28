@@ -532,3 +532,173 @@ UNMERGED WIP branches (committed on their worktree branches, NOT on main):
 - `worktree-agent-a5fe061b18bfa5dca` — item 6 phase 2, early (design in the
   branch + this file's history).
 
+
+---
+
+# ROUND 2 (added 2026-07-28) — next improvements, features, and crate adoptions
+
+Numbering continues from item 22. Same conventions. Grounded in tonight's
+findings: the measured blockers (canary smash, ASTRO mixed-dim shaders, MRT
+shader exports), the live-verify experience, and a workspace-dep audit
+(every crate below is absent from Cargo.toml today; licenses checked
+GPL-2.0-compatible).
+
+## R2-P0 — Engine critical path
+
+### 23. Shader `exp mrt1-7` recompiler extension
+- [ ] The MRT pipeline side landed (item 16) but the shader recompiler still
+  handles only MRT0 exports — real-title MRT output needs exp targets
+  0x01–0x07 declared as `%outColor1..7`. Named by the item-16 agent as THE
+  follow-up on the GTA V-class critical path.
+- **Where:** `crates/kyty-graphics/src/shader/parse.rs` (exp target decode),
+  `recompile.rs` + `spirv.rs` (per-target output variables + writes).
+- **Acceptance:** fixture shader exporting to mrt0+mrt1 → validated SPIR-V
+  with two outputs; iron test via `tests/mrt_targets.rs` extension.
+
+### 24. Hardware-watchpoint canary hunter (unblocks item 22a)
+- [ ] The GTA V/Until Dawn canary smashes need to be caught IN THE ACT: arm
+  x64 debug registers (DR0–DR3, write-watch on the canary slot / smashed
+  region) on guest threads via SetThreadContext, report the smashing RIP +
+  HLE context through the existing fault path. Env: `RAEEN_WATCH_ADDR=0x...`
+  (+ optional auto-arm on `fs:0x28` canary of the faulting thread).
+- **Why:** turns the two remaining title blockers from log-forensics into a
+  one-run diagnosis. Also generally useful forever.
+- **Where:** `crates/raeen-runtime` (thread context, VEH single-step arm),
+  runner CLI plumbing.
+
+### 25. AvPlayer real playback — audio first (menus/cutscenes)
+- [ ] Tier-B AvPlayer returns immediate EOS (honest, but menus that gate on
+  video completion show nothing). Real path: demux MP4 (`mp4` crate, MIT) +
+  decode the AUDIO track via `symphonia` (verify exact license before
+  adding; pure Rust AAC/MP3) through the existing audio mixer; video frames
+  stay honest-black with correct PTS pacing and real EOS timing. H.264
+  video decode stays future (no license-clean pure-Rust decoder; openh264
+  pulls a Cisco binary — refuse).
+- **Where:** `crates/raeen-hle/src/libsce_media.rs` + a small
+  `raeen-media` helper or module.
+
+### 26. GPU device-fault capture in crash reports
+- [ ] Enable `VK_EXT_device_fault` (when present) + debug-utils labels on
+  submissions; on VK_ERROR_DEVICE_LOST, append the fault report + last label
+  to the crash report (item 12's assembly). Directly serves ASTRO-class GPU
+  crashes.
+- **Where:** `crates/raeen-gpu/src/vulkan/instance.rs` + crash_report.rs.
+
+## R2-P1 — Tooling / CI / hygiene
+
+### 27. cargo-deny in CI (license + advisory gate)
+- [ ] `deny.toml`: allowlist GPL-2.0-compatible licenses, forbid
+  copyleft-incompatible + unknown; RustSec advisories; duplicate-version
+  bans as warn. This mechanizes the clean-room license policy that is
+  currently manual — highest-value single CI addition for this repo.
+
+### 28. cargo-nextest as the test runner (local + CI)
+- [ ] Faster parallel runs, per-test timeouts, AND automatic retries with
+  flake detection — directly addresses the vblank flake class. Add a
+  CI profile with retries=2; annotate known-slow tests rather than
+  deleting them.
+
+### 29. Fix the vblank flake properly
+- [ ] `consecutive_vblank_waits_land_one_period_apart` depends on wall-clock
+  timing and fails under load (three separate agents hit it tonight).
+  Inject a mock/monotonic test clock into the vblank source instead.
+  (`crates/raeen-hle/src/libsce_video_out.rs`.)
+
+### 30. Diagnostics bundle (one-click bug report)
+- [ ] Settings ▸ System ▸ "Export Diagnostics": zip (crate `zip`, MIT) the
+  newest crash report + paired .dmp + log tail + sysinfo block + effective
+  config with user paths redacted → `logs/diagnostics-<UTC>.zip`, toast +
+  open-folder. Pairs with the public release for actionable user reports.
+
+### 31. Local minidump symbolization
+- [ ] Resolve OUR OWN frames in captured .dmp files: `minidump` +
+  `minidump-processor` + `pdb` crates (MIT/Apache) against the build's PDB;
+  append a "host stack (symbolized)" section to crash reports. Requires
+  release.yml to also upload the PDB as a release asset.
+
+### 32. Coverage + dep hygiene (nice-to-have)
+- [ ] `cargo llvm-cov` job (informational), `cargo-machete` unused-dep sweep.
+
+## R2-P2 — Performance
+
+### 33. mimalloc global allocator (measured evaluation)
+- [ ] Windows heap is a known cost on allocation-heavy paths. Add `mimalloc`
+  (MIT) behind a cargo feature, benchmark boot time + in-world FPS +
+  shader-translate time on Minecraft before/after (perf HUD + criterion),
+  adopt only with numbers.
+
+### 34. Precise frame pacing with spin_sleep
+- [ ] The frame limiter's sleep granularity on Windows is timer-quantum
+  dependent (~15 ms); `spin_sleep` (MIT) gives hybrid sleep+spin. Wire into
+  the existing limiter + vsync paths; verify pacing variance drops via the
+  HUD worst-frame number.
+
+### 35. Perf HUD graphs
+- [ ] `egui_plot` (MIT/Apache): frame-time sparkline + 1%-low readout on the
+  F3 HUD (second row). The numbers already exist (FrameTimeStats).
+
+### 36. Micro-opt passes with evidence (smallvec / memchr / half)
+- [ ] Only with criterion deltas: `smallvec` for PM4 packet arg vectors,
+  `memchr` in log/NID scanning hot paths, `half` for f16 texture/format
+  conversions currently hand-rolled. Skip any that do not measure.
+
+### 37. profiling facade + optional Tracy
+- [ ] Adopt the `profiling` crate as the annotation layer (keeps puffin as a
+  backend, adds `tracing-tracy` as an opt-in feature) — frame-timeline
+  debugging beyond puffin's flamegraph when chasing pacing/submission bugs.
+
+## R2-P3 — Features / product
+
+### 38. Save-data manager
+- [ ] Per-game overlay: Export Save (zip of the title's savedata dir with a
+  manifest), Import Save (validate title id, back up the old one first),
+  Open Save Folder. Uses the same `zip` dep as item 30.
+
+### 39. Title updates / patch PKGs
+- [ ] Install user-supplied title-update PKGs: version-aware overlay mount in
+  the VFS (patch files shadow base files), Shell shows installed version vs
+  base. PKG parse exists in raeen-loader; the overlay logic is new.
+
+### 40. Multiple local users
+- [ ] User picker on the Shell (PS5-style), per-user savedata roots +
+  `sceUserService*` returning the selected user; trophies (item 17 store)
+  become per-user.
+
+### 41. Input remapping + multi-controller
+- [ ] Settings ▸ Controllers: rebind keyboard→pad and pad→pad buttons
+  (persisted per input device), P2+ controller assignment (gilrs ids →
+  pad handles) for local multiplayer titles.
+
+### 42. Accessibility + i18n groundwork
+- [ ] UI scale slider (egui zoom), colorblind-safe badge palette (distinct
+  hue + shape per level), and string-table extraction for the Shell (ship
+  en; structure for community translations).
+
+### 43. Compat table publishing to the website
+- [ ] `cargo xtask compat publish` already emits a sanitized markdown table —
+  wire a manual (not scheduled) flow to copy it into the raeen-site repo
+  (separate repo; downloads/compat pages go live once releases are public).
+
+## R2-P4 — Portability (north star step 2)
+
+### 44. Linux groundwork
+- [ ] Non-Windows `GuestArena` via mmap (MAP_FIXED_NOREPLACE identity map),
+  SIGSEGV-based trap-and-emulate equivalent of VEH, FSGSBASE via
+  `arch_prctl`. First gate: `cargo check --target x86_64-unknown-linux-gnu`
+  green in CI (compile-only), then the M1 fixture suite on Linux CI. Keep
+  `#[cfg]` honest per the existing gotcha.
+
+## R2 crate summary (all verified absent from Cargo.toml, licenses OK)
+
+| Crate | License | For item |
+|-------|---------|----------|
+| `zip` | MIT | 30, 38 |
+| `minidump`, `minidump-processor`, `pdb` | MIT/Apache | 31 |
+| `mimalloc` | MIT | 33 |
+| `spin_sleep` | MIT | 34 |
+| `egui_plot` | MIT/Apache | 35 |
+| `smallvec`, `memchr`, `half` | MIT/Apache | 36 |
+| `profiling`, `tracing-tracy` (opt-in) | MIT/Apache | 37 |
+| `mp4`, `symphonia` (license-verify first) | MIT / mixed | 25 |
+| `blake3` | CC0/Apache-2.0 | shader-cache/content hashing (bench vs sha1 first) |
+| cargo-deny, cargo-nextest, cargo-llvm-cov, cargo-machete | tools, MIT/Apache | 27, 28, 32 |
