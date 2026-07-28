@@ -5017,3 +5017,39 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   is_multiple_of MSRV lint (checklist item 13, another agent's wave).
 * NEXT: item 2D re-measure GTA V once 2B (compute-queue execution) merges;
   watch for titles depending on real AMPR counter/time values (currently 0).
+
+## 2026-07-27 — Checklist item 11: compat badges in the Shell library (shell-ui agent, worktree)
+
+* New `crates/raeen-gui/src/compat.rs`: minimal serde mirror of the xtask
+  baseline schema (source of truth `xtask/src/schema.rs`; stage ordering
+  mirrors `xtask/src/baseline.rs::stage_rank` — no divergent ranking).
+  `CompatIndex::load(artifacts/compat/latest.json)` digests per-title stage
+  + metrics into badge levels; missing/malformed/unknown-stage files degrade
+  to an empty index (no badges, never a crash).
+* Stage→badge mapping (documented in module docs):
+  Refused/Detected/Launching/Crashed → Broken; Exited/TimedOut with zero
+  flip_events → Boots; frames + (shader+gpu errors > 0 or fps < 10) → Menu;
+  clean frames 10 ≤ fps < 30 → In-game; clean frames fps ≥ 30 → Playable;
+  no data → Untested = no chip (absence is the badge).
+* Session-ledger fold, newest-wins with a documented asymmetry: a newer
+  faulted session is strong evidence (→ Broken, provenance "last session");
+  a newer clean exit is weak evidence (only ever upgrades to Boots; never
+  downgrades a higher baseline badge). Baseline provenance renders as
+  "baseline YYYY-MM-DD" (dependency-free civil-from-days date).
+* UI: Home rail tiles wear a painter-drawn chip at explicit rects (top-left;
+  dark ground pill + hairline + status dot + label; follows the passed-tile
+  fade; respects the no-nested-bottom_up gotcha). Colors are theme-derived
+  (`compat::badge_color`: semantic hue per level, saturation/lightness from
+  the theme's accent token — no hardcoded hex). Game Options overlay shows
+  badge + provenance on the title row (same row, so the fixed-anchor row
+  hit-rects stay aligned). Matching: param.json title id vs baseline
+  game_id first, normalized display-title fallback; newest duplicate wins.
+* Badges refresh on library rescan and session exit (ledger fold inputs);
+  the baseline index itself loads once per Shell start.
+* Tests: raeen-gui 202 green (195 baseline + 7 new: stage mapping incl. the
+  ASTRO.BOT/Minecraft/Until Dawn shapes, newest-wins fold + upgrade-only
+  clean sessions, missing/malformed baseline → no badges, id/title match +
+  newest-duplicate, library fold keying/app skip, date conversion, distinct
+  theme-derived colors). fmt green; clippy -p raeen-gui --all-targets clean.
+* NOT live-verified (agent worktree: no display/games) — verify-skill steps
+  handed to the main session.

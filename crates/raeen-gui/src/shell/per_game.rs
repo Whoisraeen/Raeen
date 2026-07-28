@@ -24,6 +24,7 @@
 
 use super::nav::NavState;
 use super::settings;
+use crate::compat;
 use crate::theme::Theme;
 use egui::{Align, Layout, RichText, UiBuilder};
 use raeen_core::config::EmulatorConfig;
@@ -302,9 +303,12 @@ const ROW_LABELS: [&str; ROW_COUNT] = [
 ];
 
 /// Draw the Game Options overlay for `title`, bound to `draft` (the in-progress
-/// override set) resolved against the global `config`. Returns a pointer
-/// selection when a row is clicked, so mouse users get the same reach as the
-/// pad's Up/Down + Confirm.
+/// override set) resolved against the global `config`. `badge` is the title's
+/// resolved compatibility badge, shown with its one-line provenance
+/// ("baseline YYYY-MM-DD" vs "last session") — absent for Untested titles.
+/// Returns a pointer selection when a row is clicked, so mouse users get the
+/// same reach as the pad's Up/Down + Confirm.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -312,6 +316,7 @@ pub fn draw(
     config: &EmulatorConfig,
     draft: &PerGameSettings,
     title: &str,
+    badge: Option<&compat::TitleBadge>,
 ) -> Option<GameOptionsClick> {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -335,6 +340,26 @@ pub fn draw(
                     .size(16.0)
                     .strong(),
             );
+            // Compatibility badge + provenance, on the title row so the
+            // fixed-anchor row hit-rects below stay aligned. Untested titles
+            // show nothing.
+            if let Some(badge) = badge {
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new("\u{25CF}")
+                        .color(compat::badge_color(&theme.palette, badge.level))
+                        .size(12.0),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} \u{00B7} {}",
+                        badge.level.label(),
+                        badge.provenance
+                    ))
+                    .color(theme.palette.text_dim)
+                    .size(13.0),
+                );
+            }
         });
         ui.add_space(18.0);
 
