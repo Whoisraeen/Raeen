@@ -1588,3 +1588,59 @@ handled — an unwritten live-in user-data register, or a preceding
 `s_mov_b32`/`s_movk_i32` constant. Anything else is a named refusal instead of a
 wrong answer. A general scalar interpreter is the real fix and is recorded as the
 follow-up.
+
+---
+
+## ★ SWEEP COVERAGE PROOF — all 431 SharpEmu commits accounted for (2026-07-28)
+
+A challenge that the sweep might have missed commits outside `main` turned out to
+be **half right, and worth chasing**: `git rev-list --count --all` on
+`reference/sharpemu` reports **431 commits**, not the 115 reachable from
+`origin/main`. **316 commits are unreachable from main.** Enumerating every ref
+(`for-each-ref refs/remotes refs/tags`) shows they belong to three CI build-tag
+families — and the tag names are squarely on-goal, so they demanded a real check:
+
+| Family | Unique commits | Tip date |
+|---|---|---|
+| `shader-decoder-part1` | 96 | **2026-07-04** |
+| `savedata-mount3` | 91 | **2026-07-03** |
+| `fix-phthread` | 89 | **2026-07-03** |
+
+### Verdict: stale pre-squash development history, already superseded by main
+
+Not unswept work. Evidence, in order of strength:
+
+1. **Dates.** All three tips are 2026-07-03/04; `origin/main` is **2026-07-28** —
+   24 days newer.
+2. **The files MOVED on merge.** `shader-decoder-part1` holds the Gen5 decoder at
+   `src/SharpEmu.Libs/Agc/{Gen5ShaderIr,Gen5ShaderMetadataReader,Gen5ShaderScalarEvaluator,Gen5ShaderTranslator,Gen5SpirvTranslator}.cs`;
+   main holds the same components under `src/SharpEmu.ShaderCompiler/`. That is a
+   squash-merge-plus-relocation, which is exactly why the individual commits are
+   unreachable while their content is not.
+3. **Content is present in main and larger.** `Gen5ShaderScalarEvaluator` appears
+   in 4 files on main and is **2394 lines** there, versus 0 at that path on the
+   branch. `sceSaveDataMount3` is present in 2 files on main.
+4. **Commit *subjects* are absent from main** (`--grep` finds 0 on main for
+   "RDNA2 decoder improvements", "pthread improvements and fixes",
+   "sceSaveDataMount3") — which is the signature of squash-merge rewriting the
+   message, NOT of missing code. Subject absence alone proves nothing; the
+   content checks above are what settle it.
+5. Raeen already implements the savedata piece independently
+   (`crates/raeen-hle/src/libsce_save_data.rs` contains `sceSaveDataMount3`).
+
+**Therefore porting from those tags would be a REGRESSION** — it would replace
+main's evolved implementation with a 24-day-older ancestor. The sweep read
+SharpEmu's *live working tree*, which is strictly the better source and is also
+what the revert trap (`6db095e` wiped, `db4339f` restored) demands.
+
+One genuinely useful lead came out of it: `shader-decoder-part1` shows upstream
+built a **Gen5 scalar evaluator** — the same "general scalar interpreter" the
+SMEM agent independently named as the real fix for unresolvable register
+soffsets. Main's version is the one to study when that follow-up is taken up
+(`src/SharpEmu.ShaderCompiler/Gen5ShaderScalarEvaluator.cs`, 2394 lines).
+
+**Coverage statement:** 115 commits on `origin/main` swept commit-by-commit and
+triaged (ported / already-have / N-A-with-reason / deliberately-skipped, all
+recorded above); 316 commits on stale pre-squash feature tags verified as
+ancestors whose content is present in main and already covered. Branch `pr-587`
+holds only a duplicate of `5228335`. **No SharpEmu ref is unexamined.**
