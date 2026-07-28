@@ -1880,6 +1880,103 @@ const fn is_vop3b_opcode(opcode: u32) -> bool {
     )
 }
 
+/// Beyond Kyty: the VOP3P (packed 16-bit math) encoding, which GFX10 moved to
+/// its own `0b110011000` prefix (`instruction >> 26 == 0x33`).
+///
+/// Ported from SharpEmu `Gen5ShaderTranslator.cs` `DecodeVop3p` (opcode table,
+/// PR #466 `3574a3b`) and its `Gen5ShaderEncoding.Vop3p` operand/control case
+/// (field layout, PR #460 `472fc96`). Opcode numbers come from LLVM's AMDGPU
+/// `VOP3PInstructions.td` and are unchanged across gfx9/gfx10; 0x20-0x22 are
+/// `V_MAD_MIX_*` on gfx9 and `V_FMA_MIX_*` (fused) on the gfx10 the PS5
+/// targets, sharing these opcodes.
+///
+/// Before this existed the whole encoding fell into `shader_parse`'s catch-all
+/// and every shader containing one packed instruction was DROPPED with
+/// `UnknownEncoding` — SharpEmu measured that as "dropping Unity HDR shaders".
+/// A packed opcode outside the table below stays a NAMED refusal (never a
+/// silent mis-decode), but the instruction LENGTH is still computed correctly
+/// first so the failure is attributable to this pc rather than desynchronizing
+/// everything after it.
+fn shader_parse_vop3p(
+    pc: u32,
+    buffer: &[u32],
+    dst: &mut ShaderCode,
+    _next_gen: bool,
+) -> Result<u32, ShaderParseError> {
+    const S: &str = "vop3p";
+    let b0 = buffer[0];
+    let b1 = dw(buffer, 1, pc)?;
+
+    let opcode = (b0 >> 16) & 0x7f;
+    let vdst = b0 & 0xff;
+    let src0 = b1 & 0x1ff;
+    let src1 = (b1 >> 9) & 0x1ff;
+    let src2 = (b1 >> 18) & 0x1ff;
+
+    let mut inst = ShaderInstruction {
+        pc,
+        ..Default::default()
+    };
+    inst.src[0] = operand_parse(src0)?;
+    inst.src[1] = operand_parse(src1)?;
+    inst.src[2] = operand_parse(src2)?;
+    inst.src_num = 3;
+    inst.dst = operand_parse(vdst + 256)?;
+    inst.format = F::VdstVsrc0Vsrc1Vsrc2;
+
+    // `op_sel_hi` is split across both dwords: bits [1:0] in word1 [28:27],
+    // bit [2] in word0 [14] (SharpEmu Gen5ShaderTranslator.cs L2045-2047).
+    inst.vop3p = Some(crate::shader::types::Vop3pControl {
+        op_sel: (b0 >> 11) & 0x7,
+        op_sel_hi: ((b1 >> 27) & 0x3) | (((b0 >> 14) & 0x1) << 2),
+        neg_lo: (b1 >> 29) & 0x7,
+        neg_hi: (b0 >> 8) & 0x7,
+        clamp: ((b0 >> 15) & 0x1) != 0,
+    });
+
+    let mut size: u32 = 2;
+    if inst.src[0].type_ == O::LiteralConstant {
+        inst.src[0].constant.u = dw(buffer, size, pc)?;
+        size += 1;
+    }
+    if inst.src[1].type_ == O::LiteralConstant {
+        inst.src[1].constant.u = dw(buffer, size, pc)?;
+        size += 1;
+    }
+    if inst.src[2].type_ == O::LiteralConstant {
+        inst.src[2].constant.u = dw(buffer, size, pc)?;
+        size += 1;
+    }
+
+    match opcode {
+        0x0e => inst.type_ = T::VPkFmaF16,
+        0x0f => inst.type_ = T::VPkAddF16,
+        0x10 => inst.type_ = T::VPkMulF16,
+        0x11 => inst.type_ = T::VPkMinF16,
+        0x12 => inst.type_ = T::VPkMaxF16,
+        0x20 => inst.type_ = T::VFmaMixF32,
+        0x21 => inst.type_ = T::VFmaMixloF16,
+        0x22 => inst.type_ = T::VFmaMixhiF16,
+        // The packed INTEGER ops (v_pk_add_u16/i16, v_pk_mad_*, dot2/dot4, …)
+        // and any future packed float op: refuse by name rather than emit
+        // wrong math. `size` above is already correct.
+        _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
+    }
+
+    // The two-source ops read only src0/src1; src2 stays parsed (the encoding
+    // always carries it) but is not consumed.
+    if inst.type_ != T::VPkFmaF16
+        && inst.type_ != T::VFmaMixF32
+        && inst.type_ != T::VFmaMixloF16
+        && inst.type_ != T::VFmaMixhiF16
+    {
+        inst.src_num = 2;
+    }
+
+    dst.get_instructions_mut().push(inst);
+    Ok(size)
+}
+
 /// Kyty: ShaderParse.cpp `shader_parse_vop3` (L1372). Handles the VOP3
 /// encoding, which also carries VOPC (opcode 0x00-0xff), VOP2 (0x100-0x13d)
 /// and VOP1 (0x180-0x1e8) operations. Legacy vs next-gen differ in the
@@ -4451,6 +4548,11 @@ pub fn shader_parse(
         } else {
             match instruction >> 26 {
                 0x32 => shader_parse_vintrp(pc, buffer, dst, next_gen)?,
+                // Beyond Kyty (SharpEmu PR #466): VOP3P packed 16-bit math,
+                // which GFX10 moved to its own 0b110011000 prefix. Without
+                // this arm the encoding hit the catch-all below and dropped
+                // the whole shader.
+                0x33 => shader_parse_vop3p(pc, buffer, dst, next_gen)?,
                 0x34 => {
                     // Kyty L3382: EXIT_NOT_IMPLEMENTED(next_gen).
                     if next_gen {
@@ -6071,13 +6173,14 @@ mod tests {
 
     #[test]
     fn unknown_encoding_is_typed_error() {
-        // instr>>26 == 0x33 matches no family.
-        let (_, result) = parse(&[0xCC00_0000], ShaderType::Vertex, false);
+        // instr>>26 == 0x39 matches no family (0x38 is MUBUF, 0x3a MTBUF).
+        // 0x33 used to serve here and is now VOP3P.
+        let (_, result) = parse(&[0xE400_0000], ShaderType::Vertex, false);
         assert_eq!(
             result,
             Err(ShaderParseError::UnknownEncoding {
                 pc: 0,
-                raw: 0xCC00_0000
+                raw: 0xE400_0000
             })
         );
     }

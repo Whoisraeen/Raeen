@@ -9288,6 +9288,372 @@ fn recompile_vcvt_pkrtz_f16_f32(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// VOP3P: packed 16-bit math and the mix ops
+//
+// Beyond Kyty; ported from SharpEmu's `Gen5SpirvTranslator.Alu.cs`
+// (`TryEmitPackedF16` / `TryEmitFmaMix`, PRs #466 `3574a3b`, #460 `472fc96`,
+// #420 `3005bab`). See `shader_parse_vop3p` for the decode side.
+//
+// A guest VGPR holds two f16 values, one per result lane. Each lane is
+// computed independently: the selected source half is widened exactly to f32,
+// `neg_lo`/`neg_hi` negates it, the op runs in f32, and the f32 result is
+// narrowed back to f16. For add/mul/min/max that is bit-exact to a true f16
+// op (an f16 sum or product rounds losslessly through f32 by the
+// double-rounding theorem, and min/max carry no rounding at all).
+//
+// DIVERGENCE from SharpEmu, deliberate and named:
+//
+//  * The f16<->f32 conversions use GLSL `UnpackHalf2x16` / `PackHalf2x16`,
+//    matching this crate's existing `VCvtF32F16` / `VCvtPkrtzF16F32` bodies,
+//    rather than SharpEmu's explicit branchless integer sequences. Those exist
+//    to pin subnormal/rounding behaviour without float-controls execution
+//    modes; the GLSL ops leave that to the driver.
+//  * `v_pk_fma_f16` lowers to a single f32 `Fma` followed by the f16 narrowing,
+//    NOT to SharpEmu's round-to-odd 2Sum sequence (PR #420 "exact single
+//    rounding"). That sequence is only error-free when every op in the chain
+//    carries `OpDecoration NoContraction`, and this generator emits
+//    decorations in a separate `write_annotations` phase with no per-body
+//    injection point — an uncorrected 2Sum measurably decays to the
+//    double-rounded answer anyway (SharpEmu observed exactly that on RDNA3).
+//    So the result can differ from hardware in the last f16 bit on midpoint
+//    inputs. Getting the shader to TRANSLATE at all is the win here: it was
+//    previously dropped whole.
+// ---------------------------------------------------------------------------
+
+/// Read the VOP3P control block, or refuse by name if the parser did not
+/// attach one (a table row wired to the wrong instruction type).
+fn vop3p_control(
+    inst: &ShaderInstruction,
+    func: &'static str,
+) -> Result<crate::shader::types::Vop3pControl, ShaderRecompileError> {
+    inst.vop3p
+        .ok_or_else(|| not_supported(func, "missing vop3p control"))
+}
+
+/// Emit the load of source `i`'s raw 32 bits as `%<name>`.
+fn vop3p_load_raw(
+    spirv: &Spirv<'_>,
+    inst: &ShaderInstruction,
+    i: usize,
+    name: &str,
+    index_str: &str,
+    out: &mut String,
+) -> Result<bool, ShaderRecompileError> {
+    let mut load = String::new();
+    if !operand_load_uint(spirv, inst.src[i], name, index_str, &mut load, 0)? {
+        return Ok(false);
+    }
+    out.push_str("         ");
+    out.push_str(&load);
+    out.push('\n');
+    Ok(true)
+}
+
+/// Saturate an f32 to `[0, 1]` the way the VOP3P `clamp` modifier does: below
+/// 0 becomes 0, above 1 becomes 1, and NaN becomes 0 (the ORDERED compares are
+/// false for it, which is the hardware's NaN-to-zero behaviour without a
+/// separate `IsNan` test). SharpEmu: `EmitClampToUnitInterval`.
+fn vop3p_clamp(value: &str, out_id: &str, body: &mut String) {
+    body.push_str(&format!(
+        "         %{out_id}_gt0 = OpFOrdGreaterThan %bool %{value} %float_0_000000\n\
+         \x20        %{out_id}_lo = OpSelect %float %{out_id}_gt0 %{value} %float_0_000000\n\
+         \x20        %{out_id}_lt1 = OpFOrdLessThan %bool %{out_id}_lo %float_1_000000\n\
+         \x20        %{out_id} = OpSelect %float %{out_id}_lt1 %{out_id}_lo %float_1_000000\n"
+    ));
+}
+
+/// Widen one 16-bit half of `raw` to f32 and apply this lane's negate bit.
+/// `hi` selects the half (`op_sel` / `op_sel_hi` bit `i`), `neg` this lane's
+/// negate bit (`neg_lo` / `neg_hi` bit `i`). SharpEmu:
+/// `EmitPackedF16Operand`.
+fn vop3p_half_operand(raw: &str, hi: bool, neg: bool, out_id: &str, body: &mut String) {
+    let component = u32::from(hi);
+    body.push_str(&format!(
+        "         %{out_id}_pk = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %{raw}\n\
+         \x20        %{out_id}{suffix} = OpCompositeExtract %float %{out_id}_pk {component}\n",
+        suffix = if neg { "_p" } else { "" }
+    ));
+    if neg {
+        body.push_str(&format!(
+            "         %{out_id} = OpFNegate %float %{out_id}_p\n"
+        ));
+    }
+}
+
+/// `fminnum_like` / `fmaxnum_like`: a NaN operand yields the other; two NaNs
+/// yield a NaN. SharpEmu: `EmitPackedF16MinMax`.
+fn vop3p_min_max(left: &str, right: &str, is_max: bool, out_id: &str, body: &mut String) {
+    let cmp = if is_max {
+        "OpFOrdGreaterThan"
+    } else {
+        "OpFOrdLessThan"
+    };
+    body.push_str(&format!(
+        "         %{out_id}_c = {cmp} %bool %{left} %{right}\n\
+         \x20        %{out_id}_n = OpSelect %float %{out_id}_c %{left} %{right}\n\
+         \x20        %{out_id}_ln = OpIsNan %bool %{left}\n\
+         \x20        %{out_id}_rn = OpIsNan %bool %{right}\n\
+         \x20        %{out_id}_wr = OpSelect %float %{out_id}_rn %{left} %{out_id}_n\n\
+         \x20        %{out_id} = OpSelect %float %{out_id}_ln %{right} %{out_id}_wr\n"
+    ));
+}
+
+/// The exec-predicated write of an f32-valued result into a VGPR, matching
+/// every other VOP body's tail (`Recompile_VCvtPkrtzF16F32_*`).
+fn vop3p_store(dst: &str, value: &str, index_str: &str, body: &mut String) {
+    body.push_str(
+        &"         %exec_lo_u_<index> = OpLoad %uint %exec_lo\n\
+          \x20        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0\n\
+          \x20        %tdst_<index> = OpLoad %float %<dst>\n\
+          \x20        %tval_<index> = OpSelect %float %exec_lo_b_<index> %<value> %tdst_<index>\n\
+          \x20              OpStore %<dst> %tval_<index>\n"
+            .replace("<dst>", dst)
+            .replace("<value>", value)
+            .replace("<index>", index_str),
+    );
+}
+
+/// `v_pk_add_f16` / `v_pk_mul_f16` / `v_pk_min_f16` / `v_pk_max_f16` /
+/// `v_pk_fma_f16`. SharpEmu: `TryEmitPackedF16`.
+fn recompile_vop3p_packed_f16(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_Vop3pPackedF16_VdstVsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+    let ctrl = vop3p_control(&inst, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not a float VGPR"));
+    }
+
+    let fused = inst.type_ == ShaderInstructionType::VPkFmaF16;
+    let src_count = if fused { 3 } else { 2 };
+
+    let mut body = String::new();
+    for i in 0..src_count {
+        if !vop3p_load_raw(
+            spirv,
+            &inst,
+            i,
+            &format!("r{i}_{index}"),
+            &index_str,
+            &mut body,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    // One result lane at a time (low, then high); `lanes` collects the id
+    // holding each lane's final f32.
+    let mut lanes: Vec<String> = Vec::with_capacity(2);
+    for (lane, hi) in [("lo", false), ("hi", true)] {
+        let sel = if hi { ctrl.op_sel_hi } else { ctrl.op_sel };
+        let neg = if hi { ctrl.neg_hi } else { ctrl.neg_lo };
+        for i in 0..src_count {
+            vop3p_half_operand(
+                &format!("r{i}_{index}"),
+                (sel >> i) & 1 != 0,
+                (neg >> i) & 1 != 0,
+                &format!("h{lane}{i}_{index}"),
+                &mut body,
+            );
+        }
+        let a = format!("h{lane}0_{index}");
+        let b = format!("h{lane}1_{index}");
+        let raw = format!("v{lane}raw_{index}");
+        match inst.type_ {
+            ShaderInstructionType::VPkAddF16 => {
+                body.push_str(&format!("         %{raw} = OpFAdd %float %{a} %{b}\n"))
+            }
+            ShaderInstructionType::VPkMulF16 => {
+                body.push_str(&format!("         %{raw} = OpFMul %float %{a} %{b}\n"))
+            }
+            ShaderInstructionType::VPkMinF16 => vop3p_min_max(&a, &b, false, &raw, &mut body),
+            ShaderInstructionType::VPkMaxF16 => vop3p_min_max(&a, &b, true, &raw, &mut body),
+            ShaderInstructionType::VPkFmaF16 => body.push_str(&format!(
+                "         %{raw} = OpExtInst %float %GLSL_std_450 Fma %{a} %{b} %h{lane}2_{index}\n"
+            )),
+            other => {
+                return Err(not_supported(
+                    FUNC,
+                    format!("instruction type {other:?} is not a packed f16 op"),
+                ));
+            }
+        }
+        // No `OpCopyObject` (this crate's assembler has no such opcode): the
+        // clamped and unclamped ids are tracked here instead of aliased in
+        // SPIR-V.
+        if ctrl.clamp {
+            vop3p_clamp(&raw, &format!("v{lane}_{index}"), &mut body);
+            lanes.push(format!("v{lane}_{index}"));
+        } else {
+            lanes.push(raw);
+        }
+    }
+
+    body.push_str(&format!(
+        "         %vpk_{index} = OpCompositeConstruct %v2float %{lo} %{hi}\n\
+         \x20        %vpu_{index} = OpExtInst %uint %GLSL_std_450 PackHalf2x16 %vpk_{index}\n\
+         \x20        %vpf_{index} = OpBitcast %float %vpu_{index}\n",
+        lo = lanes[0],
+        hi = lanes[1]
+    ));
+    vop3p_store(
+        &dst_value.value,
+        &format!("vpf_{index}"),
+        &index_str,
+        &mut body,
+    );
+
+    *dst_source += "\n";
+    *dst_source += &body;
+    Ok(true)
+}
+
+/// `v_fma_mix_f32` / `v_fma_mixlo_f16` / `v_fma_mixhi_f16`. SharpEmu:
+/// `TryEmitFmaMix` + `EmitFmaMixOperand`.
+///
+/// Each source is read independently as either a full f32 or one f16 half
+/// widened to f32: `op_sel_hi` bit `i` set means "read as f16" (with `op_sel`
+/// bit `i` picking the half). For these ops `neg_hi` is the ABSOLUTE-value
+/// modifier and `neg_lo` negates, applied abs-then-neg.
+fn recompile_vop3p_fma_mix(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_Vop3pFmaMix_VdstVsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+    let ctrl = vop3p_control(&inst, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not a float VGPR"));
+    }
+
+    let mut body = String::new();
+    // The id holding each source's post-modifier f32.
+    let mut srcs: Vec<String> = Vec::with_capacity(3);
+    for i in 0..3usize {
+        if !vop3p_load_raw(
+            spirv,
+            &inst,
+            i,
+            &format!("r{i}_{index}"),
+            &index_str,
+            &mut body,
+        )? {
+            return Ok(false);
+        }
+        let raw = format!("r{i}_{index}");
+        let val = format!("m{i}_{index}");
+        // A register/SGPR source with op_sel_hi set is read as an f16 half;
+        // an inline/literal constant is always the full f32 (SharpEmu gates
+        // `readAsHalf` on the operand kind for exactly this reason).
+        let read_as_half = (ctrl.op_sel_hi >> i) & 1 != 0 && operand_is_variable(inst.src[i]);
+        if read_as_half {
+            let component = u32::from((ctrl.op_sel >> i) & 1 != 0);
+            body.push_str(&format!(
+                "         %{val}_pk = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %{raw}\n\
+                 \x20        %{val}_b = OpCompositeExtract %float %{val}_pk {component}\n"
+            ));
+        } else {
+            body.push_str(&format!("         %{val}_b = OpBitcast %float %{raw}\n"));
+        }
+        let mut cur = format!("{val}_b");
+        if (ctrl.neg_hi >> i) & 1 != 0 {
+            body.push_str(&format!(
+                "         %{val}_a = OpExtInst %float %GLSL_std_450 FAbs %{cur}\n"
+            ));
+            cur = format!("{val}_a");
+        }
+        if (ctrl.neg_lo >> i) & 1 != 0 {
+            body.push_str(&format!("         %{val}_n = OpFNegate %float %{cur}\n"));
+            cur = format!("{val}_n");
+        }
+        // No `OpCopyObject` in this crate's assembler — track the final id.
+        srcs.push(cur);
+    }
+
+    body.push_str(&format!(
+        "         %fmix_{index} = OpExtInst %float %GLSL_std_450 Fma %{a} %{b} %{c}\n",
+        a = srcs[0],
+        b = srcs[1],
+        c = srcs[2]
+    ));
+    let product = if ctrl.clamp {
+        vop3p_clamp(
+            &format!("fmix_{index}"),
+            &format!("fmixc_{index}"),
+            &mut body,
+        );
+        format!("fmixc_{index}")
+    } else {
+        format!("fmix_{index}")
+    };
+
+    let value = match inst.type_ {
+        ShaderInstructionType::VFmaMixF32 => product,
+        // MIXLO / MIXHI: narrow to f16 and merge into one half of vdst,
+        // leaving the other half intact. `PackHalf2x16` of `(v, 0)` puts
+        // f16(v) in the low bits; of `(0, v)` in the high bits.
+        ShaderInstructionType::VFmaMixloF16 | ShaderInstructionType::VFmaMixhiF16 => {
+            let hi = inst.type_ == ShaderInstructionType::VFmaMixhiF16;
+            let pair = if hi {
+                format!("%float_0_000000 %{product}")
+            } else {
+                format!("%{product} %float_0_000000")
+            };
+            let (half_mask, keep_mask) = if hi {
+                ("%uint_0xffff0000", "%uint_0x0000ffff")
+            } else {
+                ("%uint_0x0000ffff", "%uint_0xffff0000")
+            };
+            body.push_str(&format!(
+                "         %mixv_{index} = OpCompositeConstruct %v2float {pair}\n\
+                 \x20        %mixp_{index} = OpExtInst %uint %GLSL_std_450 PackHalf2x16 %mixv_{index}\n\
+                 \x20        %mixh_{index} = OpBitwiseAnd %uint %mixp_{index} {half_mask}\n\
+                 \x20        %mixd_{index} = OpLoad %float %{dst}\n\
+                 \x20        %mixdu_{index} = OpBitcast %uint %mixd_{index}\n\
+                 \x20        %mixk_{index} = OpBitwiseAnd %uint %mixdu_{index} {keep_mask}\n\
+                 \x20        %mixo_{index} = OpBitwiseOr %uint %mixk_{index} %mixh_{index}\n\
+                 \x20        %mixf_{index} = OpBitcast %float %mixo_{index}\n",
+                dst = dst_value.value
+            ));
+            format!("mixf_{index}")
+        }
+        other => {
+            return Err(not_supported(
+                FUNC,
+                format!("instruction type {other:?} is not a mix op"),
+            ));
+        }
+    };
+
+    vop3p_store(&dst_value.value, &value, &index_str, &mut body);
+    *dst_source += "\n";
+    *dst_source += &body;
+    Ok(true)
+}
+
 /// Kyty: `Recompile_VMbcntHiU32B32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp
 /// L5455).
 fn recompile_vmbcnt_hi_u32_b32(
@@ -10369,6 +10735,17 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vinterp_p1_f32,  T::VInterpP1F32,  F::VdstVsrcAttrChan, p1("")),
     f(recompile_vinterp_p2_f32,  T::VInterpP2F32,  F::VdstVsrcAttrChan, p1("")),
 
+    // VOP3P (beyond Kyty, SharpEmu PRs #466/#460/#420): the whole encoding was
+    // undecoded, so any shader containing one packed instruction was dropped.
+    f(recompile_vop3p_packed_f16, T::VPkFmaF16,   F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_packed_f16, T::VPkAddF16,   F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_packed_f16, T::VPkMulF16,   F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_packed_f16, T::VPkMinF16,   F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_packed_f16, T::VPkMaxF16,   F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_fma_mix,    T::VFmaMixF32,    F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_fma_mix,    T::VFmaMixloF16,  F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_vop3p_fma_mix,    T::VFmaMixhiF16,  F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VMadF32,   F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VFmaF32,   F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VMadakF32, F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
@@ -10552,6 +10929,9 @@ mod tests {
     use crate::shader::types::{ShaderInstruction, ShaderOperand, ShaderType};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+    ///  — filler so a one-instruction body clears the
+    /// generator's "s_endpgm before instruction 2" floor.
+    const V_MOV_V0_0: u32 = 0x7E00_0280;
 
     fn parse(src: &[u32], type_: ShaderType) -> ShaderCode {
         let mut code = ShaderCode::new();
@@ -10762,8 +11142,10 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            337,
-            "the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),              the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
+            348,
+            "the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
+             VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
+             the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),            the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
              FlatLoadDword/X2/X3/X4 + FlatStoreDword/X2/X4), and \
              204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
              SSubU32, SNop, SVersion, the RDNA2-only rows \
@@ -10796,8 +11178,9 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 329,
-            "the seven FLAT-class rows (SharpEmu PR #587), and the \
+            implemented, 340,
+            "the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
+             the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
              VCmpxNgeF32, SVersion, the S_XXX_I32 \
              trio, VCvtFlrI32F32, VCmpxNltF32, SOrn2SaveexecB64, the ImageLoad \
@@ -10841,6 +11224,213 @@ mod tests {
                 e.format
             );
         }
+    }
+
+    /// Build one VOP3P dword pair. Field layout per `shader_parse_vop3p`.
+    #[allow(clippy::too_many_arguments)]
+    fn vop3p_words(
+        opcode: u32,
+        vdst: u32,
+        src: [u32; 3],
+        op_sel: u32,
+        op_sel_hi: u32,
+        neg_lo: u32,
+        neg_hi: u32,
+        clamp: bool,
+    ) -> [u32; 2] {
+        let w0 = (0x33 << 26)
+            | (opcode << 16)
+            | (u32::from(clamp) << 15)
+            | (((op_sel_hi >> 2) & 1) << 14)
+            | ((op_sel & 0x7) << 11)
+            | ((neg_hi & 0x7) << 8)
+            | (vdst & 0xff);
+        let w1 = ((neg_lo & 0x7) << 29)
+            | ((op_sel_hi & 0x3) << 27)
+            | ((src[2] & 0x1ff) << 18)
+            | ((src[1] & 0x1ff) << 9)
+            | (src[0] & 0x1ff);
+        [w0, w1]
+    }
+
+    /// SharpEmu PR #466 `3574a3b` ("was dropping Unity HDR shaders"): the whole
+    /// VOP3P encoding used to fall into `shader_parse`'s catch-all, so ONE
+    /// packed instruction killed the entire shader with `UnknownEncoding`.
+    ///
+    /// RED before `shader_parse_vop3p`: this parse returned
+    /// `UnknownEncoding { raw: 0xcc.. }` and nothing downstream ran at all.
+    #[test]
+    fn vop3p_encoding_no_longer_drops_the_whole_shader() {
+        // v_pk_mul_f16 v2, v0, v1 (opcode 0x10). op_sel_hi = 0b011 is the
+        // assembler default (each source's HIGH lane reads its high half).
+        let words = vop3p_words(0x10, 2, [256, 257, 0], 0, 0b011, 0, 0, false);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &[words[0], words[1], S_ENDPGM], &mut code, true)
+            .expect("VOP3P must decode, not drop the shader");
+
+        let inst = code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VPkMulF16);
+        assert_eq!(inst.src_num, 2, "the packed two-source ops read src0/src1");
+        assert_eq!(inst.dst.register_id, 2);
+        assert_eq!(inst.src[0].register_id, 0);
+        assert_eq!(inst.src[1].register_id, 1);
+        let ctrl = inst.vop3p.expect("VOP3P control attached");
+        assert_eq!(ctrl.op_sel, 0);
+        assert_eq!(ctrl.op_sel_hi, 0b011);
+        assert!(!ctrl.clamp);
+
+        // A packed opcode outside the ported table is a NAMED refusal, never a
+        // silent mis-decode: v_pk_add_u16 (0x0a, integer) has no lowering.
+        let unknown = vop3p_words(0x0a, 2, [256, 257, 0], 0, 0b011, 0, 0, false);
+        let mut other = ShaderCode::new();
+        other.set_type(ShaderType::Compute);
+        let e = shader_parse(0, &[unknown[0], unknown[1], S_ENDPGM], &mut other, true)
+            .expect_err("an unported packed opcode must refuse by name");
+        assert!(
+            format!("{e:?}").contains("vop3p"),
+            "the refusal names the vop3p family: {e:?}"
+        );
+    }
+
+    /// The full VOP3P lowering: every ported opcode translates to assembled,
+    /// spirv-val-clean SPIR-V, and the modifier bits reach the emitted body.
+    #[test]
+    fn vop3p_packed_and_mix_ops_lower_to_valid_spirv() {
+        for (name, opcode, type_) in [
+            ("v_pk_add_f16", 0x0f, T::VPkAddF16),
+            ("v_pk_mul_f16", 0x10, T::VPkMulF16),
+            ("v_pk_min_f16", 0x11, T::VPkMinF16),
+            ("v_pk_max_f16", 0x12, T::VPkMaxF16),
+            ("v_pk_fma_f16", 0x0e, T::VPkFmaF16),
+            ("v_fma_mix_f32", 0x20, T::VFmaMixF32),
+            ("v_fma_mixlo_f16", 0x21, T::VFmaMixloF16),
+            ("v_fma_mixhi_f16", 0x22, T::VFmaMixhiF16),
+        ] {
+            // Exercise clamp AND a non-default op_sel/neg on every opcode.
+            let words = vop3p_words(opcode, 4, [256, 257, 258], 0b001, 0b011, 0b010, 0b100, true);
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            // V_MOV_B32 v0, 0 tail: the generator requires a body of at least
+            // two instructions before s_endpgm.
+            shader_parse(
+                0,
+                &[words[0], words[1], V_MOV_V0_0, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{name} must parse: {e:?}"));
+            assert_eq!(code.get_instructions()[0].type_, type_, "{name}");
+            let ctrl = code.get_instructions()[0].vop3p.expect("control");
+            assert!(ctrl.clamp, "{name}: clamp bit decoded");
+            assert_eq!(ctrl.op_sel, 0b001, "{name}");
+            assert_eq!(ctrl.neg_lo, 0b010, "{name}");
+            assert_eq!(ctrl.neg_hi, 0b100, "{name}");
+
+            let mut info = ShaderComputeInputInfo::default();
+            info.threads_num = [1, 1, 1];
+            let source = spirv_generate_source(&code, None, None, Some(&info))
+                .unwrap_or_else(|e| panic!("{name} must translate: {e}"));
+
+            // The clamp modifier is applied, not silently dropped (the
+            // pre-existing VOP3 bodies refuse clamp by name — a packed op MUST
+            // implement it instead: SharpEmu PR #460 `472fc96`).
+            assert!(
+                source.contains("OpFOrdGreaterThan %bool") && source.contains("OpFOrdLessThan"),
+                "{name}: clamp saturation emitted:\n{source}"
+            );
+            // The negate modifier reached the body.
+            assert!(
+                source.contains("OpFNegate %float"),
+                "{name}: negate modifier emitted:\n{source}"
+            );
+
+            let words = spirv_run(&source).unwrap_or_else(|e| panic!("{name} must assemble: {e}"));
+            spirv_val_ok(&words, name);
+        }
+    }
+
+    /// The packed ops compute TWO independent lanes and repack them; the mix
+    /// ops compute ONE f32 and (for lo/hi) merge it into one half of vdst,
+    /// preserving the other. These shapes are what distinguish a real packed
+    /// lowering from a scalar one that happens to assemble.
+    #[test]
+    fn vop3p_lane_shapes_are_packed_not_scalar() {
+        let emit = |opcode: u32, op_sel: u32, op_sel_hi: u32| {
+            let words = vop3p_words(opcode, 4, [256, 257, 258], op_sel, op_sel_hi, 0, 0, false);
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[words[0], words[1], V_MOV_V0_0, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .expect("parse");
+            let mut info = ShaderComputeInputInfo::default();
+            info.threads_num = [1, 1, 1];
+            spirv_generate_source(&code, None, None, Some(&info)).expect("translate")
+        };
+
+        // v_pk_add_f16 with op_sel = 0 (both low halves feed the LOW lane) and
+        // op_sel_hi = 0b011 (both high halves feed the HIGH lane): the two
+        // lanes must extract DIFFERENT components and repack into one dword.
+        let packed = emit(0x0f, 0b000, 0b011);
+        assert!(
+            packed.contains("OpCompositeExtract %float %hlo0_0_pk 0")
+                && packed.contains("OpCompositeExtract %float %hhi0_0_pk 1"),
+            "the low lane reads half 0 and the high lane half 1:\n{packed}"
+        );
+        assert_eq!(
+            packed.matches("OpFAdd %float").count(),
+            2,
+            "one f16 add per packed lane:\n{packed}"
+        );
+        assert!(
+            packed.contains("OpCompositeConstruct %v2float %vloraw_0 %vhiraw_0")
+                && packed.contains("%vpu_0 = OpExtInst %uint %GLSL_std_450 PackHalf2x16 %vpk_0"),
+            "the two lanes repack into a single dword:\n{packed}"
+        );
+
+        // v_fma_mixhi_f16: ONE fma, then the result merges into the HIGH half
+        // while the low half of vdst survives.
+        let mixhi = emit(0x22, 0b000, 0b000);
+        assert_eq!(
+            mixhi.matches("GLSL_std_450 Fma").count(),
+            1,
+            "the mix ops are a single f32 fma, not two lanes:\n{mixhi}"
+        );
+        assert!(
+            mixhi.contains("OpCompositeConstruct %v2float %float_0_000000 %fmix_0"),
+            "mixhi packs the result into the HIGH half:\n{mixhi}"
+        );
+        assert!(
+            mixhi.contains("OpBitwiseAnd %uint %mixdu_0 %uint_0x0000ffff"),
+            "mixhi preserves the LOW half of vdst:\n{mixhi}"
+        );
+        // op_sel_hi = 0 means every mix source is read as a full f32, so no
+        // half is unpacked at all.
+        assert!(
+            !mixhi.contains("UnpackHalf2x16"),
+            "op_sel_hi = 0 reads full f32 sources:\n{mixhi}"
+        );
+
+        // The mirror case: op_sel_hi = 0b101 reads src0 and src2 as f16 halves,
+        // src1 as a full f32.
+        let mixlo = emit(0x21, 0b100, 0b101);
+        assert!(
+            mixlo.contains("OpCompositeExtract %float %m0_0_pk 0")
+                && mixlo.contains("OpCompositeExtract %float %m2_0_pk 1"),
+            "op_sel picks each mix source's half independently:\n{mixlo}"
+        );
+        assert!(
+            mixlo.contains("%m1_0_b = OpBitcast %float %r1_0"),
+            "a source with op_sel_hi clear stays a full f32:\n{mixlo}"
+        );
+        assert!(
+            mixlo.contains("OpBitwiseAnd %uint %mixdu_0 %uint_0xffff0000"),
+            "mixlo preserves the HIGH half of vdst:\n{mixlo}"
+        );
     }
 
     #[test]
@@ -12573,6 +13163,129 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble mixed-dim sample");
         naga_parse_and_validate(&words, "mixed-dim sample with storage shift");
+    }
+
+    /// ASTRO.BOT acceptance (SharpEmu PR #587 "support Gen5 flat memory and 3D
+    /// images"): ONE compute shader that writes a 3D `Rgba16f` froxel volume
+    /// AND a 2D `Rgba16f` target. The historical shader-wide single storage
+    /// key refused this by name —
+    /// `storage_texture_dim_format: not supported: mixed storage image
+    /// dims/formats in one shader ((Three, "Rgba16f") vs (Two, Rgba16f))` —
+    /// 20 refusals per measured run, each followed by a host crash.
+    ///
+    /// The bar is structural, not textual: the module must declare TWO
+    /// DISTINCT `OpTypeImage` storage types (`Dim3D` and `Dim2D`, both
+    /// `Rgba16f`), each at its own binding, each indexed by the body that
+    /// writes it — and it must pass real spirv-val, not just assemble.
+    #[test]
+    fn astro_mixed_2d_and_3d_rgba16f_storage_images_translate_to_two_image_types() {
+        use crate::shader::analysis::shader_calc_binding_indices;
+
+        // Two `image_store` MIMG instructions, one per storage T#.
+        let store_inst = || {
+            let mut store = ShaderCode::new();
+            store.set_type(ShaderType::Compute);
+            shader_parse(0, &[0xF020_0100, 0x0060_0800, S_ENDPGM], &mut store, true)
+                .expect("parse image_store");
+            let inst = store.get_instructions()[0];
+            assert_eq!(inst.type_, T::ImageStore);
+            inst
+        };
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let mut to_2d = store_inst();
+        to_2d.src[1].register_id = 0;
+        let mut to_3d = store_inst();
+        to_3d.src[1].register_id = 12;
+        code.get_instructions_mut().push(to_2d);
+        code.get_instructions_mut().push(to_3d);
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut info = ShaderComputeInputInfo::default();
+        info.threads_num = [1, 1, 1];
+        info.bind.push_constant_size = 128;
+        info.bind.textures2d.textures_num = 2;
+        info.bind.textures2d.textures2d_storage_num = 2;
+        // Both RW T#s carry FORMAT 71 (16_16_16_16 FLOAT = Rgba16f):
+        // `format()` is `fields[1] >> 20 & 0x1ff`, `type_()` is
+        // `fields[3] >> 28 & 0xf`.
+        for (slot, type_, start) in [(0usize, 9u32, 0i32), (1, 10, 12)] {
+            let d = &mut info.bind.textures2d.desc[slot];
+            d.texture.fields[1] |= 71 << 20;
+            d.texture.fields[3] |= type_ << 28;
+            d.start_register = start;
+            d.textures2d_without_sampler = true;
+            d.usage = crate::shader::resources::ShaderTextureUsage::ReadWrite;
+        }
+        // Real allocator, not hand-set indices: one binding per present key.
+        shader_calc_binding_indices(&mut info.bind);
+
+        let keys = storage_keys_present(&info.bind);
+        assert_eq!(
+            keys,
+            vec![
+                (SampledDim::Two, StorageFormat::Rgba16f),
+                (SampledDim::Three, StorageFormat::Rgba16f),
+            ],
+            "the two present storage keys, in canonical Dim-major order"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&info))
+            .expect("mixed 2D+3D Rgba16f storage images translate (per-key arrays)");
+
+        // Two distinct storage image TYPES, not one shader-wide type.
+        assert!(
+            source.contains("%ImageL_2D_16F = OpTypeImage %float 2D 0 0 0 2 Rgba16f"),
+            "2D Rgba16f storage image type:\n{source}"
+        );
+        assert!(
+            source.contains("%ImageL_3D_16F = OpTypeImage %float 3D 0 0 0 2 Rgba16f"),
+            "3D Rgba16f storage image type:\n{source}"
+        );
+        // Distinct bindings, one per present key, in `storage_key_ordinal`
+        // order and starting at the allocator's `binding_storage_index`.
+        let base = info.bind.textures2d.binding_storage_index;
+        assert!(
+            source.contains(&format!("OpDecorate %textures2D_L_2D_16F Binding {base}"))
+                && source.contains(&format!(
+                    "OpDecorate %textures2D_L_3D_16F Binding {}",
+                    base + 1
+                )),
+            "one binding per present storage key from {base}:\n{source}"
+        );
+        // Each write indexes ITS OWN key's array — a declaration alone would
+        // satisfy the two asserts above while every store still aliased one
+        // array.
+        assert!(
+            source
+                .contains("OpAccessChain %_ptr_UniformConstant_ImageL_2D_16F %textures2D_L_2D_16F"),
+            "the 2D store indexes the 2D array:\n{source}"
+        );
+        assert!(
+            source
+                .contains("OpAccessChain %_ptr_UniformConstant_ImageL_3D_16F %textures2D_L_3D_16F"),
+            "the 3D store indexes the 3D array:\n{source}"
+        );
+        // The 3D write must carry a THREE-component integer coordinate, or
+        // every Z slice collapses onto one plane (the #587 symptom).
+        assert!(
+            source.contains("OpCompositeConstruct %v3uint"),
+            "the 3D store builds a v3uint coordinate:\n{source}"
+        );
+
+        // Gate on REAL spirv-val (Khronos, Vulkan 1.3 — the same validator
+        // the raeen-gpu runtime uses). naga cannot serve as the gate here: its
+        // SPIR-V front end rejects *any* `OpImageWrite` storage module this
+        // generator produces with `InvalidImage`, homogeneous 2D-only
+        // included, so it is a known false negative for this whole path (the
+        // sibling of the `InvalidArrayBaseType` carve-out in
+        // `naga_parse_and_validate`) and would hide rather than prove the fix.
+        let words = spirv_run(&source).expect("assemble mixed 2D+3D storage images");
+        spirv_val_ok(&words, "mixed 2D+3D Rgba16f storage images");
     }
 
     #[test]

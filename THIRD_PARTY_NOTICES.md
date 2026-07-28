@@ -137,6 +137,23 @@ SOFTWARE.
   (global) memory + 3D-texture shader support (`Shader/*`, PSSL SEG-field
   FLAT-address decode → SPIR-V global-memory access). Ports cite the
   originating SharpEmu `file:line` in doc comments.
+- **Gen5 shader batch 2026-07-28** (`docs/sharpemu-port/gen5-shader-agc.md`):
+  the **VOP3P** (packed 16-bit math) decode and lowering is a behavioral
+  re-implementation of `Gen5ShaderTranslator.cs` (`DecodeVop3p`, the
+  `Gen5ShaderEncoding.Vop3p` operand/control case), `Gen5ShaderIr.cs`
+  (`Gen5Vop3pControl`) and `Gen5SpirvTranslator.Alu.cs` (`TryEmitPackedF16`,
+  `TryEmitFmaMix`, `EmitPackedF16Operand`, `EmitPackedF16MinMax`,
+  `EmitClampToUnitInterval`, `EmitFmaMixOperand`) — SharpEmu PRs #466
+  (`3574a3b`), #460 (`472fc96`), #420 (`3005bab`). Landed as
+  `shader_parse_vop3p` in `crates/kyty-graphics/src/shader/parse.rs`,
+  `Vop3pControl` in `shader/types.rs`, and
+  `recompile_vop3p_packed_f16` / `recompile_vop3p_fma_mix` in
+  `shader/recompile.rs`. Two deviations are documented in-tree: the f16↔f32
+  conversions use GLSL `Un/PackHalf2x16` rather than SharpEmu's explicit
+  integer sequences, and `v_pk_fma_f16` omits the round-to-odd 2Sum (#420)
+  because this generator has no per-body `NoContraction` decoration hook.
+  The type-driven 3D-image `volume` flag in `crates/raeen-gpu/src/vulkan/`
+  and `draw_translate.rs` completes the host half of PR #587 (`5228335`).
 - **How Raeen uses it:** A second-opinion reference alongside Kyty for PS5
   module loading (eboot/PRX/sysmodule chains), kernel-surface structure
   (Fiber, AMPR, PlayGo), VideoOut/AGC bring-up, and **native host controller

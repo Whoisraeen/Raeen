@@ -5215,6 +5215,21 @@ impl<'a> Spirv<'a> {
             self.add_constant_uint(0xff);
             self.add_constant_uint(0xffff);
         }
+        // VOP3P packed-f16 bodies: the clamp modifier needs 0.0/1.0 (already
+        // seeded above) and the mix ops' half merge needs the two 16-bit masks.
+        if self.code.has_any_of(&[
+            ShaderInstructionType::VPkFmaF16,
+            ShaderInstructionType::VPkAddF16,
+            ShaderInstructionType::VPkMulF16,
+            ShaderInstructionType::VPkMinF16,
+            ShaderInstructionType::VPkMaxF16,
+            ShaderInstructionType::VFmaMixF32,
+            ShaderInstructionType::VFmaMixloF16,
+            ShaderInstructionType::VFmaMixhiF16,
+        ]) {
+            self.add_constant_uint(0x0000_ffff);
+            self.add_constant_uint(0xffff_0000);
+        }
         if self.code.has_any_of(&[ShaderInstructionType::SBarrier]) {
             // OpControlBarrier memory semantics: AcquireRelease (0x8) |
             // WorkgroupMemory (0x100).

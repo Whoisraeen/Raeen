@@ -1510,6 +1510,7 @@ fn texture_cache_probe(
     depth: u32,
     cube: bool,
     array: bool,
+    volume: bool,
     tile_mode: u8,
     format: vk::Format,
 ) -> (u64, Option<TextureUpload>) {
@@ -1537,6 +1538,7 @@ fn texture_cache_probe(
                     && k.depth == depth
                     && k.cube == cube
                     && k.array == array
+                    && k.volume == volume
                     && k.format == format.as_raw()
                     && *cached_hash == hash
             })
@@ -1548,6 +1550,7 @@ fn texture_cache_probe(
                 layers,
                 cube,
                 array,
+                volume,
                 depth,
                 render_target: None,
                 guest_base: base,
@@ -1916,6 +1919,7 @@ fn decode_texture(
                 depth,
                 cube,
                 array,
+                volume,
                 t.tile_mode(),
                 format,
             );
@@ -1955,6 +1959,7 @@ fn decode_texture(
                 depth,
                 cube,
                 array,
+                volume,
                 t.tile_mode(),
                 format,
             );
@@ -2054,6 +2059,7 @@ fn decode_texture(
                     depth,
                     cube,
                     array,
+                    volume,
                     t.tile_mode(),
                     format,
                 )
@@ -2113,7 +2119,7 @@ fn decode_texture(
                         }
                     }
                     return Ok(texture_upload_from(
-                        t, width, height, format, pixels, layers, cube, array, depth, hash,
+                        t, width, height, format, pixels, layers, cube, array, volume, depth, hash,
                     ));
                 }
                 // The multi-layer array read overran the allocation: remember it
@@ -2150,6 +2156,7 @@ fn decode_texture(
                         // the T# is still type 13: the SPIR-V stays Arrayed = 1,
                         // so the view must stay TYPE_2D_ARRAY (layer_count 1).
                         array,
+                        volume,
                         depth,
                         single_hash,
                     ));
@@ -2246,6 +2253,7 @@ fn decode_texture(
         layers,
         cube,
         array,
+        volume,
         depth,
         // This path has already read and detiled the guest bytes above, so it is
         // the CPU-staging upload — not the Stage-B direct-bind of a live
@@ -2277,6 +2285,7 @@ fn texture_upload_from(
     layers: u32,
     cube: bool,
     array: bool,
+    volume: bool,
     depth: u32,
     sample_hash: u64,
 ) -> TextureUpload {
@@ -2288,6 +2297,7 @@ fn texture_upload_from(
         layers,
         cube,
         array,
+        volume,
         depth,
         render_target: None,
         guest_base: t.base40(),
@@ -2310,6 +2320,7 @@ fn placeholder_texture_dummy() -> TextureUpload {
         layers: 1,
         cube: false,
         array: false,
+        volume: false,
         depth: 1,
         render_target: None,
         guest_base: 0,
@@ -2346,11 +2357,12 @@ fn read_storage_image(
 ) -> Result<StorageImageUpload, DrawError> {
     let width = u32::from(t.width5()) + 1;
     let height = u32::from(t.height5()) + 1;
-    let depth = if t.type_() == 10 {
-        u32::from(t.depth()) + 1
-    } else {
-        1
-    };
+    // Type-driven, exactly like `array` below: a type-10 T# is a `Dim3D`
+    // storage image in the recompiled SPIR-V no matter how many slices its
+    // DEPTH field names, so the flag — not `depth > 1` — decides the host
+    // image/view type. See `StorageImageUpload::volume`.
+    let volume = t.type_() == 10;
+    let depth = if volume { u32::from(t.depth()) + 1 } else { 1 };
     let array = matches!(t.type_(), 11 | 13);
     let base_array = if array { u32::from(t.base_array5()) } else { 0 };
     let last_array = u32::from(t.depth());
@@ -2491,6 +2503,7 @@ fn read_storage_image(
         width,
         height,
         depth,
+        volume,
         layers,
         array,
         tile_mode: t.tile_mode(),
@@ -2690,6 +2703,7 @@ fn sampled_render_target(
             layers: 1,
             cube: false,
             array: false,
+            volume: false,
             depth: 1,
             render_target: Some(base),
             // Render-target binds are served by the persistent-TARGET
@@ -7275,6 +7289,7 @@ mod tests {
             layers,
             cube,
             array,
+            volume: depth > 1,
             depth,
             render_target: None,
             guest_base: 0x1000,
@@ -8000,5 +8015,68 @@ mod tests {
             refused.0.contains("3D texture tile mode 5 not implemented"),
             "the refusal must name the missing layout: {refused:?}"
         );
+    }
+
+    /// SharpEmu PR #587 (Gen5 3D images): the DEPTH the guest transports must
+    /// not decide the host image TYPE. A type-10 T# whose DEPTH field is 0 is a
+    /// one-slice volume — `depth == 1` — yet the recompiler still declares
+    /// `Dim3D` for it (`SampledDim::from_texture_type(10) == Three`), so the
+    /// upload must ask for a `VK_IMAGE_TYPE_3D` image and a `TYPE_3D` view.
+    ///
+    /// RED before the `volume` flag: both the sampled and the storage create
+    /// sites derived the volume branch from `depth > 1`, so exactly this
+    /// measured GTA V shape built a 2D image/view under a `Dim3D` image type —
+    /// the emit/bind divergence class that already cost a device loss for the
+    /// arrayed case.
+    #[test]
+    fn one_slice_type10_volume_stays_a_3d_image_not_a_2d_one() {
+        let rgba = [0x12, 0x34, 0x56, 0x78];
+        let mut blob = vec![0u8; rgba.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + rgba.len()].copy_from_slice(&rgba);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 56 << 20; // unified format 8_8_8_8 UNORM
+        t.fields[3] |= 5 << 20; // measured GTA tile mode
+        t.fields[3] |= 10 << 28; // type = 3D volume, DEPTH field left at 0
+
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("one-slice volume decodes");
+        assert_eq!(tex.depth, 1, "DEPTH 0 is a single slice");
+        assert!(
+            tex.volume,
+            "a type-10 T# is a volume regardless of its slice count"
+        );
+        assert!(!tex.array && !tex.cube);
+        // The classifier the recompiler reads must agree — the two sides of the
+        // emit/bind contract.
+        assert_eq!(
+            kyty_graphics::shader::SampledDim::from_texture_type(t.type_()),
+            kyty_graphics::shader::SampledDim::Three,
+            "SPIR-V declares Dim3D for this descriptor"
+        );
+
+        // The storage (UAV) side of the same descriptor, same contract.
+        let uav = read_storage_image(&t).expect("one-slice storage volume decodes");
+        assert_eq!(uav.depth, 1);
+        assert!(uav.volume, "a type-10 UAV is a 3D storage image");
+        assert!(!uav.array);
+
+        // A plain 2D descriptor of the same extent must NOT claim to be one —
+        // otherwise the assertion above would pass for the wrong reason.
+        let mut flat = t;
+        flat.fields[3] &= !(0xF << 28);
+        flat.fields[3] |= 9 << 28;
+        flat.fields[3] &= !(0x1F << 20); // linear: the 2D path reads 4 bytes, not a tile
+        let flat_tex =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                decode_texture(&flat)
+            })
+            .expect("2D texture decodes");
+        assert!(!flat_tex.volume, "a type-9 T# is never a volume");
     }
 }
