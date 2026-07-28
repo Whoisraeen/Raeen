@@ -289,6 +289,11 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     let deadline = std::time::Instant::now() + budget;
 
     loop {
+        // Deliver anything the GPU worker executed in-stream since the last
+        // poll (events/EOP/flips under `RAEEN_DEFER_GPU_SIDE_EFFECTS`; a
+        // relaxed-load no-op otherwise) — a waiter parked here IS the
+        // observer those effects must reach.
+        crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
         // Collect pending event fields for this queue, then edge-clear.
         let mut pending: Vec<(u64, u64, u32, i16, i64)> = Vec::new();
         for entry in ctx.kernel.kernel_equeue_events.iter() {
@@ -474,6 +479,32 @@ mod tests {
             hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
+    }
+
+    /// Ordered GPU side effects (checklist item 5, step 4): an in-stream
+    /// `EVENT_WRITE` the GPU worker published is delivered by the wait loop's
+    /// drain — a guest parked in `sceKernelWaitEqueue` IS the observation
+    /// point those effects must reach.
+    #[test]
+    fn wait_delivers_worker_published_gpu_events() {
+        // The hand-off queue is process-global: serialize with every other
+        // test that touches it.
+        let _guard = crate::SIDEFX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = raeen_gpu::ordered_side_effects::drain();
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = create(&ctx);
+        assert_eq!(hle_add_user_event(&ctx, &[eq, 0x2A]), OK);
+        raeen_gpu::ordered_side_effects::publish([
+            raeen_gpu::ordered_side_effects::OrderedGpuSideEffect::EventWrite { event_id: 0x2A },
+        ]);
+        assert_eq!(hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0]), OK);
+        assert_eq!(hle_get_event_id(&ctx, &[0x200]), 0x2A);
+        let mut cnt = [0u8; 4];
+        assert!(mem.read(0x1F0, &mut cnt));
+        assert_eq!(u32::from_le_bytes(cnt), 1);
     }
 
     #[test]

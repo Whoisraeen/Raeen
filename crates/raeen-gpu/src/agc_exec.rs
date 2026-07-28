@@ -718,8 +718,8 @@ impl AgcGpuSession {
             submit_queue: OnceLock::new(),
             in_flight: (Mutex::new(0), parking_lot::Condvar::new()),
             backend: Mutex::new(None),
-            command_processor: Mutex::new(CommandProcessor::new()),
-            compute_command_processor: Mutex::new(CommandProcessor::new()),
+            command_processor: Mutex::new(Self::new_command_processor()),
+            compute_command_processor: Mutex::new(Self::new_command_processor()),
             last_image: Mutex::new(None),
             splash: Mutex::new(None),
             draw_count: Mutex::new(0),
@@ -746,6 +746,16 @@ impl AgcGpuSession {
             present_srgb_encode_us: AtomicU64::new(0),
             present_encode_cache: Mutex::new(Vec::new()),
         }
+    }
+
+    /// A session command processor, with the unified GPU clock plumbed in:
+    /// the installed source consults `RAEEN_UNIFIED_GPU_CLOCK` per call and
+    /// DECLINES when the gate is off, so default behavior is bit-identical to
+    /// the CP's legacy process-local release counter (see `crate::gpu_clock`).
+    fn new_command_processor() -> CommandProcessor {
+        let mut cp = CommandProcessor::new();
+        cp.set_timestamp_source(Some(crate::gpu_clock::cp_timestamp_source));
+        cp
     }
 
     /// Create isolated GPU state for a new guest process.
@@ -2064,6 +2074,10 @@ impl AgcGpuSession {
                 Some(&crate::guest_mem::IdentityGuestMemory),
             )?;
             let produced = cp.take_produced_labels();
+            // In-stream completion side effects (events/EOP/flips), published
+            // for HLE delivery in execution order iff the defer gate is on
+            // (gate off: the HLE already applied them eagerly at submit).
+            crate::ordered_side_effects::publish_cp_side_effects(cp.take_side_effects());
             drop(cp);
             self.latch_produced_waits(&produced);
             return Ok((None, suspended_of(outcome)));
@@ -2104,6 +2118,10 @@ impl AgcGpuSession {
             crate::vulkan::offscreen::flush_deferred_draws_filtered(device, Some(&[]))?;
         }
         let produced = cp.take_produced_labels();
+        // In-stream completion side effects (events/EOP/flips) — see the
+        // state-only path above; a suspended walk has published nothing past
+        // its unmet wait, so delivery order is PM4 execution order.
+        crate::ordered_side_effects::publish_cp_side_effects(cp.take_side_effects());
         self.latch_produced_waits(&produced);
         // Carry any compute shader this submission observed forward to the next.
         if let Some(cs) = sink.current_compute {

@@ -113,6 +113,44 @@ fn next_release_timestamp() -> u64 {
     RELEASE_CLOCK.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// One guest-visible completion side effect a walked packet requested that
+/// this command processor cannot apply itself — kernel event queues and
+/// VideoOut flips live on the embedder's side of the seam. Recorded in
+/// **stream order** ([`CommandProcessor::take_side_effects`]) so the embedder
+/// can deliver them in PM4 submission order: a flip or event behind an unmet
+/// `WAIT_REG_MEM` is only recorded once the walk genuinely passes the wait,
+/// never early.
+///
+/// The field extraction mirrors the eager submit-time decoder
+/// (`raeen_gpu::agc::decode_submission`) exactly, so the gate-off eager
+/// duplicate and this in-order record describe the same effect.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SideEffect {
+    /// Standard `IT_EVENT_WRITE`: signal kernel equeue events keyed by this id.
+    EventWrite {
+        /// Event type (low 6 bits of the packet's first body dword).
+        event_id: u32,
+    },
+    /// AGC-form `RELEASE_MEM` end-of-pipe interrupt request: the kernel
+    /// delivers it to registered graphics-core events.
+    EopInterrupt {
+        /// The packet's INT_CTXID dword (0 when absent).
+        context_id: u32,
+    },
+    /// AGC flip packet (`IT_NOP` + `R_FLIP`): a VideoOut flip embedded in the
+    /// command stream.
+    Flip {
+        /// VideoOut handle the title opened.
+        video_out_handle: u32,
+        /// Registered display-buffer slot to scan out.
+        display_buffer_index: u32,
+        /// `SceVideoOutFlipMode`.
+        flip_mode: u32,
+        /// The title's opaque completion argument.
+        flip_arg: u64,
+    },
+}
+
 /// Which register file an unknown offset belonged to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RegFile {
@@ -482,6 +520,19 @@ pub struct CommandProcessor {
     /// the waiter even after the label was reset. Bounded by
     /// [`Self::MAX_PRODUCED_LABELS`].
     produced_labels: Vec<(u64, u64)>,
+    /// Completion side effects (events, EOP interrupts, flips) the walk
+    /// executed, in stream order, for the embedder to deliver — see
+    /// [`SideEffect`]. Drained by [`Self::take_side_effects`]; bounded by
+    /// [`Self::MAX_SIDE_EFFECTS`].
+    side_effects: Vec<SideEffect>,
+    /// Overriding clock for `RELEASE_MEM` DATA_SEL 3/4 GPU-timestamp writes.
+    /// `None` from the source (or no source at all) falls back to the legacy
+    /// process-local counter ([`next_release_timestamp`]) — bit-identical
+    /// default behavior. The embedder installs a source that consults the
+    /// `RAEEN_UNIFIED_GPU_CLOCK` gate per call, so both the eager submit-time
+    /// writer and this in-stream writer share ONE authoritative clock when
+    /// the gate is on (the two-clock double-write was measured to disagree).
+    timestamp_source: Option<fn() -> Option<u64>>,
 }
 
 impl CommandProcessor {
@@ -554,13 +605,19 @@ impl CommandProcessor {
         // Producer labels written before an in-stream queue reset must survive
         // it: the embedder still needs to latch waiters against them, and a
         // per-frame `R_DRAW_RESET` between the producer packet and the drain
-        // must not silently drop the wakeup.
+        // must not silently drop the wakeup. The same holds for undelivered
+        // side effects, and the timestamp source is embedder configuration —
+        // a queue reset must not silently fork the clock back to the counter.
         let produced_labels = std::mem::take(&mut self.produced_labels);
+        let side_effects = std::mem::take(&mut self.side_effects);
+        let timestamp_source = self.timestamp_source;
         *self = Self::new();
         self.warned = warned;
         self.shader_bind_trace_count = shader_bind_trace_count;
         self.refused_draws = refused_draws;
         self.produced_labels = produced_labels;
+        self.side_effects = side_effects;
+        self.timestamp_source = timestamp_source;
     }
 
     /// Cap on completion labels retained between drains, so a pathological
@@ -584,6 +641,42 @@ impl CommandProcessor {
         if self.produced_labels.len() < Self::MAX_PRODUCED_LABELS {
             self.produced_labels.push((address, value));
         }
+    }
+
+    /// Cap on undelivered [`SideEffect`]s retained between drains — real
+    /// streams carry a handful of events and at most one flip per frame, so
+    /// hitting this means the embedder stopped draining (warned once).
+    const MAX_SIDE_EFFECTS: usize = 1024;
+
+    /// Drain the completion side effects (events, EOP interrupts, flips) the
+    /// walk(s) since the last drain executed, in stream order. The embedder
+    /// delivers them to the kernel/VideoOut layer; a suspended walk has NOT
+    /// recorded anything past its unmet wait, so delivering after every
+    /// (partial) walk preserves PM4 submission order.
+    #[must_use]
+    pub fn take_side_effects(&mut self) -> Vec<SideEffect> {
+        std::mem::take(&mut self.side_effects)
+    }
+
+    /// Record one completion side effect for the embedder, bounded by
+    /// [`Self::MAX_SIDE_EFFECTS`].
+    fn record_side_effect(&mut self, effect: SideEffect) {
+        if self.side_effects.len() < Self::MAX_SIDE_EFFECTS {
+            self.side_effects.push(effect);
+        } else if self.first(SkipKey::Note("side_effects_capped")) {
+            warn!(
+                cap = Self::MAX_SIDE_EFFECTS,
+                "completion side effects capped — the embedder is not draining take_side_effects"
+            );
+        }
+    }
+
+    /// Install (or clear) the overriding GPU-timestamp clock for `RELEASE_MEM`
+    /// DATA_SEL 3/4 writes — see [`Self::timestamp_source`]. A source
+    /// returning `None` falls back to the legacy process-local counter, so an
+    /// installed-but-gated-off source is bit-identical to no source.
+    pub fn set_timestamp_source(&mut self, source: Option<fn() -> Option<u64>>) {
+        self.timestamp_source = source;
     }
 
     /// True the first time `key` is seen; the caller warns exactly then.
@@ -859,12 +952,14 @@ impl CommandProcessor {
             // packet in the same stream observes, so it must run in PM4 order
             // here — not only in the HLE's eager submit-time decode.
             pm4::IT_DMA_DATA => self.cp_op_it_dma_data(cmd_id, body, offset, mem),
+            // The kernel-event side effect: recorded in stream order for the
+            // embedder to deliver (it owns the equeue state) — see
+            // [`SideEffect::EventWrite`].
+            pm4::IT_EVENT_WRITE => self.cp_op_event_write(cmd_id, body, offset),
             // These carry no guest-memory completion label on the RDNA2/AGC
-            // draw path (EVENT_WRITE triggers kernel event queues, handled by
-            // the HLE submit layer; ACQUIRE_MEM/CLEAR_STATE/etc. are cache/state
+            // draw path (ACQUIRE_MEM/CLEAR_STATE/etc. are cache/state
             // ops a draw never observes). Consumed by encoded length.
             pm4::IT_ACQUIRE_MEM
-            | pm4::IT_EVENT_WRITE
             | pm4::IT_EVENT_WRITE_EOP
             | pm4::IT_EVENT_WRITE_EOS
             | pm4::IT_CONTEXT_CONTROL
@@ -1072,16 +1167,33 @@ impl CommandProcessor {
             // `dispatch`).
             pm4::R_WRITE_DATA => self.cp_op_write_data(cmd_id, body, offset, false, mem),
             pm4::R_RELEASE_MEM => self.cp_op_release_mem(cmd_id, body, offset, false, mem),
-            // Sync / flip ops: consumed, not honoured. A draw never observes
-            // them, and their side effects (flip queues) are already applied by
-            // the HLE submit decode.
-            pm4::R_ACQUIRE_MEM | pm4::R_WAIT_FLIP_DONE | pm4::R_FLIP => {
+            // The embedded VideoOut flip: recorded in stream order for the
+            // embedder to deliver, so a flip behind an unmet wait cannot
+            // become visible early. Field layout mirrors the eager decoder
+            // (`decode_submission`): body `[handle, index, mode, arg_lo,
+            // arg_hi, …]`, honoured only at the modeled >= 6-dword length.
+            pm4::R_FLIP => {
+                if pm4::body_dw(cmd_id) >= 5 {
+                    let flip_arg = u64::from(Self::body_at(body, 3, offset)?)
+                        | (u64::from(Self::body_at(body, 4, offset)?) << 32);
+                    let effect = SideEffect::Flip {
+                        video_out_handle: Self::body_at(body, 0, offset)?,
+                        display_buffer_index: Self::body_at(body, 1, offset)?,
+                        flip_mode: Self::body_at(body, 2, offset)?,
+                        flip_arg,
+                    };
+                    self.record_side_effect(effect);
+                }
+                Ok(pm4::body_dw(cmd_id))
+            }
+            // Sync ops: consumed, not honoured — a draw never observes them.
+            pm4::R_ACQUIRE_MEM | pm4::R_WAIT_FLIP_DONE => {
                 if self.first(SkipKey::Custom(r.0)) {
                     warn!(
                         cmd_id = format_args!("{cmd_id:#010x}"),
                         r = r.0,
                         offset,
-                        "AGC sync/flip packet consumed without effect"
+                        "AGC sync packet consumed without effect"
                     );
                 }
                 Ok(pm4::body_dw(cmd_id))
@@ -1341,6 +1453,24 @@ impl CommandProcessor {
     /// increments per dword unless the packet disables it (all values land on
     /// the same address then, last wins — hardware behaviour). Each written
     /// dword is recorded for the cross-queue wait latch ([`Self::record_produced`]).
+    /// Execute a standard `IT_EVENT_WRITE` packet by recording its kernel-event
+    /// side effect for the embedder ([`SideEffect::EventWrite`]) in stream
+    /// order. Event-id extraction mirrors the eager decoder: the low 6 bits of
+    /// the first body dword, honoured only at the modeled >= 2-dword length.
+    fn cp_op_event_write(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+    ) -> Result<u32, CpError> {
+        let body_len = pm4::body_dw(cmd_id);
+        if body_len >= 1 {
+            let event_id = Self::body_at(body, 0, offset)? & 0x3f;
+            self.record_side_effect(SideEffect::EventWrite { event_id });
+        }
+        Ok(body_len)
+    }
+
     fn cp_op_write_data(
         &mut self,
         cmd_id: u32,
@@ -1438,6 +1568,19 @@ impl CommandProcessor {
             // AGC form: DATA_SEL is the byte at bits 23:16; no DST_SEL gate.
             (true, (control >> 16) & 0xFF)
         };
+        if !standard {
+            // AGC-form end-of-pipe interrupt request (byte at bits 31:24),
+            // recorded for the embedder BEFORE the destination gates: an
+            // interrupt-only completion carries no memory write (dst == 0).
+            // Mirrors the eager decoder, which likewise extracts interrupts
+            // only from the AGC form.
+            let interrupt = (control >> 24) & 0xFF;
+            if interrupt != 0 {
+                self.record_side_effect(SideEffect::EopInterrupt {
+                    context_id: body.get(6).copied().unwrap_or(0),
+                });
+            }
+        }
         if !dst_sel_ok || dst == 0 {
             return Ok(body_len);
         }
@@ -1471,8 +1614,14 @@ impl CommandProcessor {
                 // monotonic counter is nonzero and strictly increasing, which is
                 // what a "became nonzero" / ">= earlier sample" poll needs. Not
                 // recorded for the equality latch (it is a counter, not a
-                // specific reference the waiter compares equal to).
-                let ts = next_release_timestamp();
+                // specific reference the waiter compares equal to). An
+                // installed timestamp source overrides the counter (the
+                // embedder's unified GPU clock — see `set_timestamp_source`);
+                // a source returning `None` is the legacy counter, exactly.
+                let ts = self
+                    .timestamp_source
+                    .and_then(|source| source())
+                    .unwrap_or_else(next_release_timestamp);
                 let _ = mem.write_bytes(dst, &ts.to_le_bytes());
             }
             _ => {
@@ -4797,6 +4946,191 @@ mod tests {
             cp.take_produced_labels().is_empty(),
             "timestamp is a counter, not an equality-latched label"
         );
+    }
+
+    // ---- Ordered completion side effects (events / EOP interrupts / flips)
+    // and the injectable RELEASE_MEM timestamp clock (checklist item 5,
+    // steps 3-5) ----
+
+    /// AGC flip packet (`IT_NOP` + `R_FLIP`), the layout the eager decoder
+    /// honours: body `[handle, index, mode, arg_lo, arg_hi, 0]`.
+    fn flip_agc(handle: u32, index: u32, mode: u32, arg: u64) -> Vec<u32> {
+        vec![
+            header(7, pm4::IT_NOP, pm4::R_FLIP),
+            handle,
+            index,
+            mode,
+            arg as u32,
+            (arg >> 32) as u32,
+            0,
+        ]
+    }
+
+    /// Events, flips and AGC EOP interrupts are recorded in STREAM order for
+    /// the embedder; draining empties the record; a queue reset must not drop
+    /// undelivered effects.
+    #[test]
+    fn events_flips_and_eop_interrupts_are_recorded_in_stream_order() {
+        let mem = RwMem::new(0x9000, 4);
+        // Standard EVENT_WRITE (event id = low 6 bits of the first body word),
+        // then a flip, then an interrupt-only AGC RELEASE_MEM (no dst).
+        let mut dcb = vec![header(3, pm4::IT_EVENT_WRITE, pm4::R_ZERO), 0x2A, 0];
+        dcb.extend(flip_agc(1, 2, 3, 0x0123_4567_89AB_CDEF));
+        dcb.push(header(8, pm4::IT_NOP, pm4::R_RELEASE_MEM));
+        dcb.extend_from_slice(&[0, 2 << 24, 0, 0, 0, 0, 0x55]);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem)).unwrap();
+        assert_eq!(
+            cp.take_side_effects(),
+            vec![
+                SideEffect::EventWrite { event_id: 0x2A },
+                SideEffect::Flip {
+                    video_out_handle: 1,
+                    display_buffer_index: 2,
+                    flip_mode: 3,
+                    flip_arg: 0x0123_4567_89AB_CDEF,
+                },
+                SideEffect::EopInterrupt { context_id: 0x55 },
+            ],
+            "all three side effects, in PM4 stream order"
+        );
+        assert!(cp.take_side_effects().is_empty(), "the drain empties");
+
+        // Undelivered effects survive an in-stream queue reset.
+        cp.run_with_memory(&flip_agc(1, 0, 0, 9), &mut sink, Some(&mem))
+            .unwrap();
+        cp.reset();
+        assert_eq!(
+            cp.take_side_effects(),
+            vec![SideEffect::Flip {
+                video_out_handle: 1,
+                display_buffer_index: 0,
+                flip_mode: 0,
+                flip_arg: 9,
+            }],
+            "a queue reset must not drop undelivered side effects"
+        );
+    }
+
+    /// Parity with the eager decoder: the STANDARD `RELEASE_MEM` form carries
+    /// no modeled interrupt extraction, and a short `R_FLIP` is unmodeled —
+    /// neither records a side effect.
+    #[test]
+    fn standard_release_mem_and_short_flips_record_no_side_effects() {
+        let mem = RwMem::new(0x9000, 4);
+        let mut dcb = vec![
+            header(8, pm4::IT_RELEASE_MEM, pm4::R_ZERO),
+            0,
+            (1u32 << 29) | (2 << 24), // DATA_SEL 1; junk in the byte at 31:24
+            0x9000u32,
+            0,
+            7,
+            0,
+            0,
+        ];
+        // 5-total-dword R_FLIP: shorter than the modeled layout.
+        dcb.extend_from_slice(&[header(5, pm4::IT_NOP, pm4::R_FLIP), 1, 0, 0, 0]);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem)).unwrap();
+        assert_eq!(mem.word(0), 7, "the standard label write still lands");
+        assert!(
+            cp.take_side_effects().is_empty(),
+            "no interrupt from the standard form, no flip from a short packet"
+        );
+    }
+
+    /// Step 5's ordering property at the CP layer: a flip queued behind an
+    /// unexecuted wait is NOT recorded (so the embedder cannot deliver it
+    /// early); it appears only once the resumed walk genuinely passes the wait.
+    #[test]
+    fn a_flip_behind_an_unmet_wait_is_not_recorded_until_the_wait_passes() {
+        let mem = RwMem::new(0x9000, 4);
+        let mut dcb = wait32(0x9000, !0, 3, 1); // wait for label == 1 (it is 0)
+        dcb.extend(flip_agc(1, 0, 0, 7));
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let outcome = cp.run_resumable(&dcb, 0, &mut sink, Some(&mem)).unwrap();
+        let RunOutcome::Suspended(suspended) = outcome else {
+            panic!("the unmet wait must suspend the walk");
+        };
+        assert!(
+            cp.take_side_effects().is_empty(),
+            "the flip must not become visible before its wait executes"
+        );
+        // The producer writes the label; the resumed walk reaches the flip.
+        mem.words.borrow_mut()[0] = 1;
+        assert_eq!(
+            cp.run_resumable(&dcb, suspended.resume_dword, &mut sink, Some(&mem))
+                .unwrap(),
+            RunOutcome::Completed
+        );
+        assert_eq!(
+            cp.take_side_effects(),
+            vec![SideEffect::Flip {
+                video_out_handle: 1,
+                display_buffer_index: 0,
+                flip_mode: 0,
+                flip_arg: 7,
+            }],
+            "the flip is recorded exactly once, after the wait passes"
+        );
+    }
+
+    fn fixed_ts() -> Option<u64> {
+        Some(0x0000_1234_5678_9ABC)
+    }
+    fn declined_ts() -> Option<u64> {
+        None
+    }
+
+    /// `RELEASE_MEM` DATA_SEL 3 timestamp packet targeting `addr`.
+    fn ts_packet(addr: u64) -> Vec<u32> {
+        vec![
+            header(7, pm4::IT_NOP, pm4::R_RELEASE_MEM),
+            0,
+            3 << 16,
+            addr as u32,
+            (addr >> 32) as u32,
+            0,
+            0,
+        ]
+    }
+
+    /// Step 3 at the CP layer: an installed timestamp source overrides the
+    /// legacy release counter (and survives a queue reset — it is embedder
+    /// configuration); a source that DECLINES (`None` — the gate off) is the
+    /// legacy counter, exactly.
+    #[test]
+    fn an_installed_timestamp_source_overrides_the_release_clock() {
+        let mem = RwMem::new(0x9000, 4);
+        let mut cp = CommandProcessor::new();
+        cp.set_timestamp_source(Some(fixed_ts));
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&ts_packet(0x9000), &mut sink, Some(&mem))
+            .unwrap();
+        assert_eq!(mem.word(0), 0x5678_9ABC, "source low dword");
+        assert_eq!(mem.word(1), 0x0000_1234, "source high dword");
+        // The source survives a queue reset.
+        let mem = RwMem::new(0x9000, 4);
+        cp.reset();
+        cp.run_with_memory(&ts_packet(0x9000), &mut sink, Some(&mem))
+            .unwrap();
+        assert_eq!(mem.word(0), 0x5678_9ABC, "source survives reset");
+
+        // A declining source falls back to the nonzero, advancing counter.
+        let mem = RwMem::new(0x9000, 4);
+        let mut cp = CommandProcessor::new();
+        cp.set_timestamp_source(Some(declined_ts));
+        cp.run_with_memory(&ts_packet(0x9000), &mut sink, Some(&mem))
+            .unwrap();
+        let first = u64::from(mem.word(0)) | (u64::from(mem.word(1)) << 32);
+        assert_ne!(first, 0, "declined source falls back to the counter");
+        cp.run_with_memory(&ts_packet(0x9000), &mut sink, Some(&mem))
+            .unwrap();
+        let second = u64::from(mem.word(0)) | (u64::from(mem.word(1)) << 32);
+        assert!(second > first, "counter advances: {first} -> {second}");
     }
 
     /// A producer with no `GuestMemory` writer is skipped (one warn), never a

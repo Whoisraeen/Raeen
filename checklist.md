@@ -158,13 +158,25 @@ top-down, update statuses in place, and keep it committed.**
   `crates/raeen-kernel/` VFS, ledger ITEM 2 notes.
 
 ### 5. Ordered GPU side effects — steps 3–5
-- [ ] Step 3: unify the two timestamp clocks (A/B carefully — ASTRO
-  timestamp-fence regression territory, per ledger).
-- [ ] Step 4: events/EOP ordering under `RAEEN_DEFER_GPU_SIDE_EFFECTS`.
-- [ ] Step 5: flip-pending ordering.
+- [x] Step 3 (code): unified timestamp clock behind `RAEEN_UNIFIED_GPU_CLOCK`
+  (default OFF, bit-identical): `raeen_gpu::gpu_clock` is the one authority;
+  HLE `next_gpu_timestamp` delegates under the gate, the worker CP gets an
+  injectable `set_timestamp_source` that declines when the gate is off.
+- [ ] Step 3 (live A/B): flip `RAEEN_UNIFIED_GPU_CLOCK=1` on a live title —
+  ASTRO timestamp-fence regression territory; stays with the main session.
+- [x] Step 4: events/EOP execute in-stream under
+  `RAEEN_DEFER_GPU_SIDE_EFFECTS` (CP `SideEffect` records →
+  `raeen_gpu::ordered_side_effects` queue → HLE drains at submit /
+  WaitEqueue poll / VideoOut status); eager duplicates gated off. Dual-policy
+  tests in kyty-graphics + raeen-gpu + raeen-hle.
+- [x] Step 5: flip-pending ordered the same way; CP test pins that a flip
+  behind an unmet wait is not recorded (so never delivered) until the wait
+  genuinely passes; VideoOut status reads drain worker flips.
+- [ ] Live A/B of `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` (Minecraft + ASTRO) before
+  making either gate the default — main session.
 - **Context:** Steps 0–2 landed (gate + fail-open + IT_DMA_DATA in-stream,
   `cp_op_it_dma_data` in kyty-graphics run.rs). Design notes in ledger
-  2026-07-25/26 ITEM 4.
+  2026-07-25/26 ITEM 4; steps 3–5 implementation in ledger 2026-07-27.
 
 ### 6. Real Vulkan swapchain + GPU-resident present phase 2
 - [ ] Phase 2: cross-process image sharing (`VK_KHR_external_memory_win32` →

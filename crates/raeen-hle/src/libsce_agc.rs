@@ -1662,8 +1662,19 @@ fn submit_validate(ctx: &HleContext, packet: u64, queue: &'static str) -> u64 {
 /// lives on `OrbisKernel` so a relaunched session restarts from its own
 /// clock instead of counting up from a prior session's final value (which
 /// would collapse timestamp deltas to ~1 ns).
+///
+/// Under `RAEEN_UNIFIED_GPU_CLOCK` (step 3 of the ordered-side-effects plan,
+/// default OFF) this delegates to the ONE process-global clock the GPU
+/// worker's in-stream `cp_op_release_mem` writer also uses
+/// (`raeen_gpu::gpu_clock`), so the two writers can no longer double-write a
+/// fence with values from disagreeing clock domains. Default OFF keeps this
+/// session clock bit-identical — the flip is A/B territory (ASTRO.BOT's
+/// timestamp-fence hang is the known regression risk).
 fn next_gpu_timestamp(ctx: &HleContext) -> u64 {
     use std::sync::atomic::Ordering;
+    if raeen_gpu::gpu_clock::unified_gpu_clock_enabled() {
+        return raeen_gpu::gpu_clock::next_unified_gpu_timestamp();
+    }
     let now = u64::try_from(ctx.services.monotonic_elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut next = now.max(1);
     let _ =
@@ -1677,16 +1688,89 @@ fn next_gpu_timestamp(ctx: &HleContext) -> u64 {
 }
 
 /// `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` (transition gate, default OFF): stop
-/// applying CP-executed guest-memory side effects eagerly at submit.
+/// applying CP-executed side effects eagerly at submit.
 /// WRITE_DATA/RELEASE_MEM labels, RELEASE_MEM timestamps, and standard
 /// `IT_DMA_DATA` copies/fills are already written in PM4 order on the GPU
 /// worker (`cp_op_write_data` / `cp_op_release_mem` / `cp_op_it_dma_data` in
 /// kyty-graphics), so the eager duplicates race the in-order writes — and the
-/// two timestamp clocks can disagree. Side effects with no in-order executor
-/// yet (events, EOP interrupts, flips) still run here. Read per call, like
-/// the `RAEEN_TRACE_*` gates, so tests can flip it per case.
+/// two timestamp clocks can disagree (see `RAEEN_UNIFIED_GPU_CLOCK`). Events,
+/// EOP interrupts, and flips are likewise executed in-stream by the worker
+/// under the gate: it records them in PM4 order and the HLE delivers them
+/// from [`apply_ordered_gpu_side_effects`]. Delegates to the single policy
+/// reader in `raeen_gpu::ordered_side_effects` (read per call, like the
+/// `RAEEN_TRACE_*` gates, so tests can flip it per case).
 fn defer_gpu_side_effects() -> bool {
-    std::env::var_os("RAEEN_DEFER_GPU_SIDE_EFFECTS").is_some()
+    raeen_gpu::ordered_side_effects::defer_gpu_side_effects()
+}
+
+/// Signal every registered equeue event keyed by `event_id` — the eager and
+/// the ordered (worker-drain) delivery paths share this one implementation,
+/// so flipping `RAEEN_DEFER_GPU_SIDE_EFFECTS` changes WHEN an event fires,
+/// never WHAT it does.
+fn signal_agc_equeue_event(ctx: &HleContext, event_id: u32) {
+    for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+        if event.key().1 == u64::from(event_id) {
+            event.triggered = true;
+            event.fflags = event.fflags.saturating_add(1);
+            event.data = i64::from(event_id);
+        }
+    }
+}
+
+/// Deliver `count` RELEASE_MEM end-of-pipe interrupts (the last one carrying
+/// `last_context`) to every graphics-core equeue event — shared by the eager
+/// and the ordered delivery paths, like [`signal_agc_equeue_event`].
+///
+/// Fidelity debt: real delivery is per (equeue, event id) with the interrupt
+/// selector (1-3) distinguishing pipe/type; this broadcasts to every
+/// graphics-core event and folds N interrupts into one trigger. Revisit if a
+/// title registers distinct events for graphics vs compute EOP and routes on
+/// data/ident.
+fn signal_eop_interrupts(ctx: &HleContext, count: u32, last_context: u32) {
+    for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+        if event.filter == EVFILT_GRAPHICS_CORE {
+            event.triggered = true;
+            event.fflags = event.fflags.saturating_add(count);
+            event.data = i64::from(last_context);
+        }
+    }
+}
+
+/// Deliver every side effect the GPU worker has executed in-stream since the
+/// last drain (steps 4–5 of the ordered-side-effects plan), in execution
+/// order. Only the worker's `RAEEN_DEFER_GPU_SIDE_EFFECTS`-gated publish
+/// fills the queue, so with the gate off this is one relaxed atomic load.
+///
+/// Called from the guest's observation points — submission entry, the
+/// `sceKernelWaitEqueue` poll loop, and the VideoOut flip/vblank status
+/// calls — so an effect becomes guest-visible no earlier than its in-stream
+/// execution and no later than the next observation.
+pub(crate) fn apply_ordered_gpu_side_effects(ctx: &HleContext) {
+    use raeen_gpu::ordered_side_effects::OrderedGpuSideEffect;
+    for effect in raeen_gpu::ordered_side_effects::drain() {
+        match effect {
+            OrderedGpuSideEffect::EventWrite { event_id } => {
+                signal_agc_equeue_event(ctx, event_id);
+            }
+            OrderedGpuSideEffect::EopInterrupt { context_id } => {
+                signal_eop_interrupts(ctx, 1, context_id);
+            }
+            OrderedGpuSideEffect::Flip {
+                video_out_handle,
+                display_buffer_index,
+                flip_mode,
+                flip_arg,
+            } => {
+                let _ = crate::libsce_video_out::submit_flip_from_agc(
+                    ctx,
+                    video_out_handle,
+                    display_buffer_index,
+                    flip_mode,
+                    flip_arg,
+                );
+            }
+        }
+    }
 }
 
 fn submit_command_buffer(
@@ -1695,6 +1779,9 @@ fn submit_command_buffer(
     dword_count: u32,
     queue: &'static str,
 ) -> u64 {
+    // Deliver anything the GPU worker executed in-stream since the guest last
+    // observed (no-op unless `RAEEN_DEFER_GPU_SIDE_EFFECTS` filled the queue).
+    apply_ordered_gpu_side_effects(ctx);
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
@@ -1816,52 +1903,42 @@ fn submit_command_buffer(
             }
         }
     }
-    for event_id in &decoded.events {
-        for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
-            if event.key().1 == u64::from(*event_id) {
-                event.triggered = true;
-                event.fflags = event.fflags.saturating_add(1);
-                event.data = i64::from(*event_id);
-            }
+    // Events, EOP interrupts, and flips: eager at submit by default (the
+    // guest-CPU observers keep working with no worker in the loop). Under
+    // `RAEEN_DEFER_GPU_SIDE_EFFECTS` the GPU worker executes them in-stream
+    // instead (kyty-graphics `SideEffect` records → `raeen_gpu::
+    // ordered_side_effects` → `apply_ordered_gpu_side_effects`), so an event
+    // or flip sequenced behind an unexecuted wait can no longer become
+    // guest-visible early — the eager duplicates below are skipped, or a flip
+    // would be delivered twice.
+    if !defer {
+        for event_id in &decoded.events {
+            signal_agc_equeue_event(ctx, *event_id);
         }
-    }
-    // RELEASE_MEM end-of-pipe interrupts: hardware raises the EOP interrupt
-    // and the kernel delivers it to every event registered via
-    // sceAgcDriverAddEqEvent. These packets carry no memory write, so without
-    // this bridge an interrupt-only completion is signaled by no component.
-    // Fidelity debt: real delivery is per (equeue, event id) with the
-    // interrupt selector (1-3) distinguishing pipe/type; this broadcasts to
-    // every graphics-core event and folds N interrupts into one trigger.
-    // Over-signaling is safe under the eager-completion model ("done" is
-    // already true when submit returns), but revisit if a title registers
-    // distinct events for graphics vs compute EOP and routes on data/ident.
-    // Under `RAEEN_DEFER_GPU_SIDE_EFFECTS` completion is no longer eager while
-    // these events still fire at submit — that over-signal is the known
-    // remainder, tracked as the events/EOP/flip step of the
-    // ordered-side-effects plan.
-    if !decoded.eop_interrupts.is_empty() {
-        let count = decoded.eop_interrupts.len() as u32;
-        let last_context = decoded
-            .eop_interrupts
-            .last()
-            .map(|i| i.context_id)
-            .unwrap_or(0);
-        for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
-            if event.filter == EVFILT_GRAPHICS_CORE {
-                event.triggered = true;
-                event.fflags = event.fflags.saturating_add(count);
-                event.data = i64::from(last_context);
-            }
+        // RELEASE_MEM end-of-pipe interrupts: hardware raises the EOP
+        // interrupt and the kernel delivers it to every event registered via
+        // sceAgcDriverAddEqEvent. These packets carry no memory write, so
+        // without this bridge an interrupt-only completion is signaled by no
+        // component. Over-signaling is safe under the eager-completion model
+        // ("done" is already true when submit returns).
+        if !decoded.eop_interrupts.is_empty() {
+            let count = decoded.eop_interrupts.len() as u32;
+            let last_context = decoded
+                .eop_interrupts
+                .last()
+                .map(|i| i.context_id)
+                .unwrap_or(0);
+            signal_eop_interrupts(ctx, count, last_context);
         }
-    }
-    for flip in &decoded.flips {
-        let _ = crate::libsce_video_out::submit_flip_from_agc(
-            ctx,
-            flip.video_out_handle,
-            flip.display_buffer_index,
-            flip.flip_mode,
-            flip.flip_arg,
-        );
+        for flip in &decoded.flips {
+            let _ = crate::libsce_video_out::submit_flip_from_agc(
+                ctx,
+                flip.video_out_handle,
+                flip.display_buffer_index,
+                flip.flip_mode,
+                flip.flip_arg,
+            );
+        }
     }
 
     use std::sync::atomic::Ordering;
@@ -5920,6 +5997,7 @@ mod tests {
         // default policy) — see `SIDEFX_ENV_LOCK`.
         let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        unsafe { std::env::remove_var("RAEEN_UNIFIED_GPU_CLOCK") };
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         // DCB at 0x900: one data_selection=3 (GPU timestamp) RELEASE_MEM
@@ -6664,11 +6742,10 @@ mod tests {
         );
     }
 
-    /// The env gate mutates submit behavior process-wide, and this module has
-    /// tests asserting BOTH policies. Serialize every side-effect submit test
-    /// on this lock so a parallel `cargo test` run cannot flip the gate under
-    /// another test's assertions.
-    static SIDEFX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The env gates mutate submit behavior process-wide, and tests across
+    /// several modules assert BOTH policies — serialize on the crate-root
+    /// lock (see `crate::SIDEFX_ENV_LOCK`).
+    use crate::SIDEFX_ENV_LOCK;
 
     /// PM4 type-3 headers for the packets exercised below, from kyty's
     /// `pm4::header(total_dw, op, r)` = `0xC000_0000 | (total_dw-2)<<16 |
@@ -6797,6 +6874,228 @@ mod tests {
             gpu.submissions.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the decoded buffer must still reach the GPU pipeline"
+        );
+    }
+
+    /// A DCB carrying all three completion side effects: a standard
+    /// EVENT_WRITE (event id 0x2A), an interrupt-only AGC RELEASE_MEM
+    /// (interrupt 2, INT_CTXID 0x55), and an embedded AGC flip (handle 1,
+    /// buffer 2, mode 1, arg 9) at 0xB00, with the submit descriptor at 0x280.
+    fn write_event_eop_flip_dcb(ctx: &HleContext) {
+        let words = [
+            pm4(3, IT_EVENT_WRITE, R_ZERO),
+            0x2A,
+            0,
+            pm4(8, IT_NOP, R_RELEASE_MEM),
+            0,
+            2 << 24, // interrupt selector 2, no DATA_SEL, no address
+            0,
+            0,
+            0,
+            0,
+            0x55, // INT_CTXID
+            pm4(7, IT_NOP, R_FLIP),
+            1, // video out handle
+            2, // display buffer index
+            1, // flip mode
+            9, // flip arg lo
+            0, // flip arg hi
+            0,
+        ];
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        assert!(ctx.mem.write(0xB00, &bytes));
+        assert!(ctx.mem.write(0x280, &0xB00u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x288, &(words.len() as u32).to_le_bytes()));
+    }
+
+    /// Register the two observer events for [`write_event_eop_flip_dcb`]:
+    /// an AGC graphics-core event (id 0x84, fired by the EOP interrupt) and a
+    /// plain event keyed by the EVENT_WRITE id 0x2A. Returns the equeue.
+    fn register_event_observers(ctx: &HleContext, kernel: &raeen_kernel::OrbisKernel) -> u64 {
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_driver_add_eq_event(ctx, &[eq, 0x84, 0]), 0);
+        kernel
+            .kernel_equeue_events
+            .insert((eq, 0x2A), raeen_kernel::EqueueUserEvent::default());
+        eq
+    }
+
+    fn event_triggered(kernel: &raeen_kernel::OrbisKernel, eq: u64, id: u64) -> bool {
+        kernel
+            .kernel_equeue_events
+            .get(&(eq, id))
+            .map(|e| e.triggered)
+            .unwrap_or(false)
+    }
+
+    /// Default policy (gate OFF): events, EOP interrupts and flips are all
+    /// applied eagerly at submit, and nothing reaches the worker hand-off
+    /// queue (the eager path owns delivery).
+    #[test]
+    fn eager_default_applies_events_eop_and_flips_at_submit() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        let _ = raeen_gpu::ordered_side_effects::drain();
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        write_event_eop_flip_dcb(&ctx);
+        let eq = register_event_observers(&ctx, &kernel);
+
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x280]), 0);
+        assert!(
+            event_triggered(&kernel, eq, 0x2A),
+            "EVENT_WRITE fires at submit by default"
+        );
+        assert!(
+            event_triggered(&kernel, eq, 0x84),
+            "the EOP interrupt fires at submit by default"
+        );
+        assert_eq!(
+            kernel
+                .video_out_flip_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the embedded flip completes at submit by default"
+        );
+        assert!(
+            raeen_gpu::ordered_side_effects::drain().is_empty(),
+            "gate off: nothing rides the worker hand-off queue"
+        );
+    }
+
+    /// Gate ON (steps 4-5): submit applies NO event/EOP/flip side effects —
+    /// the worker's in-stream execution owns them. Delivery happens when the
+    /// HLE drains the hand-off queue from an observation point, in execution
+    /// order.
+    #[test]
+    fn defer_gate_defers_events_eop_and_flips_to_the_worker_drain() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+            }
+        }
+        unsafe { std::env::set_var("RAEEN_DEFER_GPU_SIDE_EFFECTS", "1") };
+        let _reset = EnvReset;
+        let _ = raeen_gpu::ordered_side_effects::drain();
+
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        write_event_eop_flip_dcb(&ctx);
+        let eq = register_event_observers(&ctx, &kernel);
+
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x280]), 0);
+        assert!(
+            !event_triggered(&kernel, eq, 0x2A),
+            "under the gate the EVENT_WRITE must not fire at submit"
+        );
+        assert!(
+            !event_triggered(&kernel, eq, 0x84),
+            "under the gate the EOP interrupt must not fire at submit"
+        );
+        assert_eq!(
+            kernel
+                .video_out_flip_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "under the gate the flip must not become visible at submit"
+        );
+
+        // The GPU worker executes the packets in-stream and publishes the
+        // recorded side effects (the CP recording is pinned in kyty-graphics;
+        // the session publish wiring in raeen-gpu's ordered_side_effects
+        // suite). The next HLE observation point delivers them.
+        use raeen_gpu::ordered_side_effects::OrderedGpuSideEffect;
+        raeen_gpu::ordered_side_effects::publish([
+            OrderedGpuSideEffect::EventWrite { event_id: 0x2A },
+            OrderedGpuSideEffect::EopInterrupt { context_id: 0x55 },
+            OrderedGpuSideEffect::Flip {
+                video_out_handle: 1,
+                display_buffer_index: 2,
+                flip_mode: 1,
+                flip_arg: 9,
+            },
+        ]);
+        apply_ordered_gpu_side_effects(&ctx);
+        assert!(
+            event_triggered(&kernel, eq, 0x2A),
+            "the drain delivers the EVENT_WRITE"
+        );
+        {
+            let eop = kernel.kernel_equeue_events.get(&(eq, 0x84)).unwrap();
+            assert!(eop.triggered, "the drain delivers the EOP interrupt");
+            assert_eq!(eop.data, 0x55, "with the packet's INT_CTXID");
+        }
+        assert_eq!(
+            kernel
+                .video_out_flip_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the drain completes the flip"
+        );
+        assert_eq!(
+            kernel
+                .video_out_last_flip_arg
+                .load(std::sync::atomic::Ordering::Relaxed),
+            9,
+            "with the packet's flip arg"
+        );
+    }
+
+    /// Step 3: with `RAEEN_UNIFIED_GPU_CLOCK` off (default), the eager
+    /// timestamp writer uses the kernel session clock; with it on, the eager
+    /// writer and the GPU worker's in-stream writer interleave on ONE
+    /// strictly-increasing clock and the session clock is left untouched.
+    #[test]
+    fn unified_gpu_clock_gate_shares_one_clock_with_the_worker() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("RAEEN_UNIFIED_GPU_CLOCK") };
+            }
+        }
+        unsafe { std::env::remove_var("RAEEN_UNIFIED_GPU_CLOCK") };
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Gate OFF: bit-identical legacy behavior — the session clock on the
+        // kernel advances.
+        let first = next_gpu_timestamp(&ctx);
+        let second = next_gpu_timestamp(&ctx);
+        assert!(
+            second > first,
+            "session clock advances: {first} -> {second}"
+        );
+        assert_eq!(
+            kernel
+                .agc_gpu_timestamp
+                .load(std::sync::atomic::Ordering::Relaxed),
+            second,
+            "gate off: the session clock lives on the kernel"
+        );
+
+        // Gate ON: both writers draw from the one unified clock.
+        unsafe { std::env::set_var("RAEEN_UNIFIED_GPU_CLOCK", "1") };
+        let _reset = EnvReset;
+        let worker_before = raeen_gpu::gpu_clock::next_unified_gpu_timestamp();
+        let eager = next_gpu_timestamp(&ctx);
+        let worker_after = raeen_gpu::gpu_clock::next_unified_gpu_timestamp();
+        assert!(
+            worker_before < eager && eager < worker_after,
+            "one strictly-increasing clock across both writers: \
+             {worker_before} < {eager} < {worker_after}"
+        );
+        assert_eq!(
+            kernel
+                .agc_gpu_timestamp
+                .load(std::sync::atomic::Ordering::Relaxed),
+            second,
+            "gate on: the kernel session clock is untouched"
         );
     }
 

@@ -335,6 +335,10 @@ pub(crate) fn submit_flip_from_agc(
 /// the completed flip count, the last `flipArg`, and **zero pending** flips —
 /// so a title waiting on flip completion always sees it done and advances.
 fn hle_get_flip_status(ctx: &HleContext, args: &[u64]) -> u64 {
+    // Deliver any flips the GPU worker executed in-stream since the guest
+    // last observed (no-op unless `RAEEN_DEFER_GPU_SIDE_EFFECTS` filled the
+    // queue) — this status read IS the observation point for flip counts.
+    crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
     let status_ptr = args.get(1).copied().unwrap_or(0);
     if status_ptr == 0 {
         return SCE_OK;
@@ -611,7 +615,10 @@ fn hle_submit_change_buffer_attribute2(ctx: &HleContext, args: &[u64]) -> u64 {
 /// (`hle_submit_flip`), so the honest answer is always 0 — matching SharpEmu's
 /// `VideoOutIsFlipPending` (NID `zgXifHT9ErY`), which reports 0 after
 /// validating the handle.
-fn hle_is_flip_pending(_ctx: &HleContext, args: &[u64]) -> u64 {
+fn hle_is_flip_pending(ctx: &HleContext, args: &[u64]) -> u64 {
+    // Complete any worker-executed in-stream flips first, so "0 pending"
+    // stays honest under `RAEEN_DEFER_GPU_SIDE_EFFECTS` (no-op otherwise).
+    crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
     let handle = args.first().copied().unwrap_or(0) as i32;
     if handle != 1 {
         return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -623,6 +630,9 @@ fn hle_is_flip_pending(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// reports the flip count as the vblank count (a monotonically-advancing
 /// frame counter is enough for a title's frame-timing loop).
 fn hle_get_vblank_status(ctx: &HleContext, args: &[u64]) -> u64 {
+    // A completed in-stream flip advances the vblank sequence — deliver any
+    // the worker executed before reporting (no-op with the gate off).
+    crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
     let status_ptr = args.get(1).copied().unwrap_or(0);
     if status_ptr == 0 {
         return SCE_OK;
@@ -798,6 +808,10 @@ fn hle_wait_vblank(ctx: &HleContext, args: &[u64]) -> u64 {
     if handle != 1 {
         return VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
+    // Deliver any worker-executed in-stream flips before the frame-pacing
+    // wait, so their flip/vblank events are pending when the guest resumes
+    // (no-op unless `RAEEN_DEFER_GPU_SIDE_EFFECTS` filled the queue).
+    crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
     wait_next_vblank_edge();
     let vblanks = ctx
         .kernel
@@ -972,6 +986,40 @@ fn hle_vrr_fixed_rate(_ctx: &HleContext, args: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    /// Ordered GPU side effects (checklist item 5, step 5): a flip the GPU
+    /// worker executed in-stream and published is completed by the flip-status
+    /// read's drain — the status call IS the observation point for flip
+    /// visibility.
+    #[test]
+    fn get_flip_status_delivers_worker_published_flips() {
+        // The hand-off queue is process-global: serialize with every other
+        // test that touches it.
+        let _guard = crate::SIDEFX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = raeen_gpu::ordered_side_effects::drain();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        raeen_gpu::ordered_side_effects::publish([
+            raeen_gpu::ordered_side_effects::OrderedGpuSideEffect::Flip {
+                video_out_handle: 1,
+                display_buffer_index: 0,
+                flip_mode: 1,
+                flip_arg: 0x77,
+            },
+        ]);
+        hle_get_flip_status(&ctx, &[1, 0x200]);
+        let mut st = [0u8; 64];
+        assert!(mem.read(0x200, &mut st));
+        let count = u64::from_le_bytes(st[0..8].try_into().unwrap());
+        let flip_arg = i64::from_le_bytes(st[24..32].try_into().unwrap());
+        assert_eq!(count, 1, "the worker's flip completes at the status read");
+        assert_eq!(flip_arg, 0x77, "with the packet's flip arg");
+    }
 
     #[test]
     fn submit_flip_advances_the_reported_flip_count() {
