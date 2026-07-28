@@ -612,6 +612,7 @@ impl<'a> ComputeResources<'a> {
                                 depth: upload.depth.max(1),
                                 layers: upload.layers.max(1),
                                 array: upload.array,
+                                volume: upload.volume,
                                 format: upload.format.as_raw(),
                             },
                             tile_mode: upload.tile_mode,
@@ -1125,6 +1126,7 @@ impl<'a> ComputeResources<'a> {
             depth,
             layers,
             array: upload.array,
+            volume: upload.volume,
             format: upload.format.as_raw(),
         };
         if let Some(owner) = self.images.iter().find(|allocation| allocation.key == key) {
@@ -1210,7 +1212,8 @@ impl<'a> ComputeResources<'a> {
         self.images[slot].staging_memory = staging_memory;
 
         let info = vk::ImageCreateInfo::default()
-            .image_type(if depth > 1 {
+            // Type-driven, not `depth > 1`: see `StorageImageUpload::volume`.
+            .image_type(if upload.volume {
                 vk::ImageType::TYPE_3D
             } else {
                 vk::ImageType::TYPE_2D
@@ -1258,7 +1261,7 @@ impl<'a> ComputeResources<'a> {
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(if depth > 1 {
+            .view_type(if upload.volume {
                 vk::ImageViewType::TYPE_3D
             } else if upload.array {
                 vk::ImageViewType::TYPE_2D_ARRAY
@@ -2197,7 +2200,8 @@ mod tests {
             local[1],
             local[2],
         ];
-        module.resize(words.max(module.len()), (1 << 16) | 0);
+        // OpNop (opcode 0, word count 1) padding.
+        module.resize(words.max(module.len()), 1 << 16);
         module
     }
 

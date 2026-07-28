@@ -340,6 +340,12 @@ pub(crate) struct TextureKey {
     /// descriptor (or vice-versa) when both share the same base/extent/format
     /// with a single layer. See `TextureUpload::array`.
     pub array: bool,
+    /// 3D volume (T# type 10) view intent — part of the key for exactly the
+    /// [`Self::array`] reason: a one-slice volume has `depth == 1`, so without
+    /// this a `VK_IMAGE_TYPE_3D` image would be served under a plain-2D
+    /// descriptor sharing the same base/extent/format. See
+    /// `TextureUpload::volume`.
+    pub volume: bool,
     pub format: i32,
 }
 
@@ -388,6 +394,8 @@ pub(crate) struct ComputeImageKey {
     pub depth: u32,
     pub layers: u32,
     pub array: bool,
+    /// 3D volume (T# type 10) view intent — see `TextureKey::volume`.
+    pub volume: bool,
     pub format: i32,
 }
 
@@ -2627,6 +2635,7 @@ mod tests {
             depth: 1,
             layers: 1,
             array: false,
+            volume: false,
             format: vk::Format::R8G8B8A8_UNORM.as_raw(),
         };
         let snapshot = Arc::new(vec![0x11; 64]);

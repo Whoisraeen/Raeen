@@ -164,6 +164,7 @@ fn sampled_texture_pixels_reach_the_readback() {
         layers: 1,
         cube: false,
         array: false,
+        volume: false,
         depth: 1,
         render_target: None,
         guest_base: 0,

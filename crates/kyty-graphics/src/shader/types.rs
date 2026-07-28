@@ -401,6 +401,24 @@ pub enum ShaderInstructionType {
     VExpF32,
     VFloorF32,
     VFmaF32,
+    /// VOP3P 0x20 (`v_fma_mix_f32`, `v_mad_mix_f32` on gfx9). A SINGLE f32
+    /// `fma(a, b, c)` whose three sources are each read independently as
+    /// either a full f32 register/constant or one f16 half widened to f32 —
+    /// selected per operand by `op_sel_hi` (read as f16 when set) and `op_sel`
+    /// (which half). Not a packed op despite the VOP3P encoding.
+    ///
+    /// Beyond Kyty (SharpEmu PR #466 `3574a3b`): the whole VOP3P encoding was
+    /// undecoded, so every shader containing one was DROPPED at
+    /// `UnknownEncoding` — the mix ops are what Unity HDR pixel shaders use to
+    /// combine half-precision inputs.
+    VFmaMixF32,
+    /// VOP3P 0x21 (`v_fma_mixlo_f16`). Same f32 `fma` as [`Self::VFmaMixF32`],
+    /// then narrowed to f16 and merged into the LOW 16 bits of `vdst`, leaving
+    /// the high half intact.
+    VFmaMixloF16,
+    /// VOP3P 0x22 (`v_fma_mixhi_f16`). The [`Self::VFmaMixloF16`] sibling that
+    /// writes the HIGH 16 bits of `vdst`.
+    VFmaMixhiF16,
     VFractF32,
     VInterpMovF32,
     VInterpP1F32,
@@ -455,6 +473,19 @@ pub enum ShaderInstructionType {
     VMulU32U24,
     VNotB32,
     VOrB32,
+    /// VOP3P 0x0e `v_pk_fma_f16`: two independent f16 `fma`s, one per packed
+    /// 16-bit lane of the destination. Beyond Kyty (SharpEmu PR #420
+    /// `3005bab`). See [`Vop3pControl`] for the per-lane half select/negate.
+    VPkFmaF16,
+    /// VOP3P 0x0f `v_pk_add_f16`.
+    VPkAddF16,
+    /// VOP3P 0x10 `v_pk_mul_f16`.
+    VPkMulF16,
+    /// VOP3P 0x11 `v_pk_min_f16` (`fminnum_like`: a NaN operand yields the
+    /// other).
+    VPkMinF16,
+    /// VOP3P 0x12 `v_pk_max_f16` (`fmaxnum_like`).
+    VPkMaxF16,
     VRcpF32,
     /// VOP1 0x2b / VOP3 0x1ab `v_rcp_iflag_f32`: reciprocal whose only
     /// difference from `v_rcp_f32` is raising the integer-division-by-zero
@@ -842,6 +873,38 @@ pub struct DppCtrl {
     pub fetch_inactive: bool,
 }
 
+/// Packed (VOP3P) source and destination modifiers.
+///
+/// Beyond Kyty; ported from SharpEmu's `Gen5Vop3pControl`
+/// (`Gen5ShaderIr.cs`, PR #460 `472fc96` for the clamp bit). Each mask holds
+/// one bit per source operand, bit `i` for `src[i]`.
+///
+/// These cannot live on [`ShaderOperand`] the way VOP3A's `negate`/`absolute`
+/// do: VOP3P carries TWO negate masks because the two 16-bit result lanes
+/// negate their halves independently, and `op_sel`/`op_sel_hi` select a half
+/// per lane. One `bool` per operand cannot express that.
+///
+/// For the three MIX ops (`V_FMA_MIX_*`) the same fields are reinterpreted:
+/// `op_sel_hi` bit `i` means "read `src[i]` as an f16" (rather than as a full
+/// f32), `op_sel` bit `i` picks which half, `neg_hi` bit `i` is the
+/// ABSOLUTE-value modifier and `neg_lo` bit `i` negates — applied abs-then-neg.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Vop3pControl {
+    /// `op_sel` (word0 bits [13:11]): which 16-bit half of each source feeds
+    /// the LOW result lane.
+    pub op_sel: u32,
+    /// `op_sel_hi` (word1 bits [28:27] plus word0 bit 14 as bit 2): which half
+    /// feeds the HIGH result lane.
+    pub op_sel_hi: u32,
+    /// `neg` / `neg_lo` (word1 bits [31:29]): negate the value routed to the
+    /// low lane.
+    pub neg_lo: u32,
+    /// `neg_hi` (word0 bits [10:8]): negate the value routed to the high lane.
+    pub neg_hi: u32,
+    /// `clamp` (word0 bit 15): saturate each output half to `[0, 1]`.
+    pub clamp: bool,
+}
+
 /// Kyty: Shader.h `ShaderOperand` (L392).
 #[derive(Copy, Clone, Debug)]
 pub struct ShaderOperand {
@@ -926,6 +989,9 @@ pub struct ShaderInstruction {
     /// consecutive registers. One dword carries four byte-sized VGPR ids.
     pub mimg_nsa_dwords: u8,
     pub mimg_nsa_addr: [ShaderOperand; 12],
+    /// Beyond Kyty: packed-math modifiers, `Some` only for the VOP3P
+    /// instructions (`VPk*`, `VFmaMix*`). See [`Vop3pControl`].
+    pub vop3p: Option<Vop3pControl>,
 }
 
 /// Kyty: Shader.h `ShaderLabel` (L420). `dst = pc + 4 + src[0].constant.i`.

@@ -327,6 +327,7 @@ fn sampled_render_target_binds_the_gpu_image_within_a_batch() {
                     layers: 1,
                     cube: false,
                     array: false,
+                    volume: false,
                     depth: 1,
                     render_target: Some(SCENE),
                     guest_base: 0,

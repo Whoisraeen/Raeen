@@ -162,9 +162,21 @@ pub struct EudRawBinding {
 pub struct StorageImageUpload {
     pub width: u32,
     pub height: u32,
-    /// Volume depth: 1 for a 2D UAV; > 1 creates a `VK_IMAGE_TYPE_3D`
-    /// storage image (measured: ASTRO.BOT's 240x135x64 UAV volumes).
+    /// Volume depth: the T# DEPTH field + 1 for a 3D UAV, 1 otherwise
+    /// (measured: ASTRO.BOT's 240x135x64 UAV volumes).
     pub depth: u32,
+    /// The guest descriptor is a 3D volume (type 10) — create a
+    /// `VK_IMAGE_TYPE_3D` image with a `TYPE_3D` view.
+    ///
+    /// Type-driven, exactly like [`Self::array`], and deliberately NOT
+    /// `depth > 1`: SPIR-V's `Dim` operand is part of the image type, and the
+    /// recompiler declares `Dim3D` from the TYPE nibble alone
+    /// (`SampledDim::from_texture_type(10) == Three`). A type-10 T# whose
+    /// DEPTH field is 0 is a legal one-slice volume with `depth == 1`, so the
+    /// count-derived test bound a `TYPE_2D` view under a `Dim3D` image type —
+    /// the same emit/bind divergence class as the arrayed case. Measured
+    /// shape: GTA V's tile-5 single-voxel type-10 descriptor.
+    pub volume: bool,
     /// Array layers: 1 for 2D/3D, or the selected
     /// `T#.BASE_ARRAY..=T#.LAST_ARRAY` span for a type-13 2D-array storage
     /// image. Type-11 writable cubes use the same 2D-array storage
@@ -256,10 +268,20 @@ pub struct TextureUpload {
     /// (`VUID-vkCmdDispatch`: view type 2D under an `Arrayed = 1` image). A
     /// `TYPE_2D_ARRAY` view with `layer_count == 1` is valid and matches.
     pub array: bool,
-    /// Volume depth: 1 for 2D/cube; > 1 creates a `VK_IMAGE_TYPE_3D` image
-    /// with a `3D` view (measured: ASTRO.BOT's 240x135x64 froxel/LUT
-    /// volumes, T# type 10).
+    /// Volume depth: the T# DEPTH field + 1 for a 3D volume (T# type 10,
+    /// measured: ASTRO.BOT's 240x135x64 froxel/LUT volumes), 1 otherwise.
     pub depth: u32,
+    /// Create the image as `VK_IMAGE_TYPE_3D` with a `VK_IMAGE_VIEW_TYPE_3D`
+    /// view (T# type 10, 3D volume).
+    ///
+    /// The [`Self::array`] argument applies verbatim to `Dim`: the recompiled
+    /// SPIR-V declares `Dim3D` from the TYPE nibble alone, so the bound view
+    /// must be decided from this type-driven flag and never from `depth > 1`.
+    /// A type-10 descriptor whose DEPTH field is 0 is a one-slice volume with
+    /// `depth == 1` — still `Dim3D` in SPIR-V, and binding a `TYPE_2D` view
+    /// there is the same emit/bind divergence as a one-layer array bound as
+    /// plain 2D. Measured shape: GTA V's tile-5 single-voxel type-10 T#.
+    pub volume: bool,
     /// When `Some(base)`, this T# names a live persistent render target
     /// (`CB_COLOR0_BASE == base`, matching extent and format): the draw binds
     /// that target's `VkImage` directly as the sampled descriptor instead of
@@ -3204,6 +3226,7 @@ impl<'a> Resources<'a> {
                             depth: upload.depth.max(1),
                             cube: upload.cube,
                             array: upload.array,
+                            volume: upload.volume,
                             format: upload.format.as_raw(),
                         };
                         let (view, hash) = self.caches.texture_entry(&key).ok_or_else(|| {
@@ -3352,6 +3375,7 @@ impl<'a> Resources<'a> {
                 depth: upload.depth.max(1),
                 cube: upload.cube,
                 array: upload.array,
+                volume: upload.volume,
                 format: upload.format.as_raw(),
             });
         if cache_key.is_some() {
@@ -3376,8 +3400,9 @@ impl<'a> Resources<'a> {
         });
         let slot = self.texture_uploads.len() - 1;
 
-        // depth > 1 is a 3D volume (T# type 10): one layer, `depth` slices.
-        let volume = upload.depth > 1;
+        // A 3D volume (T# type 10): one layer, `depth` slices. Type-driven —
+        // see `TextureUpload::volume` for why `depth > 1` is the wrong test.
+        let volume = upload.volume;
         let info = vk::ImageCreateInfo::default()
             .image_type(if volume {
                 vk::ImageType::TYPE_3D
@@ -5304,6 +5329,7 @@ mod tests {
             layers,
             cube,
             array: false,
+            volume: false,
             depth: 1,
             render_target: None,
             guest_base: 0x3368_0000,
