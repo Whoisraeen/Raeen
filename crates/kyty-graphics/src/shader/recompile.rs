@@ -36,7 +36,7 @@ use super::spirv::{
     operand_load_int, operand_load_uint, operand_variable_to_str, operand_variable_to_str_shift,
     sampled_key_of, sampled_key_suffix, sampled_keys_present, spirv_generate_source,
     spirv_get_embedded_ps, spirv_get_embedded_vs, storage_key_of, storage_key_suffix,
-    storage_keys_present,
+    storage_keys_present, vertex_input_class, vertex_input_types,
 };
 use crate::shader::resources::{
     ShaderBindResources, ShaderComputeInputInfo, ShaderEmbeddedBufferFetch, ShaderPixelInputInfo,
@@ -1145,10 +1145,7 @@ fn recompile_exp_pos0(
         *dst_source += &vs_passthrough_source(
             index,
             info.resources_dst[0].registers_num,
-            matches!(
-                SampledClass::from_unified_format(u16::from(info.resources[0].format())),
-                SampledClass::Uint
-            ),
+            vertex_input_class(&info.resources[0]),
         )?;
         return Ok(true);
     }
@@ -1173,47 +1170,82 @@ fn recompile_exp_pos0(
     Ok(true)
 }
 
+/// Build the `RAEEN_VS_PASSTHROUGH` diagnostic body for attribute 0 of any
+/// supported (component count, numeric class) pair, using the same shared
+/// resolver the real declaration and fetch use — the three sites used to
+/// enumerate three different subsets of the pair space.
 fn vs_passthrough_source(
     index: u32,
     registers_num: i32,
-    raw_uint: bool,
+    class: SampledClass,
 ) -> Result<String, ShaderRecompileError> {
     const FUNC: &str = "Recompile_Exp_Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done";
-    let load = match (registers_num, raw_uint) {
-        (1, false) => format!(
-            "         %px_{index} = OpLoad %float %attr0\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %float_0_000000 %float_0_000000 %float_1_000000\n"
-        ),
-        (1, true) => format!(
-            "         %pu_{index} = OpLoad %uint %attr0\n\
-             %px_{index} = OpBitcast %float %pu_{index}\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %float_0_000000 %float_0_000000 %float_1_000000\n"
-        ),
-        (2, false) => format!(
-            "         %p0_{index} = OpLoad %v2float %attr0\n\
-             %px_{index} = OpCompositeExtract %float %p0_{index} 0\n\
-             %py_{index} = OpCompositeExtract %float %p0_{index} 1\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %py_{index} %float_0_000000 %float_1_000000\n"
-        ),
-        (3, false) => format!(
-            "         %p0_{index} = OpLoad %v3float %attr0\n\
-             %px_{index} = OpCompositeExtract %float %p0_{index} 0\n\
-             %py_{index} = OpCompositeExtract %float %p0_{index} 1\n\
-             %pz_{index} = OpCompositeExtract %float %p0_{index} 2\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %py_{index} %pz_{index} %float_1_000000\n"
-        ),
-        (4, false) => format!("         %pv_{index} = OpLoad %v4float %attr0\n"),
-        (n, _) => {
-            return Err(not_supported(
-                FUNC,
-                format!("VS passthrough invalid attr0 registers_num/format: {n}/raw={raw_uint}"),
-            ));
-        }
+    let Some(types) = vertex_input_types(registers_num, class) else {
+        return Err(not_supported(
+            FUNC,
+            format!(
+                "VS passthrough attr0: {registers_num} components of a {class:?} vertex format \
+                 — only 1..=4 components are supported"
+            ),
+        ));
     };
-    Ok(format!(
+    let n = registers_num as usize;
+
+    // A full-width float attribute needs no rebuild: load it straight into the
+    // clip position.
+    if n == 4 && !types.bitcast {
+        return Ok(passthrough_store(
+            index,
+            format!("         %pv_{index} = OpLoad %v4float %attr0\n"),
+        ));
+    }
+
+    let mut load = format!("         %p0_{index} = OpLoad {} %attr0\n", types.load_type);
+    let value = if types.bitcast {
+        load += &format!(
+            "             %pf_{index} = OpBitcast {} %p0_{index}\n",
+            types.float_type
+        );
+        format!("%pf_{index}")
+    } else {
+        format!("%p0_{index}")
+    };
+
+    // Widen to vec4: present components first, then (0, 0, 0, 1) defaults —
+    // the same fill the hardware fetch applies to absent channels.
+    const COMPONENTS: [&str; 4] = ["px", "py", "pz", "pw"];
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if n == 1 {
+        parts.push(value);
+    } else {
+        for (c, component) in COMPONENTS.iter().enumerate().take(n) {
+            let name = format!("%{component}_{index}");
+            load += &format!("             {name} = OpCompositeExtract %float {value} {c}\n");
+            parts.push(name);
+        }
+    }
+    while parts.len() < 4 {
+        parts.push(
+            if parts.len() == 3 {
+                "%float_1_000000"
+            } else {
+                "%float_0_000000"
+            }
+            .to_string(),
+        );
+    }
+    load += &format!(
+        "             %pv_{index} = OpCompositeConstruct %v4float {}\n",
+        parts.join(" ")
+    );
+    Ok(passthrough_store(index, load))
+}
+
+fn passthrough_store(index: u32, load: String) -> String {
+    format!(
         "{load}         %pa_{index} = OpAccessChain %_ptr_Output_v4float %outPerVertex %int_per_vertex_0\n\
                        OpStore %pa_{index} %pv_{index}\n"
-    ))
+    )
 }
 
 /// Beyond Kyty: auxiliary position exports pos1..pos3 (exp targets
@@ -3099,26 +3131,24 @@ fn recompile_fetch(
         // channels beyond the fetch are dropped into a scratch. Beyond Kyty
         // (upstream EXITs on any mismatch). Measured on Minecraft's menu VS:
         // attrib 2 as 2ch feeding a vec3 (fill z=0.0) and as 4ch (drop w).
-        let raw_uint = matches!(
-            SampledClass::from_unified_format(u16::from(info.resources[attrib_pos].format())),
-            SampledClass::Uint
-        );
-        let (temp_ty, load_ty, helper) = match (n_attr, raw_uint) {
-            (1, true) => ("%temp_float", "%uint", "%fetch_f1_f1_"),
-            (1, false) => ("%temp_float", "%float", "%fetch_f1_f1_"),
-            (2, false) => ("%temp_v2float", "%v2float", "%fetch_f1_f1_vf2_"),
-            (3, false) => ("%temp_v3float", "%v3float", "%fetch_f1_f1_f1_vf3_"),
-            (4, false) => ("%temp_v4float", "%v4float", "%fetch_f1_f1_f1_f1_vf4_"),
-            _ => {
-                return Err(not_supported(
-                    FUNC,
-                    format!(
-                        "raw integer vertex format {} with {n_attr} channels",
-                        info.resources[attrib_pos].format()
-                    ),
-                ));
-            }
+        //
+        // The attribute's declared width and numeric class come from the ONE
+        // shared resolver, so this load can never disagree with the
+        // `%attrN` OpVariable `Spirv::WriteGlobalVariables` declared for it.
+        let class = vertex_input_class(&info.resources[attrib_pos]);
+        let Some(types) = vertex_input_types(n_attr, class) else {
+            return Err(not_supported(
+                FUNC,
+                format!(
+                    "vertex attribute {attrib_pos} (attrib id {attrib_id}): {n_attr} components \
+                     of unified format {} ({class:?}) — only 1..=4 components are supported",
+                    info.resources[attrib_pos].format()
+                ),
+            ));
         };
+        let temp_ty = types.temp;
+        let load_ty = types.load_type.as_str();
+        let helper = types.helper;
         let mut params = String::new();
         for i in 0..n_attr {
             if i < n_dst {
@@ -3129,13 +3159,20 @@ fn recompile_fetch(
                 params += "%temp_float ";
             }
         }
-        let raw_bitcast = if raw_uint {
-            "%t1_f_<index> = OpBitcast %float %t1_<index>
-"
+        // A raw integer attribute keeps its BITS: the guest VGPR is
+        // float-backed, so the loaded uint/int vector is bitcast (not
+        // numerically converted) into the same-width float type the fetch
+        // helper takes. Componentwise `OpBitcast` on equal-width vectors is
+        // exactly the reinterpretation the hardware fetch performs.
+        let raw_bitcast = if types.bitcast {
+            format!(
+                "%t1_f_<index> = OpBitcast {} %t1_<index>\n",
+                types.float_type
+            )
         } else {
-            ""
+            String::new()
         };
-        let stored_value = if raw_uint {
+        let stored_value = if types.bitcast {
             "%t1_f_<index>"
         } else {
             "%t1_<index>"
@@ -15541,14 +15578,14 @@ mod tests {
 
     #[test]
     fn vertex_passthrough_matches_declared_attribute_width() {
-        let vec3 = vs_passthrough_source(7, 3, false).expect("vec3 passthrough");
+        let vec3 = vs_passthrough_source(7, 3, SampledClass::Float).expect("vec3 passthrough");
         assert!(vec3.contains("%p0_7 = OpLoad %v3float %attr0"), "{vec3}");
         assert!(
             vec3.contains("OpCompositeConstruct %v4float %px_7 %py_7 %pz_7 %float_1_000000"),
             "{vec3}"
         );
 
-        let vec4 = vs_passthrough_source(9, 4, false).expect("vec4 passthrough");
+        let vec4 = vs_passthrough_source(9, 4, SampledClass::Float).expect("vec4 passthrough");
         assert!(vec4.contains("%pv_9 = OpLoad %v4float %attr0"), "{vec4}");
         assert!(
             !vec4.contains("OpLoad %v3float"),
@@ -15625,6 +15662,132 @@ mod tests {
         // This synthetic Fetch* omits the scalar prolog registers a complete
         // shader carries. Source-level assertions are intentional here; the
         // live Minecraft verification exercises the assembled Vulkan module.
+    }
+
+    /// GTA V's measured blocker: `registers_num = 2` over unified format 5 =
+    /// `(FMT_8, UINT)`. Two RAW INTEGER components — a width the raw-integer
+    /// path did not cover ("invalid registers_num/input format: 2/5"), which
+    /// refused the whole vertex shader.
+    ///
+    /// The declaration, the fetch load and the bitcast must all agree on the
+    /// same width: a `%v2uint` variable read through a `%v2float` pointer, or
+    /// a scalar `OpBitcast` of a vector, are both invalid SPIR-V. The
+    /// assembled-and-validated module lives in
+    /// `tests/gcn_to_spirv.rs::gta_two_channel_uint_vertex_attribute_translates_to_validated_spirv`.
+    #[test]
+    fn two_channel_uint_vertex_fetch_loads_a_uint_vector() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let mut fetch = ShaderInstruction {
+            type_: T::FetchXy,
+            format: F::Vdata2VaddrSvSoffsIdxen,
+            src_num: 3,
+            ..Default::default()
+        };
+        fetch.dst = ShaderOperand {
+            type_: ShaderOperandType::Vgpr,
+            register_id: 2,
+            size: 2,
+            ..Default::default()
+        };
+        fetch.src[2] = ShaderOperand {
+            type_: ShaderOperandType::IntegerInlineConstant,
+            constant: crate::shader::types::ShaderConstant::from_i(0),
+            size: 1,
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(fetch);
+
+        let mut info = ShaderVertexInputInfo {
+            resources_num: 1,
+            fetch_embedded: true,
+            gs_prolog: true,
+            ..Default::default()
+        };
+        info.resources[0].fields[3] = 5 << 12; // unified format 5 = (FMT_8, UINT)
+        info.resources_dst[0].semantic = 0;
+        info.resources_dst[0].register_start = 2;
+        info.resources_dst[0].registers_num = 2;
+
+        let source = spirv_generate_source(&code, Some(&info), None, None)
+            .expect("2 raw-integer components must translate");
+        assert!(
+            source.contains("%attr0 = OpVariable %_ptr_Input_v2uint Input"),
+            "two uint components must declare a v2uint interface:\n{source}"
+        );
+        assert!(
+            source.contains("OpLoad %v2uint %attr0"),
+            "the load must use the declared width:\n{source}"
+        );
+        assert!(
+            source.contains("OpBitcast %v2float %t1_0_0"),
+            "the bitcast must be componentwise over the same width:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %temp_v2float %t1_f_0_0"),
+            "the reinterpreted vector feeds the vec2 fetch helper:\n{source}"
+        );
+        assert!(
+            source.contains("OpFunctionCall %void %fetch_f1_f1_vf2_ %v2 %v3 %temp_v2float"),
+            "both channels must reach the guest VGPRs:\n{source}"
+        );
+    }
+
+    /// Every (component count, numeric class) pair the shared resolver claims
+    /// support for must name a type the SPIR-V prelude actually declares — the
+    /// declaration, the load and the pointer are three separate strings, and a
+    /// typo in any of them assembles to "id is used but never defined" only at
+    /// runtime, on one title's one attribute layout.
+    #[test]
+    fn every_supported_vertex_input_pair_names_declared_types() {
+        let types_block = super::super::spirv::spirv_generate_source(
+            &{
+                let mut c = ShaderCode::new();
+                c.set_type(ShaderType::Vertex);
+                c
+            },
+            Some(&ShaderVertexInputInfo::default()),
+            None,
+            None,
+        )
+        .expect("empty vs");
+        for n in 1..=4 {
+            for class in [SampledClass::Float, SampledClass::Uint, SampledClass::Sint] {
+                let t = vertex_input_types(n, class)
+                    .unwrap_or_else(|| panic!("{n} components of {class:?} must be supported"));
+                assert!(
+                    types_block.contains(&format!("{} = OpTypePointer Input", t.ptr_type)),
+                    "{n}/{class:?} declares {} but the types block has no such pointer",
+                    t.ptr_type
+                );
+                assert_eq!(
+                    t.bitcast,
+                    class != SampledClass::Float,
+                    "only the raw integer classes are reinterpreted, never converted"
+                );
+            }
+        }
+    }
+
+    /// An unsupported width must name the exact pair (not just the count) and
+    /// be counted, so a log line identifies which attribute of which title is
+    /// still refused instead of reporting an anonymous whole-shader drop.
+    #[test]
+    fn unsupported_vertex_input_pair_is_named_and_counted() {
+        let before = super::super::spirv::vertex_input_pair_skips();
+        assert!(vertex_input_types(5, SampledClass::Uint).is_none());
+        assert!(vertex_input_types(0, SampledClass::Float).is_none());
+        assert!(
+            super::super::spirv::vertex_input_pair_skips() >= before + 2,
+            "each refused pair must be counted in the shader diagnostics"
+        );
+
+        let err = vs_passthrough_source(0, 5, SampledClass::Uint).expect_err("5 components");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("5 components") && msg.contains("Uint"),
+            "the refusal must name the pair, got: {msg}"
+        );
     }
 
     // ---- 3. acceptance: minimal PS ----------------------------------------

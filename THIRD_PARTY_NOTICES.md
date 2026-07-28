@@ -31,6 +31,13 @@ proprietary SDK/headers, using only the community sources credited below.
   values as layout-compatible. Raeen's Rust implementation additionally
   validates unsupported operations and preserves the guest's separate test and
   operation reference values.
+- **Divergence recorded (vertex-input numeric classes, 2026-07-28).** Kyty's
+  `Spirv::WriteGlobalVariables` (`ShaderSpirv.cpp` L7229) declares vertex
+  attributes as **float only** and `EXIT`s on any other width; it has no
+  integer vertex-input concept. `kyty-graphics`' shared
+  `vertex_input_types` resolver therefore goes beyond Kyty for the raw
+  integer classes (see the SharpEmu section below), while keeping Kyty's
+  structure and `fetch_*` helper functions unchanged.
 
 MIT is compatible with GPL-2.0: MIT-derived portions may be combined into this
 GPL-2.0-only work, and this notice preserves the required MIT attribution for
@@ -249,6 +256,24 @@ SOFTWARE.
   options 0x40 and the `GetOutputStatus` 0x30 layout, which Raeen already
   matched); the audit, the guard API, the Rust code, and all of its tests are
   original. Findings recorded in `docs/sharpemu-port/outbuffer-audit.md`.
+  **Gen5 vertex-input numeric classes (2026-07-28).** The model in
+  `Gen5SpirvTranslator.DeclareVertexInputs` /`TryEmitVertexInputFetch`
+  (`SharpEmu.ShaderCompiler.Vulkan/Gen5SpirvTranslator.cs` L1307-1353, L3234;
+  read from SharpEmu's live working tree, since `6db095e`/`db4339f` make
+  per-commit reads misleading) — build a vertex attribute's SPIR-V interface
+  type as `componentKind(numberFormat) x componentCount` for **all** widths
+  1..=4 and all three numeric classes (`numberFormat 4 => Uint`, `5 => Sint`,
+  else `Float`), and **bitcast** raw integer components into the float-backed
+  register representation rather than numerically converting them — is
+  re-implemented in `kyty-graphics`' shared `vertex_input_types` resolver
+  (`src/shader/spirv.rs`), consumed by `Spirv::WriteGlobalVariables`,
+  `Recompile_Fetch` and the `RAEEN_VS_PASSTHROUGH` diagnostic. This closed the
+  measured GTA V blocker (`invalid registers_num/input format: 2/5` = two
+  components of unified format 5 = `8_UINT`). Unified-format decoding uses
+  Raeen's existing classifier, itself already attributed to SharpEmu's
+  `Gfx10UnifiedFormat.cs`; the Rust resolver, the diagnostics counter, the
+  refusal messages, and all tests are original. Findings recorded in
+  `docs/sharpemu-port/gtav-shader-inputs.md`.
   From the GTA V / UE5 boot-unblocker family (upstream `a1cbff8` PR #454,
   `db4339f` PR #650, `daaeb62` PR #406, `2764aaa` PR #542): three semantics were
   re-implemented after reading SharpEmu's current tree.

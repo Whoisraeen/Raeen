@@ -2259,6 +2259,108 @@ impl SampledClass {
             Self::Sint => "%v4int",
         }
     }
+
+    /// The scalar SPIR-V type one component of this class loads as.
+    pub(crate) const fn scalar_type_str(self) -> &'static str {
+        match self {
+            Self::Float => "float",
+            Self::Uint => "uint",
+            Self::Sint => "int",
+        }
+    }
+}
+
+/// Process-wide count of vertex attributes refused for an unsupported
+/// (component count, unified format) pair — see [`vertex_input_types`]. The
+/// refusal drops the whole vertex shader, so a growing count is the honest
+/// measure of what a follow-up would recover; `raeen-gpu`'s shader-skip warning
+/// reports it next to the other per-cause counters.
+static VERTEX_INPUT_PAIR_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total vertex attributes refused for an unsupported (component count,
+/// unified-format) pair.
+#[must_use]
+pub fn vertex_input_pair_skips() -> u64 {
+    VERTEX_INPUT_PAIR_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The SPIR-V spellings one Gen5 vertex attribute is declared and consumed
+/// with: `registers_num` components (the semantic's `size_in_elements`, i.e.
+/// how many VGPRs the fetch writes) of the V#'s numeric class.
+///
+/// A single source of truth for the three sites that must agree — the
+/// `OpVariable` declaration (`Spirv::WriteGlobalVariables`), the `Fetch*`
+/// recompile that loads it, and the `RAEEN_VS_PASSTHROUGH` diagnostic. They
+/// previously carried three independent `match` arms over the same pair, and
+/// each covered a different subset: measured on GTA V, whose attribute is
+/// `registers_num = 2` of unified format 5 = (FMT_8, UINT) — two raw integer
+/// components, a pair NO site accepted ("invalid registers_num/input format:
+/// 2/5", the title's first blocker with 192 flips already presented).
+///
+/// SharpEmu port: `Gen5SpirvTranslator.DeclareVertexInputs`
+/// (`reference/sharpemu/src/SharpEmu.ShaderCompiler.Vulkan/`
+/// `Gen5SpirvTranslator.cs` L1307-1353) builds the type as
+/// `componentKind(numberFormat) x componentCount` for ALL of 1..=4 components
+/// and all three numeric classes, rather than enumerating a hand-picked
+/// subset. Kyty upstream (`ShaderSpirv.cpp` L7229) declares float only and
+/// `EXIT`s on any other width, so the integer classes are beyond it.
+///
+/// Vulkan requires the interface type's numeric class to match the bound
+/// attribute's `VkFormat` class (`R8_UINT` demands a uint-typed input), and the
+/// guest consumes raw integer bits, so the raw classes must not be converted
+/// to float numerically — only bitcast, which is why `float_type` exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VertexInputTypes {
+    /// Pointer type for the `OpVariable` declaration, e.g. `%_ptr_Input_v2uint`.
+    pub ptr_type: String,
+    /// Type an `OpLoad` of the variable yields, e.g. `%v2uint`.
+    pub load_type: String,
+    /// The all-float type of the same width — the fetch helper's parameter type
+    /// and the bitcast target for a raw integer class.
+    pub float_type: &'static str,
+    /// Function-scope float scratch handed to the fetch helper.
+    pub temp: &'static str,
+    /// The `fetch_*` helper that splats `float_type` into the guest's
+    /// float-backed VGPRs.
+    pub helper: &'static str,
+    /// Whether the loaded value needs an `OpBitcast` into `float_type` — true
+    /// for the raw integer classes, whose bits the guest reinterprets.
+    pub bitcast: bool,
+}
+
+/// Resolve a vertex attribute's SPIR-V types, or `None` when the pair is not
+/// supported (which the caller must report by naming the pair). Counts every
+/// refusal in [`vertex_input_pair_skips`].
+pub(crate) fn vertex_input_types(
+    registers_num: i32,
+    class: SampledClass,
+) -> Option<VertexInputTypes> {
+    let (width, float_type, temp, helper) = match registers_num {
+        1 => ("", "%float", "%temp_float", "%fetch_f1_f1_"),
+        2 => ("v2", "%v2float", "%temp_v2float", "%fetch_f1_f1_vf2_"),
+        3 => ("v3", "%v3float", "%temp_v3float", "%fetch_f1_f1_f1_vf3_"),
+        4 => ("v4", "%v4float", "%temp_v4float", "%fetch_f1_f1_f1_f1_vf4_"),
+        _ => {
+            VERTEX_INPUT_PAIR_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    let scalar = class.scalar_type_str();
+    Some(VertexInputTypes {
+        ptr_type: format!("%_ptr_Input_{width}{scalar}"),
+        load_type: format!("%{width}{scalar}"),
+        float_type,
+        temp,
+        helper,
+        bitcast: class != SampledClass::Float,
+    })
+}
+
+/// The numeric class a vertex attribute's V# unified format loads as.
+pub(crate) fn vertex_input_class(
+    resource: &crate::shader::resources::ShaderBufferResource,
+) -> SampledClass {
+    SampledClass::from_unified_format(u16::from(resource.format()))
 }
 
 /// Canonical ordering of the (Dim, numeric class) sampled-array keys —
@@ -3745,7 +3847,12 @@ impl<'a> Spirv<'a> {
            %_ptr_Input_v2float = OpTypePointer Input %v2float
            %_ptr_Input_v3float = OpTypePointer Input %v3float
            %_ptr_Input_v4float = OpTypePointer Input %v4float
+            %_ptr_Input_v2uint = OpTypePointer Input %v2uint
             %_ptr_Input_v3uint = OpTypePointer Input %v3uint
+            %_ptr_Input_v4uint = OpTypePointer Input %v4uint
+             %_ptr_Input_v2int = OpTypePointer Input %v2int
+             %_ptr_Input_v3int = OpTypePointer Input %v3int
+             %_ptr_Input_v4int = OpTypePointer Input %v4int
           %_ptr_Output_v4float = OpTypePointer Output %v4float
           %_ptr_Function_float = OpTypePointer Function %float
            %_ptr_Function_bool = OpTypePointer Function %bool
@@ -4135,35 +4242,19 @@ impl<'a> Spirv<'a> {
             ShaderType::Vertex => {
                 if let Some(info) = self.vs_input_info {
                     for i in 0..info.resources_num as usize {
-                        let raw_uint = matches!(
-                            SampledClass::from_unified_format(u16::from(
-                                info.resources[i].format()
-                            )),
-                            SampledClass::Uint
-                        );
-                        match (info.resources_dst[i].registers_num, raw_uint) {
-                            (1, true) => {
-                                vars.push(format!("%attr{i} = OpVariable %_ptr_Input_uint Input"))
-                            }
-                            (1, false) => {
-                                vars.push(format!("%attr{i} = OpVariable %_ptr_Input_float Input"))
-                            }
-                            (2, false) => vars
-                                .push(format!("%attr{i} = OpVariable %_ptr_Input_v2float Input")),
-                            (3, false) => vars
-                                .push(format!("%attr{i} = OpVariable %_ptr_Input_v3float Input")),
-                            (4, false) => vars
-                                .push(format!("%attr{i} = OpVariable %_ptr_Input_v4float Input")),
-                            (n, _) => {
-                                return Err(not_supported(
-                                    "Spirv::WriteGlobalVariables",
-                                    format!(
-                                        "invalid registers_num/input format: {n}/{}",
-                                        info.resources[i].format()
-                                    ),
-                                ));
-                            }
-                        }
+                        let n = info.resources_dst[i].registers_num;
+                        let class = vertex_input_class(&info.resources[i]);
+                        let Some(types) = vertex_input_types(n, class) else {
+                            return Err(not_supported(
+                                "Spirv::WriteGlobalVariables",
+                                format!(
+                                    "vertex attribute {i}: {n} components of unified format {} ({class:?}) \
+                                     — only 1..=4 components are supported",
+                                    info.resources[i].format()
+                                ),
+                            ));
+                        };
+                        vars.push(format!("%attr{i} = OpVariable {} Input", types.ptr_type));
                     }
                     // The register-derived count can under-read the body's
                     // real exports (measured: menu VS writes param1 with a
