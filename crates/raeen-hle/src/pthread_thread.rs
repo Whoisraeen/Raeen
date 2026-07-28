@@ -265,9 +265,13 @@ fn hle_getthreadid(ctx: &HleContext, _args: &[u64]) -> u64 {
     ctx.guest_threads.current_thread()
 }
 
-/// `scePthreadYield()`: hint a reschedule. Native guest threads are already
-/// host-scheduled, so no additional scheduler action is required.
+/// `scePthreadYield()` / `pthread_yield()` / `sched_yield()`: hint a
+/// reschedule. Guest threads are host threads, so the honest translation is a
+/// host yield — returning without one turns a guest's yield-based backoff loop
+/// (a spin that expects to donate its slice) into a pure busy-wait that can
+/// starve the very thread it is waiting on.
 fn hle_yield(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    std::thread::yield_now();
     OK
 }
 

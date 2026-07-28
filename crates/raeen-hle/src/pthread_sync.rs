@@ -187,9 +187,14 @@ fn register_posix(registry: &HleRegistry) {
     register_posix_abi(registry, "pthread_rwlock_init", hle_rwlock_init);
     register_posix_abi(registry, "pthread_rwlock_destroy", hle_rwlock_destroy);
     register_posix_abi(registry, "pthread_rwlock_rdlock", hle_rwlock_rdlock);
-    register_posix_abi(registry, "pthread_rwlock_tryrdlock", hle_rwlock_rdlock);
+    // The POSIX try-variants must be the NON-blocking bodies. They were wired
+    // to the blocking ones, so a guest probing a contended rwlock with
+    // tryrdlock/trywrlock parked instead of getting EBUSY — a hang where the
+    // guest expected a fast negative answer. (The SCE spellings above were
+    // always correct, which is why this went unnoticed.)
+    register_posix_abi(registry, "pthread_rwlock_tryrdlock", hle_rwlock_tryrdlock);
     register_posix_abi(registry, "pthread_rwlock_wrlock", hle_rwlock_wrlock);
-    register_posix_abi(registry, "pthread_rwlock_trywrlock", hle_rwlock_wrlock);
+    register_posix_abi(registry, "pthread_rwlock_trywrlock", hle_rwlock_trywrlock);
     register_posix_abi(registry, "pthread_rwlock_unlock", hle_rwlock_unlock);
 }
 
@@ -1339,5 +1344,37 @@ mod tests {
         // And the live reader still keeps writers out (before the fix, the stray
         // unlock would have zeroed the count and let this Trywrlock succeed).
         assert_eq!(hle_rwlock_trywrlock(&ctx, &[rw]), EBUSY);
+    }
+
+    /// The POSIX `pthread_rwlock_try*` names must resolve to the non-blocking
+    /// bodies. They were registered to the blocking ones, so a guest probing a
+    /// write-held rwlock parked instead of receiving EBUSY. Registration is
+    /// compared by function pointer so a future re-wiring fails here.
+    #[test]
+    fn posix_rwlock_try_names_are_the_non_blocking_bodies() {
+        let registry = HleRegistry::new();
+        for (name, expected) in [
+            (
+                "pthread_rwlock_tryrdlock",
+                hle_rwlock_tryrdlock as HleFunction,
+            ),
+            (
+                "pthread_rwlock_trywrlock",
+                hle_rwlock_trywrlock as HleFunction,
+            ),
+        ] {
+            let mut found = false;
+            for library in ["libScePosix", "libkernel", "libc", "libSceLibcInternal"] {
+                let key = format!("{library}::{name}");
+                if let Some(entry) = registry.functions.get(&key) {
+                    found = true;
+                    assert!(
+                        std::ptr::fn_addr_eq(*entry.value(), expected),
+                        "{key} must be the non-blocking body"
+                    );
+                }
+            }
+            assert!(found, "{name} is not registered under any provider");
+        }
     }
 }
