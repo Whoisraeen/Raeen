@@ -1207,6 +1207,14 @@ impl PthreadCond {
     pub fn waiter_count(&self) -> usize {
         self.queue.waiter_count()
     }
+
+    /// Discard every entry belonging to a dead thread — see
+    /// [`GuestWaitQueue::remove_waiters_of`]. Used by owner-death recovery: an
+    /// abandoned entry would otherwise absorb a `signal_one` that a live waiter
+    /// needed.
+    pub fn remove_waiters_of(&self, thread: u64) -> usize {
+        self.queue.remove_waiters_of(thread)
+    }
 }
 
 /// The process-wide **address-keyed parking lot** behind libkernel's
