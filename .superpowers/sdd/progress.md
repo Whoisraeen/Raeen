@@ -1,3 +1,51 @@
+- ORDERED GPU SIDE-EFFECT LIVE A/B — checklist item 5 (2026-07-28, release
+  build from HEAD `472275f2ce37`+dirty; machine-local reports under
+  `artifacts/diagnostics/astro-gates-20260728/`):
+  * ASTRO gates off: crashed at 29.765 s, 4 flips, 20 shader / 17 GPU errors,
+    peak 2.55 GiB. First blocker was the known mixed 3D/2D Rgba16f
+    storage-image refusal.
+  * `RAEEN_UNIFIED_GPU_CLOCK=1` alone: same blocker and counts (4 flips,
+    20/17 errors) at 28.117 s; no timestamp-fence park, peak 3.14 GiB.
+  * `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` alone: survived the prior crash window
+    to the 60.345 s harness timeout, 36 flips, 18/17 errors, peak 3.17 GiB.
+  * Both gates: also timed out cleanly at 60.329 s and 36 flips, but shader /
+    GPU error lines rose to 94/93 through retries, peak 3.89 GiB.
+  * Minecraft deferred-only evidence from the earlier quieting pass remains
+    correctly rendered menu / 32 FPS / no hang or corruption, but the
+    contention-heavy boot was ~85 s vs ~50 s gate-off.
+  * Decision: the required A/B is complete. Neither experimental gate becomes
+    production default yet. First land/verify mixed storage-image routing,
+    then repeat Minecraft on a quiet host and explain the combined retry
+    amplification before changing policy.
+
+- DRAGON BALL FALSE EQUEUE TIMEOUT FIX — checklist item 4 (2026-07-28,
+  current working tree at HEAD `76589194f605`+dirty):
+  * Clean-room disassembly of the user-owned title image showed
+    `module+0x241c820` is a frame-pointer backtrace walker reached by the
+    title's fatal-reporting path. It was downstream evidence, not a malformed
+    title list/count.
+  * The trigger was Raeen's `sceKernelWaitEqueue` implementation: a NULL
+    timeout (guest contract: wait forever) was capped at 50 ms and surfaced
+    as `SCE_KERNEL_ERROR_ETIMEDOUT`. The title's AGC worker treated that
+    impossible result as fatal.
+  * `kernel_equeue` now uses the shared `KernelSubsystems::wait_until`
+    contract. Internal host slices remain termination-responsive but never
+    become guest timeouts; finite deadlines are honored across slices;
+    unreadable timeout pointers return `EFAULT`. User, VideoOut, APR, and AGC
+    event producers publish then wake the queue, with the notification lock
+    closing the check/sleep lost-wakeup race.
+  * Regression coverage includes NULL and finite waits signaled after 80 ms
+    (past the former 50 ms cap), bad timeout pointers, and worker-published
+    GPU events. `cargo test -p raeen-hle`: 525 passed; `cargo clippy -p
+    raeen-hle --all-targets -- -D warnings`: green.
+  * Live evidence: the exact content hash `4375317b…` that previously faulted
+    at ~7 s ran for a bounded 20 s with `guest_faults=0`,
+    `equeue_timeouts=0`, and four AGC submit markers. Scratch diagnostics
+    remain machine-local under `artifacts/diagnostics/`.
+  * License/data boundary: only Raeen-owned code and a local analysis tool
+    were used; no game bytes, decrypted modules, or reference code were added
+    to git.
+
 - SYNCHRONOUS GUEST CALLBACKS — checklist item 7 (2026-07-27; worktree agent,
   commit 6ff4132, branch worktree-agent-a8a0f93f4ac611946; raeen-runtime 77
   lib + 56 execute

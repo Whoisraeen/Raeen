@@ -773,6 +773,12 @@ impl DrawCaches {
             .module(module)
             .name(c"main");
         let info = vk::ComputePipelineCreateInfo::default()
+            // Heavy translated shaders are divided with vkCmdDispatchBase so
+            // each command remains preemptible under Windows TDR. Vulkan
+            // requires this flag even when only later uses have non-zero base
+            // groups; enabling it uniformly keeps the canonical pipeline key
+            // independent of a particular dispatch's dimensions.
+            .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
             .stage(stage)
             .layout(layout);
         // SAFETY: module and layout are live cached handles from this device;
@@ -795,8 +801,22 @@ impl DrawCaches {
     pub(crate) fn sampler(
         &mut self,
         dev: &VulkanDevice,
-        state: SamplerState,
+        mut state: SamplerState,
     ) -> Result<vk::Sampler, GpuError> {
+        if !dev.supports_sampler_mirror_clamp_to_edge() {
+            // Mirror-once is optional Vulkan functionality. Preserve the
+            // mirror direction on unsupported devices without passing an
+            // enum whose feature was not enabled (invalid Vulkan).
+            for mode in [
+                &mut state.address_mode_u,
+                &mut state.address_mode_v,
+                &mut state.address_mode_w,
+            ] {
+                if *mode == vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE {
+                    *mode = vk::SamplerAddressMode::MIRRORED_REPEAT;
+                }
+            }
+        }
         if let Some(&sampler) = self.samplers.get(&state) {
             return Ok(sampler);
         }
@@ -1065,6 +1085,7 @@ impl DrawCaches {
         &mut self,
         dev: &VulkanDevice,
     ) -> Result<(vk::CommandBuffer, vk::Fence), GpuError> {
+        dev.ensure_device_usable()?;
         if self.submit.is_none() {
             let alloc_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(dev.command_pool())
@@ -1089,8 +1110,10 @@ impl DrawCaches {
         // SAFETY: the previous submission that used this fence was waited to
         // completion before the cache lock was released (synchronous-draw
         // contract); resetting an unsignaled fence is also legal.
-        unsafe { dev.device().reset_fences(&[fence]) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkResetFences: {e}")))?;
+        unsafe { dev.device().reset_fences(&[fence]) }.map_err(|e| {
+            dev.note_vk_error(e);
+            GpuError::VulkanInitFailed(format!("vkResetFences: {e}"))
+        })?;
         Ok((command_buffer, fence))
     }
 
@@ -1540,17 +1563,23 @@ impl DrawCaches {
             // SAFETY: the shared batch fence completed. The persistent
             // readback allocation is HOST_VISIBLE|COHERENT and was created for
             // exactly this image's linear byte size.
-            let ptr = unsafe {
-                dev.device().map_memory(
-                    entry.readback_memory,
-                    0,
-                    linear_size as u64,
-                    vk::MemoryMapFlags::empty(),
-                )
-            }
-            .map_err(|e| {
-                GpuError::VulkanInitFailed(format!("compute image batch vkMapMemory: {e}"))
-            })?;
+            let (ptr, must_unmap) =
+                if let Some(mapped) = self.mapped_host_memory(entry.readback_memory) {
+                    (mapped as *mut std::ffi::c_void, false)
+                } else {
+                    let ptr = unsafe {
+                        dev.device().map_memory(
+                            entry.readback_memory,
+                            0,
+                            linear_size as u64,
+                            vk::MemoryMapFlags::empty(),
+                        )
+                    }
+                    .map_err(|e| {
+                        GpuError::VulkanInitFailed(format!("compute image batch vkMapMemory: {e}"))
+                    })?;
+                    (ptr, true)
+                };
             let linear = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), linear_size) };
             let nonzero = linear.iter().any(|&byte| byte != 0);
             if nonzero
@@ -1564,7 +1593,9 @@ impl DrawCaches {
             {
                 let mut pixels = Vec::new();
                 if pixels.try_reserve_exact(linear_size).is_err() {
-                    unsafe { dev.device().unmap_memory(entry.readback_memory) };
+                    if must_unmap {
+                        unsafe { dev.device().unmap_memory(entry.readback_memory) };
+                    }
                     return Err(GpuError::VulkanInitFailed(format!(
                         "deferred compute image {:#x} present copy allocation failed",
                         key.base
@@ -1582,7 +1613,9 @@ impl DrawCaches {
                 ));
             }
             let guest = encode_compute_image_writeback(writeback, linear);
-            unsafe { dev.device().unmap_memory(entry.readback_memory) };
+            if must_unmap {
+                unsafe { dev.device().unmap_memory(entry.readback_memory) };
+            }
             let guest = guest?;
             if crate::guest_mem::mirror_compute_image_to_guest(
                 key.base,
@@ -2244,6 +2277,15 @@ impl DrawCaches {
                 device.destroy_image_view(image.view, None);
                 device.destroy_image(image.image, None);
                 device.free_memory(image.memory, None);
+                if self
+                    .host_pool_mapped
+                    .remove(&image.readback_memory.as_raw())
+                    .is_some()
+                {
+                    device.unmap_memory(image.readback_memory);
+                }
+                self.host_pool_capacity
+                    .remove(&image.readback_buffer.as_raw());
                 device.destroy_buffer(image.readback_buffer, None);
                 device.free_memory(image.readback_memory, None);
             }

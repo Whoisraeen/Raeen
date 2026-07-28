@@ -2082,9 +2082,13 @@ pub fn shader_push_constant_spill_binding(bind: &ShaderBindResources) -> Option<
         after(bind.storage_buffers.binding_index);
     }
     if bind.textures2d.textures_num > 0 {
-        // The storage binding follows every sampled (Dim, class) group and
-        // is therefore the final binding reserved for the T# family.
-        after(bind.textures2d.binding_storage_index);
+        // The storage bindings follow every sampled (Dim, class) group —
+        // one per present storage (Dim, format) key — so the last of them is
+        // the final binding reserved for the T# family.
+        after(
+            bind.textures2d.binding_storage_index
+                + (storage_keys_present(bind).len().max(1) as i32 - 1),
+        );
     }
     if bind.samplers.samplers_num > 0 {
         after(bind.samplers.binding_index);
@@ -2385,51 +2389,191 @@ pub(crate) fn sampled_key_layout(bind: &ShaderBindResources) -> Vec<SampledArray
         .collect()
 }
 
-/// The single `OpTypeImage` (Dim, storage format) of the STORAGE
-/// (read-write) image array (`%textures2D_L`), decided from the measured RW
-/// T#s: type 8 = height-1 2D, type 9 = 2D, type 10 = 3D (ASTRO.BOT:
-/// 240x135x64 UAV volumes), and types 11/13 = writable 2D arrays
-/// (Minecraft's panorama builder); guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`,
-/// format 77 (32_32_32_32 FLOAT) = `Rgba32f`, everything else keeps the
-/// legacy `Rgba8` view (the 32-bpp guest formats the upload path reads, or
-/// the zero-filled seed). Mixed dims/formats stay a named refusal — one
-/// SPIR-V array type carries exactly one `OpTypeImage`.
-pub(crate) fn storage_texture_dim_format(
-    bind: &ShaderBindResources,
-) -> Result<(SampledDim, &'static str), ShaderRecompileError> {
+/// SPIR-V storage-image format of one RW (storage) T#, decoded from the
+/// unified FORMAT field: guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`,
+/// 77 (32_32_32_32 FLOAT) = `Rgba32f`, everything else keeps the legacy
+/// `Rgba8` view (the 32-bpp guest formats the upload path reads, or the
+/// zero-filled seed). One axis of the storage-array key — one SPIR-V array
+/// type carries exactly one `OpTypeImage` (Dim, format), so a mixed shader
+/// declares one array per PRESENT key (see [`storage_key_layout`]) instead
+/// of the historical shader-wide refusal (measured: ASTRO.BOT compute binds
+/// a 3D Rgba16f froxel volume next to 2D Rgba16f targets — 20 refusals/run).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StorageFormat {
+    Rgba8,
+    Rgba16f,
+    Rgba32f,
+}
+
+impl StorageFormat {
+    /// Classify a unified T# format. Same arms as the historical
+    /// `storage_texture_dim_format` — the measured RW T#s on ASTRO.BOT
+    /// (71 = 16_16_16_16 FLOAT) and its table-1 UAV (77 = 32_32_32_32 FLOAT).
+    pub const fn from_unified_format(fmt: u16) -> Self {
+        match fmt {
+            71 => Self::Rgba16f,
+            77 => Self::Rgba32f,
+            _ => Self::Rgba8,
+        }
+    }
+
+    /// The `OpTypeImage` storage format token this key declares.
+    pub(crate) const fn format_str(self) -> &'static str {
+        match self {
+            Self::Rgba8 => "Rgba8",
+            Self::Rgba16f => "Rgba16f",
+            Self::Rgba32f => "Rgba32f",
+        }
+    }
+
+    /// Canonical ordering within one Dim — see [`storage_key_ordinal`].
+    pub const fn ordinal(self) -> u32 {
+        match self {
+            Self::Rgba8 => 0,
+            Self::Rgba16f => 1,
+            Self::Rgba32f => 2,
+        }
+    }
+}
+
+/// The (Dim, storage format) key of one RW (storage) T#: the Dim from
+/// `type_()` (type 8 = height-1 2D, 9 = 2D, 10 = 3D — ASTRO.BOT's 240x135x64
+/// UAV volumes — and 11/13 = writable 2D arrays, Minecraft's panorama
+/// builder), the format from the unified FORMAT field. Both read from the
+/// same captured descriptor dwords the host's view creation decodes.
+pub(crate) const fn storage_key_of(
+    t: &crate::shader::resources::ShaderTextureResource,
+) -> (SampledDim, StorageFormat) {
+    (
+        SampledDim::from_texture_type(t.type_()),
+        StorageFormat::from_unified_format(t.format()),
+    )
+}
+
+/// Canonical ordering of the (Dim, storage format) storage-array keys —
+/// Dim-major, format-minor. The single source of truth for which per-key
+/// binding a mixed shader's storage descriptor array lands at: bindings are
+/// assigned per PRESENT key starting at `binding_storage_index` in this
+/// order, by the SPIR-V generator, `shader_calc_binding_indices`, and the
+/// host descriptor path alike (exactly the [`sampled_key_ordinal`] contract).
+pub const fn storage_key_ordinal(dim: SampledDim, format: StorageFormat) -> u32 {
+    dim.ordinal() * 3 + format.ordinal()
+}
+
+/// SPIR-V identifier suffix distinguishing one (Dim, format) storage-image
+/// array from another's in a MIXED shader (e.g. `%textures2D_L_3D_16F`). A
+/// homogeneous shader uses no suffix, so its output stays byte-identical to
+/// the single-array path.
+pub(crate) const fn storage_key_suffix(dim: SampledDim, format: StorageFormat) -> &'static str {
+    match (dim, format) {
+        (SampledDim::Two, StorageFormat::Rgba8) => "_2D",
+        (SampledDim::Two, StorageFormat::Rgba16f) => "_2D_16F",
+        (SampledDim::Two, StorageFormat::Rgba32f) => "_2D_32F",
+        (SampledDim::TwoArray, StorageFormat::Rgba8) => "_2DArray",
+        (SampledDim::TwoArray, StorageFormat::Rgba16f) => "_2DArray_16F",
+        (SampledDim::TwoArray, StorageFormat::Rgba32f) => "_2DArray_32F",
+        (SampledDim::Three, StorageFormat::Rgba8) => "_3D",
+        (SampledDim::Three, StorageFormat::Rgba16f) => "_3D_16F",
+        (SampledDim::Three, StorageFormat::Rgba32f) => "_3D_32F",
+        // Unreachable today (`SampledDim::from_texture_type` never yields
+        // Cube for a storage T#) but the key space is total by construction.
+        (SampledDim::Cube, StorageFormat::Rgba8) => "_Cube",
+        (SampledDim::Cube, StorageFormat::Rgba16f) => "_Cube_16F",
+        (SampledDim::Cube, StorageFormat::Rgba32f) => "_Cube_32F",
+    }
+}
+
+/// The distinct storage (Dim, format) keys a shader binds, in canonical
+/// [`storage_key_ordinal`] order. One entry = a homogeneous shader (the
+/// legacy single `%textures2D_L` array); more than one = a MIXED shader that
+/// declares one array per key, each at its own binding.
+///
+/// Measured on ASTRO.BOT after ACB Phase B made descriptor-form compute
+/// submissions execute: one compute shader writes a 3D Rgba16f volume AND 2D
+/// Rgba16f targets, which the shader-wide single-array path refused by name
+/// (20 `storage_texture_dim_format` errors/run).
+pub(crate) fn storage_keys_present(bind: &ShaderBindResources) -> Vec<(SampledDim, StorageFormat)> {
     let bound = usize::try_from(bind.textures2d.textures_num)
         .unwrap_or(0)
         .min(bind.textures2d.desc.len());
-    let mut chosen: Option<(SampledDim, &'static str)> = None;
+    let mut keys: Vec<(SampledDim, StorageFormat)> = Vec::new();
     for d in &bind.textures2d.desc[..bound] {
         if !d.textures2d_without_sampler {
             continue; // sampled — lives in %textures2D_S
         }
-        let dim = match d.texture.type_() {
-            10 => SampledDim::Three,
-            11 | 13 => SampledDim::TwoArray,
-            _ => SampledDim::Two,
-        };
-        let format = match d.texture.format() {
-            71 => "Rgba16f",
-            77 => "Rgba32f",
-            _ => "Rgba8",
-        };
-        match chosen {
-            None => chosen = Some((dim, format)),
-            Some(prev) if prev == (dim, format) => {}
-            Some(prev) => {
-                return Err(not_supported(
-                    "storage_texture_dim_format",
-                    format!(
-                        "mixed storage image dims/formats in one shader \
-                         ({prev:?} vs ({dim:?}, {format}))"
-                    ),
-                ));
-            }
+        let key = storage_key_of(&d.texture);
+        if !keys.contains(&key) {
+            keys.push(key);
         }
     }
-    Ok(chosen.unwrap_or((SampledDim::Two, "Rgba8")))
+    keys.sort_by_key(|&(d, f)| storage_key_ordinal(d, f));
+    keys
+}
+
+/// The number of storage descriptors of a given key (the element count of
+/// that key's SPIR-V array in a mixed shader). Each array is packed tight —
+/// descriptors are re-indexed per key by `storage_descriptor_index_constant`
+/// and the host's `prepare_stage_binding` alike, so an index never exceeds
+/// this count (no OOB, no device loss).
+pub(crate) fn storage_key_count(
+    bind: &ShaderBindResources,
+    key: (SampledDim, StorageFormat),
+) -> u32 {
+    let bound = usize::try_from(bind.textures2d.textures_num)
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    bind.textures2d.desc[..bound]
+        .iter()
+        .filter(|d| d.textures2d_without_sampler)
+        .filter(|d| storage_key_of(&d.texture) == key)
+        .count() as u32
+}
+
+/// One per-present-key storage-array layout entry — the single source of
+/// truth `write_types` / `write_annotations` / `write_global_variables` all
+/// consume, so the type, the descriptor decoration, and the variable of each
+/// key's array can never disagree (the [`SampledArrayLayout`] contract).
+pub(crate) struct StorageArrayLayout {
+    pub dim: SampledDim,
+    pub format: StorageFormat,
+    pub suffix: &'static str,
+    pub count: u32,
+    pub binding: i32,
+}
+
+/// Per-present-key storage layout. For a homogeneous shader this yields
+/// exactly one entry with an empty suffix, `binding_storage_index`, and the
+/// analyzer's `textures2d_storage_num` count — i.e. the legacy single array
+/// unchanged (byte-identical output). A fixture that declares
+/// `textures2d_storage_num > 0` without captured RW T# dwords keeps the
+/// legacy 2D `Rgba8` default.
+pub(crate) fn storage_key_layout(bind: &ShaderBindResources) -> Vec<StorageArrayLayout> {
+    let present = storage_keys_present(bind);
+    if present.is_empty() {
+        return vec![StorageArrayLayout {
+            dim: SampledDim::Two,
+            format: StorageFormat::Rgba8,
+            suffix: "",
+            count: bind.textures2d.textures2d_storage_num.max(0) as u32,
+            binding: bind.textures2d.binding_storage_index,
+        }];
+    }
+    let mixed = present.len() > 1;
+    present
+        .iter()
+        .enumerate()
+        .map(|(i, &(dim, format))| StorageArrayLayout {
+            dim,
+            format,
+            suffix: if mixed {
+                storage_key_suffix(dim, format)
+            } else {
+                ""
+            },
+            count: storage_key_count(bind, (dim, format)),
+            binding: bind.textures2d.binding_storage_index + i as i32,
+        })
+        .collect()
 }
 
 /// Kyty: ShaderSpirv.cpp `operand_is_exec` (L1671).
@@ -3235,7 +3379,11 @@ impl<'a> Spirv<'a> {
                 }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
-                vars.push("%textures2D_L".to_string());
+                // One interface variable per present storage (Dim, format)
+                // key; a homogeneous shader yields exactly `%textures2D_L`.
+                for l in storage_key_layout(bind) {
+                    vars.push(format!("%textures2D_L{}", l.suffix));
+                }
             }
             if bind.samplers.samplers_num > 0 {
                 vars.push("%samplers".to_string());
@@ -3434,8 +3582,8 @@ impl<'a> Spirv<'a> {
        OpDecorate %textures2D_S<S> Binding <BindingIndex>
 "#;
         const TEXTURES_ANNOTATIONS_L: &str = r#"
-       OpDecorate %textures2D_L DescriptorSet <DescriptorSet>
-       OpDecorate %textures2D_L Binding <BindingIndex>
+       OpDecorate %textures2D_L<L> DescriptorSet <DescriptorSet>
+       OpDecorate %textures2D_L<L> Binding <BindingIndex>
 "#;
         const SAMPLERS_ANNOTATIONS: &str = r#"
        OpDecorate %samplers DescriptorSet <DescriptorSet>
@@ -3502,12 +3650,17 @@ impl<'a> Spirv<'a> {
                 }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
-                self.source += &TEXTURES_ANNOTATIONS_L
-                    .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
-                    .replace(
-                        "<BindingIndex>",
-                        &format!("{}", bind.textures2d.binding_storage_index),
-                    );
+                // One STORAGE_IMAGE descriptor array per present (Dim,
+                // format) key, each at its own binding
+                // (`binding_storage_index + position`). A homogeneous shader
+                // emits exactly one, unsuffixed, at `binding_storage_index`
+                // — byte-identical to the old output.
+                for l in storage_key_layout(bind) {
+                    self.source += &TEXTURES_ANNOTATIONS_L
+                        .replace("<L>", l.suffix)
+                        .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
+                        .replace("<BindingIndex>", &format!("{}", l.binding));
+                }
             }
             if bind.samplers.samplers_num > 0 {
                 self.source += &SAMPLERS_ANNOTATIONS
@@ -3675,13 +3828,14 @@ impl<'a> Spirv<'a> {
 "#;
 
         // Dim and storage format parametric (round 7 — 3D Rgba16f UAVs
-        // measured on ASTRO.BOT); see `storage_texture_dim_format`.
+        // measured on ASTRO.BOT); one instance per present (Dim, format)
+        // key, see `storage_key_layout`.
         const TEXTURES_LOADED_TYPES: &str = r#"
-                                             %ImageL = OpTypeImage %float <dim> 0 <arrayed> 0 2 <format>
-                    %textures2D_L_uint_<buffers_num> = OpConstant %uint <buffers_num>
-                     %_arr_ImageL_uint_<buffers_num> = OpTypeArray %ImageL %textures2D_L_uint_<buffers_num>
-%_ptr_UniformConstant__arr_ImageL_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageL_uint_<buffers_num>
-                        %_ptr_UniformConstant_ImageL = OpTypePointer UniformConstant %ImageL
+                                             %ImageL<L> = OpTypeImage %float <dim> 0 <arrayed> 0 2 <format>
+                    %textures2D_L<L>_uint_<buffers_num> = OpConstant %uint <buffers_num>
+                     %_arr_ImageL<L>_uint_<buffers_num> = OpTypeArray %ImageL<L> %textures2D_L<L>_uint_<buffers_num>
+%_ptr_UniformConstant__arr_ImageL<L>_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageL<L>_uint_<buffers_num>
+                        %_ptr_UniformConstant_ImageL<L> = OpTypePointer UniformConstant %ImageL<L>
 "#;
 
         const SAMPLERS_TYPES: &str = r#"
@@ -3756,15 +3910,21 @@ impl<'a> Spirv<'a> {
                 }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
-                let (dim, format) = storage_texture_dim_format(bind)?;
-                self.source += &TEXTURES_LOADED_TYPES
-                    .replace(
-                        "<buffers_num>",
-                        &format!("{}", bind.textures2d.textures2d_storage_num),
-                    )
-                    .replace("<dim>", dim.dim_str())
-                    .replace("<arrayed>", dim.arrayed_str())
-                    .replace("<format>", format);
+                // One image array type per present (Dim, format) key. Each
+                // array is sized to that key's own descriptor count
+                // (`storage_key_layout`), packed tight, so the store bodies'
+                // key-local index constants stay in range. A homogeneous
+                // shader emits one unsuffixed `%ImageL` array of
+                // `textures2d_storage_num` — identical to the old single
+                // path.
+                for l in storage_key_layout(bind) {
+                    self.source += &TEXTURES_LOADED_TYPES
+                        .replace("<L>", l.suffix)
+                        .replace("<buffers_num>", &format!("{}", l.count))
+                        .replace("<dim>", l.dim.dim_str())
+                        .replace("<arrayed>", l.dim.arrayed_str())
+                        .replace("<format>", l.format.format_str());
+                }
             }
             if bind.samplers.samplers_num > 0 {
                 self.source += &SAMPLERS_TYPES
@@ -3818,6 +3978,7 @@ impl<'a> Spirv<'a> {
         use ShaderInstructionType as T;
         self.code.has_any_of(&[
             T::DsAddU32,
+            T::DsAddRtnU32,
             T::DsWrxchgRtnB32,
             T::DsReadB32,
             T::DsWriteB32,
@@ -3908,10 +4069,16 @@ impl<'a> Spirv<'a> {
                 }
             }
             if bind.textures2d.textures2d_storage_num > 0 {
-                vars.push(format!(
-                    "%textures2D_L = OpVariable %_ptr_UniformConstant__arr_ImageL_uint_{} UniformConstant",
-                    bind.textures2d.textures2d_storage_num
-                ));
+                // One array variable per present storage (Dim, format) key,
+                // each pointing at its own per-key-sized array type.
+                // Homogeneous => one unsuffixed `%textures2D_L` of
+                // `textures2d_storage_num` — unchanged.
+                for l in storage_key_layout(bind) {
+                    let (suffix, count) = (l.suffix, l.count);
+                    vars.push(format!(
+                        "%textures2D_L{suffix} = OpVariable %_ptr_UniformConstant__arr_ImageL{suffix}_uint_{count} UniformConstant"
+                    ));
+                }
             }
             if bind.samplers.samplers_num > 0 {
                 vars.push(format!(

@@ -12,8 +12,10 @@
 
 use ash::vk;
 use raeen_gpu::backend::GpuBackend;
-use raeen_gpu::vulkan::compute::{ComputeState, dispatch_compute};
-use raeen_gpu::vulkan::offscreen::{ShaderStageBinding, StorageImageBinding, StorageImageUpload};
+use raeen_gpu::vulkan::compute::{ComputeState, dispatch_compute, dispatch_compute_deferred};
+use raeen_gpu::vulkan::offscreen::{
+    ShaderStageBinding, StorageImageBinding, StorageImageUpload, flush_deferred_draws,
+};
 use raeen_gpu::vulkan::{VulkanBackend, validation_error_count};
 
 /// UNORM8 conversion is allowed a little slack (0.6 ULP), same as the other
@@ -175,6 +177,7 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
                 pixels: vec![0xEE; 16].into(),
                 guest_base: 0,
             }],
+            groups: Vec::new(),
         }),
         gds_binding: None,
         eud_raw: None,
@@ -251,6 +254,7 @@ fn compute_storage_image_allocations_are_reused_across_dispatches() {
                 pixels: vec![0xEE; 16].into(),
                 guest_base: 0x3368_0000,
             }],
+            groups: Vec::new(),
         }),
         gds_binding: None,
         eud_raw: None,
@@ -293,6 +297,118 @@ fn compute_storage_image_allocations_are_reused_across_dispatches() {
     );
 }
 
+/// Batch publication must read the host pool's persistent mapping directly.
+/// Mapping that allocation again is invalid Vulkan and was the first
+/// validation failure after ASTRO.BOT's mixed storage-image shaders began
+/// reaching command submission.
+#[test]
+fn deferred_storage_image_publication_reuses_the_persistent_mapping() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let spirv = kyty_graphics::spirv_asm::assemble(STORE_PATTERN_CS)
+        .expect("storage-image compute shader assembles");
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        push_uniform_binding: None,
+        storage_buffers: None,
+        textures: None,
+        storage_images: Some(StorageImageBinding {
+            binding: 0,
+            images: vec![StorageImageUpload {
+                width: 2,
+                height: 2,
+                depth: 1,
+                layers: 1,
+                array: false,
+                tile_mode: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: vec![0xEE; 16].into(),
+                guest_base: 0x3369_0000,
+            }],
+            groups: Vec::new(),
+        }),
+        gds_binding: None,
+        eud_raw: None,
+    };
+    dispatch_compute_deferred(
+        dev,
+        &ComputeState {
+            groups: [1, 1, 1],
+            spirv: &spirv,
+            binding: Some(&binding),
+        },
+    )
+    .expect("deferred storage-image dispatch records");
+
+    flush_deferred_draws(dev).expect("deferred storage-image batch publishes");
+    assert_eq!(
+        validation_error_count(),
+        0,
+        "batch publication must not map persistently mapped host memory twice"
+    );
+}
+
+/// A synchronous/TDR-sliced dispatch can follow a deferred dispatch that
+/// created the same persistent UAV. The synchronous path must submit the open
+/// batch before consulting the image cache; otherwise the cache hit assumes
+/// TRANSFER_SRC_OPTIMAL while the first transition is still unsubmitted and
+/// Vulkan sees the image in UNDEFINED (the measured ASTRO.BOT device loss).
+#[test]
+fn synchronous_compute_flushes_deferred_uav_creator_before_reuse() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    let spirv = kyty_graphics::spirv_asm::assemble(STORE_PATTERN_CS)
+        .expect("storage-image compute shader assembles");
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        push_uniform_binding: None,
+        storage_buffers: None,
+        textures: None,
+        storage_images: Some(StorageImageBinding {
+            binding: 0,
+            images: vec![StorageImageUpload {
+                width: 2,
+                height: 2,
+                depth: 1,
+                layers: 1,
+                array: false,
+                tile_mode: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: vec![0xEE; 16].into(),
+                guest_base: 0x336A_0000,
+            }],
+            groups: Vec::new(),
+        }),
+        gds_binding: None,
+        eud_raw: None,
+    };
+    let state = ComputeState {
+        groups: [1, 1, 1],
+        spirv: &spirv,
+        binding: Some(&binding),
+    };
+    dispatch_compute_deferred(dev, &state).expect("deferred UAV creator records");
+
+    let output = dispatch_compute(dev, &state)
+        .expect("synchronous reuse must first submit the deferred UAV creator");
+    assert_eq!(output.images.len(), 1);
+    assert_eq!(
+        validation_error_count(),
+        0,
+        "deferred-to-synchronous UAV reuse must preserve the actual image layout"
+    );
+}
+
 #[test]
 fn compute_shader_writes_every_2d_array_layer() {
     let Some(backend) = backend_or_skip() else {
@@ -322,6 +438,7 @@ fn compute_shader_writes_every_2d_array_layer() {
                 pixels: vec![0xEE; 32].into(),
                 guest_base: 0,
             }],
+            groups: Vec::new(),
         }),
         gds_binding: None,
         eud_raw: None,
@@ -369,6 +486,7 @@ fn compute_shader_writes_every_2d_array_layer() {
                 pixels: vec![0xEE; 16].into(),
                 guest_base: 0,
             }],
+            groups: Vec::new(),
         }),
         gds_binding: None,
         eud_raw: None,

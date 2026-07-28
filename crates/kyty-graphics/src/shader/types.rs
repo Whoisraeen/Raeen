@@ -105,6 +105,10 @@ pub enum ShaderInstructionType {
     /// Lowered to an exec-guarded `OpAtomicIAdd` on the `%lds` Workgroup
     /// array at `(addr + offset) >> 2`.
     DsAddU32,
+    /// DS 0x20: LDS atomic dword add returning the old value
+    /// (`vdst = lds[a]; lds[a] += data`). Measured on ASTRO.BOT after mixed
+    /// storage-image routing advanced tiled-lighting compute.
+    DsAddRtnU32,
     DsAppend,
     DsConsume,
     /// DS 0x37: two independent LDS dword reads at `addr + offset0*4` and
@@ -309,6 +313,10 @@ pub enum ShaderInstructionType {
     VCmpGtF32,
     VCmpGtI32,
     VCmpGtU32,
+    /// GFX10 VOPC/VOP3 0xe4: unsigned 64-bit greater-than. Sources are
+    /// adjacent low/high dwords and the scalar-mask destination is a pair.
+    /// Measured in ASTRO.BOT scene compute.
+    VCmpGtU64,
     VCmpLeF32,
     VCmpLeI32,
     VCmpLeU32,
@@ -349,6 +357,9 @@ pub enum ShaderInstructionType {
     /// (58 dispatches/run).
     VCmpxLeF32,
     VCmpxLeI32,
+    /// VOPC 0xd3: `exec/smask = vsrc0 <= vsrc1` (unsigned). Measured after
+    /// ASTRO.BOT's mixed-storage-image shader advanced to tiled lighting.
+    VCmpxLeU32,
     VCmpxLtF32,
     VCmpxLtI32,
     VCmpxLtU32,
@@ -457,6 +468,12 @@ pub enum ShaderInstructionType {
     VSqrtF32,
     VSubF32,
     VSubI32,
+    /// RDNA2 VOP2 0x29 `v_subb_u32`: `src0 - src1 - VCC`, with the unsigned
+    /// borrow-out written back to VCC.
+    VSubbU32,
+    /// RDNA2 VOP2 0x2a `v_subbrev_u32`: reverse subtract with borrow,
+    /// `src1 - src0 - VCC`, with the unsigned borrow-out written back to VCC.
+    VSubbrevU32,
     /// RDNA2 (`next_gen`) VOP2 0x26: carry-less `vdst = vsrc0 - vsrc1`.
     VSubNcU32,
     VSubrevF32,
@@ -558,6 +575,9 @@ pub mod shader_instruction_format {
     pub const POS2: u64 = 53;
     pub const POS3: u64 = 54;
     pub const DMASK_2: u64 = 55;
+    /// Beyond Kyty: two-channel ZW image-load mask. Measured on four
+    /// ASTRO.BOT scene compute shaders after the mixed-storage path advanced.
+    pub const DMASK_C: u64 = 57;
 
     /// Kyty: Shader.h `FormatDefine` (L293). Packs FormatByte tokens into a
     /// u64, first token in the highest-used byte.
@@ -650,6 +670,8 @@ pub mod shader_instruction_format {
         /// Beyond Kyty: two-channel unsampled fetch — measured on ASTRO.BOT
         /// `image_load` (MIMG 0x00 dmask 0x3).
         Vdata2Vaddr3StDmask3 = format_define(&[DA2, S0A3, S1A8, DMASK_3]),
+        /// Beyond Kyty: two-channel ZW unsampled fetch (dmask 0xc).
+        Vdata2Vaddr3StDmaskC = format_define(&[DA2, S0A3, S1A8, DMASK_C]),
         Vdata2VaddrStDmask3 = format_define(&[DA2, S0, S1A8, DMASK_3]),
         Vdata2VaddrSvSoffsIdxen = format_define(&[DA2, S0, S1A4, S2, IDXEN]),
         // Beyond Kyty: the two-dword MUBUF addressing variants completing the
@@ -1119,6 +1141,7 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
             sif::DMASK_5 => "dmask:0x5".to_string(),
             sif::DMASK_7 => "dmask:0x7".to_string(),
             sif::DMASK_9 => "dmask:0x9".to_string(),
+            sif::DMASK_C => "dmask:0xc".to_string(),
             sif::DMASK_F => "dmask:0xf".to_string(),
             sif::GDS => "gds".to_string(),
             _ => "???".to_string(),

@@ -23,6 +23,105 @@ pub struct ComputeState<'a> {
     pub binding: Option<&'a ShaderStageBinding>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchSlice {
+    base: [u32; 3],
+    groups: [u32; 3],
+}
+
+/// Conservative translated-work budget for one Vulkan dispatch command.
+///
+/// This is not a performance score. It is a TDR containment boundary: a
+/// 64x64x1 dispatch of ASTRO.BOT's 8.7K-word, 16x16 shader reproducibly reset
+/// the Radeon 760M, while the same program divided into workgroup-base slices
+/// stays preemptible. The estimate intentionally includes declaration words;
+/// overestimating creates a few extra commands but preserves guest work.
+const DISPATCH_TDR_BUDGET: u128 = 1_000_000_000;
+
+fn compute_local_size(spirv: &[u32]) -> [u32; 3] {
+    // SPIR-V: five-word header, OpExecutionMode = 16, LocalSize = 17.
+    let mut at = 5usize;
+    while at < spirv.len() {
+        let word_count = (spirv[at] >> 16) as usize;
+        let opcode = spirv[at] & 0xffff;
+        if word_count == 0 || at.saturating_add(word_count) > spirv.len() {
+            break;
+        }
+        if opcode == 16 && word_count >= 6 && spirv[at + 2] == 17 {
+            return [spirv[at + 3], spirv[at + 4], spirv[at + 5]].map(|n| n.max(1));
+        }
+        at += word_count;
+    }
+    [1, 1, 1]
+}
+
+fn dispatch_slices(state: &ComputeState<'_>) -> Vec<DispatchSlice> {
+    let local = compute_local_size(state.spirv);
+    let words = state.spirv.len().max(1) as u128;
+    let local_invocations = local.into_iter().map(u128::from).product::<u128>().max(1);
+    let total_groups = state.groups.into_iter().map(u128::from).product::<u128>();
+    let total_work = words
+        .saturating_mul(local_invocations)
+        .saturating_mul(total_groups);
+    if total_work <= DISPATCH_TDR_BUDGET || total_groups == 0 {
+        return vec![DispatchSlice {
+            base: [0; 3],
+            groups: state.groups,
+        }];
+    }
+
+    // Slice the largest group dimension. The two untouched dimensions stay
+    // whole, while vkCmdDispatchBase preserves the original WorkGroupID.
+    let axis = (0..3)
+        .max_by_key(|&axis| state.groups[axis])
+        .unwrap_or_default();
+    let axis_groups = state.groups[axis];
+    if axis_groups <= 1 {
+        return vec![DispatchSlice {
+            base: [0; 3],
+            groups: state.groups,
+        }];
+    }
+    let other_groups = state
+        .groups
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != axis)
+        .map(|(_, &n)| u128::from(n))
+        .product::<u128>()
+        .max(1);
+    let work_per_axis_group = words
+        .saturating_mul(local_invocations)
+        .saturating_mul(other_groups)
+        .max(1);
+    let groups_per_slice = u32::try_from((DISPATCH_TDR_BUDGET / work_per_axis_group).max(1))
+        .unwrap_or(u32::MAX)
+        .min(axis_groups);
+
+    let mut slices = Vec::new();
+    let mut base_axis = 0u32;
+    while base_axis < axis_groups {
+        let count = groups_per_slice.min(axis_groups - base_axis);
+        let mut base = [0; 3];
+        let mut groups = state.groups;
+        base[axis] = base_axis;
+        groups[axis] = count;
+        slices.push(DispatchSlice { base, groups });
+        base_axis += count;
+    }
+    slices
+}
+
+/// Whether this dispatch must cross queue-submission boundaries to stay below
+/// the conservative Windows TDR work budget.
+///
+/// Heavy dispatches cannot join the deferred frame batch: dividing one command
+/// buffer into several `vkCmdDispatchBase` calls does not give the Windows
+/// scheduler a fence-completed preemption boundary.
+pub(crate) fn compute_requires_slicing(state: &ComputeState<'_>) -> bool {
+    dispatch_slices(state).len() > 1
+}
+
 /// Post-dispatch device content, in the binding's declaration order.
 pub struct ComputeOutputs {
     /// One entry per writable storage buffer, preserving
@@ -117,6 +216,21 @@ pub fn dispatch_compute(
             "compute binding has non-compute stage {:?}",
             binding.stage
         )));
+    }
+
+    // A synchronous dispatch (including every TDR-sliced dispatch) cannot
+    // reuse persistent resources from an open deferred batch until that batch
+    // has actually executed. Cache insertion happens while recording, so a
+    // cache hit alone does not prove the image has left UNDEFINED or the
+    // buffer contains its preceding writer. Submit/fence/publish the ordered
+    // batch before acquiring the cache for this dispatch. The empty target
+    // filter avoids unrelated colour-target readback.
+    let open_batch = {
+        let caches = dev.draw_caches();
+        caches.batch_open()
+    };
+    if open_batch {
+        super::offscreen::flush_deferred_draws_filtered(dev, Some(&[]))?;
     }
 
     let timing = crate::diagnostics::gpu_env().time_compute;
@@ -225,6 +339,11 @@ pub fn dispatch_compute_deferred(
     dev: &VulkanDevice,
     state: &ComputeState<'_>,
 ) -> Result<(), GpuError> {
+    if compute_requires_slicing(state) {
+        return Err(GpuError::PipelineCreationFailed(
+            "TDR-sliced compute dispatch cannot join the deferred submission batch".to_owned(),
+        ));
+    }
     let timing = crate::diagnostics::gpu_env().time_compute;
     let total_at = timing.then(std::time::Instant::now);
     let binding = state.binding.ok_or_else(|| {
@@ -500,13 +619,29 @@ impl<'a> ComputeResources<'a> {
                         });
                     }
                 }
-                layout_bindings.push(
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(images.binding)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .descriptor_count(self.images.len() as u32)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                );
+                if images.groups.is_empty() {
+                    // Homogeneous: one array of every storage view.
+                    layout_bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(images.binding)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .descriptor_count(self.images.len() as u32)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    );
+                } else {
+                    // Mixed (Dim, format): one `%textures2D_L<key>` array per
+                    // key, at its own binding — matching the recompiled
+                    // SPIR-V.
+                    for group in &images.groups {
+                        layout_bindings.push(
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(group.binding)
+                                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                                .descriptor_count(group.view_indices.len() as u32)
+                                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                        );
+                    }
+                }
             }
             // Sampled textures + samplers (the recompiled SPIR-V declares
             // %textures2D_S and %samplers as separate bindings) — first
@@ -691,14 +826,39 @@ impl<'a> ComputeResources<'a> {
                         .buffer_info(&buffer_infos),
                 );
             }
+            // Mixed (Dim, format): split the storage-view pool into one
+            // descriptor array per key, in SPIR-V array order.
+            // `self.images[i]` corresponds to `images.images[i]`, so a
+            // group's `view_indices` select its views directly. Kept alive
+            // alongside `image_infos`.
+            let storage_group_infos: Vec<Vec<vk::DescriptorImageInfo>> = storage_images
+                .map(|imgs| {
+                    imgs.groups
+                        .iter()
+                        .map(|group| group.view_indices.iter().map(|&i| image_infos[i]).collect())
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(images) = storage_images {
-                writes.push(
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.descriptor_set)
-                        .dst_binding(images.binding)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&image_infos),
-                );
+                if images.groups.is_empty() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(self.descriptor_set)
+                            .dst_binding(images.binding)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(&image_infos),
+                    );
+                } else {
+                    for (group, infos) in images.groups.iter().zip(&storage_group_infos) {
+                        writes.push(
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(self.descriptor_set)
+                                .dst_binding(group.binding)
+                                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                                .image_info(infos),
+                        );
+                    }
+                }
             }
             let sampled_infos: Vec<_> = self
                 .sampled
@@ -1478,12 +1638,139 @@ impl<'a> ComputeResources<'a> {
                     &binding.push_constants,
                 );
             }
-            self.device().cmd_dispatch(
-                self.command_buffer,
-                state.groups[0],
-                state.groups[1],
-                state.groups[2],
-            );
+            let slices = dispatch_slices(state);
+            if slices.len() > 1 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static SLICED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+                let sliced = SLICED_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+                if sliced <= 16 || sliced.is_power_of_two() {
+                    tracing::warn!(
+                        sliced_dispatch = sliced,
+                        groups = format_args!(
+                            "{}x{}x{}",
+                            state.groups[0], state.groups[1], state.groups[2]
+                        ),
+                        local_size = ?compute_local_size(state.spirv),
+                        spirv_words = state.spirv.len(),
+                        slices = slices.len(),
+                        "compute dispatch divided into TDR-safe WorkGroupID slices"
+                    );
+                }
+            }
+            for (index, slice) in slices.iter().enumerate() {
+                if slice.base == [0; 3] && slice.groups == state.groups {
+                    self.device().cmd_dispatch(
+                        self.command_buffer,
+                        slice.groups[0],
+                        slice.groups[1],
+                        slice.groups[2],
+                    );
+                } else {
+                    self.device().cmd_dispatch_base(
+                        self.command_buffer,
+                        slice.base[0],
+                        slice.base[1],
+                        slice.base[2],
+                        slice.groups[0],
+                        slice.groups[1],
+                        slice.groups[2],
+                    );
+                }
+                if index + 1 != slices.len() {
+                    // The original dispatch provides no ordering between
+                    // workgroups. Serial slices are necessarily stronger; make
+                    // any guest storage effects visible before the next slice.
+                    let between_slices = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        );
+                    self.device().cmd_pipeline_barrier(
+                        self.command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[between_slices],
+                        &[],
+                        &[],
+                    );
+                    if !self.batched {
+                        // A second vkCmdDispatch in the same command buffer did
+                        // not contain ASTRO.BOT's measured Windows TDR. End,
+                        // submit, and fence-complete every slice so the next
+                        // slice is a genuinely separate schedulable unit.
+                        self.device()
+                            .end_command_buffer(self.command_buffer)
+                            .map_err(|e| {
+                                self.dev.note_vk_error(e);
+                                GpuError::VulkanInitFailed(format!(
+                                    "vkEndCommandBuffer (compute slice): {e}"
+                                ))
+                            })?;
+                        let command_buffers = [self.command_buffer];
+                        let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+                        self.device()
+                            .queue_submit(self.dev.queue(), &submits, self.fence)
+                            .map_err(|e| {
+                                self.dev.note_vk_error(e);
+                                GpuError::VulkanInitFailed(format!(
+                                    "vkQueueSubmit (compute slice): {e}"
+                                ))
+                            })?;
+                        self.device()
+                            .wait_for_fences(&[self.fence], true, u64::MAX)
+                            .map_err(|e| {
+                                self.dev.note_vk_error(e);
+                                GpuError::VulkanInitFailed(format!(
+                                    "vkWaitForFences (compute slice): {e}"
+                                ))
+                            })?;
+                        self.device().reset_fences(&[self.fence]).map_err(|e| {
+                            self.dev.note_vk_error(e);
+                            GpuError::VulkanInitFailed(format!(
+                                "vkResetFences (compute slice): {e}"
+                            ))
+                        })?;
+                        let begin = vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                        self.device()
+                            .begin_command_buffer(self.command_buffer, &begin)
+                            .map_err(|e| {
+                                self.dev.note_vk_error(e);
+                                GpuError::VulkanInitFailed(format!(
+                                    "vkBeginCommandBuffer (compute slice): {e}"
+                                ))
+                            })?;
+                        self.device().cmd_bind_pipeline(
+                            self.command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.pipeline,
+                        );
+                        if !self.descriptor_set.is_null() {
+                            self.device().cmd_bind_descriptor_sets(
+                                self.command_buffer,
+                                vk::PipelineBindPoint::COMPUTE,
+                                self.pipeline_layout,
+                                0,
+                                &[self.descriptor_set],
+                                &[],
+                            );
+                        }
+                        if let Some(binding) = state.binding
+                            && !binding.push_constants.is_empty()
+                            && binding.push_uniform_binding.is_none()
+                        {
+                            self.device().cmd_push_constants(
+                                self.command_buffer,
+                                self.pipeline_layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                binding.push_constant_offset,
+                                &binding.push_constants,
+                            );
+                        }
+                    }
+                }
+            }
 
             // GDS contents persist across dispatches: make this dispatch's
             // GDS writes available to LATER dispatches' shader reads/writes
@@ -1553,13 +1840,15 @@ impl<'a> ComputeResources<'a> {
                     &[],
                 );
             }
-            if self.batched {
-                Ok(())
-            } else {
-                self.device().end_command_buffer(self.command_buffer)
+            if !self.batched {
+                self.device()
+                    .end_command_buffer(self.command_buffer)
+                    .map_err(|e| {
+                        self.dev.note_vk_error(e);
+                        GpuError::VulkanInitFailed(format!("vkEndCommandBuffer: {e}"))
+                    })?;
             }
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkEndCommandBuffer: {e}")))?;
         if self.batched {
             // Do not submit one command buffer at a time. The batch flush
             // submits every recorded draw/dispatch command buffer in PM4
@@ -1576,10 +1865,15 @@ impl<'a> ComputeResources<'a> {
                 self.device()
                     .queue_submit(self.dev.queue(), &submits, self.fence)
             }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkQueueSubmit: {e}")))?;
+            .map_err(|e| {
+                self.dev.note_vk_error(e);
+                GpuError::VulkanInitFailed(format!("vkQueueSubmit: {e}"))
+            })?;
             // SAFETY: waiting on this submission's live fence.
-            unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }
-                .map_err(|e| GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}")))
+            unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }.map_err(|e| {
+                self.dev.note_vk_error(e);
+                GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}"))
+            })
         }
     }
 
@@ -1884,7 +2178,28 @@ impl Drop for ComputeResources<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::inline_push_constant_range;
+    use super::{
+        ComputeState, compute_local_size, compute_requires_slicing, dispatch_slices,
+        inline_push_constant_range,
+    };
+
+    fn compute_module(local: [u32; 3], words: usize) -> Vec<u32> {
+        let mut module = vec![
+            0x0723_0203,
+            0x0001_0300,
+            0,
+            10,
+            0,
+            (6 << 16) | 16, // OpExecutionMode %1 LocalSize x y z
+            1,
+            17,
+            local[0],
+            local[1],
+            local[2],
+        ];
+        module.resize(words.max(module.len()), (1 << 16) | 0);
+        module
+    }
 
     #[test]
     fn minecraft_304_byte_resource_table_uses_spill_ssbo() {
@@ -1907,5 +2222,57 @@ mod tests {
             inline_push_constant_range(16, 128, None, 256).expect("inline range is valid"),
             Some((16, 128))
         );
+    }
+
+    #[test]
+    fn reads_compute_local_size_from_execution_mode() {
+        assert_eq!(
+            compute_local_size(&compute_module([16, 8, 2], 32)),
+            [16, 8, 2]
+        );
+    }
+
+    #[test]
+    fn astro_heavy_compute_is_divided_without_changing_workgroup_ids() {
+        let spirv = compute_module([16, 16, 1], 8_700);
+        let state = ComputeState {
+            groups: [64, 64, 1],
+            spirv: &spirv,
+            binding: None,
+        };
+        let slices = dispatch_slices(&state);
+        assert!(slices.len() > 1, "{slices:?}");
+
+        // Equal X/Y dimensions choose one axis, preserve the other two, and
+        // cover every original workgroup exactly once through dispatch-base.
+        let axis = (0..3)
+            .find(|&axis| slices.iter().any(|slice| slice.base[axis] != 0))
+            .expect("one dimension must be sliced");
+        let mut next = 0;
+        for slice in &slices {
+            assert_eq!(slice.base[axis], next);
+            next += slice.groups[axis];
+            for other in (0..3).filter(|&candidate| candidate != axis) {
+                assert_eq!(slice.base[other], 0);
+                assert_eq!(slice.groups[other], state.groups[other]);
+            }
+        }
+        assert_eq!(next, state.groups[axis]);
+        assert!(compute_requires_slicing(&state));
+    }
+
+    #[test]
+    fn ordinary_compute_stays_one_plain_dispatch() {
+        let spirv = compute_module([8, 8, 1], 256);
+        let state = ComputeState {
+            groups: [8, 8, 1],
+            spirv: &spirv,
+            binding: None,
+        };
+        let slices = dispatch_slices(&state);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].base, [0; 3]);
+        assert_eq!(slices[0].groups, state.groups);
+        assert!(!compute_requires_slicing(&state));
     }
 }

@@ -1708,12 +1708,24 @@ fn defer_gpu_side_effects() -> bool {
 /// so flipping `RAEEN_DEFER_GPU_SIDE_EFFECTS` changes WHEN an event fires,
 /// never WHAT it does.
 fn signal_agc_equeue_event(ctx: &HleContext, event_id: u32) {
+    let mut queues = Vec::new();
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
         if event.key().1 == u64::from(event_id) {
+            let eq = event.key().0;
             event.triggered = true;
             event.fflags = event.fflags.saturating_add(1);
             event.data = i64::from(event_id);
+            if !queues.contains(&eq) {
+                queues.push(eq);
+            }
         }
+    }
+    for eq in queues {
+        crate::kernel_equeue::wake_equeue(
+            ctx,
+            eq,
+            raeen_core::subsystems::WakeReason::SubmissionComplete,
+        );
     }
 }
 
@@ -1727,12 +1739,24 @@ fn signal_agc_equeue_event(ctx: &HleContext, event_id: u32) {
 /// title registers distinct events for graphics vs compute EOP and routes on
 /// data/ident.
 fn signal_eop_interrupts(ctx: &HleContext, count: u32, last_context: u32) {
+    let mut queues = Vec::new();
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
         if event.filter == EVFILT_GRAPHICS_CORE {
+            let eq = event.key().0;
             event.triggered = true;
             event.fflags = event.fflags.saturating_add(count);
             event.data = i64::from(last_context);
+            if !queues.contains(&eq) {
+                queues.push(eq);
+            }
         }
+    }
+    for eq in queues {
+        crate::kernel_equeue::wake_equeue(
+            ctx,
+            eq,
+            raeen_core::subsystems::WakeReason::SubmissionComplete,
+        );
     }
 }
 

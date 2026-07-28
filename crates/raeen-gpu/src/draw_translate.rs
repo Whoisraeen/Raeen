@@ -22,7 +22,9 @@
 //!   must not hide every other draw.
 
 use crate::shader_fetch::{ShaderTranslateCache, TranslatedShader};
-use crate::vulkan::compute::{ComputeState, dispatch_compute, dispatch_compute_deferred};
+use crate::vulkan::compute::{
+    ComputeState, compute_requires_slicing, dispatch_compute, dispatch_compute_deferred,
+};
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
     BlendState, CLEAR_COLOR, DepthState, DrawState, EudRawBinding, RenderedImage, SampledGroup,
@@ -43,6 +45,15 @@ use kyty_graphics::shader::{
     shader_push_constant_spill_binding, spirv_get_embedded_ps, spirv_get_embedded_vs,
 };
 use kyty_graphics::spirv_asm;
+
+/// One captured ASTRO.BOT compute program is validation-clean but
+/// reproducibly poisons the Windows Vulkan device after submission. Keep the
+/// production path alive with an exact, named quarantine while its
+/// exec-mask/reloop semantics are audited. The address + dispatch shape is
+/// deliberately narrower than a generic "large compute" heuristic.
+const fn is_known_device_loss_compute(cs_addr: u64, groups: [u32; 3]) -> bool {
+    cs_addr == 0x5005_3c700 && groups[0] == 64 && groups[1] == 64 && groups[2] == 1
+}
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -1592,6 +1603,26 @@ fn sampled_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usiz
     kyty_graphics::shader::sampled_key_ordinal(
         kyty_graphics::shader::SampledDim::from_texture_type(t.type_()),
         kyty_graphics::shader::SampledClass::from_unified_format(t.format()),
+    ) as usize
+}
+
+/// The number of distinct storage-array keys — 4 Dims x 3 storage formats
+/// (`kyty_graphics::shader::storage_key_ordinal` is Dim-major).
+const STORAGE_KEYS: usize = 12;
+
+/// The canonical (Dim, storage format) key ordinal of a RW (storage) T#,
+/// matching `kyty_graphics::shader::storage_key_ordinal`. A mixed shader
+/// assigns per-key storage bindings in this order, so the host and the
+/// SPIR-V generator agree on which `%textures2D_L<key>` array each RW T#
+/// lands at (`binding_storage_index + position-among-present-keys`).
+fn storage_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usize {
+    // Delegates to the SPIR-V generator's own classifiers so the host and
+    // the shader can never disagree on a RW T#'s array (drift here would
+    // write a 3D volume's descriptor into the 2D array's binding — the
+    // shader would then image-write through the wrong image).
+    kyty_graphics::shader::storage_key_ordinal(
+        kyty_graphics::shader::SampledDim::from_texture_type(t.type_()),
+        kyty_graphics::shader::StorageFormat::from_unified_format(t.format()),
     ) as usize
 }
 
@@ -3167,6 +3198,14 @@ fn prepare_stage_binding_inner(
     // to assign per-key bindings.
     let mut sampled_key_count = [0u64; SAMPLED_KEYS];
     let mut sampled_key_views: [Vec<usize>; SAMPLED_KEYS] = std::array::from_fn(|_| Vec::new());
+    // Mixed-key STORAGE routing, the exact same contract for RW T#s: one
+    // `%textures2D_L<key>` array per present storage (Dim, format) key
+    // (measured: ASTRO.BOT compute writes a 3D Rgba16f volume next to 2D
+    // Rgba16f targets). Each storage T#'s seeded index is its position
+    // WITHIN its own key's array, and `storage_key_images[ord]` records
+    // which `storage_images` entry fills each slot.
+    let mut storage_key_count = [0u64; STORAGE_KEYS];
+    let mut storage_key_images: [Vec<usize>; STORAGE_KEYS] = std::array::from_fn(|_| Vec::new());
     // Per-stage decoded-byte budget (see `stage_texture_byte_cap`): a composite
     // sampling several full-resolution scene targets decodes them all from guest
     // memory at once, and the peak host allocation can abort the process. Refuse
@@ -3217,7 +3256,14 @@ fn prepare_stage_binding_inner(
                     );
                 }
             }
-            rewritten.update_address38(storage_images.len() as u64);
+            let ord = storage_key_ordinal(&desc.texture);
+            let image_index = storage_images.len();
+            // Seed the RW T# index WITHIN its key's array (homogeneous
+            // shaders have one key, so this counts 0,1,2… exactly as the
+            // old `storage_images.len()` did).
+            rewritten.update_address38(storage_key_count[ord]);
+            storage_key_count[ord] += 1;
+            storage_key_images[ord].push(image_index);
             storage_images.push(upload);
         } else {
             // A T# naming a live persistent render target binds that target's
@@ -3300,6 +3346,26 @@ fn prepare_stage_binding_inner(
             .map(|(pos, &ord)| SampledGroup {
                 binding: bind.textures2d.binding_sampled_index as u32 + pos as u32,
                 view_indices: std::mem::take(&mut sampled_key_views[ord]),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Same split for the storage arrays: present keys in canonical ordinal
+    // order, consecutive bindings starting at `binding_storage_index` —
+    // matching the SPIR-V generator and `shader_calc_binding_indices`
+    // exactly. A homogeneous shader leaves `storage_groups` empty
+    // (single-array path).
+    let storage_present_keys: Vec<usize> = (0..STORAGE_KEYS)
+        .filter(|&o| !storage_key_images[o].is_empty())
+        .collect();
+    let storage_groups: Vec<SampledGroup> = if storage_present_keys.len() > 1 {
+        storage_present_keys
+            .iter()
+            .enumerate()
+            .map(|(pos, &ord)| SampledGroup {
+                binding: bind.textures2d.binding_storage_index as u32 + pos as u32,
+                view_indices: std::mem::take(&mut storage_key_images[ord]),
             })
             .collect()
     } else {
@@ -3403,6 +3469,7 @@ fn prepare_stage_binding_inner(
         storage_images: (!storage_images.is_empty()).then_some(StorageImageBinding {
             binding: bind.textures2d.binding_storage_index as u32,
             images: storage_images,
+            groups: storage_groups,
         }),
         gds_binding: (gds_num != 0).then_some(bind.gds_pointers.binding_index as u32),
         // The raw EUD-window snapshot (SharpEmu port): read at dispatch time
@@ -4698,23 +4765,6 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // dispatch-only ACB buffers translate against the shader the title bound
         // on the DCB instead of skipping on a null address.
         let cs = Self::seed_compute(&sh.cs, &mut self.current_compute);
-        // Forensic kill switch: `RAEEN_SKIP_CS=0xADDR[,0xADDR...]` skips the
-        // named compute programs as a counted, named degradation. Used to
-        // bisect device-loss culprits: a lethal dispatch resets the whole
-        // device and every later draw in the session fails, so isolating one
-        // program by address is the fastest way to pin the killer.
-        if let Some(list) = crate::diagnostics::gpu_env().skip_cs.as_deref() {
-            let addr = format!("{:#x}", cs.cs_regs.data_addr);
-            if list
-                .split(',')
-                .any(|s| s.trim().eq_ignore_ascii_case(&addr))
-            {
-                self.dispatch_skips += 1;
-                self.last_dispatch_skip_reason = Some(format!("RAEEN_SKIP_CS: {addr}"));
-                debug!(cs_addr = %addr, "compute dispatch skipped by RAEEN_SKIP_CS");
-                return Ok(());
-            }
-        }
         let translate_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_CS_TRANSLATE_NS,
         );
@@ -4739,6 +4789,47 @@ impl DrawSink for OffscreenDrawSink<'_> {
             }
         };
         drop(translate_timer);
+        // Forensic kill switch: translate (and therefore dump, when
+        // RAEEN_DUMP_SHADERS is set) the named compute program, but never
+        // submit it. Keeping the cut after translation makes a confirmed
+        // device-loss shader inspectable without risking another GPU reset.
+        // Translation failures already return through the named refusal above.
+        if let Some(list) = crate::diagnostics::gpu_env().skip_cs.as_deref() {
+            let addr = format!("{:#x}", cs.cs_regs.data_addr);
+            if list
+                .split(',')
+                .any(|s| s.trim().eq_ignore_ascii_case(&addr))
+            {
+                self.dispatch_skips += 1;
+                self.last_dispatch_skip_reason = Some(format!("RAEEN_SKIP_CS: {addr}"));
+                debug!(cs_addr = %addr, "translated compute dispatch skipped by RAEEN_SKIP_CS");
+                return Ok(());
+            }
+        }
+        if is_known_device_loss_compute(cs.cs_regs.data_addr, groups)
+            && !crate::diagnostics::gpu_env().allow_known_device_loss_cs
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static QUARANTINED: AtomicU64 = AtomicU64::new(0);
+            let occurrence = QUARANTINED.fetch_add(1, Ordering::Relaxed) + 1;
+            let reason = format!(
+                "known-device-loss compute quarantined at {:#x} (64x64x1); \
+                 RAEEN_ALLOW_KNOWN_DEVICE_LOSS_CS=1 restores it for diagnostics",
+                cs.cs_regs.data_addr
+            );
+            self.dispatch_skips += 1;
+            self.last_dispatch_skip_reason = Some(reason.clone());
+            if occurrence <= 4 || occurrence.is_power_of_two() {
+                tracing::warn!(
+                    occurrence,
+                    cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                    groups = ?groups,
+                    reason,
+                    "compute dispatch safely refused before the known Windows driver reset"
+                );
+            }
+            return Ok(());
+        }
         let prepare_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_NS,
         );
@@ -4888,30 +4979,60 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // Forensic breadcrumb: device loss surfaces LAZILY (the next
         // vkQueueSubmit reports it), so identifying a lethal dispatch needs
         // the pre-submit identity of every dispatch in the log.
-        debug!(
-            cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
-            groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
-            storage_num,
-            null_vsharps = guest_outputs
+        let log_submit = |trace: bool| {
+            let cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr);
+            let groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]);
+            let null_vsharps = guest_outputs
                 .iter()
                 .filter(|(addr, len)| *addr == 0 || *len == 0)
-                .count(),
-            gds = prepared.as_ref().is_some_and(|p| p.gds_binding.is_some()),
-            textures = prepared
+                .count();
+            let gds = prepared.as_ref().is_some_and(|p| p.gds_binding.is_some());
+            let textures = prepared
                 .as_ref()
                 .and_then(|p| p.textures.as_ref())
-                .map_or(0, |t| t.textures.len()),
-            samplers = prepared
+                .map_or(0, |t| t.textures.len());
+            let samplers = prepared
                 .as_ref()
                 .and_then(|p| p.textures.as_ref())
-                .map_or(0, |t| t.samplers.len()),
-            images = prepared
+                .map_or(0, |t| t.samplers.len());
+            let images = prepared
                 .as_ref()
                 .and_then(|p| p.storage_images.as_ref())
-                .map_or(0, |i| i.images.len()),
-            "compute dispatch submitting"
-        );
+                .map_or(0, |i| i.images.len());
+            if trace {
+                tracing::warn!(
+                    cs_addr,
+                    groups,
+                    storage_num,
+                    null_vsharps,
+                    gds,
+                    textures,
+                    samplers,
+                    images,
+                    "TRACE_DRAWS: compute dispatch submitting"
+                );
+            } else {
+                debug!(
+                    cs_addr,
+                    groups,
+                    storage_num,
+                    null_vsharps,
+                    gds,
+                    textures,
+                    samplers,
+                    images,
+                    "compute dispatch submitting"
+                );
+            }
+        };
+        log_submit(crate::diagnostics::gpu_env().trace_draws);
+        let compute_state = ComputeState {
+            groups,
+            spirv: &translated.spirv,
+            binding: prepared.as_ref(),
+        };
         let deferred = !crate::diagnostics::gpu_env().no_defer_compute
+            && !compute_requires_slicing(&compute_state)
             && prepared.as_ref().is_some_and(|binding| {
                 let storage_ok = binding
                     .storage_buffers
@@ -4936,15 +5057,9 @@ impl DrawSink for OffscreenDrawSink<'_> {
             &crate::vulkan::offscreen::DRAW_STAGE_CS_BACKEND_NS,
         );
         if deferred {
-            dispatch_compute_deferred(
-                self.dev,
-                &ComputeState {
-                    groups,
-                    spirv: &translated.spirv,
-                    binding: prepared.as_ref(),
-                },
-            )
-            .map_err(|error| err(format!("deferred Vulkan compute dispatch failed: {error}")))?;
+            dispatch_compute_deferred(self.dev, &compute_state).map_err(|error| {
+                err(format!("deferred Vulkan compute dispatch failed: {error}"))
+            })?;
             self.queued_compute = true;
             self.dispatches += 1;
             return Ok(());
@@ -4952,15 +5067,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
         let dispatch_at = crate::diagnostics::gpu_env()
             .time_compute
             .then(std::time::Instant::now);
-        let outputs = dispatch_compute(
-            self.dev,
-            &ComputeState {
-                groups,
-                spirv: &translated.spirv,
-                binding: prepared.as_ref(),
-            },
-        )
-        .map_err(|error| err(format!("Vulkan compute dispatch failed: {error}")))?;
+        let outputs = dispatch_compute(self.dev, &compute_state)
+            .map_err(|error| err(format!("Vulkan compute dispatch failed: {error}")))?;
         drop(backend_timer);
         if let Some(dispatch_at) = dispatch_at {
             let elapsed = dispatch_at.elapsed();
@@ -5145,6 +5253,13 @@ impl DrawSink for OffscreenDrawSink<'_> {
 mod tests {
     use super::*;
     use kyty_graphics::hw_regs::{ColorAttrib2, ComputeShaderInfo};
+
+    #[test]
+    fn astrobot_device_loss_quarantine_is_exact() {
+        assert!(is_known_device_loss_compute(0x5005_3c700, [64, 64, 1]));
+        assert!(!is_known_device_loss_compute(0x5005_3c700, [64, 63, 1]));
+        assert!(!is_known_device_loss_compute(0x5005_3c701, [64, 64, 1]));
+    }
 
     #[test]
     fn gen5_stencil_operations_map_explicitly_to_vulkan() {

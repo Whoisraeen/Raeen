@@ -8,15 +8,14 @@
 //! structs). The `GetEvent*` accessors read fields back out of a delivered
 //! event.
 //!
-//! Registration/trigger/delivery is **fully correct** under Raeen's
-//! single-active-execution model. `WaitEqueue` blocks a real thread when no
-//! event is pending; with one guest thread nothing else can trigger, so it
-//! delivers immediately when events are pending and otherwise reports a
-//! timeout. AMPR/graphics events and true blocking waits need the M1-E/M2
-//! infrastructure. State lives in the kernel (`kernel_equeues` /
+//! `WaitEqueue` uses Raeen's shared wait service, so a NULL guest timeout means
+//! a real indefinite wait while finite deadlines remain guest-visible. User,
+//! VideoOut, APR, and AGC producers wake blocked waiters after publishing their
+//! events. State lives in the kernel (`kernel_equeues` /
 //! `kernel_equeue_events`).
 
 use crate::{HleContext, HleRegistry};
+use raeen_core::subsystems::{WaitKey, WaitOutcome, WakeReason};
 use tracing::debug;
 
 const OK: u64 = 0;
@@ -90,7 +89,23 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_ESRCH;
     }
     ctx.kernel.kernel_equeue_events.retain(|k, _| k.0 != eq);
+    wake_equeue(ctx, eq, WakeReason::Deleted);
     OK
+}
+
+/// Wake threads blocked in `sceKernelWaitEqueue(eq, ...)`.
+///
+/// All producers use the Raeen-owned wait contract instead of reaching into
+/// the kernel's host synchronization primitive directly.
+pub(crate) fn wake_equeue(ctx: &HleContext, eq: u64, reason: WakeReason) {
+    ctx.services.wake(
+        WaitKey {
+            class: "kernel-equeue",
+            object: eq,
+            guest_thread: ctx.guest_threads.current_thread(),
+        },
+        reason,
+    );
 }
 
 /// `sceKernelAddUserEvent[Edge](eq, id)`: register an (initially un-triggered)
@@ -242,6 +257,8 @@ fn hle_trigger_user_event_inner(ctx: &HleContext, args: &[u64]) -> u64 {
     ev.triggered = true;
     ev.udata = udata;
     ev.fflags += 1;
+    drop(ev);
+    wake_equeue(ctx, eq, WakeReason::Signal);
     OK
 }
 
@@ -273,20 +290,28 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         None
     } else {
         let mut buf = [0u8; 4];
-        ctx.mem
-            .read(timeout_ptr, &mut buf)
-            .then(|| u64::from(u32::from_le_bytes(buf)))
+        if !ctx.mem.read(timeout_ptr, &mut buf) {
+            return SCE_KERNEL_ERROR_EFAULT;
+        }
+        Some(u64::from(u32::from_le_bytes(buf)))
     };
 
-    // A truly unbounded block is not safe here: this runs on the HLE dispatch
-    // thread, and an infinite wait deadlocks a title whose producer already
-    // exited (and hangs the unit tests, which have no termination signal). Cap
-    // the wait and report a timeout — the guest re-waits, which is exactly what
-    // a spurious wakeup looks like and what it already tolerates.
-    const INFINITE_CAP_US: u64 = 50_000; // 50 ms
-    const POLL_US: u64 = 250;
-    let budget = std::time::Duration::from_micros(timeout_us.unwrap_or(INFINITE_CAP_US));
-    let deadline = std::time::Instant::now() + budget;
+    // NULL means FOREVER. The host wait remains sliced so process teardown is
+    // observed promptly, but an internal slice expiry is never exposed to the
+    // guest as ETIMEDOUT. The old implementation did exactly that after 50 ms:
+    // Dragon Ball's AGC workers entered their fatal path after a fabricated
+    // timeout. This mirrors the corrected WaitEventFlag contract.
+    const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    // The deferred worker queue has no kernel handle with which to notify this
+    // condvar. Keep its observation latency bounded without returning the
+    // slice as a guest timeout; normal eager/event producers wake immediately.
+    let wait_slice = if raeen_gpu::ordered_side_effects::defer_gpu_side_effects() {
+        std::time::Duration::from_millis(1)
+    } else {
+        WAIT_SLICE
+    };
+    let deadline =
+        timeout_us.map(|us| std::time::Instant::now() + std::time::Duration::from_micros(us));
 
     loop {
         // Deliver anything the GPU worker executed in-stream since the last
@@ -294,21 +319,63 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         // relaxed-load no-op otherwise) — a waiter parked here IS the
         // observer those effects must reach.
         crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
-        // Collect pending event fields for this queue, then edge-clear.
-        let mut pending: Vec<(u64, u64, u32, i16, i64)> = Vec::new();
-        for entry in ctx.kernel.kernel_equeue_events.iter() {
-            let (q, id) = *entry.key();
-            if q == eq && entry.triggered && (pending.len() as u64) < num {
-                pending.push((id, entry.udata, entry.fflags, entry.filter, entry.data));
+        let delivered = std::cell::Cell::new(None);
+        let deleted = std::cell::Cell::new(false);
+        let mut ready = || {
+            if !ctx.kernel.kernel_equeues.contains_key(&eq) {
+                deleted.set(true);
+                return true;
             }
+            // Collect and deliver while the wait subsystem's notification lock
+            // is held. Producers take that same lock in `wake_equeue`, closing
+            // the check-then-sleep lost-wakeup race.
+            let mut pending: Vec<(u64, u64, u32, i16, i64)> = Vec::new();
+            for entry in ctx.kernel.kernel_equeue_events.iter() {
+                let (q, id) = *entry.key();
+                if q == eq && entry.triggered && (pending.len() as u64) < num {
+                    pending.push((id, entry.udata, entry.fflags, entry.filter, entry.data));
+                }
+            }
+            if pending.is_empty() {
+                false
+            } else {
+                delivered.set(Some(deliver_events(
+                    ctx, eq, events_ptr, out_count, &pending,
+                )));
+                true
+            }
+        };
+
+        let wait = deadline.map_or(wait_slice, |dl| {
+            dl.saturating_duration_since(std::time::Instant::now())
+                .min(wait_slice)
+        });
+        let outcome = ctx.services.wait_until(
+            WaitKey {
+                class: "kernel-equeue",
+                object: eq,
+                guest_thread: ctx.guest_threads.current_thread(),
+            },
+            wait,
+            &|| ctx.guest_threads.process_is_terminating(),
+            &mut ready,
+        );
+        if deleted.get() {
+            return SCE_KERNEL_ERROR_ESRCH;
         }
-        if !pending.is_empty() {
-            return deliver_events(ctx, eq, events_ptr, out_count, &pending);
+        if let Some(result) = delivered.get() {
+            return result;
         }
-        if std::time::Instant::now() >= deadline || ctx.guest_threads.process_is_terminating() {
+        if outcome == WaitOutcome::Terminating {
+            return OK;
+        }
+        if outcome == WaitOutcome::TimedOut
+            && deadline.is_some_and(|dl| std::time::Instant::now() >= dl)
+        {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_micros(POLL_US));
+        // An internal 50 ms slice elapsed. A NULL-timeout wait loops forever;
+        // a finite wait loops until its actual deadline.
     }
 
     // Waited out the caller's interval with nothing pending: report zero.
@@ -336,7 +403,7 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
             tracing::warn!(
                 eq = format_args!("{eq:#x}"),
                 want = num,
-                waited_us = budget.as_micros(),
+                waited_us = timeout_us.unwrap_or(0),
                 registered_count = registered.len(),
                 registered = ?registered,
                 "TRACE_EQUEUE: wait timed out"
@@ -475,8 +542,9 @@ mod tests {
         assert_eq!(hle_get_event_filter(&ctx, &[0x200]), (-11i64) as u64);
         assert_eq!(hle_get_event_user_data(&ctx, &[0x200]), 0xABCD);
         // Edge-cleared: a second wait finds nothing pending → timeout.
+        assert!(mem.write(0x120, &1_000u32.to_le_bytes()));
         assert_eq!(
-            hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0]),
+            hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0, 0x120]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
     }
@@ -513,13 +581,95 @@ mod tests {
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let eq = create(&ctx);
         hle_add_user_event(&ctx, &[eq, 7]); // registered but not triggered
+        assert!(mem.write(0x120, &1_000u32.to_le_bytes()));
         assert_eq!(
-            hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0]),
+            hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0, 0x120]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
         let mut cnt = [0u8; 4];
         assert!(mem.read(0x1F0, &mut cnt));
         assert_eq!(u32::from_le_bytes(cnt), 0);
+    }
+
+    /// A NULL timeout is an indefinite wait, not a 50 ms timeout. Dragon
+    /// Ball's AGC workers use this exact shape; the old single-slice
+    /// implementation returned ETIMEDOUT and sent every worker into the
+    /// title's fatal-reporting path before its first submission.
+    #[test]
+    fn null_timeout_waits_past_internal_slice_until_event_arrives() {
+        let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+        let eq = create(&ctx);
+        assert_eq!(hle_add_user_event(&ctx, &[eq, 0x20]), OK);
+
+        let producer = std::thread::spawn({
+            let kernel = std::sync::Arc::clone(&kernel);
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let mem = crate::TestMemory::new(0x100);
+                let alloc = crate::TestAllocator::new(0);
+                let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+                assert_eq!(hle_trigger_user_event(&ctx, &[eq, 0x20, 0xCAFE]), OK);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            hle_wait(&ctx, &[eq, 0x200, 1, 0x1F0, 0]),
+            OK,
+            "NULL timeout must remain blocked until a producer signals"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(75),
+            "wait returned at the internal 50 ms slice instead of the 80 ms event"
+        );
+        producer.join().unwrap();
+        assert_eq!(hle_get_event_id(&ctx, &[0x200]), 0x20);
+        assert_eq!(hle_get_event_user_data(&ctx, &[0x200]), 0xCAFE);
+    }
+
+    #[test]
+    fn finite_timeout_longer_than_internal_slice_waits_for_event() {
+        let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+        let eq = create(&ctx);
+        assert_eq!(hle_add_user_event(&ctx, &[eq, 0x21]), OK);
+        assert!(mem.write(0x120, &200_000u32.to_le_bytes()));
+
+        let producer = std::thread::spawn({
+            let kernel = std::sync::Arc::clone(&kernel);
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let mem = crate::TestMemory::new(0x100);
+                let alloc = crate::TestAllocator::new(0);
+                let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+                assert_eq!(hle_trigger_user_event(&ctx, &[eq, 0x21, 0xBEEF]), OK);
+            }
+        });
+
+        assert_eq!(
+            hle_wait(&ctx, &[eq, 0x200, 1, 0x1F0, 0x120]),
+            OK,
+            "a finite guest deadline must not expire at an internal host slice"
+        );
+        producer.join().unwrap();
+        assert_eq!(hle_get_event_id(&ctx, &[0x200]), 0x21);
+        assert_eq!(hle_get_event_user_data(&ctx, &[0x200]), 0xBEEF);
+    }
+
+    #[test]
+    fn unreadable_timeout_pointer_is_efault_not_an_infinite_wait() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = create(&ctx);
+        assert_eq!(
+            hle_wait(&ctx, &[eq, 0x200, 1, 0x1F0, 0xFFFF]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ Generated only from Raeen's sanitized compatibility-result schema. A result is e
 
 | Title | Build | Stage | Wall | Peak RAM | Flips | Shader errors | First blocker |
 |---|---:|---|---:|---:|---:|---:|---|
-| ASTRO.BOT | `b9c2daf5501d` | TimedOut | 180.4s | 2670 MiB | 96 | 83 | 2026-07-27T07:02:44.511964Z ERROR ThreadId(62) kyty_graphics::shader::parse: unknown exp target: 0x09 at addr <ADDR> (en=0x0 done=1 compr=0 vm=1) (hash0 = <ADDR>, crc32 = <ADDR>) |
-| Minecraft | `b9c2daf5501d` | TimedOut | 180.4s | 1794 MiB | 13536 | 0 | none observed |
-| Until Dawn | `b9c2daf5501d` | Exited | 4.0s | 998 MiB | 0 | 0 | 2026-07-27T07:08:38.643154Z ERROR ThreadId(01) raeen_runtime::dispatch: guest fault at <ADDR> (execute <ADDR>) — 4096 HLE call(s) recorded before the fault; distilled leads follow at WARN, the full oldest-first ring once at DEBUG |
-| Subnautica Below Zero | `b9c2daf5501d` | TimedOut | 180.0s | 406 MiB | 0 | 0 | 2026-07-27T07:08:40.812277Z WARN ThreadId(05) raeen_hle::libkernel: sceKernelRaiseException: guest handler is registered but asynchronous delivery is not implemented; acknowledging target_thread=0x1 signum=30 handler=<ADDR> |
+| ASTRO.BOT | `472275f2ce37` | Crashed | 39.5s | 1685 MiB | 4 | 20 | 2026-07-28T07:07:00.393432Z ERROR ThreadId(62) kyty_graphics::shader::spirv: storage_texture_dim_format: not supported: mixed storage image dims/formats in one shader ((Three, "Rgba16f") vs (Two, Rgba16f)) |
+| Minecraft | `472275f2ce37` | TimedOut | 180.3s | 1358 MiB | 11232 | 0 | none observed |
+| Until Dawn | `472275f2ce37` | Exited | 5.7s | 579 MiB | 0 | 0 | 2026-07-28T07:10:35.136984Z ERROR ThreadId(01) raeen_hle::libc: __stack_chk_fail: guest stack canary smashed on thread 1 ('<unnamed>'), guest ra=<ADDR> — terminating the calling guest thread (exit code <ADDR>); the frame that called this is the one that overflowed |
+| Subnautica Below Zero | `472275f2ce37` | TimedOut | 180.1s | 411 MiB | 0 | 0 | 2026-07-28T07:10:38.278774Z WARN ThreadId(05) raeen_hle::libkernel: sceKernelRaiseException: guest handler is registered but asynchronous delivery is not implemented; acknowledging target_thread=0x1 signum=30 handler=<ADDR> |

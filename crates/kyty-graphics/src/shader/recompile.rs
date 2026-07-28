@@ -31,11 +31,12 @@ use std::sync::OnceLock;
 
 pub use super::spirv::ShaderRecompileError;
 use super::spirv::{
-    SampledClass, SampledDim, Spirv, SpirvType, SpirvValue, not_supported, operand_is_constant,
-    operand_is_exec, operand_is_variable, operand_load_float, operand_load_int, operand_load_uint,
-    operand_variable_to_str, operand_variable_to_str_shift, sampled_key_of, sampled_key_suffix,
-    sampled_keys_present, spirv_generate_source, spirv_get_embedded_ps, spirv_get_embedded_vs,
-    storage_texture_dim_format,
+    SampledClass, SampledDim, Spirv, SpirvType, SpirvValue, StorageFormat, not_supported,
+    operand_is_constant, operand_is_exec, operand_is_variable, operand_load_float,
+    operand_load_int, operand_load_uint, operand_variable_to_str, operand_variable_to_str_shift,
+    sampled_key_of, sampled_key_suffix, sampled_keys_present, spirv_generate_source,
+    spirv_get_embedded_ps, spirv_get_embedded_vs, storage_key_of, storage_key_suffix,
+    storage_keys_present,
 };
 use crate::shader::resources::{
     ShaderBindResources, ShaderComputeInputInfo, ShaderEmbeddedBufferFetch, ShaderPixelInputInfo,
@@ -2101,19 +2102,23 @@ fn recompile_skip(
     Ok(true)
 }
 
-/// Scalar wait-count instructions order prior vector/global-memory writes
-/// before later work. SPIR-V has no counter-specific equivalent, so use the
-/// conservative device-scope AcquireRelease barrier covering uniform,
-/// workgroup, cross-workgroup, and image memory (`semantics=0xB48`).
+/// Scalar wait-count instructions stall one guest wave until its own
+/// outstanding VMEM/LGKM/export operations reach the encoded counter. SPIR-V
+/// already carries each invocation's producer/consumer data dependencies; a
+/// cross-invocation memory barrier is not equivalent.
+///
+/// Kyty, KytyPS5, SharpEmu, and shadPS4 therefore all lower `s_waitcnt` to an
+/// IR/SPIR-V no-op. The former device-scope AcquireRelease barrier was much
+/// stronger than the guest instruction and multiplied into millions of
+/// device-wide barriers in ASTRO.BOT compute, reproducibly hanging the driver.
 fn recompile_s_waitcnt(
     _index: u32,
     _code: &ShaderCode,
-    dst_source: &mut String,
+    _dst_source: &mut String,
     _spirv: &Spirv<'_>,
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    *dst_source += "\n               OpMemoryBarrier %uint_1 %uint_0x00000b48\n";
     Ok(true)
 }
 
@@ -4178,6 +4183,72 @@ fn recompile_ds_add_u32(
     Ok(true)
 }
 
+/// Return-value twin of [`recompile_ds_add_u32`]:
+/// `vdst = atomic_add(lds[(addr + offset) >> 2], data)`.
+fn recompile_ds_add_rtn_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_DsAddRtnU32_VdstVsrc0Vsrc1Vsrc2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if !operand_is_variable(inst.dst)
+        || !operand_is_variable(inst.src[0])
+        || !operand_is_variable(inst.src[1])
+    {
+        return Err(not_supported(FUNC, "dst/addr/data are not variables"));
+    }
+    if !operand_is_constant(inst.src[2]) {
+        return Err(not_supported(FUNC, "offset is not a constant"));
+    }
+
+    let dst = operand_variable_to_str(inst.dst);
+    let addr = operand_variable_to_str(inst.src[0]);
+    let data = operand_variable_to_str(inst.src[1]);
+    if dst.type_ != SpirvType::Float
+        || addr.type_ != SpirvType::Float
+        || data.type_ != SpirvType::Float
+    {
+        return Err(not_supported(FUNC, "unexpected operand types"));
+    }
+    let offset = spirv.get_constant(inst.src[2]);
+    let clamp = spirv.get_constant_uint(spirv.lds_size_dw() - 1);
+
+    let i = format!("{index}");
+    let text = format!(
+        "
+        %ldsaar_e0_{i} = OpLoad %uint %exec_lo
+        %ldsaar_e1_{i} = OpINotEqual %bool %ldsaar_e0_{i} %uint_0
+               OpSelectionMerge %ldsaar_end_{i} None
+               OpBranchConditional %ldsaar_e1_{i} %ldsaar_body_{i} %ldsaar_end_{i}
+        %ldsaar_body_{i} = OpLabel
+        %ldsaar_a_{i} = OpLoad %float %{addr}
+        %ldsaar_au_{i} = OpBitcast %uint %ldsaar_a_{i}
+        %ldsaar_ao_{i} = OpIAdd %uint %ldsaar_au_{i} %{offset}
+        %ldsaar_ai_{i} = OpShiftRightLogical %uint %ldsaar_ao_{i} %uint_2
+        %ldsaar_ac_{i} = OpExtInst %uint %GLSL_std_450 UMin %ldsaar_ai_{i} %{clamp}
+        %ldsaar_p_{i} = OpAccessChain %_ptr_Workgroup_uint %lds %ldsaar_ac_{i}
+        %ldsaar_d_{i} = OpLoad %float %{data}
+        %ldsaar_du_{i} = OpBitcast %uint %ldsaar_d_{i}
+        %ldsaar_old_{i} = OpAtomicIAdd %uint %ldsaar_p_{i} %uint_2 %uint_0 %ldsaar_du_{i}
+        %ldsaar_of_{i} = OpBitcast %float %ldsaar_old_{i}
+               OpStore %{dst} %ldsaar_of_{i}
+               OpBranch %ldsaar_end_{i}
+        %ldsaar_end_{i} = OpLabel
+",
+        addr = addr.value,
+        data = data.value,
+        dst = dst.value,
+    );
+
+    *dst_source += &text;
+    Ok(true)
+}
+
 /// Beyond Kyty (`ds_wrxchg_rtn_b32` is `KYTY_NI` upstream): LDS atomic
 /// write-exchange returning the OLD value — `vdst = lds[a]; lds[a] = data`,
 /// via `OpAtomicExchange` on `%lds[(addr + offset) >> 2]` at Workgroup scope
@@ -5003,6 +5074,71 @@ fn route_sampled_ids(body: &mut String, suffix: &str) {
         .replace("%ImageS ", &format!("%ImageS{suffix} "));
 }
 
+/// The per-descriptor STORAGE-image route for a MIMG store body: the SPIR-V
+/// id suffix that points its `%textures2D_L`/`%ImageL`/pointer references at
+/// the array matching the RW T#'s own (Dim, storage format) key, plus that
+/// Dim (for texel-coordinate width) and format. In a homogeneous shader the
+/// suffix is empty and the key is the shader-wide one, so output is
+/// byte-identical to the single-array path. The exact storage analogue of
+/// [`sampled_site_route`] — first needed when ASTRO.BOT's ACB Phase B
+/// dispatches bound a 3D Rgba16f volume and 2D Rgba16f targets in one
+/// compute shader (the historical shader-global `%ImageL` refused it).
+fn storage_site_route(
+    spirv: &Spirv<'_>,
+    matched: Option<usize>,
+    func: &'static str,
+) -> Result<(&'static str, SampledDim, StorageFormat), ShaderRecompileError> {
+    let bind = spirv
+        .get_bind_info()
+        .expect("storage MIMG bodies check textures2d_storage_num > 0 first");
+    let present = storage_keys_present(bind);
+    if present.len() <= 1 {
+        // Homogeneous (or a fixture with no captured RW T# dwords): the
+        // single present key, defaulting to the legacy 2D-Rgba8 shape.
+        let (dim, format) = present
+            .first()
+            .copied()
+            .unwrap_or((SampledDim::Two, StorageFormat::Rgba8));
+        return Ok(("", dim, format));
+    }
+    // `mimg_descriptor_guard` runs before every route call and refuses an
+    // unmatched T#, so a mixed shader reaching here without a resolution is
+    // a defensive named refusal, not a reachable path.
+    let Some(i) = matched else {
+        return Err(not_supported(
+            func,
+            "mixed-key storage T# matches no captured storage descriptor",
+        ));
+    };
+    // Bounded: the guard produced `i` from an iterator over
+    // `desc[..tex_num]` with `tex_num` clamped to `desc.len()`.
+    let (dim, format) = storage_key_of(&bind.textures2d.desc[i].texture);
+    Ok((storage_key_suffix(dim, format), dim, format))
+}
+
+/// Rewrite the three storage-image identifiers in a freshly-built MIMG store
+/// body to the per-key suffixed names, routing the write to the array
+/// matching the RW T#'s (Dim, format) key in a mixed shader. `suffix == ""`
+/// (homogeneous) is a no-op.
+///
+/// Each identifier is always followed by a space in every store body
+/// template, so matching the trailing space keeps the
+/// `%_ptr_UniformConstant_ImageL` / `%ImageL` overlap safe: the pointer's
+/// "ImageL" is preceded by `_`, never `%`, so `%ImageL ` can never match
+/// inside `%_ptr_UniformConstant_ImageL `.
+fn route_storage_ids(body: &mut String, suffix: &str) {
+    if suffix.is_empty() {
+        return;
+    }
+    *body = body
+        .replace(
+            "%_ptr_UniformConstant_ImageL ",
+            &format!("%_ptr_UniformConstant_ImageL{suffix} "),
+        )
+        .replace("%textures2D_L ", &format!("%textures2D_L{suffix} "))
+        .replace("%ImageL ", &format!("%ImageL{suffix} "));
+}
+
 /// Retype a freshly-built MIMG body's texel result for an INTEGER-class
 /// sampled image: SPIR-V requires the sample/gather/fetch result to be a
 /// vec4 of the image's sampled type, so each `... %v4float` result line is
@@ -5086,7 +5222,7 @@ fn mimg_descriptor_guard(
         .unwrap_or(0)
         .min(bind.textures2d.desc.len());
     // `textures2d_without_sampler` is the recompiler-native storage/sampled
-    // discriminator (`sampled_keys_present` / `storage_texture_dim_format`
+    // discriminator (`sampled_keys_present` / `storage_keys_present`
     // split the two SPIR-V arrays on it). The resolution keeps WHICH
     // descriptor matched (its `desc` index): `sampled_site_route` routes the
     // MIMG body to that descriptor's own Dim array in a mixed-dim shader —
@@ -6546,6 +6682,21 @@ fn recompile_image_load_dmask3(
     image_load_channels(index, code, dst_source, spirv, FUNC, &[(46, 0), (50, 1)])
 }
 
+/// Beyond-Kyty: `image_load` with `dmask == 0xc` (ZW fetch), measured in
+/// ASTRO.BOT scene compute. Enabled channels are packed into consecutive
+/// destination VGPRs, so vdata receives texel.z followed by texel.w.
+fn recompile_image_load_dmask_c(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageLoad_Vdata2Vaddr3StDmaskC";
+    image_load_channels(index, code, dst_source, spirv, FUNC, &[(54, 2), (57, 3)])
+}
+
 /// The integer texel-coordinate construction (`%t73_<index>`) for a
 /// storage-image (UAV) write: `v2uint (x, y)` for a 2D UAV, `v3uint
 /// (x, y, z)` for a 3D one, and `v3uint (x, y, layer)` for a 2D array.
@@ -6562,7 +6713,10 @@ fn storage_image_coord_text(
     let bind_info = spirv
         .get_bind_info()
         .expect("callers check textures2d_storage_num > 0");
-    let (dim, _) = storage_texture_dim_format(bind_info)?;
+    // The coordinate width follows the RESOLVED descriptor's own Dim (a
+    // mixed shader writes 2D and 3D UAVs from one body shape), falling back
+    // to the shader-wide key for fixtures without captured RW T# dwords.
+    let (_, dim, _) = storage_site_route(spirv, matched, "storage_image_coord_text")?;
     let texture_type =
         matched.and_then(|i| bind_info.textures2d.desc.get(i).map(|d| d.texture.type_()));
     Ok(match (dim, texture_type) {
@@ -6648,11 +6802,17 @@ fn storage_descriptor_index_constant(
             format!("descriptor {matched} is sampled, not storage"),
         ));
     }
-    let class_index = bind.textures2d.desc[..matched]
+    // KEY-local, not class-local: each per-(Dim, format) SPIR-V array is
+    // packed tight (`storage_key_layout` sizes it to its own key's count),
+    // so the index counts only earlier storage descriptors of the SAME key.
+    // A homogeneous shader has one key, making this identical to the old
+    // storage-class-wide count.
+    let key = storage_key_of(&desc.texture);
+    let key_index = bind.textures2d.desc[..matched]
         .iter()
-        .filter(|d| d.textures2d_without_sampler)
+        .filter(|d| d.textures2d_without_sampler && storage_key_of(&d.texture) == key)
         .count() as u32;
-    Ok(spirv.get_constant_uint(class_index))
+    Ok(spirv.get_constant_uint(key_index))
 }
 
 /// Beyond-Kyty: `image_store` with `dmask == 0x1` (single channel), measured
@@ -6704,12 +6864,15 @@ fn recompile_image_store_dmask1(
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<storage_index>", &storage_index)
                 .replace("<dst_value0>", &dst_value0.value);
+            route_storage_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -6768,13 +6931,16 @@ fn recompile_image_store_dmask3(
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<storage_index>", &storage_index)
                 .replace("<dst_value0>", &dst_value0.value)
                 .replace("<dst_value1>", &dst_value1.value);
+            route_storage_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -6846,7 +7012,8 @@ fn recompile_image_store_dmask_f(
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let mut body = TEXT
                 .replace("<coord>", &coord)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
@@ -6856,6 +7023,8 @@ fn recompile_image_store_dmask_f(
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value)
                 .replace("<dst_value3>", &dst_value3.value);
+            route_storage_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -6936,7 +7105,8 @@ fn recompile_image_store_mip_dmask_f(
                OpImageWrite %t27_<index> %t172_<index> %t88_<index>
 "#;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            *dst_source += &TEXT
+            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let mut body = TEXT
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
@@ -6947,6 +7117,8 @@ fn recompile_image_store_mip_dmask_f(
                 .replace("<dst_value1>", &dst_value1.value)
                 .replace("<dst_value2>", &dst_value2.value)
                 .replace("<dst_value3>", &dst_value3.value);
+            route_storage_ids(&mut body, suffix);
+            *dst_source += &body;
 
             return Ok(true);
         }
@@ -7734,6 +7906,131 @@ fn recompile_v_add_co_ci_u32(
         .replace("<index>", &index_str);
 
     Ok(true)
+}
+
+/// RDNA2 compact VOP2 subtract-with-borrow family. The parser supplies VCC as
+/// both `src[2]` (borrow in) and `dst2` (borrow out). This follows SharpEmu's
+/// clean-room `EmitSubtractWithBorrow`: subtract in two steps and report a
+/// borrow when either step underflows.
+fn recompile_v_sub_borrow_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    reverse: bool,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VSubBorrowU32_VdstSdst2Vsrc0Vsrc1Smask2";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    if !operand_is_variable(inst.dst2) {
+        return Err(not_supported(FUNC, "dst2 (borrow-out) is not a variable"));
+    }
+    let borrow_out0 = operand_variable_to_str_shift(inst.dst2, 0);
+    let borrow_out1 = operand_variable_to_str_shift(inst.dst2, 1);
+    if borrow_out0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "borrow-out is not uint"));
+    }
+    if operand_is_exec(inst.dst2) {
+        return Err(not_supported(FUNC, "exec borrow-out"));
+    }
+
+    if !operand_is_variable(inst.src[2]) {
+        return Err(not_supported(FUNC, "borrow-in is not a variable"));
+    }
+    let borrow_in = operand_variable_to_str_shift(inst.src[2], 0);
+    if borrow_in.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "borrow-in is not uint"));
+    }
+
+    let (left, right) = if reverse {
+        (inst.src[1], inst.src[0])
+    } else {
+        (inst.src[0], inst.src[1])
+    };
+    let mut load_left = String::new();
+    let mut load_right = String::new();
+    if !operand_load_uint(spirv, left, "tleft_<index>", &index_str, &mut load_left, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(
+        spirv,
+        right,
+        "tright_<index>",
+        &index_str,
+        &mut load_right,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load_left>
+        <load_right>
+        %tbin_raw_<index> = OpLoad %uint %<borrowin>
+        %tbin_<index> = OpBitwiseAnd %uint %tbin_raw_<index> %uint_1
+        %tpartial_<index> = OpISub %uint %tleft_<index> %tright_<index>
+        %tresult_<index> = OpISub %uint %tpartial_<index> %tbin_<index>
+        %tb0_<index> = OpULessThan %bool %tleft_<index> %tright_<index>
+        %tb1_<index> = OpULessThan %bool %tpartial_<index> %tbin_<index>
+        %tborrow_<index> = OpLogicalOr %bool %tb0_<index> %tb1_<index>
+        %tborrow_u_<index> = OpSelect %uint %tborrow_<index> %uint_1 %uint_0
+               OpStore %<borrowout0> %tborrow_u_<index>
+               OpStore %<borrowout1> %uint_0
+        %tresult_f_<index> = OpBitcast %float %tresult_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tresult_f_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load_left>", &load_left)
+        .replace("<load_right>", &load_right)
+        .replace("<borrowin>", &borrow_in.value)
+        .replace("<borrowout0>", &borrow_out0.value)
+        .replace("<borrowout1>", &borrow_out1.value)
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+fn recompile_v_subb_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    recompile_v_sub_borrow_u32(index, code, dst_source, spirv, false)
+}
+
+fn recompile_v_subbrev_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    recompile_v_sub_borrow_u32(index, code, dst_source, spirv, true)
 }
 
 /// Beyond-Kyty: `v_mad_u64_u32` — widening multiply-accumulate
@@ -8617,6 +8914,91 @@ fn recompile_vcmp_xxx_u32(
         .replace("<param>", param[0].unwrap_or(""))
         .replace("<index>", &index_str);
 
+    Ok(true)
+}
+
+/// GFX10 `v_cmp_gt_u64`: compare the high dwords first, then the low dwords
+/// when the high halves are equal. SPIR-V Int64 is intentionally unnecessary
+/// here, keeping the generated module valid on devices without shaderInt64.
+fn recompile_vcmp_gt_u64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VCmpGtU64_SmaskVsrc02Vsrc12";
+    let inst = inst_at(code, index, FUNC)?;
+    if !operand_is_variable(inst.dst) || operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "non-scalar-mask destination"));
+    }
+
+    let dst_lo = operand_variable_to_str_shift(inst.dst, 0);
+    let dst_hi = operand_variable_to_str_shift(inst.dst, 1);
+    if dst_lo.type_ != SpirvType::Uint || dst_hi.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "destination is not a uint pair"));
+    }
+
+    let index_str = format!("{index}");
+    let mut lhs_lo = String::new();
+    let mut lhs_hi = String::new();
+    let mut rhs_lo = String::new();
+    let mut rhs_hi = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "u64_lhs_lo_<index>",
+        &index_str,
+        &mut lhs_lo,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "u64_lhs_hi_<index>",
+        &index_str,
+        &mut lhs_hi,
+        1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "u64_rhs_lo_<index>",
+        &index_str,
+        &mut rhs_lo,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "u64_rhs_hi_<index>",
+        &index_str,
+        &mut rhs_hi,
+        1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+          <lhs_lo>
+          <lhs_hi>
+          <rhs_lo>
+          <rhs_hi>
+          %u64_hi_gt_<index> = OpUGreaterThan %bool %u64_lhs_hi_<index> %u64_rhs_hi_<index>
+          %u64_hi_eq_<index> = OpIEqual %bool %u64_lhs_hi_<index> %u64_rhs_hi_<index>
+          %u64_lo_gt_<index> = OpUGreaterThan %bool %u64_lhs_lo_<index> %u64_rhs_lo_<index>
+          %u64_eq_and_lo_gt_<index> = OpLogicalAnd %bool %u64_hi_eq_<index> %u64_lo_gt_<index>
+          %u64_gt_<index> = OpLogicalOr %bool %u64_hi_gt_<index> %u64_eq_and_lo_gt_<index>
+          %u64_mask_<index> = OpSelect %uint %u64_gt_<index> %uint_1 %uint_0
+          OpStore %<dst_lo> %u64_mask_<index>
+          OpStore %<dst_hi> %uint_0
+"#;
+    *dst_source += &TEXT
+        .replace("<lhs_lo>", &lhs_lo)
+        .replace("<lhs_hi>", &lhs_hi)
+        .replace("<rhs_lo>", &rhs_lo)
+        .replace("<rhs_hi>", &rhs_hi)
+        .replace("<dst_lo>", &dst_lo.value)
+        .replace("<dst_hi>", &dst_hi.value)
+        .replace("<index>", &index_str);
     Ok(true)
 }
 
@@ -9624,6 +10006,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // Beyond Kyty: LDS write/read + the workgroup barrier gluing them
     // (ASTRO.BOT scene compute).
     f(recompile_ds_add_u32,   T::DsAddU32,   F::Vsrc0Vsrc1Vsrc2,    p1("")),
+    f(recompile_ds_add_rtn_u32, T::DsAddRtnU32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_ds_wrxchg_rtn_b32, T::DsWrxchgRtnB32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_ds_write_b32, T::DsWriteB32, F::Vsrc0Vsrc1Vsrc2,    p1("")),
     f(recompile_ds_read_b32,  T::DsReadB32,  F::SVdstSVsrc0SVsrc1,  p1("")),
@@ -9657,6 +10040,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_load_dmask_f,        T::ImageLoad,      F::Vdata4Vaddr3StDmaskF,   p1("")),
     f(recompile_image_load_dmask1,         T::ImageLoad,      F::Vdata1Vaddr3StDmask1,   p1("")),
     f(recompile_image_load_dmask3,         T::ImageLoad,      F::Vdata2Vaddr3StDmask3,   p1("")),
+    f(recompile_image_load_dmask_c,        T::ImageLoad,      F::Vdata2Vaddr3StDmaskC,   p1("")),
     f(recompile_image_load_dmask7,         T::ImageLoad,      F::Vdata3Vaddr3StDmask7,   p1("")),
     // Wired for the texture chain: Minecraft's content pixel shaders reach
     // ImageSample the moment their vertex partners translate. The nine
@@ -9791,6 +10175,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // RDNA2 v_add_co_ci_u32 (VOP2 0x28 + VOP3B 0x128): add with carry in/out.
     // Measured in ASTRO.BOT scene composite CS.
     f(recompile_v_add_co_ci_u32, T::VAddCoCiU32, F::VdstSdst2Vsrc0Vsrc1Smask2, p1("")),
+    f(recompile_v_subb_u32, T::VSubbU32, F::VdstSdst2Vsrc0Vsrc1Smask2, p1("")),
+    f(recompile_v_subbrev_u32, T::VSubbrevU32, F::VdstSdst2Vsrc0Vsrc1Smask2, p1("")),
     // RDNA2 v_mad_u64_u32 (VOP3B 0x176): u64 = u32*u32 + u64. Shares the
     // add-with-carry format key (distinct type). Measured in ASTRO.BOT scene
     // composite CS 0x555f4f500.
@@ -9926,6 +10312,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcmp_xxx_u32, T::VCmpFU32,   F::SmaskVsrc0Vsrc1, p1("OpIEqual %bool %uint_0 %uint_1 ; ")),
     f(recompile_vcmp_xxx_u32, T::VCmpGeU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThanEqual")),
     f(recompile_vcmp_xxx_u32, T::VCmpGtU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThan")),
+    f(recompile_vcmp_gt_u64,  T::VCmpGtU64,  F::SmaskVsrc0Vsrc1, p1("")),
     f(recompile_vcmp_xxx_u32, T::VCmpLeU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThanEqual")),
     f(recompile_vcmp_xxx_u32, T::VCmpLtU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThan")),
     f(recompile_vcmp_xxx_u32, T::VCmpTU32,   F::SmaskVsrc0Vsrc1, p1("OpIEqual %bool %uint_0 %uint_0 ; ")),
@@ -9950,6 +10337,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcmpx_xxx_i32, T::VCmpxNeU32,  F::SmaskVsrc0Vsrc1, p1("OpINotEqual")),
     f(recompile_vcmpx_xxx_u32, T::VCmpxGeU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThanEqual")),
     f(recompile_vcmpx_xxx_u32, T::VCmpxGtU32,  F::SmaskVsrc0Vsrc1, p1("OpUGreaterThan")),
+    f(recompile_vcmpx_xxx_u32, T::VCmpxLeU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThanEqual")),
     f(recompile_vcmpx_xxx_u32, T::VCmpxLtU32,  F::SmaskVsrc0Vsrc1, p1("OpULessThan")),
     // The `v_cmpx_*_i32` block: same lowering as its unsigned twins above, but
     // through `_i32` — that variant loads its operands with `operand_load_int`,
@@ -10374,7 +10762,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            334,
+            337,
             "the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),              the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
              FlatLoadDword/X2/X3/X4 + FlatStoreDword/X2/X4), and \
              204 Kyty rows plus the compute batch DsWrxchgRtnB32 and VCmpxNgeF32, and \
@@ -10403,11 +10791,12 @@ mod tests {
              and VMadU64U32, and the composite-frontier batch: the integer \
              min/max quartet (VMinU32/VMaxU32/VMinI32/VMaxI32), the four \
              BufferStoreDwordX2 rows, VBfeU32 wired from staged, and the \
-             ASTRO.BOT pixel ImageSample dmask2 + ImageSampleLzO dmask1/2 rows"
+             ASTRO.BOT pixel ImageSample dmask2 + ImageSampleLzO dmask1/2 rows, \
+             and the measured VCmpxLeU32 + DsAddRtnU32 rows"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 326,
+            implemented, 329,
             "the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
              VCmpxNgeF32, SVersion, the S_XXX_I32 \
@@ -10431,7 +10820,9 @@ mod tests {
               and the RDNA2 scene-composite batch: VXnorB32, VAddCoCiU32, \
               SAndn1SaveexecB64, VMadU64U32, and the composite-frontier batch: \
               the integer min/max quartet, four BufferStoreDwordX2 rows, \
-              VBfeU32, ImageSample dmask2, ImageSampleLzO dmask1/2, and the               exp-null row: EXP target 9 accepted and dropped)"
+              VBfeU32, ImageSample dmask2, ImageSampleLzO dmask1/2, VCmpxLeU32, \
+              DsAddRtnU32, \
+              and the exp-null row: EXP target 9 accepted and dropped)"
         );
         assert_eq!(
             ni, 8,
@@ -10760,6 +11151,156 @@ mod tests {
         assert!(source.contains("OpIEqual"), "the compare:\n{source}");
         let words = spirv_run(&source).expect("assemble v_cmp_eq_u32");
         naga_parse_and_validate(&words, "v_cmp_eq_u32");
+    }
+
+    /// ASTRO.BOT scene compute uses the VOP3 form of `v_cmp_gt_u64`. The
+    /// comparison must consume adjacent low/high dwords and must not require
+    /// the optional SPIR-V Int64 capability.
+    #[test]
+    fn astro_vop3_cmp_gt_u64_compares_high_then_low_dwords() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                0xD4E4_006A, // measured VOP3 opcode 0xe4, scalar pair s[106:107]
+                0x0002_0501, // v[1:2], v[2:3]
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse v_cmp_gt_u64");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VCmpGtU64);
+        assert_eq!(inst.src[0].size, 2);
+        assert_eq!(inst.src[1].size, 2);
+        assert_eq!(inst.dst.size, 2);
+
+        let entry = recomp_func(T::VCmpGtU64, F::SmaskVsrc0Vsrc1).expect("VCmpGtU64 row");
+        assert!(matches!(entry.func, RecompileFn::Func(_)));
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile v_cmp_gt_u64");
+        assert!(
+            source.contains("%u64_hi_gt_0 = OpUGreaterThan"),
+            "high compare:\n{source}"
+        );
+        assert!(
+            source.contains("%u64_hi_eq_0 = OpIEqual"),
+            "high equality:\n{source}"
+        );
+        assert!(
+            source.contains("%u64_lo_gt_0 = OpUGreaterThan"),
+            "low compare:\n{source}"
+        );
+        assert!(!source.contains("OpTypeInt 64"), "no Int64:\n{source}");
+        let words = spirv_run(&source).expect("assemble v_cmp_gt_u64");
+        naga_parse_and_validate(&words, "v_cmp_gt_u64");
+    }
+
+    /// GFX10 compact VOP2 opcode 0x2b is `v_fmac_f32`, not the legacy
+    /// `v_ldexp_f32`. This measured ASTRO.BOT word previously stopped four
+    /// compute shaders at their first fused accumulate.
+    #[test]
+    fn astro_vop2_fmac_f32_uses_existing_fused_accumulate_lowering() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                0x5626_26F4, // measured compact v_fmac_f32
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse v_fmac_f32");
+        assert_eq!(code.get_instructions()[0].type_, T::VMacF32);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile v_fmac_f32");
+        assert!(
+            source.contains("GLSL_std_450 Fma"),
+            "fused accumulate:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble v_fmac_f32");
+        naga_parse_and_validate(&words, "v_fmac_f32");
+    }
+
+    /// GFX10 compact VOP2 opcode 0x2a is reverse subtract-with-borrow. Four
+    /// ASTRO.BOT compute shaders previously stopped at the measured family,
+    /// whose raw words begin `0x5400....`.
+    #[test]
+    fn astro_vop2_subbrev_u32_reverses_operands_and_updates_vcc() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        let subbrev = (0x2au32 << 25) | (3 << 17) | (2 << 9) | 257;
+        shader_parse(
+            0,
+            &[subbrev, 0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse v_subbrev_u32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VSubbrevU32);
+        assert_eq!(inst.src[0].register_id, 1);
+        assert_eq!(inst.src[1].register_id, 2);
+        assert_eq!(inst.src[2].type_, ShaderOperandType::VccLo);
+        assert_eq!(inst.dst2.type_, ShaderOperandType::VccLo);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile v_subbrev_u32");
+        assert!(
+            source.contains("%ttleft_0 = OpLoad %float %v2"),
+            "reverse form must load vsrc1 as the left operand:\n{source}"
+        );
+        assert!(
+            source.contains("%ttright_0 = OpLoad %float %v1"),
+            "reverse form must load src0 as the right operand:\n{source}"
+        );
+        assert!(
+            source.contains("OpLogicalOr")
+                && source.contains("OpStore %vcc_lo")
+                && source.contains("OpStore %vcc_hi"),
+            "borrow-out must update VCC:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble v_subbrev_u32");
+        naga_parse_and_validate(&words, "v_subbrev_u32");
+
+        // Captured ASTRO.BOT VOP2-in-VOP3 form:
+        //   v_subbrev_u32 v0, 0, v26, s[4:5] -> borrow-out VCC
+        // Bits [14:11] read as op_sel=0xd unless opcode 0x12a is treated as
+        // VOP3B, which previously refused all four shaders at this word.
+        let mut captured = ShaderCode::new();
+        captured.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[0xD52A_6A00, 0x0012_3480, 0xBF80_0000, S_ENDPGM],
+            &mut captured,
+            true,
+        )
+        .expect("parse captured VOP3B v_subbrev_u32");
+        let inst = &captured.get_instructions()[0];
+        assert_eq!(inst.type_, T::VSubbrevU32);
+        assert_eq!(inst.dst2.type_, ShaderOperandType::VccLo);
+        assert_eq!(inst.src[2].register_id, 4);
+        let source = spirv_generate_source(&captured, None, Some(&input_info), None)
+            .expect("recompile captured VOP3B v_subbrev_u32");
+        let words = spirv_run(&source).expect("assemble captured VOP3B v_subbrev_u32");
+        naga_parse_and_validate(&words, "captured_vop3b_v_subbrev_u32");
     }
 
     /// The beyond-Kyty extended (EUD) `SLoadDwordx2` path, measured on
@@ -12348,7 +12889,7 @@ mod tests {
     }
 
     #[test]
-    fn v_cmpx_i32_block_is_wired_and_compares_signed() {
+    fn v_cmpx_integer_blocks_use_their_signedness() {
         // (type, expected SPIR-V op). Ordering ops MUST be signed: these share
         // one lowering with their unsigned twins, so the op is the only thing
         // separating them — swap it and the shader silently compares as the
@@ -12380,6 +12921,7 @@ mod tests {
             (T::VCmpxLtU32, "OpULessThan"),
             (T::VCmpxGeU32, "OpUGreaterThanEqual"),
             (T::VCmpxGtU32, "OpUGreaterThan"),
+            (T::VCmpxLeU32, "OpULessThanEqual"),
         ] {
             let entry = recomp_func(ty, F::SmaskVsrc0Vsrc1).unwrap_or_else(|| panic!("{ty:?} row"));
             assert_eq!(entry.param[0], Some(op), "{ty:?} must stay UNSIGNED");
@@ -12885,6 +13427,37 @@ mod tests {
         // false-negative class its dmask1/7/F siblings ship under; real
         // Vulkan accepts it. The real-driver gate is the --run-eboot render.
         let _ = spirv_run(&source).expect("assemble image_load dmask3");
+    }
+
+    #[test]
+    fn astro_image_load_dmask_c_fetches_z_then_w() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF000_0C00, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_load dmask0xc");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_load dmask0xc");
+        assert!(source.contains("OpImageFetch %v4float"), "{source}");
+        assert!(
+            source.contains("OpAccessChain %_ptr_Function_float %temp_v4float %uint_2"),
+            "first packed destination must receive Z:\n{source}"
+        );
+        assert!(
+            source.contains("OpAccessChain %_ptr_Function_float %temp_v4float %uint_3"),
+            "second packed destination must receive W:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble image_load dmask0xc");
     }
 
     /// image_load of a 3D texture must build a 3-component (x, y, z) integer
@@ -15236,6 +15809,45 @@ mod tests {
         naga_parse_and_validate(&words, "ds_add_u32");
     }
 
+    #[test]
+    fn astro_ds_add_rtn_u32_returns_the_old_lds_value() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0 (addr)
+                0x7E02_0280, // v_mov_b32 v1, 0 (data)
+                0xD880_0080, // ds_add_rtn_u32, offset 0x80
+                0x0200_0100, // vdst=v2, data0=v1, addr=v0
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ds_add_rtn_u32");
+        let inst = &code.get_instructions()[2];
+        assert_eq!(inst.type_, T::DsAddRtnU32);
+        assert_eq!(inst.format, F::VdstVsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.dst.register_id, 2);
+        assert_eq!(inst.src[2].constant.u, 0x80);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ds_add_rtn_u32");
+        assert!(
+            source.contains("OpAtomicIAdd %uint %ldsaar_p_2 %uint_2 %uint_0 %ldsaar_du_2"),
+            "LDS atomic add expected:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %v2 %ldsaar_of_2"),
+            "the pre-add value must be returned to vdst:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble ds_add_rtn_u32");
+        naga_parse_and_validate(&words, "ds_add_rtn_u32");
+    }
+
     /// ASTRO.BOT tiled-lighting compute (`ds_wrxchg_rtn_b32`, DS 0x2d, raw
     /// 0xd8b40510, byte offset 0x510): an LDS write-exchange that returns the
     /// old value — `vdst = lds[a]; lds[a] = data`. Lowers to an exec-guarded
@@ -15323,7 +15935,8 @@ mod tests {
     fn reloop_accepts_branch_to_s_waitcnt_vscnt_after_mubuf() {
         // Reduced live ASTRO.BOT sequence. MUBUF is 8 bytes (pc 0x4..0xc)
         // and s_waitcnt_vscnt at 0xc is the branch target. Recording the wait
-        // preserves that boundary and its memory ordering through SPIR-V.
+        // preserves that boundary; the wait itself is a SPIR-V no-op because
+        // it waits on the same wave's scoreboard, not cross-invocation memory.
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
         shader_parse(
@@ -15348,12 +15961,9 @@ mod tests {
             .expect("wait target is a real relooper boundary");
         assert!(source.contains("OpSwitch"), "relooper is active:\n{source}");
         assert!(
-            source.contains("OpMemoryBarrier %uint_1 %uint_0x00000b48"),
-            "vector-store wait must retain memory ordering:\n{source}"
+            !source.contains("OpMemoryBarrier"),
+            "waitcnt must not become a device-wide barrier:\n{source}"
         );
-        // Naga does not currently implement OpMemoryBarrier in function
-        // bodies; spirv-as still verifies that the emitted instruction is a
-        // well-formed SPIR-V module.
         let words = spirv_run(&source).expect("assemble branch-to-wait shader");
         spirv_val_ok(&words, "branch_to_waitcnt_vscnt_after_mubuf");
     }

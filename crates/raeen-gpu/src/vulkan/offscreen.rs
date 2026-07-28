@@ -206,7 +206,7 @@ impl StorageImageUpload {
     }
 }
 
-/// One descriptor binding containing an array of storage images.
+/// One or more descriptor bindings containing arrays of storage images.
 ///
 /// The recompiled SPIR-V declares `%textures2D_L` as
 /// `OpTypeImage %float <dim> 0 0 0 2 <format>` — a STORAGE_IMAGE array in
@@ -216,6 +216,14 @@ impl StorageImageUpload {
 pub struct StorageImageBinding {
     pub binding: u32,
     pub images: Vec<StorageImageUpload>,
+    /// Per-(Dim, format) storage-image descriptor groups for a MIXED shader
+    /// (measured: ASTRO.BOT compute writes a 3D Rgba16f volume next to 2D
+    /// Rgba16f targets). The recompiled SPIR-V declares one
+    /// `%textures2D_L<key>` array per present key, each at its own binding;
+    /// a group's `view_indices` select which `images` entries (in per-key
+    /// order) fill that array. Empty for a homogeneous shader, which binds
+    /// the whole `images` list as one array at `binding` (unchanged path).
+    pub groups: Vec<SampledGroup>,
 }
 
 /// A guest texture decoded to linear pixels, ready to upload as a sampled
@@ -1659,10 +1667,16 @@ fn record_and_read_flush(
         let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
         device
             .queue_submit(dev.queue(), &[submit], fence)
-            .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkQueueSubmit: {e}")))?;
+            .map_err(|e| {
+                dev.note_vk_error(e);
+                GpuError::VulkanInitFailed(format!("flush vkQueueSubmit: {e}"))
+            })?;
         device
             .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkWaitForFences: {e}")))?;
+            .map_err(|e| {
+                dev.note_vk_error(e);
+                GpuError::VulkanInitFailed(format!("flush vkWaitForFences: {e}"))
+            })?;
     }
     let fence_wait_us = fence_wait_at.elapsed().as_micros() as u64;
 
@@ -4659,13 +4673,18 @@ impl<'a> Resources<'a> {
             self.device()
                 .queue_submit(self.dev.queue(), &[submit], self.fence)
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkQueueSubmit failed: {e}")))?;
+        .map_err(|e| {
+            self.dev.note_vk_error(e);
+            GpuError::VulkanInitFailed(format!("vkQueueSubmit failed: {e}"))
+        })?;
 
         // Wait for the GPU. u64::MAX = no timeout; a hang here means a driver
         // fault, which surfaces as a hung test rather than silent bad pixels.
         // SAFETY: the fence was just submitted with and belongs to this device.
-        unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkWaitForFences failed: {e}")))?;
+        unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }.map_err(|e| {
+            self.dev.note_vk_error(e);
+            GpuError::VulkanInitFailed(format!("vkWaitForFences failed: {e}"))
+        })?;
         Ok(())
     }
 
@@ -5067,22 +5086,16 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
         .copied()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        // The pixel shader reads interpolants the vertex shader doesn't export.
-        // This is normal on GCN when a geometry/primitive (GS copy) shader
-        // supplies some params, or when the PS over-reads a param-cache slot:
-        // real hardware (and shadPS4, which has no such guard) simply feeds the
-        // fragment stage *undefined* values for the unmatched Location(s) rather
-        // than failing the draw. Refusing here dropped ALL of Astro Bot's scene
-        // geometry (measured 2026-07-22: es=0x500643f00 exports 1 param, the PS
-        // reads 2). Let the pipeline link and the driver supply undefined for the
-        // missing Location; the affected interpolant may render as garbage (a
-        // localized glitch) but the geometry draws. Validation layers (off by
-        // default) may warn — expected. Proper fix = source params from the GS
-        // copy shader; tracked separately.
-        tracing::debug!(
-            "graphics interface: fragment inputs {missing:?} have no matching \
-             vertex outputs — linking anyway (driver supplies undefined)"
-        );
+        // Vulkan does NOT permit the GCN behavior of feeding undefined values
+        // to unmatched fragment inputs. Letting this pair link produced
+        // VUID-RuntimeSpirv-OpEntryPoint-08743 and an AMD device loss on
+        // ASTRO.BOT. Until the GS-copy/primitive stage is translated and can
+        // supply these params, skip this draw by name rather than submitting
+        // invalid SPIR-V to the host.
+        return Err(GpuError::PipelineCreationFailed(format!(
+            "fragment input locations {missing:?} have no vertex-stage outputs \
+             (GS-copy/primitive-stage params are not translated)"
+        )));
     }
     Ok(())
 }
@@ -5322,18 +5335,16 @@ mod tests {
     }
 
     #[test]
-    fn graphics_interface_gate_allows_missing_vertex_output() {
-        // A pixel shader that reads an interpolant the vertex shader doesn't
-        // export (common when a GS/copy shader supplies params, or the PS
-        // over-reads a param-cache slot) must LINK anyway: real hardware and
-        // shadPS4 feed the fragment stage undefined for the unmatched Location
-        // rather than dropping the draw. Refusing here dropped all of Astro
-        // Bot's scene geometry (measured 2026-07-22).
+    fn graphics_interface_gate_rejects_missing_vertex_output() {
+        // Vulkan requires every fragment input Location to be supplied by the
+        // previous host stage. The guest may source it from a GS-copy stage,
+        // but linking the incomplete VS/FS pair is invalid and can device-loss.
         let vs = location_module(3, 0);
         let fs = location_module(1, 1);
         let state = DrawState::new(16, 16, &vs, &fs);
-        validate_graphics_interface(&state)
-            .expect("missing vertex output must link (driver supplies undefined)");
+        let error = validate_graphics_interface(&state).unwrap_err().to_string();
+        assert!(error.contains("locations [1]"), "{error}");
+        assert!(error.contains("GS-copy"), "{error}");
     }
 
     #[test]

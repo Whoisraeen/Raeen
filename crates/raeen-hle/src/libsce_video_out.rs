@@ -237,14 +237,22 @@ fn add_video_out_event(ctx: &HleContext, args: &[u64], ident: u64, kind: &str) -
 /// `data >> 16`).
 fn trigger_vblank_events(ctx: &HleContext, count: u64) {
     let event_hint = VIDEO_OUT_EVENT_VBLANK_ID | ((count & 0x0000_ffff_ffff_ffff) << 16);
+    let mut queues = Vec::new();
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
         if event.key().1 == VIDEO_OUT_EVENT_VBLANK_ID
             && event.filter == KERNEL_EVENT_FILTER_VIDEO_OUT
         {
+            let eq = event.key().0;
             event.triggered = true;
             event.fflags = event.fflags.saturating_add(1);
             event.data = event_hint as i64;
+            if !queues.contains(&eq) {
+                queues.push(eq);
+            }
         }
+    }
+    for eq in queues {
+        crate::kernel_equeue::wake_equeue(ctx, eq, raeen_core::subsystems::WakeReason::Signal);
     }
 }
 
@@ -291,13 +299,25 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
         ctx.gpu.present_scanout(buffer.address, Some(descriptor));
     }
     let event_hint = VIDEO_OUT_EVENT_FLIP_ID | ((flip_arg as u64 & 0x0000_ffff_ffff_ffff) << 16);
+    let mut flip_queues = Vec::new();
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
         if event.key().1 == VIDEO_OUT_EVENT_FLIP_ID && event.filter == KERNEL_EVENT_FILTER_VIDEO_OUT
         {
+            let eq = event.key().0;
             event.triggered = true;
             event.fflags = event.fflags.saturating_add(1);
             event.data = event_hint as i64;
+            if !flip_queues.contains(&eq) {
+                flip_queues.push(eq);
+            }
         }
+    }
+    for eq in flip_queues {
+        crate::kernel_equeue::wake_equeue(
+            ctx,
+            eq,
+            raeen_core::subsystems::WakeReason::SubmissionComplete,
+        );
     }
     // A completed flip implies a display refresh: advance the vblank sequence
     // and wake any vblank-parked frame loop (Raeen has no host vblank timer

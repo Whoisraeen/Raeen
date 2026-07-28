@@ -16,7 +16,7 @@ use parking_lot::{Mutex, MutexGuard};
 use raeen_core::error::GpuError;
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 /// Count of validation-layer messages at ERROR severity, since process start.
@@ -66,6 +66,10 @@ pub struct VulkanDevice {
     /// Number of fresh pipelines compiled in this process. Used to checkpoint
     /// the driver blob during long-running/force-terminated title sessions.
     pipeline_cache_generation: AtomicU64,
+    /// Sticky logical-device loss. Once Vulkan reports DEVICE_LOST, no handle
+    /// from that device is legal to reset or resubmit; callers fail soft
+    /// before producing a validation cascade or retaining more host memory.
+    device_lost: AtomicBool,
     /// Application-side caches of long-lived draw/dispatch resources
     /// (pipelines, layouts, shader modules, persistent render targets,
     /// command buffer/fence, descriptor pool). See [`super::cache`] for the
@@ -95,6 +99,9 @@ pub struct VulkanDevice {
     /// exactly when the physical device supports it). Without it every MRT
     /// attachment must share the primary's blend/write-mask state.
     independent_blend: bool,
+    /// Whether Vulkan 1.2 `samplerMirrorClampToEdge` was enabled. Guest
+    /// mirror-once modes must use a defined fallback when this is false.
+    sampler_mirror_clamp_to_edge: bool,
     /// Whether the validation layer was actually enabled.
     validation_enabled: bool,
     /// `VK_EXT_external_memory_host` support: the required host-pointer
@@ -109,12 +116,13 @@ pub struct VulkanDevice {
 
 /// Result of physical-device selection: `(physical_device, device,
 /// graphics_queue_family, name, depth_range_unrestricted,
-/// imported_host_pointer_alignment)`.
+/// sampler_mirror_clamp_to_edge, imported_host_pointer_alignment)`.
 type PickedDevice = (
     vk::PhysicalDevice,
     Device,
     u32,
     String,
+    bool,
     bool,
     Option<vk::DeviceSize>,
 );
@@ -162,6 +170,7 @@ impl VulkanDevice {
             queue_family_index,
             device_name,
             depth_range_unrestricted,
+            sampler_mirror_clamp_to_edge,
             imported_host_pointer_alignment,
         ) = match result {
             Ok(v) => v,
@@ -300,6 +309,7 @@ impl VulkanDevice {
             pipeline_cache,
             pipeline_cache_path,
             pipeline_cache_generation: AtomicU64::new(0),
+            device_lost: AtomicBool::new(false),
             caches: Mutex::new(DrawCaches::default()),
             allocator: Mutex::new(allocator),
             memory_properties,
@@ -307,6 +317,7 @@ impl VulkanDevice {
             device_name,
             depth_range_unrestricted,
             independent_blend,
+            sampler_mirror_clamp_to_edge,
             imported_host_pointer_alignment,
             max_push_constants_size,
             validation_enabled,
@@ -318,6 +329,13 @@ impl VulkanDevice {
     #[must_use]
     pub fn supports_independent_blend(&self) -> bool {
         self.independent_blend
+    }
+
+    /// Whether guest mirror-once sampler modes can use Vulkan's exact
+    /// `MIRROR_CLAMP_TO_EDGE` representation.
+    #[must_use]
+    pub(crate) fn supports_sampler_mirror_clamp_to_edge(&self) -> bool {
+        self.sampler_mirror_clamp_to_edge
     }
 
     /// `VkPhysicalDeviceLimits::maxPushConstantsSize` for the selected
@@ -404,6 +422,25 @@ impl VulkanDevice {
     /// Whether the Khronos validation layer is actually active.
     pub fn validation_enabled(&self) -> bool {
         self.validation_enabled
+    }
+
+    /// Record a Vulkan result that may have poisoned every device handle.
+    pub(crate) fn note_vk_error(&self, error: vk::Result) {
+        if error == vk::Result::ERROR_DEVICE_LOST {
+            self.device_lost.store(true, Ordering::Release);
+        }
+    }
+
+    /// Refuse more submissions after logical-device loss. Continuing to reset
+    /// its fence/command buffer is invalid Vulkan and can turn one bad guest
+    /// shader into an unbounded host-memory failure.
+    pub(crate) fn ensure_device_usable(&self) -> Result<(), GpuError> {
+        if self.device_lost.load(Ordering::Acquire) {
+            return Err(GpuError::VulkanInitFailed(
+                "logical device is lost; GPU work is disabled for this title session".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// The selected physical device.
@@ -708,13 +745,22 @@ impl VulkanDevice {
         // later draw in the session).
         // SAFETY: `physical_device` is a live handle from this instance and
         // the query structs are local; the calls only write into them.
-        let (supported, robust_image_access, r2_buffer, r2_image, r2_null) = unsafe {
+        let (
+            supported,
+            sampler_mirror_clamp_to_edge,
+            robust_image_access,
+            r2_buffer,
+            r2_image,
+            r2_null,
+        ) = unsafe {
+            let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut supported13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut supported_r2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
             let feats;
             {
-                let mut supported2 =
-                    vk::PhysicalDeviceFeatures2::default().push_next(&mut supported13);
+                let mut supported2 = vk::PhysicalDeviceFeatures2::default()
+                    .push_next(&mut supported12)
+                    .push_next(&mut supported13);
                 if robustness2 {
                     supported2 = supported2.push_next(&mut supported_r2);
                 }
@@ -723,6 +769,7 @@ impl VulkanDevice {
             }
             (
                 feats,
+                supported12.sampler_mirror_clamp_to_edge == vk::TRUE,
                 supported13.robust_image_access == vk::TRUE,
                 supported_r2.robust_buffer_access2 == vk::TRUE,
                 supported_r2.robust_image_access2 == vk::TRUE,
@@ -732,6 +779,8 @@ impl VulkanDevice {
         // Vulkan 1.3 core features — dynamicRendering is the whole point of
         // targeting 1.3 (no render-pass/framebuffer objects); robustImageAccess
         // is the image half of the RDNA out-of-bounds contract above.
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge);
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .robust_image_access(robust_image_access);
@@ -758,6 +807,7 @@ impl VulkanDevice {
             .queue_create_infos(&queue_infos)
             .enabled_features(&features)
             .enabled_extension_names(&extension_names)
+            .push_next(&mut features12)
             .push_next(&mut features13);
         if robustness2 {
             create_info = create_info.push_next(&mut robustness2_features);
@@ -793,6 +843,7 @@ impl VulkanDevice {
             queue_family_index,
             device_name,
             depth_range_unrestricted,
+            sampler_mirror_clamp_to_edge,
             imported_host_pointer_alignment,
         ))
     }

@@ -7,6 +7,7 @@
 use std::sync::OnceLock;
 
 pub(crate) struct GpuEnv {
+    pub allow_known_device_loss_cs: bool,
     pub dump_all_targets: bool,
     pub dump_draw_state: Option<String>,
     pub dump_draw_target: Option<String>,
@@ -37,6 +38,7 @@ impl GpuEnv {
     fn capture() -> Self {
         let on = |name| std::env::var_os(name).is_some();
         Self {
+            allow_known_device_loss_cs: on("RAEEN_ALLOW_KNOWN_DEVICE_LOSS_CS"),
             dump_all_targets: on("RAEEN_DUMP_ALL_TARGETS"),
             dump_draw_state: std::env::var("RAEEN_DUMP_DRAW_STATE").ok(),
             dump_draw_target: std::env::var("RAEEN_DUMP_DRAW_TARGET").ok(),

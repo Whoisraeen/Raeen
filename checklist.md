@@ -151,9 +151,17 @@ top-down, update statuses in place, and keep it committed.**
   properly reported with an actionable signature (`ad605ab2…`) instead of a
   silent UD2 walk. Follow-up folded into the canary hunt (item 22 / GTA V
   shares the same failure family).
-- [ ] Dragon Ball: worker threads deref a count (rax=2 → 0x20) as a list
-  pointer at module+0x241c820 after WaitEqueue timeouts — needs fault-region
-  disassembly follow-through (started, see ledger 2026-07-25/26 ITEM 2).
+- [x] Dragon Ball fixed and live A/B verified (2026-07-28): clean-room local
+  disassembly proved module+0x241c820 is the title's downstream frame-pointer
+  backtrace collector, not the source bug. Raeen was fabricating
+  `ETIMEDOUT` after 50 ms for a NULL-timeout `sceKernelWaitEqueue`, sending
+  AGC workers into that fatal path. NULL waits now remain indefinite through
+  bounded host slices; finite waits keep their real deadline, bad timeout
+  pointers return `EFAULT`, and user/VideoOut/APR/AGC producers wake the
+  shared wait service. The exact previously crashing image ran 20 s past its
+  ~7 s failure window with 0 guest faults, 0 equeue timeouts, and 4 AGC
+  submission markers. `raeen-hle`: 525/525 tests and clippy all-targets
+  `-D warnings` green.
 - **Where:** `crates/raeen-hle/` (stack_chk, getdents/fstat),
   `crates/raeen-kernel/` VFS, ledger ITEM 2 notes.
 
@@ -162,8 +170,11 @@ top-down, update statuses in place, and keep it committed.**
   (default OFF, bit-identical): `raeen_gpu::gpu_clock` is the one authority;
   HLE `next_gpu_timestamp` delegates under the gate, the worker CP gets an
   injectable `set_timestamp_source` that declines when the gate is off.
-- [ ] Step 3 (live A/B): flip `RAEEN_UNIFIED_GPU_CLOCK=1` on a live title —
-  ASTRO timestamp-fence regression territory; stays with the main session.
+- [x] Step 3 (live A/B, 2026-07-28): on ASTRO.BOT, unified clock alone
+  matched the default path at the current blocker (4 flips, 20 shader errors,
+  17 GPU errors, same mixed 3D/2D Rgba16f storage-image crash at 28.1 s vs
+  29.8 s baseline). It did not reintroduce the timestamp-fence park, but
+  raised peak RAM from 2.55 to 3.14 GiB, so the gate remains default-OFF.
 - [x] Step 4: events/EOP execute in-stream under
   `RAEEN_DEFER_GPU_SIDE_EFFECTS` (CP `SideEffect` records →
   `raeen_gpu::ordered_side_effects` queue → HLE drains at submit /
@@ -172,8 +183,14 @@ top-down, update statuses in place, and keep it committed.**
 - [x] Step 5: flip-pending ordered the same way; CP test pins that a flip
   behind an unmet wait is not recorded (so never delivered) until the wait
   genuinely passes; VideoOut status reads drain worker flips.
-- [ ] Live A/B of `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` (Minecraft + ASTRO) before
-  making either gate the default — main session.
+- [x] Live A/B of `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` on Minecraft + ASTRO
+  (2026-07-28). Minecraft reached a correctly rendered menu at 32 FPS but
+  booted slower in the earlier contention-heavy run (~85 s vs ~50 s).
+  ASTRO improved from a mixed-image host crash at 4 flips/~30 s to a clean
+  bounded timeout at 36 flips/60 s. Enabling both gates also reached 36 flips
+  but caused 94 shader-error retries vs 18 with deferred-only. These are
+  measured A/B results, not a default-on acceptance: both gates stay OFF
+  pending the mixed-storage fix and a quiet Minecraft performance re-run.
 - **Context:** Steps 0–2 landed (gate + fail-open + IT_DMA_DATA in-stream,
   `cp_op_it_dma_data` in kyty-graphics run.rs). Design notes in ledger
   2026-07-25/26 ITEM 4; steps 3–5 implementation in ledger 2026-07-27.

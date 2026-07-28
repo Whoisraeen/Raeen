@@ -40,6 +40,7 @@ const fn is_vcmpx_instruction(type_: T) -> bool {
             | T::VCmpxGeI32
             | T::VCmpxLtU32
             | T::VCmpxEqU32
+            | T::VCmpxLeU32
             | T::VCmpxGtU32
             | T::VCmpxNeU32
             | T::VCmpxGeU32
@@ -1268,8 +1269,8 @@ fn shader_parse_vopc(
         // the same lowering and the title decides one opcode at a time.
         0x91 => inst.type_ = T::VCmpxLtI32,
         0x92 => inst.type_ = T::VCmpxEqI32,
-        // 0x93 has no unsigned twin (there is no 0xd3), so it is easy to miss
-        // when mirroring that block — Minecraft emits it.
+        // Minecraft emits the signed <= twin; ASTRO.BOT later proved the
+        // corresponding unsigned 0xd3 form is live as well.
         0x93 => inst.type_ = T::VCmpxLeI32,
         0x94 => inst.type_ = T::VCmpxGtI32,
         0x95 => inst.type_ = T::VCmpxNeI32,
@@ -1282,8 +1283,14 @@ fn shader_parse_vopc(
         0xc5 => inst.type_ = T::VCmpNeU32,
         0xc6 => inst.type_ = T::VCmpGeU32,
         0xc7 => inst.type_ = T::VCmpTU32,
+        0xe4 => {
+            inst.type_ = T::VCmpGtU64;
+            inst.src[0].size = 2;
+            inst.src[1].size = 2;
+        }
         0xd1 => inst.type_ = T::VCmpxLtU32,
         0xd2 => inst.type_ = T::VCmpxEqU32,
+        0xd3 => inst.type_ = T::VCmpxLeU32,
         0xd4 => inst.type_ = T::VCmpxGtU32,
         0xd5 => inst.type_ = T::VCmpxNeU32,
         0xd6 => inst.type_ = T::VCmpxGeU32,
@@ -1772,21 +1779,41 @@ fn shader_parse_vop2(
         }
         0x29 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                inst.type_ = T::VSubbU32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+                inst.src_num = 3;
+                inst.dst2.type_ = O::VccLo;
+                inst.dst2.size = 2;
+                inst.src[2].type_ = O::VccLo;
+                inst.src[2].size = 2;
+            } else {
+                return Err(ni(dst, S, "v_subb_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_subb_u32", opcode, pc, b0));
         }
         0x2a => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                inst.type_ = T::VSubbrevU32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+                inst.src_num = 3;
+                inst.dst2.type_ = O::VccLo;
+                inst.dst2.size = 2;
+                inst.src[2].type_ = O::VccLo;
+                inst.src[2].size = 2;
+            } else {
+                return Err(ni(dst, S, "v_subbrev_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_subbrev_u32", opcode, pc, b0));
         }
         0x2b => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // GFX10 moves the fused multiply-accumulate encoding here
+                // (`v_fmac_f32`; SharpEmu and KytyPS5 both route it through
+                // the VMacF32 lowering). ASTRO.BOT scene compute emits this
+                // exact compact VOP2 form.
+                inst.type_ = T::VMacF32;
             }
-            return Err(ni(dst, S, "v_ldexp_f32", opcode, pc, b0));
+            if !next_gen {
+                return Err(ni(dst, S, "v_ldexp_f32", opcode, pc, b0));
+            }
         }
         0x2c => {
             if next_gen {
@@ -1840,15 +1867,16 @@ fn shader_parse_vop2(
 /// RDNA2 VOP3B opcodes: VOP3 ops that carry a scalar carry/borrow/mask
 /// destination (`sdst`, bits [14:8]) instead of the VOP3A `op_sel`/`abs` fields.
 /// SharpEmu Gen5 keeps the identical set (`IsVop3BOpcode`,
-/// Gen5ShaderTranslator.cs L1163-1164): 0x128 `v_add_co_ci_u32`, 0x16d/0x16e
-/// `v_div_scale_f32/f64`, 0x176/0x177 `v_mad_u64_u32`/`v_mad_i64_i32`, 0x30f
-/// `v_add_co_u32`, 0x310 `v_sub_co_u32`, 0x319 `v_subrev_co_u32`. Only 0x128 is
-/// implemented so far; the rest are named refusals but must still be recognised
-/// here so their sdst is not misread as op_sel.
+/// Gen5ShaderTranslator.cs L1163-1164) covers 0x128 `v_add_co_ci_u32`, 0x16d/
+/// 0x16e `v_div_scale_f32/f64`, 0x176/0x177 `v_mad_u64_u32`/
+/// `v_mad_i64_i32`, 0x30f `v_add_co_u32`, 0x310 `v_sub_co_u32`, and 0x319
+/// `v_subrev_co_u32`. Captured ASTRO.BOT GFX10 words additionally prove that
+/// the VOP2-in-VOP3 forms 0x129/0x12a carry `sdst` in the same overlapping
+/// field (`d52a6a00 00123480`: sdst=VCC_LO encoding 106, not op_sel=0xd).
 const fn is_vop3b_opcode(opcode: u32) -> bool {
     matches!(
         opcode,
-        0x128 | 0x16d | 0x16e | 0x176 | 0x177 | 0x30f | 0x310 | 0x319
+        0x128 | 0x129 | 0x12a | 0x16d | 0x16e | 0x176 | 0x177 | 0x30f | 0x310 | 0x319
     )
 }
 
@@ -2015,8 +2043,8 @@ fn shader_parse_vop3(
         // the same lowering and the title decides one opcode at a time.
         0x91 => inst.type_ = T::VCmpxLtI32,
         0x92 => inst.type_ = T::VCmpxEqI32,
-        // 0x93 has no unsigned twin (there is no 0xd3), so it is easy to miss
-        // when mirroring that block — Minecraft emits it.
+        // Minecraft emits the signed <= twin; ASTRO.BOT later proved the
+        // corresponding unsigned 0xd3 form is live as well.
         0x93 => inst.type_ = T::VCmpxLeI32,
         0x94 => inst.type_ = T::VCmpxGtI32,
         0x95 => inst.type_ = T::VCmpxNeI32,
@@ -2029,8 +2057,14 @@ fn shader_parse_vop3(
         0xc5 => inst.type_ = T::VCmpNeU32,
         0xc6 => inst.type_ = T::VCmpGeU32,
         0xc7 => inst.type_ = T::VCmpTU32,
+        0xe4 => {
+            inst.type_ = T::VCmpGtU64;
+            inst.src[0].size = 2;
+            inst.src[1].size = 2;
+        }
         0xd1 => inst.type_ = T::VCmpxLtU32,
         0xd2 => inst.type_ = T::VCmpxEqU32,
+        0xd3 => inst.type_ = T::VCmpxLeU32,
         0xd4 => inst.type_ = T::VCmpxGtU32,
         0xd5 => inst.type_ = T::VCmpxNeU32,
         0xd6 => inst.type_ = T::VCmpxGeU32,
@@ -2155,15 +2189,27 @@ fn shader_parse_vop3(
         }
         0x129 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                inst.type_ = T::VSubbU32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+                inst.src_num = 3;
+                inst.src[2].size = 2;
+                inst.dst2 = operand_parse(sdst)?;
+                inst.dst2.size = 2;
+            } else {
+                return Err(ni(dst, S, "v_subb_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_subb_u32", opcode, pc, b0));
         }
         0x12a => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                inst.type_ = T::VSubbrevU32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1Smask2;
+                inst.src_num = 3;
+                inst.src[2].size = 2;
+                inst.dst2 = operand_parse(sdst)?;
+                inst.dst2.size = 2;
+            } else {
+                return Err(ni(dst, S, "v_subbrev_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_subbrev_u32", opcode, pc, b0));
         }
         0x12b => {
             if next_gen {
@@ -3470,7 +3516,20 @@ fn shader_parse_ds(
         0x1d => return Err(ni(dst, S, "ds_gws_barrier", opcode, pc, b0)),
         0x1e => return Err(ni(dst, S, "ds_write_b8", opcode, pc, b0)),
         0x1f => return Err(ni(dst, S, "ds_write_b16", opcode, pc, b0)),
-        0x20 => return Err(ni(dst, S, "ds_add_rtn_u32", opcode, pc, b0)),
+        // Return-value twin of ds_add_u32: same address, data, and byte
+        // offset, plus vdst receiving the pre-add value.
+        0x20 => {
+            if gds != 0 {
+                return Err(feature(S, "ds_add_rtn_u32 with gds == 1", pc));
+            }
+            inst.type_ = T::DsAddRtnU32;
+            inst.format = F::VdstVsrc0Vsrc1Vsrc2;
+            inst.src[0] = operand_parse(addr + 256)?;
+            inst.src[1] = operand_parse(data0 + 256)?;
+            inst.src[2].type_ = O::LiteralConstant;
+            inst.src[2].constant.u = offset0 | (offset1 << 8);
+            inst.src_num = 3;
+        }
         0x21 => return Err(ni(dst, S, "ds_sub_rtn_u32", opcode, pc, b0)),
         0x22 => return Err(ni(dst, S, "ds_rsub_rtn_u32", opcode, pc, b0)),
         0x23 => return Err(ni(dst, S, "ds_inc_rtn_u32", opcode, pc, b0)),
@@ -3857,6 +3916,12 @@ fn shader_parse_mimg(
                 0x7 => {
                     inst.format = F::Vdata3Vaddr3StDmask7;
                     inst.dst.size = 3;
+                }
+                // Beyond Kyty: ZW two-channel fetch. Measured on ASTRO.BOT
+                // scene compute (four distinct shaders at pc 0x574/0x580).
+                0xc => {
+                    inst.format = F::Vdata2Vaddr3StDmaskC;
+                    inst.dst.size = 2;
                 }
                 0xf => {
                     inst.format = F::Vdata4Vaddr3StDmaskF;
@@ -4949,6 +5014,20 @@ mod tests {
         assert_eq!(inst.type_, T::VCmpEqF32);
         assert_eq!(inst.format, F::SmaskVsrc0Vsrc1);
         assert_eq!((inst.dst.type_, inst.dst.size), (O::VccLo, 2));
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 0));
+        assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Vgpr, 1));
+    }
+
+    #[test]
+    fn astro_v_cmpx_le_u32_decodes_to_exec() {
+        // Compact next-gen VOPC 0xd3: v_cmpx_le_u32 v0, v1. Unlike legacy
+        // compare encodings, GFX10 writes EXEC rather than VCC.
+        let (code, result) = parse(&[0x7DA6_0300, S_ENDPGM], ShaderType::Compute, true);
+        assert_eq!(result.unwrap(), 2);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VCmpxLeU32);
+        assert_eq!(inst.format, F::SmaskVsrc0Vsrc1);
+        assert_eq!((inst.dst.type_, inst.dst.size), (O::ExecLo, 2));
         assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 0));
         assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Vgpr, 1));
     }
@@ -6108,6 +6187,21 @@ mod tests {
         assert_eq!(inst.type_, T::ImageLoad);
         assert_eq!(inst.format, F::Vdata3Vaddr3StDmask7);
         assert_eq!(inst.dst.size, 3);
+    }
+
+    #[test]
+    fn astro_mimg_image_load_dmask_c_decodes_zw_pair() {
+        let (code, result) = parse(
+            &[0xF000_0C00, 0x0061_0800, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("image_load dmask 0xc");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageLoad);
+        assert_eq!(inst.format, F::Vdata2Vaddr3StDmaskC);
+        assert_eq!(inst.dst.size, 2);
+        assert_eq!(inst.src_num, 2);
     }
 
     #[test]

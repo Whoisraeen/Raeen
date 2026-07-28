@@ -997,6 +997,11 @@ fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
                         },
                     );
                 }
+                crate::kernel_equeue::wake_equeue(
+                    ctx,
+                    equeue,
+                    raeen_core::subsystems::WakeReason::SubmissionComplete,
+                );
                 offset += 0x30;
             }
             APR_RECORD_WRITE_ADDRESS => {

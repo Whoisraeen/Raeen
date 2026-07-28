@@ -1497,16 +1497,17 @@ pub fn shader_calc_binding_indices(bind: &mut ShaderBindResources) {
         // Sampled textures take one Vulkan binding PER PRESENT (Dim, numeric
         // class) key (a mixed shader declares one `%textures2D_S<key>` array
         // each — one SPIR-V array type carries exactly one image Dim and one
-        // sampled component type). The storage array follows all of them. A
-        // homogeneous shader has one present key, so this reserves the same
-        // two bindings as before (sampled, storage); a storage-only shader
-        // reserves one placeholder sampled binding to keep the storage index
-        // where it has always been.
+        // sampled component type). The storage arrays follow all of them,
+        // likewise one binding PER PRESENT storage (Dim, format) key
+        // (`%textures2D_L<key>`). A homogeneous shader has one present key
+        // per class, so this reserves the same two bindings as before
+        // (sampled, storage); a storage-only shader reserves one placeholder
+        // sampled binding to keep the storage index where it has always been.
         bind.textures2d.binding_sampled_index = binding_index;
         let sampled_bindings = super::spirv::sampled_keys_present(bind).len().max(1) as i32;
         binding_index += sampled_bindings;
         bind.textures2d.binding_storage_index = binding_index;
-        binding_index += 1;
+        binding_index += super::spirv::storage_keys_present(bind).len().max(1) as i32;
 
         bind.push_constant_size += bind.textures2d.textures_num as u32 * 32;
     }
@@ -1769,10 +1770,11 @@ pub fn shader_synthesize_placeholder_sampled_texture(
 /// Fields for a PLACEHOLDER storage (UAV) T#: a 1x1 dummy at guest base 0.
 ///
 /// When a captured storage descriptor exists, its image Dim (type nibble) and
-/// format are copied in so `storage_texture_dim_format` still sees ONE
-/// `%ImageL` (dim, format) across the array — a placeholder of a different
-/// dim/format would make that helper refuse a mixed array, defeating the
-/// rescue. base 0 keeps the bind path from reading real guest memory: it
+/// format are copied in so the placeholder joins an EXISTING storage
+/// (Dim, format) key instead of minting a new `%ImageL` array of its own
+/// (`storage_key_layout` declares one array per present key — a gratuitous
+/// placeholder key would burn a binding and split the host descriptor
+/// groups). base 0 keeps the bind path from reading real guest memory: it
 /// allocates a 1x1 zero-seeded UAV, and `robustImageAccess2` (enabled on the
 /// device) discards the dispatch's out-of-bounds writes into it.
 fn placeholder_storage_fields(

@@ -79,6 +79,15 @@ Claude `/goal` (≤200 chars):
   that it is equivalent to PS4's T# `min_lod`; enabling
   `VK_EXT_image_view_min_lod` without a captured title descriptor would be a
   speculative semantic change.
+- **Gen5 `s_waitcnt`/`v_fmac_f32` shader semantics — PORTED (working tree).**
+  A measured ASTRO.BOT compute program exposed two stale GCN assumptions.
+  Kyty's `Recompile_Skip`, KytyPS5's empty `EmitWaitcnt`, SharpEmu's no-op
+  `SWaitcnt`, and shadPS4's marker-only lowering independently agree that
+  `s_waitcnt` must not become a device-scope SPIR-V memory barrier; Raeen now
+  emits no operation while retaining the instruction as a CFG boundary.
+  SharpEmu and KytyPS5 also agree that GFX10 compact VOP2 opcode `0x2b` is
+  fused `v_fmac_f32`; it now reuses Raeen's tested `VMacF32` Fma lowering.
+  Focused parser/recompiler and spirv-val regressions cover both changes.
 - **Mesa delta — NO AMD CHANGE.** `3e2d851..780727e` contains no files under
   `src/amd`; AddrLib/register/PM4 source used by Raeen is unchanged.
 
