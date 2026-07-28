@@ -400,9 +400,15 @@ fn hle_port_set_attributes(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `sceAudioOut2ContextGetQueueLevel(context, outLevel)`: the push/advance
 /// paths pace synchronously, so the queue is always drained — report level 0
 /// (SharpEmu's answer). A null out-pointer is tolerated, matching SharpEmu.
+///
+/// The out is a **32-bit** queue depth: callers compare `dword [out]`, and
+/// they stack-allocate it. Writing 8 bytes here clobbered the 4 bytes above
+/// the slot — for GTA V's audio thread that was the frame canary, so the
+/// title aborted in `__stack_chk_fail` with no HLE error ever reported.
+/// (SharpEmu hit and fixed the identical defect: PR #532, restored by #650.)
 fn hle_context_get_queue_level(ctx: &HleContext, args: &[u64]) -> u64 {
     let level = args.get(1).copied().unwrap_or(0);
-    if level != 0 && !ctx.mem.write(level, &0u64.to_le_bytes()) {
+    if level != 0 && !ctx.mem.write(level, &0u32.to_le_bytes()) {
         return SCE_ERROR_MEMORY_FAULT;
     }
     OK
@@ -710,17 +716,25 @@ fn hle_port_get_state(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
-/// `sceAudioOut2GetSpeakerInfo(info)`: fills a 0x40-byte speaker-info struct
-/// (1 device, 2 channels, 48000 Hz).
+/// `sceAudioOut2GetSpeakerInfo(info)`: fills the **0x20-byte** speaker-info
+/// struct — 2 channels at 48 kHz, connected.
+///
+/// The size and field layout both matter. Writing 0x40 bytes overran the
+/// struct into whatever the caller placed after it: in GTA V that is the
+/// speaker-array parameter block (its `+0x18` is the first `PortGetState`
+/// out), and the overrun reached the main thread's frame canary. Layout is
+/// `u32 channels @+0x00`, `u32 sampleRate @+0x04`, `u16 connected @+0x08` —
+/// the earlier `(1, 2, 48000)` triple had channels and the device count
+/// transposed. (SharpEmu PR #532, restored by #650, `SpeakerInfoSize = 0x20`.)
 fn hle_get_speaker_info(ctx: &HleContext, args: &[u64]) -> u64 {
     let info = args.first().copied().unwrap_or(0);
     if info == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    let mut buf = [0u8; 0x40];
-    buf[0x00..0x04].copy_from_slice(&1u32.to_le_bytes());
-    buf[0x04..0x08].copy_from_slice(&2u32.to_le_bytes());
-    buf[0x08..0x0C].copy_from_slice(&48000u32.to_le_bytes());
+    let mut buf = [0u8; 0x20];
+    buf[0x00..0x04].copy_from_slice(&2u32.to_le_bytes());
+    buf[0x04..0x08].copy_from_slice(&48_000u32.to_le_bytes());
+    buf[0x08..0x0A].copy_from_slice(&1u16.to_le_bytes());
     if ctx.mem.write(info, &buf) {
         OK
     } else {
@@ -903,10 +917,22 @@ mod tests {
             SCE_ERROR_INVALID_ARGUMENT
         );
 
+        // Speaker info is 0x20 bytes: channels, rate, connected — and it must
+        // not write a byte past 0x20 (0x40 overran into the caller's next
+        // param block and reached the main thread's canary).
+        assert!(mem.write(0x80 + 0x20, &[0xAB; 0x20]));
         assert_eq!(hle_get_speaker_info(&ctx, &[0x80]), OK);
-        assert_eq!(read_u32(&mem, 0x80), 1);
-        assert_eq!(read_u32(&mem, 0x84), 2);
-        assert_eq!(read_u32(&mem, 0x88), 48000);
+        assert_eq!(read_u32(&mem, 0x80), 2, "channels");
+        assert_eq!(read_u32(&mem, 0x84), 48_000, "sample rate");
+        let mut connected = [0u8; 2];
+        assert!(mem.read(0x88, &mut connected));
+        assert_eq!(u16::from_le_bytes(connected), 1, "connected");
+        let mut past = [0u8; 0x20];
+        assert!(mem.read(0x80 + 0x20, &mut past));
+        assert!(
+            past.iter().all(|&b| b == 0xAB),
+            "speaker info must not write past its 0x20-byte struct"
+        );
     }
 
     #[test]
@@ -1055,11 +1081,22 @@ mod tests {
         assert!(CONTEXTS.get(&handle).is_none());
 
         // Queue level: always drained (synchronous pacing), null out tolerated.
+        // The out is a 32-bit depth and callers stack-allocate exactly that:
+        // the 4 bytes ABOVE the slot must survive (they were GTA V's canary).
         assert!(mem.write(0x190, &u64::MAX.to_le_bytes()));
         assert_eq!(hle_context_get_queue_level(&ctx, &[handle, 0x190]), OK);
         let mut lvl = [0u8; 8];
         assert!(mem.read(0x190, &mut lvl));
-        assert_eq!(u64::from_le_bytes(lvl), 0);
+        assert_eq!(
+            u32::from_le_bytes(lvl[0..4].try_into().unwrap()),
+            0,
+            "queue level dword must read drained"
+        );
+        assert_eq!(
+            u32::from_le_bytes(lvl[4..8].try_into().unwrap()),
+            u32::MAX,
+            "the dword past the 32-bit out must be untouched (canary guard)"
+        );
         assert_eq!(hle_context_get_queue_level(&ctx, &[handle, 0]), OK);
     }
 
