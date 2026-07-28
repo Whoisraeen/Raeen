@@ -3196,6 +3196,15 @@ fn sync_on_address_wait(ctx: &HleContext, args: &[u64], width: Option<SyncWidth>
         }
     }
 
+    // Spin-then-park, sharing the mutex path's waiter primitive and budget
+    // (`RAEEN_MUTEX_SPIN`; 0 disables): a wake that lands within the spin
+    // budget is observed without a host park/unpark round trip. The waiter is
+    // already enqueued, so FIFO wake order and the compare-before-park futex
+    // contract above are unchanged.
+    let spin_budget = raeen_kernel::guest_waiter_spin_budget();
+    if spin_budget > 0 && waiter.spin_for_signal(spin_budget) {
+        return SCE_OK;
+    }
     let parked_since = std::time::Instant::now();
     loop {
         if waiter.wait_for_signal(SYNC_ADDRESS_SLICE) {
