@@ -200,6 +200,83 @@ pub struct ColorBase {
     pub addr: u64,
 }
 
+/// Kyty: `ColorView` (L28) — `CB_COLOR{n}_VIEW` decode (array-slice window +
+/// mip selection of the bound target).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorView {
+    pub base_array_slice_index: u32,
+    pub last_array_slice_index: u32,
+    pub current_mip_level: u32,
+}
+
+/// Kyty: `ColorAttrib` (L54) — `CB_COLOR{n}_ATTRIB` decode (tiling + MSAA).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorAttrib {
+    pub force_dest_alpha_to_one: bool,
+    pub tile_mode: u32,
+    pub fmask_tile_mode: u32,
+    pub num_samples: u32,
+    pub num_fragments: u32,
+}
+
+/// Kyty: `ColorDccControl` (L79) — `CB_COLOR{n}_DCC_CONTROL` decode.
+/// Compression metadata: decoded into named fields, deliberately not emulated.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorDccControl {
+    pub max_uncompressed_block_size: u32,
+    pub max_compressed_block_size: u32,
+    pub min_compressed_block_size: u32,
+    pub color_transform: u32,
+    pub dcc_clear_key_enable: bool,
+    pub overwrite_combiner_disable: bool,
+    pub independent_64b_blocks: bool,
+    pub independent_128b_blocks: bool,
+    pub data_write_on_dcc_clear_to_reg: bool,
+}
+
+/// Kyty: `ColorCmask` (L92). CMASK metadata address (low dword shifted by 8,
+/// high byte from `CB_COLOR{n}_CMASK_BASE_EXT`). Decoded, not emulated.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorCmask {
+    pub addr: u64,
+}
+
+/// Kyty: `ColorCmaskSlice` (L97).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorCmaskSlice {
+    pub slice_minus1: u32,
+}
+
+/// Kyty: `ColorFmask` (L102). FMASK metadata address. Decoded, not emulated.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorFmask {
+    pub addr: u64,
+}
+
+/// Kyty: `ColorFmaskSlice` (L107).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorFmaskSlice {
+    pub slice_minus1: u32,
+}
+
+/// Kyty: `ColorClearWord0` (L112) — low dword of the packed fast-clear colour.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorClearWord0 {
+    pub word0: u32,
+}
+
+/// Kyty: `ColorClearWord1` (L117) — high dword of the packed fast-clear colour.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorClearWord1 {
+    pub word1: u32,
+}
+
+/// Kyty: `ColorDccAddr` (L122). DCC metadata address. Decoded, not emulated.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorDccAddr {
+    pub addr: u64,
+}
+
 /// Kyty: `ColorInfo` (L34). Format/type/order drive the Vulkan format choice.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColorInfo {
@@ -241,14 +318,28 @@ pub struct ColorAttrib3 {
     pub dcc_pipe_aligned: bool,
 }
 
-/// Kyty: `RenderTarget` (L162). Phase-1 subset — the Gen4 pitch/slice/view
-/// members and the DCC/CMASK/FMASK block are not ported.
+/// Kyty: `RenderTarget` (L133). The Gen4-only pitch/slice/size members are
+/// not ported (Gen5 sizes come from `attrib2`); everything else — including
+/// the DCC/CMASK/FMASK compression-metadata block and the fast-clear words —
+/// is decoded into named fields. Compression metadata is deliberately not
+/// *emulated* (see `run.rs` `note_compression_metadata_ignored`); the
+/// fast-clear words feed the eliminate-fast-clear direct clear.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderTarget {
     pub base: ColorBase,
+    pub view: ColorView,
     pub info: ColorInfo,
+    pub attrib: ColorAttrib,
     pub attrib2: ColorAttrib2,
     pub attrib3: ColorAttrib3,
+    pub dcc: ColorDccControl,
+    pub cmask: ColorCmask,
+    pub cmask_slice: ColorCmaskSlice,
+    pub fmask: ColorFmask,
+    pub fmask_slice: ColorFmaskSlice,
+    pub clear_word0: ColorClearWord0,
+    pub clear_word1: ColorClearWord1,
+    pub dcc_addr: ColorDccAddr,
 }
 
 /// Kyty: `BlendControl` (L200).

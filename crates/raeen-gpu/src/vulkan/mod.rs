@@ -28,7 +28,8 @@ use tracing::info;
 pub use cache::DrawCacheStats;
 pub use instance::validation_error_count;
 pub use offscreen::{
-    CLEAR_COLOR, IndexBinding, RenderedImage, render_triangle, render_triangle_with_spirv, unorm8,
+    CLEAR_COLOR, IndexBinding, MrtAttachment, RenderedImage, render_triangle,
+    render_triangle_with_spirv, unorm8,
 };
 pub use shaders::TRIANGLE_COLOR;
 

@@ -199,6 +199,16 @@ re-implementations are license-compatible; this notice preserves attribution.
   tests are an original implementation informed by shadPS4 commit `26f4270`;
   no C++ is copied.
 
+  The 2026-07-27 eliminate-fast-clear handling in
+  `crates/raeen-gpu/src/draw_translate.rs` (`cb_mode`, `fast_clear_image`,
+  `OffscreenDrawSink::eliminate_fast_clear`) is a Rust re-implementation of
+  shadPS4's `Rasterizer::FilterDraw`/`EliminateFastClear` pattern
+  (`src/video_core/renderer_vulkan/vk_rasterizer.cpp`): a CB special pass
+  (CB_COLOR_CONTROL mode 2) is consumed and applied as a direct clear of the
+  bound target; resolve/decompress passes are named skips. The packed
+  CLEAR_WORD splat is Raeen's own simplification (shadPS4 unpacks per format
+  for `vkCmdClearColorImage`); no C++ is copied.
+
   **Data incorporated in-tree:** `crates/raeen-firmware/src/dynlib/nid_names.txt`
   is derived from shadPS4's `src/core/aerolib/aerolib.inl` — a generated table
   of public SCE symbol names and their NIDs. Raeen uses it strictly as a

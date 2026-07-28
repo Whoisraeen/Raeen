@@ -267,10 +267,35 @@ top-down, update statuses in place, and keep it committed.**
   already wired (`RAEEN_PROFILE=1`).
 
 ### 16. MRT1–7 + fast-clear (DCC/CMASK/FMASK/CLEAR_WORD) register support
-- [ ] The "143 distinct unknown context registers" triage (ledger 2026-07-27
-  late) — implement MRT1–7 colour-buffer blocks + fast-clear; keep skipping
-  compression metadata deliberately where safe. Schedule with item 2 (same
-  register-decode neighborhood).
+- [x] CODE DONE 2026-07-28 (worktree branch, this commit). Three layers:
+  1. **Register decode complete** (kyty-graphics): every `CB_COLOR{0-7}`
+     sub-register now lands in a named `RenderTarget` field — VIEW, ATTRIB,
+     DCC_CONTROL, CMASK(+SLICE), FMASK(+SLICE), CLEAR_WORD0/1, DCC_BASE,
+     plus the Gen5 `BASE/CMASK/FMASK/DCC_BASE_EXT` high-byte blocks
+     (0x390–0x3AF) and the full INFO field set. Compression metadata is
+     decoded but deliberately NOT emulated — one process-wide INFO note
+     replaces the per-register "unknown context register" warnings.
+  2. **MRT1–7 actually attach** (raeen-gpu): `DrawState.mrt` carries slots
+     1–7 (per-slot format, `CB_TARGET_MASK` nibble write mask,
+     `CB_BLEND{n}_CONTROL` blend); the offscreen pipeline declares N colour
+     attachments (`independentBlend` enabled when supported, identical-state
+     fallback otherwise), seeds each extra from the framebuffer map, and
+     reads every attachment back to its own guest base. MRT draws take the
+     immediate path (deferred batch can't file multi-target readbacks).
+  3. **Fast clear** (shadPS4 FilterDraw port): `CB_COLOR_CONTROL.MODE 2`
+     (eliminate-fast-clear) is consumed and applied as a real direct clear —
+     the packed CLEAR_WORD splatted over the target's framebuffer entry +
+     persistent-image eviction; modes 3/5/6 (resolve/decompress) are named
+     once-logged skips, never silent scene draws.
+  - Limitation (named): guest pixel shaders exporting `mrt1`+ still fail
+    translation (recompiler handles MRT0 exports only), so real-title MRT
+    output waits on the shader-side `exp mrt1-7` extension — plumbing and
+    tests are in place for it.
+  - Tests: kyty-graphics 484 (register decode incl. every slot/family);
+    raeen-gpu lib 275 (MRT state translation, fast-clear decode + session
+    FCE end-to-end) + `tests/mrt_targets.rs` (2 iron Vulkan MRT draws:
+    dual-output FS hits both attachments; per-attachment write mask + LOAD
+    seed verified pixel-exact).
 
 ---
 

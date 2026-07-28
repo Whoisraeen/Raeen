@@ -153,6 +153,22 @@ fn warn_skip_reg_once(file: RegFile, reg: u32) -> bool {
         .insert((file, reg))
 }
 
+/// One process-wide note that the CB compression-metadata registers
+/// (DCC/CMASK/FMASK addresses, slices, and DCC_CONTROL) are decoded into
+/// named `RenderTarget` fields but deliberately NOT emulated: every target
+/// renders uncompressed, and no path reads or writes the metadata surfaces.
+/// This replaces per-register "unknown context register" warnings for the
+/// whole block — the skip is intentional, so it is an INFO, once.
+fn note_compression_metadata_ignored() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            "CB compression metadata (DCC/CMASK/FMASK) decoded but ignored — \
+             colour targets render uncompressed by design"
+        );
+    });
+}
+
 /// A draw that could not be translated. Never silent: the message names the
 /// register or resource that was missing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2211,9 +2227,12 @@ impl CommandProcessor {
                     blend_bypass: pm4::field(value, f::BLEND_BYPASS) != 0,
                     round_mode: pm4::field(value, f::ROUND_MODE) != 0,
                     cmask_tile_mode: pm4::field(value, f::CMASK_IS_LINEAR),
+                    fmask_data_compression_disable: pm4::field(value, f::FMASK_COMPRESSION_DISABLE)
+                        != 0,
+                    fmask_one_frag_mode: pm4::field(value, f::FMASK_COMPRESS_1FRAG_ONLY) != 0,
                     dcc_compression_enable: pm4::field(value, f::DCC_ENABLE) != 0,
+                    cmask_tile_mode_neo: pm4::field(value, f::CMASK_ADDR_TYPE),
                     neo_mode: pm4::field(value, f::ALT_TILE_MODE) != 0,
-                    ..ColorInfo::default()
                 };
             }
 
@@ -2237,6 +2256,152 @@ impl CommandProcessor {
                     cmask_pipe_aligned: pm4::field(value, f::CMASK_PIPE_ALIGNED) != 0,
                     dcc_pipe_aligned: pm4::field(value, f::DCC_PIPE_ALIGNED) != 0,
                 };
+            }
+
+            // ---- Remaining per-slot CB_COLOR{n} sub-registers (stride 15) ----
+            // Kyty: g_hw_ctx_indirect_func loops (GraphicsRun.cpp L3522-3700).
+            // VIEW and the CLEAR_WORDs are live feature state (array-slice
+            // window / fast-clear colour); ATTRIB and the DCC/CMASK/FMASK
+            // block are compression metadata — decoded into named fields so
+            // they never log as unknown, but deliberately not emulated.
+            r if (pm4::CB_COLOR0_VIEW..=pm4::CB_COLOR7_VIEW).contains(&r)
+                && (r - pm4::CB_COLOR0_VIEW) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_VIEW, pm4::CB_COLOR_SLOT_STRIDE);
+                use pm4::cb_color_view as f;
+                self.ctx.render_targets[slot].view = crate::hw_regs::ColorView {
+                    base_array_slice_index: pm4::field(value, f::SLICE_START),
+                    last_array_slice_index: pm4::field(value, f::SLICE_MAX),
+                    current_mip_level: pm4::field(value, f::MIP_LEVEL),
+                };
+            }
+
+            r if (pm4::CB_COLOR0_ATTRIB..=pm4::CB_COLOR7_ATTRIB).contains(&r)
+                && (r - pm4::CB_COLOR0_ATTRIB) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_ATTRIB, pm4::CB_COLOR_SLOT_STRIDE);
+                use pm4::cb_color_attrib as f;
+                self.ctx.render_targets[slot].attrib = crate::hw_regs::ColorAttrib {
+                    force_dest_alpha_to_one: pm4::field(value, f::FORCE_DST_ALPHA_1) != 0,
+                    tile_mode: pm4::field(value, f::TILE_MODE_INDEX),
+                    fmask_tile_mode: pm4::field(value, f::FMASK_TILE_MODE_INDEX),
+                    num_samples: pm4::field(value, f::NUM_SAMPLES),
+                    num_fragments: pm4::field(value, f::NUM_FRAGMENTS),
+                };
+            }
+
+            r if (pm4::CB_COLOR0_DCC_CONTROL..=pm4::CB_COLOR7_DCC_CONTROL).contains(&r)
+                && (r - pm4::CB_COLOR0_DCC_CONTROL) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_DCC_CONTROL, pm4::CB_COLOR_SLOT_STRIDE);
+                use pm4::cb_color_dcc_control as f;
+                self.ctx.render_targets[slot].dcc = crate::hw_regs::ColorDccControl {
+                    overwrite_combiner_disable: pm4::field(value, f::OVERWRITE_COMBINER_DISABLE)
+                        != 0,
+                    dcc_clear_key_enable: pm4::field(value, f::KEY_CLEAR_ENABLE) != 0,
+                    max_uncompressed_block_size: pm4::field(value, f::MAX_UNCOMPRESSED_BLOCK_SIZE),
+                    min_compressed_block_size: pm4::field(value, f::MIN_COMPRESSED_BLOCK_SIZE),
+                    max_compressed_block_size: pm4::field(value, f::MAX_COMPRESSED_BLOCK_SIZE),
+                    color_transform: pm4::field(value, f::COLOR_TRANSFORM),
+                    independent_64b_blocks: pm4::field(value, f::INDEPENDENT_64B_BLOCKS) != 0,
+                    data_write_on_dcc_clear_to_reg: pm4::field(
+                        value,
+                        f::ENABLE_CONSTANT_ENCODE_REG_WRITE,
+                    ) != 0,
+                    independent_128b_blocks: pm4::field(value, f::INDEPENDENT_128B_BLOCKS) != 0,
+                };
+                note_compression_metadata_ignored();
+            }
+
+            r if (pm4::CB_COLOR0_CMASK..=pm4::CB_COLOR7_CMASK).contains(&r)
+                && (r - pm4::CB_COLOR0_CMASK) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_CMASK, pm4::CB_COLOR_SLOT_STRIDE);
+                let addr = &mut self.ctx.render_targets[slot].cmask.addr;
+                *addr &= 0xFFFF_FF00_0000_00FF;
+                *addr |= u64::from(value) << 8;
+                note_compression_metadata_ignored();
+            }
+
+            r if (pm4::CB_COLOR0_CMASK_SLICE..=pm4::CB_COLOR7_CMASK_SLICE).contains(&r)
+                && (r - pm4::CB_COLOR0_CMASK_SLICE) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_CMASK_SLICE, pm4::CB_COLOR_SLOT_STRIDE);
+                self.ctx.render_targets[slot].cmask_slice.slice_minus1 = value;
+                note_compression_metadata_ignored();
+            }
+
+            r if (pm4::CB_COLOR0_FMASK..=pm4::CB_COLOR7_FMASK).contains(&r)
+                && (r - pm4::CB_COLOR0_FMASK) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_FMASK, pm4::CB_COLOR_SLOT_STRIDE);
+                let addr = &mut self.ctx.render_targets[slot].fmask.addr;
+                *addr &= 0xFFFF_FF00_0000_00FF;
+                *addr |= u64::from(value) << 8;
+                note_compression_metadata_ignored();
+            }
+
+            r if (pm4::CB_COLOR0_FMASK_SLICE..=pm4::CB_COLOR7_FMASK_SLICE).contains(&r)
+                && (r - pm4::CB_COLOR0_FMASK_SLICE) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_FMASK_SLICE, pm4::CB_COLOR_SLOT_STRIDE);
+                self.ctx.render_targets[slot].fmask_slice.slice_minus1 = value;
+                note_compression_metadata_ignored();
+            }
+
+            r if (pm4::CB_COLOR0_CLEAR_WORD0..=pm4::CB_COLOR7_CLEAR_WORD0).contains(&r)
+                && (r - pm4::CB_COLOR0_CLEAR_WORD0) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_CLEAR_WORD0, pm4::CB_COLOR_SLOT_STRIDE);
+                self.ctx.render_targets[slot].clear_word0.word0 = value;
+            }
+
+            r if (pm4::CB_COLOR0_CLEAR_WORD1..=pm4::CB_COLOR7_CLEAR_WORD1).contains(&r)
+                && (r - pm4::CB_COLOR0_CLEAR_WORD1) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_CLEAR_WORD1, pm4::CB_COLOR_SLOT_STRIDE);
+                self.ctx.render_targets[slot].clear_word1.word1 = value;
+            }
+
+            r if (pm4::CB_COLOR0_DCC_BASE..=pm4::CB_COLOR7_DCC_BASE).contains(&r)
+                && (r - pm4::CB_COLOR0_DCC_BASE) % pm4::CB_COLOR_SLOT_STRIDE == 0 =>
+            {
+                let slot = slot_of(pm4::CB_COLOR0_DCC_BASE, pm4::CB_COLOR_SLOT_STRIDE);
+                let addr = &mut self.ctx.render_targets[slot].dcc_addr.addr;
+                *addr &= 0xFFFF_FF00_0000_00FF;
+                *addr |= u64::from(value) << 8;
+                note_compression_metadata_ignored();
+            }
+
+            // ---- Gen5 `_EXT` high-address-byte blocks (stride 1) ----
+            // Kyty: GraphicsRun.cpp L3609-3688 — the low byte of the value is
+            // bits 40..48 of the matching address.
+            r if (pm4::CB_COLOR0_BASE_EXT..=pm4::CB_COLOR7_BASE_EXT).contains(&r) => {
+                let slot = (r - pm4::CB_COLOR0_BASE_EXT) as usize;
+                let addr = &mut self.ctx.render_targets[slot].base.addr;
+                *addr &= 0xFFFF_00FF_FFFF_FFFF;
+                *addr |= u64::from(value & 0xFF) << 40;
+            }
+            r if (pm4::CB_COLOR0_CMASK_BASE_EXT..=pm4::CB_COLOR7_CMASK_BASE_EXT).contains(&r) => {
+                let slot = (r - pm4::CB_COLOR0_CMASK_BASE_EXT) as usize;
+                let addr = &mut self.ctx.render_targets[slot].cmask.addr;
+                *addr &= 0xFFFF_00FF_FFFF_FFFF;
+                *addr |= u64::from(value & 0xFF) << 40;
+                note_compression_metadata_ignored();
+            }
+            r if (pm4::CB_COLOR0_FMASK_BASE_EXT..=pm4::CB_COLOR7_FMASK_BASE_EXT).contains(&r) => {
+                let slot = (r - pm4::CB_COLOR0_FMASK_BASE_EXT) as usize;
+                let addr = &mut self.ctx.render_targets[slot].fmask.addr;
+                *addr &= 0xFFFF_00FF_FFFF_FFFF;
+                *addr |= u64::from(value & 0xFF) << 40;
+                note_compression_metadata_ignored();
+            }
+            r if (pm4::CB_COLOR0_DCC_BASE_EXT..=pm4::CB_COLOR7_DCC_BASE_EXT).contains(&r) => {
+                let slot = (r - pm4::CB_COLOR0_DCC_BASE_EXT) as usize;
+                let addr = &mut self.ctx.render_targets[slot].dcc_addr.addr;
+                *addr &= 0xFFFF_00FF_FFFF_FFFF;
+                *addr |= u64::from(value & 0xFF) << 40;
+                note_compression_metadata_ignored();
             }
 
             // Viewport scale/offset: six consecutive registers per viewport.
@@ -3225,6 +3390,123 @@ mod tests {
             (31, 15),
             "the second register in the batch must land in slot 1"
         );
+    }
+
+    /// Every CB_COLOR{n} sub-register family must land in the right slot's
+    /// named field — nothing in the 0x318..=0x3BF block may fall through to
+    /// "unknown context register" any more.
+    #[test]
+    fn set_context_reg_decodes_cb_color_sub_registers_for_every_slot() {
+        for slot in [0u32, 3, 7] {
+            let mut cp = CommandProcessor::new();
+            let mut sink = RecordingSink::default();
+            let s15 = slot * pm4::CB_COLOR_SLOT_STRIDE;
+            let view = (2 << 26) | (5 << 13) | 1; // mip 2, slice_max 5, start 1
+            let attrib = (1 << 17) | (2 << 15) | (3 << 12) | (9 << 5) | 4;
+            let dcc_control = 1 | (1 << 1) | (2 << 2) | (1 << 4) | (1 << 5) | (1 << 9) | (1 << 20);
+            let writes: Vec<(u32, u32)> = vec![
+                (pm4::CB_COLOR0_VIEW + s15, view),
+                (pm4::CB_COLOR0_ATTRIB + s15, attrib),
+                (pm4::CB_COLOR0_DCC_CONTROL + s15, dcc_control),
+                (pm4::CB_COLOR0_CMASK + s15, 0xAB_CDEF),
+                (pm4::CB_COLOR0_CMASK_SLICE + s15, 0x3F),
+                (pm4::CB_COLOR0_FMASK + s15, 0x12_3456),
+                (pm4::CB_COLOR0_FMASK_SLICE + s15, 0x7F),
+                (pm4::CB_COLOR0_CLEAR_WORD0 + s15, 0xFF80_4020),
+                (pm4::CB_COLOR0_CLEAR_WORD1 + s15, 0x0000_00FF),
+                (pm4::CB_COLOR0_DCC_BASE + s15, 0x77_8899),
+                (pm4::CB_COLOR0_CMASK_BASE_EXT + slot, 0xAA),
+                (pm4::CB_COLOR0_FMASK_BASE_EXT + slot, 0xBB),
+                (pm4::CB_COLOR0_DCC_BASE_EXT + slot, 0xCC),
+            ];
+            let mut dcb = Vec::new();
+            for (reg, value) in writes {
+                dcb.extend([header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO), reg, value]);
+            }
+            cp.run(&dcb, &mut sink).expect("CB sub-register writes");
+            let rt = &cp.get_ctx().render_targets[slot as usize];
+            assert_eq!(
+                (
+                    rt.view.base_array_slice_index,
+                    rt.view.last_array_slice_index,
+                    rt.view.current_mip_level
+                ),
+                (1, 5, 2),
+                "slot {slot} VIEW"
+            );
+            assert_eq!(
+                (
+                    rt.attrib.tile_mode,
+                    rt.attrib.fmask_tile_mode,
+                    rt.attrib.num_samples,
+                    rt.attrib.num_fragments,
+                    rt.attrib.force_dest_alpha_to_one
+                ),
+                (4, 9, 3, 2, true),
+                "slot {slot} ATTRIB"
+            );
+            assert!(rt.dcc.overwrite_combiner_disable && rt.dcc.dcc_clear_key_enable);
+            assert_eq!(rt.dcc.max_uncompressed_block_size, 2);
+            assert_eq!(rt.dcc.min_compressed_block_size, 1);
+            assert_eq!(rt.dcc.max_compressed_block_size, 1);
+            assert!(rt.dcc.independent_64b_blocks && rt.dcc.independent_128b_blocks);
+            // Metadata addresses assemble exactly like colour BASE: low dword
+            // shifted by 8, `_EXT` low byte into bits 40..48.
+            assert_eq!(rt.cmask.addr, (0xAB_CDEFu64 << 8) | (0xAAu64 << 40));
+            assert_eq!(rt.fmask.addr, (0x12_3456u64 << 8) | (0xBBu64 << 40));
+            assert_eq!(rt.dcc_addr.addr, (0x77_8899u64 << 8) | (0xCCu64 << 40));
+            assert_eq!(rt.cmask_slice.slice_minus1, 0x3F);
+            assert_eq!(rt.fmask_slice.slice_minus1, 0x7F);
+            assert_eq!(
+                (rt.clear_word0.word0, rt.clear_word1.word1),
+                (0xFF80_4020, 0x0000_00FF),
+                "slot {slot} fast-clear words"
+            );
+        }
+    }
+
+    /// `CB_COLOR{n}_BASE_EXT` carries bits 40..48 of the colour base, exactly
+    /// like the depth `_HI` registers (Kyty GraphicsRun.cpp L3609).
+    #[test]
+    fn set_context_reg_color_base_ext_sets_high_address_byte() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::CB_COLOR0_BASE + 2 * pm4::CB_COLOR_SLOT_STRIDE,
+            0x1_0000 >> 8,
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::CB_COLOR0_BASE_EXT + 2,
+            0xFF12, // only the low byte may land
+        ];
+        cp.run(&dcb, &mut sink).expect("base + base_ext writes");
+        assert_eq!(
+            cp.get_ctx().render_targets[2].base.addr,
+            0x1_0000 | (0x12u64 << 40)
+        );
+    }
+
+    /// The INFO decode carries the full Kyty field set, including the FMASK
+    /// compression flags and the NEO cmask address type.
+    #[test]
+    fn set_context_reg_color_info_decodes_compression_flags() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let value = (1u32 << 13) // FAST_CLEAR
+            | (1 << 26) // FMASK_COMPRESSION_DISABLE
+            | (1 << 27) // FMASK_COMPRESS_1FRAG_ONLY
+            | (2 << 29); // CMASK_ADDR_TYPE
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::CB_COLOR0_INFO + pm4::CB_COLOR_SLOT_STRIDE,
+            value,
+        ];
+        cp.run(&dcb, &mut sink).expect("info write");
+        let info = &cp.get_ctx().render_targets[1].info;
+        assert!(info.cmask_fast_clear_enable);
+        assert!(info.fmask_data_compression_disable);
+        assert!(info.fmask_one_frag_mode);
+        assert_eq!(info.cmask_tile_mode_neo, 2);
     }
 
     #[test]

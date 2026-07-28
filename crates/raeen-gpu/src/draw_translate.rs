@@ -215,7 +215,14 @@ fn gen5_blend_op(code: u8) -> Result<vk::BlendOp, DrawError> {
 /// `separate_alpha_blend`, the alpha channel uses the *colour* factors — that
 /// is what the hardware does, not a shortcut.
 fn blend_state_from_regs(ctx: &Context) -> Result<BlendState, DrawError> {
-    let bc = &ctx.blend_control[0];
+    blend_state_for_slot(ctx, 0)
+}
+
+/// Per-slot variant of [`blend_state_from_regs`]: MRT slot `n` blends by
+/// `CB_BLEND{n}_CONTROL`. The blend CONSTANTS (`CB_BLEND_RED..ALPHA`) are
+/// per-context and shared by every slot.
+fn blend_state_for_slot(ctx: &Context, slot: usize) -> Result<BlendState, DrawError> {
+    let bc = &ctx.blend_control[slot];
     let color_src = gen5_blend_factor(bc.color_srcblend)?;
     let color_dst = gen5_blend_factor(bc.color_destblend)?;
     let color_op = gen5_blend_op(bc.color_comb_fcn)?;
@@ -459,6 +466,72 @@ fn vulkan_format(
              channel_order={channel_order} — no Vulkan format mapping"
         ))),
     }
+}
+
+/// `CB_COLOR_CONTROL.MODE` operation modes (shadPS4 `regs_color.h`
+/// `OperationMode`; Kyty accepts only Disable/Normal — `bc_check`,
+/// GraphicsRender.cpp L938). Anything above Normal is a special CB pass, not
+/// an ordinary draw.
+pub(crate) mod cb_mode {
+    pub const ELIMINATE_FAST_CLEAR: u8 = 2;
+    pub const RESOLVE: u8 = 3;
+    pub const FMASK_DECOMPRESS: u8 = 5;
+    pub const DCC_DECOMPRESS: u8 = 6;
+}
+
+/// Build the direct-clear image for an eliminate-fast-clear pass on `rt`.
+///
+/// Hardware fast clear stores the clear colour PACKED in the surface's own
+/// format in `CB_COLOR{n}_CLEAR_WORD0/1`; the FCE pass rewrites CMASK-cleared
+/// tiles with exactly those bytes. Raeen keeps no CMASK, so the honest
+/// equivalent (shadPS4 `Rasterizer::EliminateFastClear`) is a full-target
+/// clear to the packed words — a raw byte splat, no per-format unpack needed,
+/// because the framebuffer map holds raw target-format bytes.
+///
+/// Returns `Ok(None)` when there is nothing to clear (no bound target, fast
+/// clear not enabled on it, or a degenerate extent — the register state does
+/// not describe a real FCE). `resolution_scale` mirrors
+/// [`DrawState::scale_resolution`] so the cleared image matches the extent
+/// later draws render at.
+pub(crate) fn fast_clear_image(
+    rt: &kyty_graphics::hw_regs::RenderTarget,
+    resolution_scale: f32,
+) -> Result<Option<RenderedImage>, DrawError> {
+    if rt.base.addr == 0 || !rt.info.cmask_fast_clear_enable {
+        return Ok(None);
+    }
+    if rt.attrib2.width == 0 || rt.attrib2.height == 0 {
+        return Ok(None);
+    }
+    let format = vulkan_format(rt.info.format, rt.info.channel_type, rt.info.channel_order)?;
+    let bpp = crate::vulkan::offscreen::readback_bpp(format)
+        .map_err(|e| err(format!("eliminate-fast-clear: {e}")))?;
+    let factor = if resolution_scale.is_finite() {
+        resolution_scale.clamp(0.5, 4.0)
+    } else {
+        1.0
+    };
+    let scale_u = |v: u32| ((v as f32 * factor).round() as u32).max(1);
+    let (width, height) = (
+        scale_u(rt.attrib2.width + 1),
+        scale_u(rt.attrib2.height + 1),
+    );
+    let texel: [u8; 8] = {
+        let mut t = [0u8; 8];
+        t[..4].copy_from_slice(&rt.clear_word0.word0.to_le_bytes());
+        t[4..].copy_from_slice(&rt.clear_word1.word1.to_le_bytes());
+        t
+    };
+    let mut pixels = vec![0u8; (width * height * bpp) as usize];
+    for chunk in pixels.chunks_exact_mut(bpp as usize) {
+        chunk.copy_from_slice(&texel[..bpp as usize]);
+    }
+    Ok(Some(RenderedImage {
+        width,
+        height,
+        pixels,
+        bytes_per_pixel: bpp,
+    }))
 }
 
 /// Assemble the SPIR-V for an embedded shader stage.
@@ -3338,16 +3411,27 @@ fn prepare_stage_binding_inner(
     })
 }
 
+/// One WARN per distinct `CB_COLOR_CONTROL.MODE` value for the whole process
+/// — the special-pass skip stays visible without per-draw spam.
+fn warn_once_per_mode(mode: u8, message: &str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<[bool; 8]> = Mutex::new([false; 8]);
+    let first = SEEN
+        .lock()
+        .map(|mut seen| {
+            let slot = &mut seen[usize::from(mode.min(7))];
+            !std::mem::replace(slot, true)
+        })
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(mode, "{message}");
+    }
+}
+
 /// Report, once per distinct set, which `CB_COLOR` slots a draw has bound.
-///
-/// Raeen attaches only `render_targets[0]`. Whether that actually loses output
-/// depends on a question the logs could not answer: does the title bind slots
-/// 1-7 *simultaneously* (true MRT, so everything past slot 0 is silently
-/// dropped), or does it merely render to different single targets in
-/// successive passes (in which case slot 0 is the whole story and MRT is a red
-/// herring)? The render-target census shows several distinct target addresses
-/// either way, so it cannot distinguish the two. This can: it reports the set
-/// of slots live *within one draw*.
+/// Purely diagnostic now that MRT slots 1–7 are attached for real
+/// (`mrt_attachments_from_regs`); the once-per-set line remains so a title's
+/// MRT usage stays visible in the logs.
 fn note_active_color_slots(ctx: &Context) {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -3370,14 +3454,72 @@ fn note_active_color_slots(ctx: &Context) {
         .unwrap_or(false);
     if first {
         let slots: Vec<usize> = (0..8).filter(|s| mask & (1 << s) != 0).collect();
-        tracing::warn!(
+        tracing::info!(
             slot_mask = format_args!("{mask:#010b}"),
             ?slots,
             target_mask = format_args!("{:#x}", ctx.render_target_mask),
-            "draw binds MULTIPLE colour render targets — Raeen attaches only slot 0, \
-             so every attachment above it is dropped"
+            "draw binds MULTIPLE colour render targets (attached as Vulkan MRT)"
         );
     }
+}
+
+/// Build the extra-attachment list (MRT slots 1–7) from decoded register
+/// state. A slot joins when it has a base address AND its `CB_TARGET_MASK`
+/// nibble writes anything; a slot the pipeline cannot honour (extent mismatch
+/// with slot 0, unmapped format, untranslatable blend) is dropped with a
+/// rate-limited WARN naming the reason — a localized loss, never a silent
+/// one and never a failed draw.
+fn mrt_attachments_from_regs(ctx: &Context) -> Vec<crate::vulkan::MrtAttachment> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static WARNED: AtomicU32 = AtomicU32::new(0);
+    let warn_slot = |slot: usize, reason: &str| {
+        if WARNED.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::warn!(slot, reason, "MRT attachment dropped");
+        }
+    };
+
+    let rt0 = &ctx.render_targets[0];
+    let mut extras = Vec::new();
+    for slot in 1..ctx.render_targets.len() {
+        let rt = &ctx.render_targets[slot];
+        if rt.base.addr == 0 {
+            continue;
+        }
+        let nibble = (ctx.render_target_mask >> (slot * 4)) & 0xF;
+        if nibble == 0 {
+            // Bound but fully write-masked: attaching it would only risk an
+            // undefined-content write; hardware writes nothing either.
+            continue;
+        }
+        if (rt.attrib2.width, rt.attrib2.height) != (rt0.attrib2.width, rt0.attrib2.height) {
+            warn_slot(slot, "extent differs from slot 0");
+            continue;
+        }
+        let format =
+            match vulkan_format(rt.info.format, rt.info.channel_type, rt.info.channel_order) {
+                Ok(format) => format,
+                Err(e) => {
+                    warn_slot(slot, &e.to_string());
+                    continue;
+                }
+            };
+        let blend = match blend_state_for_slot(ctx, slot) {
+            Ok(blend) => blend,
+            Err(e) => {
+                warn_slot(slot, &e.to_string());
+                continue;
+            }
+        };
+        extras.push(crate::vulkan::MrtAttachment {
+            slot: slot as u8,
+            format,
+            write_mask: vulkan_color_write_mask(nibble),
+            blend,
+            target_base: rt.base.addr,
+            initial: None,
+        });
+    }
+    extras
 }
 
 /// Build a [`DrawState`] from decoded register state.
@@ -3607,6 +3749,13 @@ pub fn draw_state_from_regs<'a>(
         index: None,
         color_output,
         depth,
+        // MRT slots 1-7, decoded per-slot; the caller (draw_common) seeds
+        // each extra's `initial` from the framebuffer map.
+        mrt: if color_output {
+            mrt_attachments_from_regs(ctx)
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -3636,6 +3785,9 @@ pub struct OffscreenDrawSink<'a> {
     /// up in the framebuffer map AFTER the flush lands the batch's pixels.
     pub last_target: Option<u64>,
     pub draws: u64,
+    /// Eliminate-fast-clear passes applied as direct clears (real feature
+    /// work, not skips — see `eliminate_fast_clear`).
+    pub fast_clears: u64,
     /// Draws and compute dispatches skipped because a bound guest shader failed
     /// translation. The named reason was warned once by the cache; each skip
     /// here is quiet (debug) so 1600 re-binds of one bad shader stay one loud
@@ -3703,6 +3855,7 @@ impl<'a> OffscreenDrawSink<'a> {
             last: None,
             last_target: None,
             draws: 0,
+            fast_clears: 0,
             shader_skips: 0,
             draw_skips: 0,
             dispatch_skips: 0,
@@ -3804,6 +3957,26 @@ impl OffscreenDrawSink<'_> {
         let _draw_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_DRAWCOMMON_NS,
         );
+        // Special CB passes (shadPS4 `FilterDraw`): a draw issued with
+        // CB_COLOR_CONTROL.MODE above Normal is not ordinary geometry.
+        // Eliminate-fast-clear becomes a real direct clear of the bound
+        // target; the resolve/decompress passes are named, counted skips —
+        // never silently rasterized as if they were scene draws.
+        match ctx.color_control.mode {
+            cb_mode::ELIMINATE_FAST_CLEAR => return self.eliminate_fast_clear(ctx),
+            cb_mode::RESOLVE => {
+                warn_once_per_mode(ctx.color_control.mode, "CB resolve pass skipped");
+                return Ok(());
+            }
+            cb_mode::FMASK_DECOMPRESS | cb_mode::DCC_DECOMPRESS => {
+                warn_once_per_mode(
+                    ctx.color_control.mode,
+                    "CB FMASK/DCC decompress pass skipped (compression metadata not emulated)",
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
         // A zero colour mask with depth/stencil disabled is a state-carrying
         // no-op. With depth/stencil enabled it is a real z-prepass/clear and
         // must reach the now-wired depth backend; dropping it leaves a stale
@@ -4273,36 +4446,80 @@ impl OffscreenDrawSink<'_> {
         // readbacks), so the backend may LOAD the persistent GPU copy
         // instead of re-uploading these bytes.
         state.target_base = state.color_output.then_some(rt_base);
+        // MRT extras: PM4-ordered flush first (a pending deferred draw into
+        // the primary or any extra base must land before this immediate
+        // draw), then seed each extra's LOAD from the framebuffer map when
+        // the prior readback matches this draw's extent and byte size.
+        if !state.mrt.is_empty() {
+            let needs_flush = {
+                let caches = self.dev.draw_caches();
+                caches.base_is_batch_dirty(rt_base)
+                    || state
+                        .mrt
+                        .iter()
+                        .any(|extra| caches.base_is_batch_dirty(extra.target_base))
+            };
+            if needs_flush {
+                self.flush_deferred_into_framebuffers()?;
+            }
+            for extra in &mut state.mrt {
+                let expected = crate::vulkan::offscreen::readback_bpp(extra.format)
+                    .ok()
+                    .map(|bpp| state.width as usize * state.height as usize * bpp as usize);
+                if let Some(prior) = self
+                    .framebuffers
+                    .get(&extra.target_base)
+                    .filter(|p| p.width == state.width && p.height == state.height)
+                    .filter(|p| Some(p.pixels.len()) == expected)
+                {
+                    extra.initial = Some(prior.pixels.clone());
+                }
+            }
+        }
         // Stage B: the draw is submitted with its readback DEFERRED —
         // `Ok(None)` means the pixels land in the framebuffer map at the next
         // flush (end of submission, presentation, or a feedback fallback).
         // `Ok(Some(image))` is the immediate-fallback path (readback now),
-        // preserving the old per-draw behaviour.
+        // preserving the old per-draw behaviour. MRT draws are immediate by
+        // construction and additionally land every extra attachment's
+        // readback in the framebuffer map by its own guest base.
         let color_output = state.color_output;
-        let immediate =
-            crate::vulkan::offscreen::render_draw_deferred(self.dev, &state).map_err(|e| {
-                let depth = state.depth.as_ref().map(|d| {
-                    (
-                        d.target_base,
-                        d.format,
-                        d.test_enable,
-                        d.write_enable,
-                        d.stencil_test_enable,
-                    )
-                });
-                err(format!(
-                    "offscreen draw failed: {e}; vs={vs_addr:#x} ps={ps_addr:#x} \
-                     target={rt_base:#x} {}x{} format={:?} prim={} vertices={} indexed={} \
-                     depth={depth:?} stage_bindings={}",
-                    state.width,
-                    state.height,
-                    state.format,
-                    ucfg.prim_type,
-                    state.vertex_count,
-                    index.is_some(),
-                    state.stage_bindings.len()
-                ))
-            })?;
+        let has_mrt = !state.mrt.is_empty();
+        let backend_error = |e: raeen_core::error::GpuError, state: &DrawState| {
+            let depth = state.depth.as_ref().map(|d| {
+                (
+                    d.target_base,
+                    d.format,
+                    d.test_enable,
+                    d.write_enable,
+                    d.stencil_test_enable,
+                )
+            });
+            err(format!(
+                "offscreen draw failed: {e}; vs={vs_addr:#x} ps={ps_addr:#x} \
+                 target={rt_base:#x} {}x{} format={:?} prim={} vertices={} indexed={} \
+                 depth={depth:?} mrt={} stage_bindings={}",
+                state.width,
+                state.height,
+                state.format,
+                ucfg.prim_type,
+                state.vertex_count,
+                index.is_some(),
+                state.mrt.len(),
+                state.stage_bindings.len()
+            ))
+        };
+        let immediate = if has_mrt {
+            let output = crate::vulkan::offscreen::render_draw(self.dev, &state)
+                .map_err(|e| backend_error(e, &state))?;
+            for (base, image) in output.mrt_colors {
+                self.framebuffers.insert(base, Arc::new(image));
+            }
+            output.color
+        } else {
+            crate::vulkan::offscreen::render_draw_deferred(self.dev, &state)
+                .map_err(|e| backend_error(e, &state))?
+        };
         drop(backend_timer);
         drop(state);
         match immediate {
@@ -4324,6 +4541,72 @@ impl OffscreenDrawSink<'_> {
             self.last_target = Some(rt_base);
         }
         self.draws += 1;
+        Ok(())
+    }
+
+    /// Eliminate-fast-clear as a direct clear (shadPS4
+    /// `Rasterizer::EliminateFastClear`). The FCE draw itself is consumed;
+    /// its effect — the CMASK-cleared tiles materializing as the packed
+    /// `CLEAR_WORD` colour — is applied to the WHOLE target, because Raeen
+    /// keeps no CMASK to know which tiles were fast-cleared. Titles issue FCE
+    /// right after a full-surface fast clear, where whole-target == exact;
+    /// a partial fast clear would be over-cleared, which the once-log names.
+    fn eliminate_fast_clear(&mut self, ctx: &Context) -> Result<(), DrawError> {
+        let rt = &ctx.render_targets[0];
+        let scale = crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale;
+        let image = match fast_clear_image(rt, scale) {
+            Ok(Some(image)) => image,
+            // No bound target / fast clear not armed: an FCE with nothing to
+            // eliminate is a quiet no-op (shadPS4 returns the same way).
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Named degradation: the clear colour cannot be materialized
+                // (unmapped format). Skipping is visible, not silent.
+                self.draw_skips += 1;
+                self.last_draw_skip_reason = Some(e.to_string());
+                debug!(reason = %e, "eliminate-fast-clear skipped");
+                return Ok(());
+            }
+        };
+        let base = rt.base.addr;
+        // PM4 order: deferred draws recorded before this FCE must land their
+        // readbacks first, or the flush would overwrite the clear.
+        if self.dev.draw_caches().base_is_batch_dirty(base) {
+            self.flush_deferred_into_framebuffers()?;
+        }
+        // The persistent GPU image (if any) now holds stale pre-clear pixels:
+        // evict every image at this base so the next draw seeds from the
+        // cleared CPU pixels. The sentinel key matches nothing, so ALL
+        // extents/formats at this base go.
+        {
+            let sentinel = crate::vulkan::cache::TargetKey {
+                base,
+                width: 0,
+                height: 0,
+                format: 0,
+            };
+            let mut caches = self.dev.draw_caches();
+            caches.evict_targets_for_base(self.dev, base, &sentinel);
+        }
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            tracing::info!(
+                target_base = format_args!("{base:#x}"),
+                "eliminate-fast-clear implemented as a whole-target direct clear \
+                 (no CMASK: partial fast clears would be over-cleared)"
+            );
+        });
+        debug!(
+            target_base = format_args!("{base:#x}"),
+            width = image.width,
+            height = image.height,
+            clear_word0 = format_args!("{:#010x}", rt.clear_word0.word0),
+            clear_word1 = format_args!("{:#010x}", rt.clear_word1.word1),
+            "eliminate-fast-clear: direct clear"
+        );
+        self.framebuffers.insert(base, Arc::new(image));
+        self.last_target = Some(base);
+        self.fast_clears += 1;
         Ok(())
     }
 
@@ -5042,6 +5325,141 @@ mod tests {
             draw_state_from_regs(&ctx_96x48(), &ucfg_rect(), 3, SPIRV, SPIRV).expect("valid");
         // x = xoffset - xscale, w = xscale * 2
         assert_eq!(state.viewport, [0.0, 0.0, 96.0, 48.0]);
+    }
+
+    /// A second bound slot with a live `CB_TARGET_MASK` nibble becomes a real
+    /// extra attachment carrying its own base, format, write mask, and
+    /// per-slot blend.
+    #[test]
+    fn mrt_slots_reach_the_draw_state_with_per_slot_state() {
+        let mut ctx = ctx_96x48();
+        let rt2 = &mut ctx.render_targets[2];
+        rt2.base.addr = 0x2_0000;
+        rt2.info.format = 0xa; // RGBA8 UNORM
+        rt2.attrib2 = ColorAttrib2 {
+            width: 95,
+            height: 47,
+            num_mip_levels: 0,
+        };
+        // Slot 0 writes RGBA, slot 2 writes only R+A.
+        ctx.render_target_mask = 0xF | (0x9 << 8);
+        // Slot-2 blend differs from slot 0 (which stays disabled).
+        ctx.blend_control[2] = kyty_graphics::hw_regs::BlendControl {
+            color_srcblend: 0x04,  // SrcAlpha
+            color_comb_fcn: 0x00,  // Add
+            color_destblend: 0x05, // OneMinusSrcAlpha
+            alpha_srcblend: 0x01,
+            alpha_comb_fcn: 0x00,
+            alpha_destblend: 0x00,
+            separate_alpha_blend: true,
+            enable: true,
+        };
+
+        let state =
+            draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).expect("valid MRT state");
+        assert_eq!(state.mrt.len(), 1, "one extra attachment");
+        let extra = &state.mrt[0];
+        assert_eq!(extra.slot, 2);
+        assert_eq!(extra.target_base, 0x2_0000);
+        assert_eq!(extra.format, vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(
+            extra.write_mask,
+            vk::ColorComponentFlags::R | vk::ColorComponentFlags::A
+        );
+        assert!(extra.blend.enable);
+        assert_eq!(extra.blend.src_color, vk::BlendFactor::SRC_ALPHA);
+        assert_eq!(extra.blend.dst_color, vk::BlendFactor::ONE_MINUS_SRC_ALPHA);
+        // The primary attachment is untouched by slot-2 state.
+        assert!(!state.blend.enable);
+        assert_eq!(state.color_write_mask, vk::ColorComponentFlags::RGBA);
+    }
+
+    /// A bound slot whose `CB_TARGET_MASK` nibble is zero writes nothing on
+    /// hardware — it must not become an attachment. A slot whose extent
+    /// differs from slot 0 cannot share the render area — dropped (named).
+    #[test]
+    fn mrt_masked_or_mismatched_slots_are_not_attached() {
+        let mut ctx = ctx_96x48();
+        // Slot 1: bound, but mask nibble zero.
+        ctx.render_targets[1].base.addr = 0x3_0000;
+        ctx.render_targets[1].info.format = 0xa;
+        ctx.render_targets[1].attrib2 = ctx.render_targets[0].attrib2;
+        // Slot 3: bound + written, but a different extent.
+        let rt3 = &mut ctx.render_targets[3];
+        rt3.base.addr = 0x4_0000;
+        rt3.info.format = 0xa;
+        rt3.attrib2 = ColorAttrib2 {
+            width: 31,
+            height: 31,
+            num_mip_levels: 0,
+        };
+        ctx.render_target_mask = 0xF | (0xF << 12);
+
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).expect("valid");
+        assert!(
+            state.mrt.is_empty(),
+            "masked and extent-mismatched slots must not attach: {:?}",
+            state.mrt
+        );
+    }
+
+    /// The eliminate-fast-clear image is the packed `CLEAR_WORD` splatted in
+    /// the target's own byte layout — no per-format unpack.
+    #[test]
+    fn fast_clear_image_splats_the_packed_clear_words() {
+        let mut rt = kyty_graphics::hw_regs::RenderTarget::default();
+        rt.base.addr = 0x1_0000;
+        rt.info.format = 0xa; // RGBA8 UNORM
+        rt.info.cmask_fast_clear_enable = true;
+        rt.attrib2 = ColorAttrib2 {
+            width: 3,
+            height: 1,
+            num_mip_levels: 0,
+        };
+        rt.clear_word0.word0 = 0x8040_20FF;
+
+        let image = fast_clear_image(&rt, 1.0)
+            .expect("mapped format")
+            .expect("armed fast clear");
+        assert_eq!(
+            (image.width, image.height, image.bytes_per_pixel),
+            (4, 2, 4)
+        );
+        assert_eq!(image.pixels.len(), 4 * 2 * 4);
+        for px in image.pixels.chunks_exact(4) {
+            assert_eq!(px, 0x8040_20FFu32.to_le_bytes());
+        }
+        // Resolution scale supersamples the clear like every draw.
+        let scaled = fast_clear_image(&rt, 2.0).expect("mapped").expect("armed");
+        assert_eq!((scaled.width, scaled.height), (8, 4));
+    }
+
+    /// FCE with nothing to eliminate (no base / fast clear unarmed /
+    /// degenerate extent) is a quiet no-op; an unmapped format is a named
+    /// error, never a wrong-coloured clear.
+    #[test]
+    fn fast_clear_image_refuses_unarmed_or_unmapped_state() {
+        let mut rt = kyty_graphics::hw_regs::RenderTarget::default();
+        assert!(matches!(fast_clear_image(&rt, 1.0), Ok(None)), "no base");
+        rt.base.addr = 0x1_0000;
+        rt.attrib2 = ColorAttrib2 {
+            width: 3,
+            height: 1,
+            num_mip_levels: 0,
+        };
+        assert!(
+            matches!(fast_clear_image(&rt, 1.0), Ok(None)),
+            "fast clear not armed"
+        );
+        rt.info.cmask_fast_clear_enable = true;
+        rt.attrib2.width = 0;
+        assert!(
+            matches!(fast_clear_image(&rt, 1.0), Ok(None)),
+            "degenerate extent"
+        );
+        rt.attrib2.width = 3;
+        rt.info.format = 0x1F; // unmapped CB format
+        assert!(fast_clear_image(&rt, 1.0).is_err(), "unmapped format");
     }
 
     /// 16-bit indices — the common case — are read straight from guest memory
