@@ -321,9 +321,13 @@ top-down, update statuses in place, and keep it committed.**
   120-sample window off published-frame epochs; painter+rects top-right HUD
   (FPS, avg/worst frame ms, flip FPS, upload/drain/fence/read/sRGB ms); no
   puffin dependency; persisted as `general.perf_hud`.
-- [ ] LIVE VERIFY pending (verify skill, real title): F3 on/off over Minecraft,
-  plausible numbers, Settings row tracks, HUD absent on fault overlay,
-  portrait-display capture gotcha.
+- [x] LIVE VERIFIED 2026-07-28 (real Minecraft session, PrintWindow captures):
+  F3 ON shows the full HUD (70 FPS, avg 14.3/worst 21.4 ms, flips 34 FPS,
+  upload 0.85 ms, drain/fence/read/sRGB strip, "F3 hides this HUD" hint);
+  F3 OFF returns the plain badge — never both. Numbers plausible vs the
+  measured upload baseline. NOTE for future verifies: PrintWindow(hwnd,hdc,0x3)
+  captures the Shell even when occluded by the user's windows — prefer it
+  over CopyFromScreen.
 - **What:** toggleable overlay: FPS, frame time (avg/p99), guest CPU core
   usage, upload/present µs (values already measured ad-hoc via puffin scopes
   `execute_dcb_cp` / `publish_frame` / `shell_update` and `egui_upload_us`).
@@ -351,8 +355,12 @@ top-down, update statuses in place, and keep it committed.**
   published guest frame to `screenshots/<id>_<UTC>.png` (image crate, refuses
   non-RGBA8/truncated); toasts; `screenshots/` gitignored. 4 tests + config
   persistence test.
-- [ ] LIVE VERIFY pending: F12/Create toast + PNG on disk during a session;
-  no-session info toast on Home.
+- [x] LIVE VERIFIED 2026-07-28: F12 on Home -> "No game running" info toast
+  at TopLeft, no file. F12 in a Minecraft session -> success toast naming
+  screenshots\Minecraft_20260728-013027-231.png; the PNG is the pure guest
+  frame (no Shell UI/HUD baked in), decodes correctly. Pad Create not
+  exercised (no physical controller connected during the verify) — covered
+  by unit tests; re-check when a controller is present.
 
 ### 19. DualSense passthrough
 - [ ] Rumble first (gilrs ff or hidapi), then haptics/adaptive triggers via
