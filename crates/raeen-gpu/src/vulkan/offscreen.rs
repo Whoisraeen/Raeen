@@ -12,15 +12,21 @@
 
 use super::cache::{
     BlendKey, DepthPipelineKey, DepthTargetKey, DepthTargetLayout, DrawCaches, GraphicsPipelineKey,
-    PendingDrawResources, PersistentDepthTarget, PersistentTarget, PersistentTexture, StencilKey,
-    TargetContent, TargetKey, TargetLayout, TextureKey,
+    GpuPresentKey, PendingDrawResources, PersistentDepthTarget, PersistentTarget,
+    PersistentTexture, StencilKey, TargetContent, TargetKey, TargetLayout, TextureKey,
 };
 use super::instance::VulkanDevice;
 use super::shaders::{triangle_fragment_spirv, triangle_vertex_spirv};
 use ash::vk::Handle;
 use ash::{Device, util::Align, vk};
 use raeen_core::error::GpuError;
-use std::{mem, sync::Arc};
+use std::{
+    mem,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use tracing::debug;
 
 /// The color the attachment is cleared to before the draw, as linear RGBA.
@@ -1436,6 +1442,9 @@ pub(crate) struct DeferredFlushTiming {
 /// image-only wrapper above so diagnostics do not leak into the rendering API.
 pub(crate) struct DeferredFlush {
     pub images: Vec<(u64, RenderedImage)>,
+    /// GPU-plugin results keyed by the native target base. These are for
+    /// presentation only and must never replace the native framebuffer seed.
+    pub plugin_images: Vec<(u64, RenderedImage)>,
     pub timing: DeferredFlushTiming,
 }
 
@@ -1451,6 +1460,7 @@ pub(crate) fn flush_deferred_draws_filtered_timed(
     if !caches.batch_open() {
         return Ok(DeferredFlush {
             images: Vec::new(),
+            plugin_images: Vec::new(),
             timing: DeferredFlushTiming::default(),
         });
     }
@@ -1465,13 +1475,14 @@ pub(crate) fn flush_deferred_draws_filtered_timed(
         caches.requeue_touched(keep);
         return Ok(DeferredFlush {
             images: Vec::new(),
+            plugin_images: Vec::new(),
             timing: DeferredFlushTiming::default(),
         });
     }
     let pending_draws = pending.len();
     let gpu_at = std::time::Instant::now();
     match record_and_read_flush(dev, &mut caches, &pending, already_submitted, &read_now) {
-        Ok((mut images, flush_timing)) => {
+        Ok((mut images, plugin_images, flush_timing)) => {
             let gpu_flush = gpu_at.elapsed();
             let publish_at = std::time::Instant::now();
             let (compute_dirty_bytes, compute_dirty_spans) =
@@ -1534,6 +1545,7 @@ pub(crate) fn flush_deferred_draws_filtered_timed(
             }
             Ok(DeferredFlush {
                 images,
+                plugin_images,
                 timing: flush_timing,
             })
         }

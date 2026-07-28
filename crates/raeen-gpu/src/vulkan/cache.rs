@@ -2548,6 +2548,140 @@ fn destroy_compute_buffer(device: &ash::Device, buffer: PersistentComputeBuffer)
     }
 }
 
+fn create_gpu_present_target(
+    dev: &VulkanDevice,
+    key: GpuPresentKey,
+    bytes_per_pixel: u32,
+) -> Result<GpuPresentTarget, GpuError> {
+    let device = dev.device();
+    let format = vk::Format::from_raw(key.format);
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: key.width,
+            height: key.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+        )
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    // SAFETY: create info is complete and the device is live.
+    let image = unsafe { device.create_image(&image_info, None) }.map_err(|error| {
+        GpuError::VulkanInitFailed(format!("GPU plugin output vkCreateImage: {error}"))
+    })?;
+    // SAFETY: image belongs to this device.
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let memory_type = match dev.find_memory_type(
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            // SAFETY: image is not bound or in use.
+            unsafe { device.destroy_image(image, None) };
+            return Err(error);
+        }
+    };
+    let allocation = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type);
+    // SAFETY: allocation matches the image requirements.
+    let memory = match unsafe { device.allocate_memory(&allocation, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            // SAFETY: image is not bound or in use.
+            unsafe { device.destroy_image(image, None) };
+            return Err(GpuError::VulkanInitFailed(format!(
+                "GPU plugin output vkAllocateMemory: {error}"
+            )));
+        }
+    };
+    // SAFETY: memory was allocated for this image at offset zero.
+    if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+        // SAFETY: neither handle is in use.
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_image(image, None);
+        }
+        return Err(GpuError::VulkanInitFailed(format!(
+            "GPU plugin output vkBindImageMemory: {error}"
+        )));
+    }
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    // SAFETY: image is live and the view describes its sole color subresource.
+    let view = match unsafe { device.create_image_view(&view_info, None) } {
+        Ok(view) => view,
+        Err(error) => {
+            // SAFETY: handles are not in use.
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(GpuError::VulkanInitFailed(format!(
+                "GPU plugin output vkCreateImageView: {error}"
+            )));
+        }
+    };
+    let readback_size = u64::from(key.width)
+        .checked_mul(u64::from(key.height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(bytes_per_pixel)))
+        .ok_or_else(|| {
+            GpuError::VulkanInitFailed("GPU plugin output readback size overflow".to_owned())
+        });
+    let readback_size = match readback_size {
+        Ok(size) => size,
+        Err(error) => {
+            // SAFETY: handles are not in use.
+            unsafe {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            return Err(error);
+        }
+    };
+    let (readback_buffer, readback_memory) = match create_host_buffer(dev, readback_size) {
+        Ok(pair) => pair,
+        Err(error) => {
+            // SAFETY: handles are not in use.
+            unsafe {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            return Err(error);
+        }
+    };
+    Ok(GpuPresentTarget {
+        image,
+        memory,
+        view,
+        readback_buffer,
+        readback_memory,
+        layout: vk::ImageLayout::UNDEFINED,
+    })
+}
+
 /// Destroy one persistent target's handles.
 ///
 /// # Safety
@@ -2556,6 +2690,17 @@ fn destroy_compute_buffer(device: &ash::Device, buffer: PersistentComputeBuffer)
 /// be destroyed exactly once (the entry must already be out of the map).
 unsafe fn destroy_target(device: &ash::Device, target: &PersistentTarget) {
     // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        device.destroy_image_view(target.view, None);
+        device.destroy_image(target.image, None);
+        device.free_memory(target.memory, None);
+        device.destroy_buffer(target.readback_buffer, None);
+        device.free_memory(target.readback_memory, None);
+    }
+}
+
+unsafe fn destroy_gpu_present_target(device: &ash::Device, target: &GpuPresentTarget) {
+    // SAFETY: forwarded from the caller's no-live-work contract.
     unsafe {
         device.destroy_image_view(target.view, None);
         device.destroy_image(target.image, None);
