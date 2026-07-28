@@ -923,10 +923,13 @@ fn hle_aio_initialize_impl(ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// Record types inside an AMPR command buffer (SharpEmu `AmprExports`).
+/// Record types inside an AMPR command buffer (SharpEmu `AmprExports`;
+/// type 4 is Raeen's self-sizing skip record from the KytyPS5-ported
+/// nop/marker/wait/map commands — see `libsce_ampr::NOP_RECORD_TYPE`).
 const APR_RECORD_READ_FILE: u32 = 1;
 const APR_RECORD_KERNEL_EVENT_QUEUE: u32 = 2;
 const APR_RECORD_WRITE_ADDRESS: u32 = 3;
+const APR_RECORD_NOP: u32 = 4;
 
 /// Complete one AMPR command buffer synchronously: walk its records and do
 /// the completion work a console does async — fire completion events and
@@ -1008,6 +1011,23 @@ fn apr_complete_command_buffer(ctx: &HleContext, cb: u64) -> u64 {
                     return SCE_KERNEL_ERROR_EFAULT;
                 }
                 offset += 0x20;
+            }
+            APR_RECORD_NOP => {
+                // Self-sizing skip record ([type][total_size][payload…]):
+                // nops, markers, dropped waits, and map bookkeeping — no
+                // completion effect. `total_size` includes the 8-byte header.
+                let mut sz = [0u8; 4];
+                if !ctx.mem.read(record + 4, &mut sz) {
+                    return SCE_KERNEL_ERROR_EFAULT;
+                }
+                let total = u64::from(u32::from_le_bytes(sz));
+                if total < 8 || (total & 3) != 0 {
+                    warn!(
+                        "APR command buffer: corrupt skip record (total_size {total:#x}) at +{offset:#x}"
+                    );
+                    return SCE_KERNEL_ERROR_EINVAL;
+                }
+                offset += total;
             }
             other => {
                 warn!("APR command buffer: unknown record type {other} at +{offset:#x}");
