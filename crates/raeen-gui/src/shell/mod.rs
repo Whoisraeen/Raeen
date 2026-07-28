@@ -86,6 +86,17 @@ struct ActiveSession {
     /// launcher's session map. `None` if the launcher shares no kernel
     /// (`StubLauncher`).
     kernel: Option<std::sync::Arc<raeen_kernel::OrbisKernel>>,
+    /// This title's local trophy store file (`savedata/<title>-trophies.json`),
+    /// polled during the session to toast new unlocks. `None` for non-game
+    /// launches. The store is written by the HLE (UDS `_UnlockTrophy` path)
+    /// in whichever process runs the guest; the Shell only reads it.
+    trophy_store_path: Option<PathBuf>,
+    /// Unlock count already seen (baseline loaded at launch), so only *new*
+    /// unlocks toast.
+    trophies_seen: usize,
+    /// Last trophy-store poll, so the file is read at most every couple of
+    /// seconds instead of every frame.
+    trophies_polled: std::time::Instant,
 }
 
 /// Cap on the Switcher's recent-titles history (spec §10).
@@ -95,6 +106,10 @@ const MAX_RECENT_TITLES: usize = 6;
 /// reports stay on disk under `logs/crashes/` behind the "Open Crash
 /// Reports Folder" row.
 const MAX_CRASH_REPORT_ROWS: usize = 8;
+
+/// How often a running session re-reads its local trophy store to toast new
+/// unlocks. File-mtime cheap, but no reason to touch disk every frame.
+const TROPHY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// User-supplied UI sound packs live under `sounds/<pack>/` (repo-root
 /// relative, like `themes/` and `Games/`).
@@ -308,6 +323,11 @@ pub struct Shell {
     /// overlay opens and persisted when it closes (see [`per_game`]).
     game_options_draft: per_game::PerGameSettings,
     game_options_target_id: Option<String>,
+    /// Trophy summary for the title the Game Options overlay is showing,
+    /// loaded from its local unlock store when the overlay opens. `None` for
+    /// apps and titles without a store file yet — the overlay then shows
+    /// "none unlocked yet" for games and nothing for apps.
+    game_options_trophies: Option<per_game::TrophySummary>,
     /// Press-and-hold state for the in-session pad quit (SharpEmu PR #415).
     session_quit_hold: QuitHold,
     /// Last frame's merged Create-button state, so an in-session press takes
@@ -448,6 +468,7 @@ impl Shell {
             settings_key_provider_input,
             crash_reports,
             game_options_draft: per_game::PerGameSettings::default(),
+            game_options_trophies: None,
             game_options_target_id: None,
             session_quit_hold: QuitHold::default(),
             pad_create_was_down: false,
@@ -601,6 +622,7 @@ impl Shell {
         self.pump_updater_events(ctx);
         self.tick_library_watcher(ctx);
         self.poll_session();
+        self.tick_session_trophies();
         self.push_pad_state(ctx);
         self.tick_rumble();
         self.tick_session_quit(ctx);
@@ -806,8 +828,10 @@ impl Shell {
             return;
         };
         let id = item.id.clone();
+        let trophies = trophy_summary_for(item);
         self.game_options_draft = per_game::PerGameSettings::load(&self.per_game_dir(), &id);
         self.game_options_target_id = Some(id);
+        self.game_options_trophies = trophies;
     }
 
     /// Persist the edited per-game overrides (an all-inherit draft deletes the
@@ -817,6 +841,7 @@ impl Shell {
             self.game_options_draft.save(&self.per_game_dir(), &id);
         }
         self.game_options_draft = per_game::PerGameSettings::default();
+        self.game_options_trophies = None;
     }
 
     /// Step the config field addressed by `(section, row)` — see
@@ -1612,6 +1637,13 @@ impl Shell {
                 ledger::store(&ledger_dir, &item.id, &title_ledger);
                 self.ledgers.insert(item.id.clone(), title_ledger);
                 let kernel = self.launcher.session_kernel(&handle);
+                // Trophy toast baseline: unlocks already on disk before this
+                // session must not toast when the first poll runs.
+                let trophy_store_path = trophy_store_path_for(item);
+                let trophies_seen = trophy_store_path
+                    .as_deref()
+                    .map(|path| raeen_core::trophies::TrophyStore::load(path).unlocked_count())
+                    .unwrap_or(0);
                 self.session = Some(ActiveSession {
                     handle,
                     title: item.title.clone(),
@@ -1620,6 +1652,9 @@ impl Shell {
                     faulted_seen: false,
                     target_index: index,
                     kernel,
+                    trophy_store_path,
+                    trophies_seen,
+                    trophies_polled: std::time::Instant::now(),
                 });
             }
             Err(err) => {
@@ -1664,6 +1699,42 @@ impl Shell {
             // the previous title's final image before it renders anything.
             self.frame_view.clear();
         }
+    }
+
+    /// Poll the running title's local trophy store (at most every
+    /// [`TROPHY_POLL_INTERVAL`]) and toast newly appeared unlocks. The store
+    /// is written by the HLE's UDS `_UnlockTrophy` path in whichever process
+    /// runs the guest, so a plain file re-read works for both the in-process
+    /// launcher and the isolated runner child. Counts only — trophy names
+    /// are unavailable without the title's encrypted trophy pack, and no
+    /// name is ever invented.
+    fn tick_session_trophies(&mut self) {
+        let newly = {
+            let Some(session) = &mut self.session else {
+                return;
+            };
+            let Some(path) = session.trophy_store_path.as_deref() else {
+                return;
+            };
+            if session.trophies_polled.elapsed() < TROPHY_POLL_INTERVAL {
+                return;
+            }
+            session.trophies_polled = std::time::Instant::now();
+            let count = raeen_core::trophies::TrophyStore::load(path).unlocked_count();
+            if count <= session.trophies_seen {
+                return;
+            }
+            let newly = count - session.trophies_seen;
+            session.trophies_seen = count;
+            (newly, count)
+        };
+        let (new_unlocks, total) = newly;
+        self.sound_pack.play(sounds::UiSound::Confirm);
+        self.toasts.success(if new_unlocks == 1 {
+            format!("Trophy unlocked \u{2014} {total} total")
+        } else {
+            format!("{new_unlocks} trophies unlocked \u{2014} {total} total")
+        });
     }
 
     fn ledger_dir(&self) -> PathBuf {
@@ -1793,7 +1864,11 @@ impl Shell {
                     &self.config,
                     &self.game_options_draft,
                     &title,
+<<<<<<< HEAD
                     badge,
+=======
+                    self.game_options_trophies.as_ref(),
+>>>>>>> worktree-agent-ab8451f5668e88c3c
                 );
                 return;
             }
@@ -2342,6 +2417,33 @@ fn background_textures_for(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The local trophy store file for a library item, when it is a game:
+/// `savedata/<title-dir>-trophies.json` — derived exactly like the launch
+/// path derives the title's save-data host root (`savedata/<eboot's parent
+/// directory name>`), so the Shell reads the same file the HLE writes.
+fn trophy_store_path_for(item: &LibraryItem) -> Option<PathBuf> {
+    let LaunchTarget::Game { path } = &item.launch else {
+        return None;
+    };
+    let title_dir = path.parent()?.file_name()?;
+    let savedata_root = std::path::Path::new("savedata").join(title_dir);
+    Some(raeen_core::trophies::TrophyStore::path_for_savedata_root(
+        &savedata_root,
+    ))
+}
+
+/// Trophy summary for the Game Options overlay: local unlock count + last
+/// unlock time. `None` for apps (no trophy store); a game without a store
+/// file yet reads as zero unlocks.
+fn trophy_summary_for(item: &LibraryItem) -> Option<per_game::TrophySummary> {
+    let path = trophy_store_path_for(item)?;
+    let store = raeen_core::trophies::TrophyStore::load(path);
+    Some(per_game::TrophySummary {
+        unlocked: store.unlocked_count(),
+        last_unlock_ms: store.last_unlock_ms(),
+    })
+}
+
 fn draw_session_overlay(
     ui: &mut egui::Ui,
     theme: &Theme,

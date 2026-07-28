@@ -110,7 +110,17 @@ SOFTWARE.
   gather/scatter read-stream continuation (file id sticks, destination and
   file offset continue past each read), the `WriteAddressFrom*` value-0
   completion, and the APR map-window `EPERM` state machine; record byte
-  layouts, the eager-read model, and all tests are Raeen's own. No C++ is
+  layouts, the eager-read model, and all tests are Raeen's own. The local
+  trophy-store batch (2026-07-28) cross-checks `src/libs/libNet.cpp`:
+  `LibNpTrophy2`'s prototypes and struct sizes (`NpTrophy2GameDetails` 152 B,
+  `NpTrophy2Details` 1312 B static-asserts), the confirmed
+  `NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND` (`0x80553911`) icon-getter shape
+  (`*size = 0`), and `LibNpUniversalDataSystem`'s field-proven UDS prototypes
+  (`CreateEvent(eventName*, prop, newEvent**, propPtr**)`, property setters
+  `(object, key, value)`) re-implemented in
+  `crates/raeen-hle/src/libsce_np_trophy2.rs` and
+  `libsce_np_universal_data.rs`; KytyPS5's fabricated one-bronze-trophy
+  "Kyty" game info is deliberately not ported. No C++ is
   vendored or compiled into Raeen.
 
 ---
