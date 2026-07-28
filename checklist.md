@@ -426,3 +426,26 @@ top-down, update statuses in place, and keep it committed.**
   with the parallel session, passed on retry). NEXT highest-value: item 2B
   (compute-queue execution) + live re-measure of GTA V and Until Dawn, item
   4's abort/exit noreturn fix, live-verify pass for HUD/screenshots.
+
+## INTERRUPTED WAVE (2026-07-27 ~8:45pm CT) — resume after the usage-limit reset (11:20pm CT)
+
+Eight agents died mid-work on the session usage limit. Their worktrees under
+`.claude/worktrees/agent-<id>/` hold UNCOMMITTED partial work. To resume: send
+each agent a message to continue (same agent id), or start fresh agents in the
+EXISTING worktrees telling them to finish + commit. States at interruption:
+
+| Item | Worktree agent id | Last known state (from its progress notes) |
+|------|-------------------|---------------------------------------------|
+| 22b ASTRO shader/overrun | af9b1e5e4a3652f06 | mid shader fix: `storage_image_coord_text` + `storage_descriptor_index_constant` (3 files modified) |
+| 19 DualSense rumble | a25b1414c6cf305da | near done: "un-reserve the Settings hint" left (12 files) |
+| 17 Trophy store | ab8451f5668e88c3c | Shell wiring: ActiveSession construction/helpers/tick/draw call site (8 files) |
+| 14 Async pipelines | af052f8a8fffa3490 | lib tests green (275, +6 pool tests); Vulkan-device integration test left (8 files) |
+| 16 MRT1-7 + fast-clear | a75ce852ccac64bf2 | tests rerunning; checklist+ledger update left (12 files) |
+| 21 Video clips | a2ef7b7d8f3338947 | settings.rs row const/count/draw/tests left (6 files) |
+| 9 Soak harness | a02e09e7762605222 | adding record_memory to ResourceStats + resource test (5 files) |
+| 6 GPU present phase 2 | (worktree gone — design done, no code) | full design in its final notification; relaunch fresh with the design pasted |
+| 11 Badges | aae9109900b0f7b09 | was waiting on cargo test -p raeen-gui -j 4 (5 files) |
+
+Also owed after resume: live 30-min soak (9), A/B gate flips (5), canary hunt
+(22a), badges/crash-view/phase-2 live verifies, DualSense hardware check,
+v0.1.0 release-workflow result check (GitHub Actions).
