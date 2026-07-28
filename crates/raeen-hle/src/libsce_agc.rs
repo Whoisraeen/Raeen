@@ -1698,6 +1698,18 @@ fn submit_command_buffer(
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
+    // The Agc runtime may hand the driver a 5-DWORD *descriptor* instead of
+    // the ACB itself; unwrap it to the real stream before decoding.
+    let (command_address, dword_count) = if queue == "ACB" {
+        let (unwrapped_address, unwrapped_dwords) =
+            unwrap_acb_descriptor(ctx, command_address, dword_count);
+        if unwrapped_dwords == 0 || unwrapped_dwords > 1_000_000 {
+            return SCE_ERROR_INVALID_ARGUMENT;
+        }
+        (unwrapped_address, unwrapped_dwords)
+    } else {
+        (command_address, dword_count)
+    };
     let Some(byte_count) = (dword_count as usize).checked_mul(4) else {
         return SCE_ERROR_INVALID_ARGUMENT;
     };
@@ -1709,6 +1721,13 @@ fn submit_command_buffer(
         .chunks_exact(4)
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect();
+    // Graphics→compute ordering: an ACB may wait on a label whose RELEASE_MEM
+    // producer sits in graphics PM4 the title built AFTER its last DCB submit
+    // (and has not submitted yet). Flush that pending segment as a DCB first,
+    // or the compute queue parks on a label no submitted producer will write.
+    if queue == "ACB" {
+        flush_pending_graphics_segment_before_acb(ctx, &words);
+    }
     let Ok(decoded) = raeen_gpu::agc::decode_submission(&words) else {
         return SCE_ERROR_INVALID_ARGUMENT;
     };
@@ -1940,7 +1959,289 @@ fn submit_command_buffer(
     );
     ctx.gpu.submit(words, gpu_queue);
 
+    // KytyPS5 `submit_dcb` (agc.cpp L3691-3696): after every graphics submit,
+    // start tracking the ring region behind it as the new pending segment.
+    if queue != "ACB" {
+        track_pending_graphics_segment_after_submit(ctx, command_address, dword_count);
+    }
+
     0
+}
+
+/// Magic in the fifth DWORD of an ACB submission descriptor
+/// (KytyPS5 `submit_acb`, agc.cpp L3928-3946).
+const ACB_DESCRIPTOR_MAGIC: u32 = 0x5533_ccaa;
+
+/// KytyPS5 grows the pending segment at most 0xfffff DWORDs past its start.
+const PENDING_SEGMENT_RANGE_BYTES: u64 = 0xf_ffff * 4;
+
+/// Unwrap the ACB submission descriptor indirection (KytyPS5 `submit_acb`,
+/// agc.cpp L3928-3946): when the submitted "buffer" is (at least) 5 DWORDs of
+/// `[addr_lo, addr_hi, size_in_dwords, flags == 0, 0x5533ccaa]`, the real
+/// command stream is at that address. Anything else is the stream itself.
+fn unwrap_acb_descriptor(ctx: &HleContext, address: u64, dwords: u32) -> (u64, u32) {
+    if dwords < 5 {
+        return (address, dwords);
+    }
+    let mut descriptor = [0u8; 20];
+    if !ctx.mem.read(address, &mut descriptor) {
+        return (address, dwords);
+    }
+    let word =
+        |index: usize| u32::from_le_bytes(descriptor[index * 4..index * 4 + 4].try_into().unwrap());
+    let real_address = u64::from(word(0)) | (u64::from(word(1)) << 32);
+    let real_dwords = word(2);
+    let flags = word(3);
+    let magic = word(4);
+    if real_address != 0 && real_dwords != 0 && flags == 0 && magic == ACB_DESCRIPTOR_MAGIC {
+        debug!(
+            descriptor = format_args!("{address:#x}"),
+            real_address = format_args!("{real_address:#x}"),
+            real_dwords,
+            "ACB submission descriptor unwrapped to its real command stream"
+        );
+        (real_address, real_dwords)
+    } else {
+        (address, dwords)
+    }
+}
+
+/// Total DWORD length of a type-3 PM4 packet from its header.
+const fn pm4_total_dwords(header: u32) -> usize {
+    (((header >> 16) & 0x3fff) + 2) as usize
+}
+
+/// KytyPS5 `track_pending_graphics_segment_after_submit` (agc.cpp L223-235):
+/// the pending segment restarts, empty, right after the submitted DCB.
+fn track_pending_graphics_segment_after_submit(
+    ctx: &HleContext,
+    dcb_address: u64,
+    dword_count: u32,
+) {
+    if dcb_address == 0 || dword_count == 0 {
+        return;
+    }
+    let start = dcb_address + u64::from(dword_count) * 4;
+    let mut segment = ctx
+        .kernel
+        .agc_pending_graphics_segment
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    segment.start = start;
+    segment.end = start;
+    segment.range_end = start.saturating_add(PENDING_SEGMENT_RANGE_BYTES);
+}
+
+/// KytyPS5 `track_pending_graphics_allocation` (agc.cpp L237-264): a
+/// command-buffer allocation inside the tracked range extends the pending
+/// segment, but only contiguously — a gap means the allocation belongs to a
+/// different ring region and is ignored (log-limited, like the original).
+fn track_pending_graphics_allocation(ctx: &HleContext, address: u64, size_dwords: u64) {
+    if address == 0 || size_dwords == 0 {
+        return;
+    }
+    let mut segment = ctx
+        .kernel
+        .agc_pending_graphics_segment
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if segment.start == 0
+        || segment.range_end == 0
+        || address < segment.start
+        || address >= segment.range_end
+    {
+        return;
+    }
+    if address > segment.end {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NONCONTIGUOUS: AtomicU32 = AtomicU32::new(0);
+        if NONCONTIGUOUS.fetch_add(1, Ordering::Relaxed) < 64 {
+            debug!(
+                address = format_args!("{address:#x}"),
+                tracked_end = format_args!("{:#x}", segment.end),
+                "pending graphics segment: ignoring non-contiguous allocation"
+            );
+        }
+        return;
+    }
+    let allocation_end = address + size_dwords * 4;
+    if allocation_end > segment.end && allocation_end <= segment.range_end {
+        segment.end = allocation_end;
+    }
+}
+
+/// Collect the guest addresses an ACB's `R_WAIT_MEM32`/`R_WAIT_MEM64` packets
+/// poll (KytyPS5 `collect_acb_wait_addresses`, agc.cpp L3698-3728; length
+/// gates widened to the 6-DWORD 32-bit wait this file's own builders emit).
+/// Deviation from the original: a lone `0x8000_0000` type-2 padding dword is
+/// one DWORD (as everywhere else in Raeen's decoders), not a 2-DWORD packet.
+fn collect_acb_wait_addresses(words: &[u32]) -> Vec<u64> {
+    let mut addresses = Vec::new();
+    let mut offset = 0usize;
+    while offset < words.len() {
+        let header = words[offset];
+        if header == 0x8000_0000 {
+            offset += 1;
+            continue;
+        }
+        if header >> 30 != 3 {
+            break;
+        }
+        let length = pm4_total_dwords(header);
+        if length > words.len() - offset {
+            break;
+        }
+        let op = (header >> 8) & 0xff;
+        let register = (header >> 2) & 0x3f;
+        if op == IT_NOP
+            && ((register == R_WAIT_MEM32 && length >= 6)
+                || (register == R_WAIT_MEM64 && length >= 9))
+        {
+            let address = u64::from(words[offset + 1]) | (u64::from(words[offset + 2]) << 32);
+            if address != 0 {
+                addresses.push(address);
+            }
+        }
+        offset += length;
+    }
+    addresses
+}
+
+/// Port of KytyPS5 `flush_pending_graphics_segment_before_acb` (agc.cpp
+/// L3741-3839). Before an ACB runs, the graphics PM4 built since the last
+/// DCB submit is flushed as a DCB so its `RELEASE_MEM` producers execute
+/// ahead of the ACB's waits:
+///
+/// 1. When the ACB carries waits, scan the pending segment for `RELEASE_MEM`
+///    packets whose destination matches an awaited label; truncate the
+///    segment to just past the LAST matching producer (no match keeps the
+///    whole segment — the flush itself is unconditional).
+/// 2. Trim the segment to whole, structurally valid packets (the tail of the
+///    ring may hold a partially written packet).
+/// 3. Submit what remains through the real DCB path, which re-tracks the
+///    pending segment behind the flushed region.
+fn flush_pending_graphics_segment_before_acb(ctx: &HleContext, acb_words: &[u32]) {
+    let wait_addresses = collect_acb_wait_addresses(acb_words);
+    let (segment_address, segment_dwords) = {
+        let mut segment = ctx
+            .kernel
+            .agc_pending_graphics_segment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if segment.start == 0 || segment.end <= segment.start {
+            return;
+        }
+        let total_dwords = usize::try_from((segment.end - segment.start) / 4)
+            .unwrap_or(usize::MAX)
+            .min(1_000_000);
+        let mut bytes = vec![0u8; total_dwords * 4];
+        if !ctx.mem.read(segment.start, &mut bytes) {
+            warn!(
+                start = format_args!("{:#x}", segment.start),
+                dwords = total_dwords,
+                "pending graphics segment is unreadable — dropped"
+            );
+            *segment = raeen_kernel::AgcPendingGraphicsSegment::default();
+            return;
+        }
+        let segment_words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect();
+        // Pass 1: truncate to the last RELEASE_MEM producing an awaited label.
+        if !wait_addresses.is_empty() {
+            let mut matched_end = 0usize;
+            let mut offset = 0usize;
+            while offset < segment_words.len() {
+                let header = segment_words[offset];
+                if header == 0x8000_0000 {
+                    offset += 1;
+                    continue;
+                }
+                if header >> 30 != 3 {
+                    break;
+                }
+                let length = pm4_total_dwords(header);
+                if length > segment_words.len() - offset {
+                    break;
+                }
+                let op = (header >> 8) & 0xff;
+                let register = (header >> 2) & 0x3f;
+                if op == IT_NOP && register == R_RELEASE_MEM && length >= 7 {
+                    let address = u64::from(segment_words[offset + 3])
+                        | (u64::from(segment_words[offset + 4]) << 32);
+                    if wait_addresses.contains(&address) {
+                        matched_end = offset + length;
+                    }
+                }
+                offset += length;
+            }
+            if matched_end > 0 {
+                segment.end = segment.start + matched_end as u64 * 4;
+            }
+        }
+        // Pass 2: trim to whole, structurally valid packets.
+        let limit = usize::try_from((segment.end - segment.start) / 4)
+            .unwrap_or(usize::MAX)
+            .min(segment_words.len());
+        let mut offset = 0usize;
+        let mut valid_end = 0usize;
+        while offset < limit {
+            let header = segment_words[offset];
+            if header == 0x8000_0000 {
+                offset += 1;
+                valid_end = offset;
+                continue;
+            }
+            if header >> 30 != 3 {
+                break;
+            }
+            let length = pm4_total_dwords(header);
+            if length > limit - offset {
+                break;
+            }
+            offset += length;
+            valid_end = offset;
+        }
+        if valid_end < limit {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static TRIMMED: AtomicU32 = AtomicU32::new(0);
+            if TRIMMED.fetch_add(1, Ordering::Relaxed) < 64 {
+                warn!(
+                    start = format_args!("{:#x}", segment.start),
+                    old_dwords = limit,
+                    new_dwords = valid_end,
+                    "trimming pending graphics segment to whole packets"
+                );
+            }
+            segment.end = segment.start + valid_end as u64 * 4;
+        }
+        if segment.end <= segment.start {
+            return;
+        }
+        (segment.start, ((segment.end - segment.start) / 4) as u32)
+    };
+    tracing::info!(
+        address = format_args!("{segment_address:#x}"),
+        dwords = segment_dwords,
+        awaited_labels = wait_addresses.len(),
+        "flushing pending graphics segment before ACB"
+    );
+    let rc = submit_command_buffer(ctx, segment_address, segment_dwords, "DCB");
+    if rc != 0 {
+        warn!(
+            address = format_args!("{segment_address:#x}"),
+            dwords = segment_dwords,
+            rc = format_args!("{rc:#x}"),
+            "pending graphics segment failed to submit — dropped"
+        );
+        let mut segment = ctx
+            .kernel
+            .agc_pending_graphics_segment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *segment = raeen_kernel::AgcPendingGraphicsSegment::default();
+    }
 }
 
 /// Decode a command packet's identity: `(op, register)` from its Agc PM4
@@ -3775,6 +4076,9 @@ fn alloc_command_dwords(ctx: &HleContext, cb_addr: u64, size_dwords: u64) -> Opt
     if !ctx.mem.write(cb_addr + CB_CURSOR_UP, &next.to_le_bytes()) {
         return None;
     }
+    // KytyPS5 `CommandBuffer::AllocateDW` (agc.cpp L358-364): every builder
+    // allocation may extend the pending post-submit graphics segment.
+    track_pending_graphics_allocation(ctx, cursor_up, size_dwords);
     Some(cursor_up)
 }
 
@@ -6573,6 +6877,256 @@ mod tests {
     }
 
     /// DRAW_INDIRECT is the non-indexed sibling of DRAW_INDEX_INDIRECT: same
+    // ---- Phase B: ACB execution (descriptor indirection + pre-ACB flush) ---
+
+    /// Recording GPU stub for the ACB-execution tests: captures every
+    /// `(words, queue)` pair handed to the submission subsystem, in order.
+    #[derive(Default)]
+    struct AcbRecordingGpu {
+        submissions: std::sync::Mutex<Vec<(Vec<u32>, raeen_core::subsystems::GpuQueue)>>,
+    }
+    impl raeen_core::subsystems::GpuSubmissionSubsystem for AcbRecordingGpu {
+        fn submit(&self, words: Vec<u32>, queue: raeen_core::subsystems::GpuQueue) {
+            self.submissions.lock().unwrap().push((words, queue));
+        }
+        fn map_shader_metadata(
+            &self,
+            _code_address: u64,
+            _data: raeen_core::subsystems::ShaderMappedData,
+        ) {
+        }
+        fn present_scanout(
+            &self,
+            _address: u64,
+            _descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
+        ) {
+        }
+        fn wait_idle(&self) {}
+        fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
+            raeen_core::subsystems::GpuSubmissionStats::default()
+        }
+    }
+
+    /// KytyPS5 `submit_acb` (agc.cpp L3928-3946): the submitted "ACB" may be a
+    /// 5-DWORD descriptor `[addr_lo, addr_hi, size, flags = 0, 0x5533ccaa]`
+    /// whose real command stream lives at that address. Without the unwrap the
+    /// descriptor bytes fail PM4 decode and the whole ACB is dropped.
+    #[test]
+    fn submit_acb_unwraps_the_five_dword_descriptor_indirection() {
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = AcbRecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        // The REAL ACB at 0x600: one direct compute dispatch.
+        let acb = [pm4(5, IT_DISPATCH_DIRECT, R_ZERO), 8, 4, 2, 1];
+        for (i, w) in acb.iter().enumerate() {
+            assert!(ctx.mem.write(0x600 + i as u64 * 4, &w.to_le_bytes()));
+        }
+        // The descriptor at 0x900.
+        for (i, w) in [0x600u32, 0, 5, 0, ACB_DESCRIPTOR_MAGIC].iter().enumerate() {
+            assert!(ctx.mem.write(0x900 + i as u64 * 4, &w.to_le_bytes()));
+        }
+        // Gen5 submission packet {addr, dwords} pointing at the DESCRIPTOR.
+        assert!(ctx.mem.write(0x180, &0x900u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &5u32.to_le_bytes()));
+        assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x180]), 0);
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(
+            submissions[0].0, acb,
+            "the REAL stream reached the GPU, not the descriptor dwords"
+        );
+        assert_eq!(
+            submissions[0].1,
+            raeen_core::subsystems::GpuQueue::AsyncCompute
+        );
+        assert_eq!(
+            kernel
+                .agc_dispatch_packet_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the unwrapped stream's dispatch was decoded"
+        );
+    }
+
+    /// A 5-DWORD buffer whose flags/magic do not match the descriptor shape
+    /// is the command stream itself and must be submitted verbatim.
+    #[test]
+    fn submit_acb_without_the_magic_is_the_stream_itself() {
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = AcbRecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        let acb = [pm4(5, IT_DISPATCH_DIRECT, R_ZERO), 1, 1, 1, 1];
+        for (i, w) in acb.iter().enumerate() {
+            assert!(ctx.mem.write(0x600 + i as u64 * 4, &w.to_le_bytes()));
+        }
+        assert!(ctx.mem.write(0x180, &0x600u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &5u32.to_le_bytes()));
+        assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x180]), 0);
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, acb);
+    }
+
+    /// KytyPS5 `flush_pending_graphics_segment_before_acb` (agc.cpp
+    /// L3741-3839): graphics PM4 built after the last DCB submit — here a
+    /// RELEASE_MEM emitted through the REAL builder + allocator path — is
+    /// flushed as a DCB before the ACB that waits on its label, so the
+    /// producer executes ahead of the consumer.
+    #[test]
+    fn acb_flushes_the_pending_graphics_segment_producer_first() {
+        // Asserts the eager side-effect default — serialize with the env-gate
+        // tests, exactly like `submit_signals_timestamp_fences_and_eop_interrupts`.
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = AcbRecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        // 1. The title submits a graphics DCB (2-dword NOP at 0x400)...
+        assert!(ctx.mem.write(0x400, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert!(ctx.mem.write(0x404, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x180, &0x400u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &2u32.to_le_bytes()));
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
+        // ...which starts pending-segment tracking right behind it (0x408).
+        // 2. It then BUILDS (does not submit) a RELEASE_MEM writing 0x42 to
+        //    the label 0x980, through the real builder + allocator.
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x408, 0x800);
+        let rm = hle_cb_release_mem(&ctx, &[cb, 0, 0, 0, 0, 0x980, 1, 0x42, 0, 0, 0, 0]);
+        assert_eq!(rm, 0x408, "the builder allocated at the segment start");
+        // 3. It submits an ACB that WAITS on that label, then dispatches.
+        let acb = [
+            pm4(6, IT_NOP, R_WAIT_MEM32),
+            0x980,
+            0,
+            0xFFFF_FFFF,
+            3,
+            0x42,
+            pm4(5, IT_DISPATCH_DIRECT, R_ZERO),
+            1,
+            1,
+            1,
+            1,
+        ];
+        for (i, w) in acb.iter().enumerate() {
+            assert!(ctx.mem.write(0x700 + i as u64 * 4, &w.to_le_bytes()));
+        }
+        assert!(ctx.mem.write(0x190, &0x700u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x198, &(acb.len() as u32).to_le_bytes()));
+        assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x190]), 0);
+        // Order: the DCB, then the flushed segment AS a DCB, then the ACB.
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 3, "DCB, flushed segment, ACB");
+        assert_eq!(
+            submissions[1].1,
+            raeen_core::subsystems::GpuQueue::Graphics,
+            "the pending segment flushes on the graphics queue"
+        );
+        assert_eq!(submissions[1].0.len(), 8);
+        assert_eq!(submissions[1].0[0], pm4(8, IT_NOP, R_RELEASE_MEM));
+        assert_eq!(
+            submissions[2].1,
+            raeen_core::subsystems::GpuQueue::AsyncCompute
+        );
+        drop(submissions);
+        // The producer's label write landed before the ACB was handed off.
+        assert_eq!(read_u32(&ctx, 0x980), 0x42);
+        // The segment re-tracked behind the flushed region.
+        let segment = *kernel
+            .agc_pending_graphics_segment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(segment.start, 0x408 + 8 * 4);
+        assert_eq!(
+            segment.end, segment.start,
+            "nothing pending after the flush"
+        );
+    }
+
+    /// The wait-address scan truncates the flush to the LAST producer the ACB
+    /// actually awaits: a second RELEASE_MEM built behind it (label 0x9A0,
+    /// never awaited) is not flushed (KytyPS5 pass 1, agc.cpp L3749-3783).
+    #[test]
+    fn acb_wait_match_truncates_the_flush_to_its_producer() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = AcbRecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        assert!(ctx.mem.write(0x400, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert!(ctx.mem.write(0x404, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x180, &0x400u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &2u32.to_le_bytes()));
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x408, 0x800);
+        assert_eq!(
+            hle_cb_release_mem(&ctx, &[cb, 0, 0, 0, 0, 0x980, 1, 0x42, 0, 0, 0, 0]),
+            0x408
+        );
+        assert_eq!(
+            hle_cb_release_mem(&ctx, &[cb, 0, 0, 0, 0, 0x9A0, 1, 0x43, 0, 0, 0, 0]),
+            0x428
+        );
+        // The ACB waits ONLY on 0x980.
+        let acb = [pm4(6, IT_NOP, R_WAIT_MEM32), 0x980, 0, 0xFFFF_FFFF, 3, 0x42];
+        for (i, w) in acb.iter().enumerate() {
+            assert!(ctx.mem.write(0x700 + i as u64 * 4, &w.to_le_bytes()));
+        }
+        assert!(ctx.mem.write(0x190, &0x700u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x198, &(acb.len() as u32).to_le_bytes()));
+        assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x190]), 0);
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 3);
+        assert_eq!(
+            submissions[1].0.len(),
+            8,
+            "flush truncated to the awaited producer only"
+        );
+        drop(submissions);
+        assert_eq!(read_u32(&ctx, 0x980), 0x42, "awaited label written");
+        assert_eq!(read_u32(&ctx, 0x9A0), 0, "unawaited producer NOT flushed");
+    }
+
+    /// An allocation with a gap from the tracked end belongs to a different
+    /// ring region: it must not join the segment, and an ACB then flushes
+    /// nothing (KytyPS5 `track_pending_graphics_allocation`, agc.cpp L250-259).
+    #[test]
+    fn non_contiguous_allocations_do_not_join_the_pending_segment() {
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = AcbRecordingGpu::default();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        assert!(ctx.mem.write(0x400, &pm4(2, IT_NOP, R_ZERO).to_le_bytes()));
+        assert!(ctx.mem.write(0x404, &0u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x180, &0x400u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x188, &2u32.to_le_bytes()));
+        assert_eq!(hle_driver_submit_dcb(&ctx, &[0x180]), 0);
+        // The builder's cursor starts at 0x500 — a gap from the tracked 0x408.
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x500, 0x800);
+        assert_eq!(
+            hle_cb_release_mem(&ctx, &[cb, 0, 0, 0, 0, 0x980, 1, 0x42, 0, 0, 0, 0]),
+            0x500
+        );
+        let acb = [pm4(6, IT_NOP, R_WAIT_MEM32), 0x980, 0, 0xFFFF_FFFF, 3, 0x42];
+        for (i, w) in acb.iter().enumerate() {
+            assert!(ctx.mem.write(0x700 + i as u64 * 4, &w.to_le_bytes()));
+        }
+        assert!(ctx.mem.write(0x190, &0x700u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x198, &(acb.len() as u32).to_le_bytes()));
+        assert_eq!(hle_driver_submit_acb(&ctx, &[7, 0x190]), 0);
+        let submissions = gpu.submissions.lock().unwrap();
+        assert_eq!(
+            submissions.len(),
+            2,
+            "no segment flush: the gapped allocation was never tracked"
+        );
+        assert_eq!(
+            submissions[1].1,
+            raeen_core::subsystems::GpuQueue::AsyncCompute
+        );
+    }
+
     /// 5-DWORD shape, opcode 0x24.
     #[test]
     fn draw_indirect_emits_the_five_dword_packet() {

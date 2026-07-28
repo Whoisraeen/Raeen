@@ -445,6 +445,11 @@ pub struct CommandProcessor {
     /// `IT_SET_BASE` select 1: base address for indirect-draw argument
     /// buffers.
     indirect_draw_base: u64,
+    /// `IT_SET_BASE` select 1 with the shader-type header bit set: base
+    /// address for indirect-dispatch argument buffers. KytyPS5 keeps the two
+    /// bases separate (`CpOpSetBase`, pm4Handlers.cpp L2546: PM4 header bit 1
+    /// encodes `Gnmp::ShaderType` — 0 = draw args, 1 = dispatch args).
+    indirect_dispatch_base: u64,
     /// Latched by the `R_ZERO` 'hu' marker; types subsequent user-SGPR writes.
     user_data_marker: UserSgprType,
     /// Which distinct unknown ops/registers have already been warned about.
@@ -773,6 +778,9 @@ impl CommandProcessor {
             pm4::IT_SET_UCONFIG_REG_INDEX => self.cp_op_set_uconfig_reg_index(cmd_id, body, offset),
             pm4::IT_DRAW_INDEX_AUTO => self.cp_op_draw_index_auto(cmd_id, body, offset, sink),
             pm4::IT_DISPATCH_DIRECT => self.cp_op_dispatch_direct(cmd_id, body, offset, sink),
+            pm4::IT_DISPATCH_INDIRECT => {
+                self.cp_op_dispatch_indirect(cmd_id, body, offset, sink, mem)
+            }
             // Kyty: cp_op_draw_index (L2757), raw IT form 0xc0042700.
             pm4::IT_DRAW_INDEX_2 => self.cp_op_draw_index(cmd_id, body, offset, sink),
             // Not in Kyty's table — and it is what Minecraft draws with. See
@@ -804,17 +812,25 @@ impl CommandProcessor {
                 self.index_buffer_size = Self::body_at(body, 0, offset)?;
                 Ok(pm4::body_dw(cmd_id))
             }
-            // SET_BASE select 1 = indirect-draw argument buffer base.
+            // SET_BASE select 1 = indirect argument buffer base. The PM4
+            // header's bit 1 carries `Gnmp::ShaderType` (libSceAgc
+            // setBaseIndirectArgs folds it in): 0 routes to the indirect-DRAW
+            // base, 1 to the indirect-DISPATCH base — KytyPS5 `CpOpSetBase`
+            // (pm4Handlers.cpp L2546-2567).
             pm4::IT_SET_BASE => {
-                let select = Self::body_at(body, 0, offset)?;
+                let select = Self::body_at(body, 0, offset)? & 0xf;
                 let lo = Self::body_at(body, 1, offset)?;
                 let hi = Self::body_at(body, 2, offset)?;
-                if select == 1 {
-                    self.indirect_draw_base = u64::from(lo) | (u64::from(hi) << 32);
+                let shader_type = (cmd_id >> 1) & 0x3;
+                let base = u64::from(lo & !7) | (u64::from(hi & 0xffff) << 32);
+                if select == 1 && shader_type == 0 {
+                    self.indirect_draw_base = base;
+                } else if select == 1 && shader_type == 1 {
+                    self.indirect_dispatch_base = base;
                 } else if self.first(SkipKey::Note("set_base_select")) {
                     warn!(
                         select,
-                        offset, "IT_SET_BASE with unsupported base select — ignored"
+                        shader_type, offset, "IT_SET_BASE with unsupported base select — ignored"
                     );
                 }
                 Ok(pm4::body_dw(cmd_id))
@@ -1586,6 +1602,90 @@ impl CommandProcessor {
         sink.dispatch_direct(&self.ctx, &self.ucfg, &self.sh_ctx, groups, mode)
             .map_err(|source| CpError::Draw { offset, source })?;
         Ok(pm4::body_dw(cmd_id))
+    }
+
+    /// Indirect compute dispatch: read the `[x, y, z]` thread-group counts
+    /// from guest memory, then dispatch exactly like the direct form.
+    ///
+    /// Port of KytyPS5 `CpOpDispatchIndirect` (pm4Handlers.cpp L2009-2036) +
+    /// `CommandProcessor::DispatchIndirect` (graphicsRun.cpp L1100-1113). Two
+    /// encodings exist:
+    /// - 3-DWORD packet, body `[data_offset, mode]`: args live at the
+    ///   indirect-DISPATCH base (`IT_SET_BASE` select 1, shader type 1) plus
+    ///   `data_offset`;
+    /// - 4-DWORD packet, body `[addr_lo, addr_hi, mode]`: args live at the
+    ///   absolute guest address.
+    ///
+    /// Where KytyPS5 `EXIT`s (no base programmed, unmappable args) this skips
+    /// by encoded length with a once-warn, mirroring [`Self::cp_op_draw_indirect`]:
+    /// the completion labels behind the dispatch must still run.
+    fn cp_op_dispatch_indirect(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let consumed = pm4::body_dw(cmd_id);
+        let (args_addr, mode) = match consumed {
+            2 => {
+                let data_offset = u64::from(Self::body_at(body, 0, offset)?);
+                let mode = Self::body_at(body, 1, offset)?;
+                if self.indirect_dispatch_base == 0 {
+                    if self.first(SkipKey::Note("indirect_dispatch_no_base")) {
+                        warn!(
+                            offset,
+                            "indirect dispatch with no IT_SET_BASE(1, dispatch) programmed — skipped"
+                        );
+                    }
+                    return Ok(consumed);
+                }
+                (self.indirect_dispatch_base + data_offset, mode)
+            }
+            3 => {
+                let lo = Self::body_at(body, 0, offset)?;
+                let hi = Self::body_at(body, 1, offset)?;
+                let mode = Self::body_at(body, 2, offset)?;
+                (u64::from(lo) | (u64::from(hi) << 32), mode)
+            }
+            other => {
+                if self.first(SkipKey::Note("indirect_dispatch_len")) {
+                    warn!(
+                        body_dw = other,
+                        offset, "IT_DISPATCH_INDIRECT with unknown body length — skipped"
+                    );
+                }
+                return Ok(consumed);
+            }
+        };
+        let Some(mem) = mem else {
+            if self.first(SkipKey::Note("indirect_dispatch_no_memory")) {
+                warn!(
+                    offset,
+                    "indirect dispatch needs a GuestMemory reader — skipped"
+                );
+            }
+            return Ok(consumed);
+        };
+        let Some(groups) = mem.read_dwords(args_addr, 3) else {
+            if self.first(SkipKey::Note("indirect_dispatch_unreadable_args")) {
+                warn!(
+                    args_addr = format_args!("{args_addr:#x}"),
+                    offset, "indirect dispatch args unreadable — skipped"
+                );
+            }
+            return Ok(consumed);
+        };
+        sink.dispatch_direct(
+            &self.ctx,
+            &self.ucfg,
+            &self.sh_ctx,
+            [groups[0], groups[1], groups[2]],
+            mode,
+        )
+        .map_err(|source| CpError::Draw { offset, source })?;
+        Ok(consumed)
     }
 
     /// Kyty: `cp_op_marker` — latches the user-data marker type.
@@ -3906,6 +4006,103 @@ mod tests {
         cp.run(&dcb, &mut sink).expect("skip without memory");
         assert!(sink.auto_draws.is_empty());
         assert!(cp.distinct_skips() >= 2);
+    }
+
+    // ---- indirect dispatches (async-compute ACB arm) -----------------------
+
+    /// KytyPS5 `CpOpDispatchIndirect` 3-DWORD form: `SET_BASE(1, dispatch)` +
+    /// `DISPATCH_INDIRECT [data_offset, mode]` reads the thread-group counts
+    /// from guest memory at base + offset. The shader-type header bit routes
+    /// the base to the DISPATCH slot without disturbing the draw slot.
+    #[test]
+    fn dispatch_indirect_reads_groups_from_the_dispatch_base() {
+        let mem = BufMem {
+            base: 0x9000,
+            // two args records: {x, y, z}
+            words: vec![4, 5, 6, 7, 8, 9],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            // libSceAgc setBaseIndirectArgs with ShaderType compute → bit 1.
+            header(4, pm4::IT_SET_BASE, pm4::R_ZERO) | (1 << 1),
+            1, // base select: indirect args
+            0x9000,
+            0,
+            header(3, pm4::IT_DISPATCH_INDIRECT, pm4::R_ZERO),
+            12,   // data offset -> second record
+            0x2A, // mode/initiator
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("indirect dispatch");
+        assert_eq!(
+            cp.indirect_draw_base(),
+            0,
+            "compute SET_BASE must not clobber the draw-args base"
+        );
+        assert_eq!(sink.dispatches.len(), 1);
+        let (groups, mode, ..) = sink.dispatches[0];
+        assert_eq!(
+            groups,
+            [7, 8, 9],
+            "groups come from the record at base+offset"
+        );
+        assert_eq!(mode, 0x2A);
+    }
+
+    /// The 4-DWORD form carries the absolute args address inline
+    /// (KytyPS5 pm4Handlers.cpp L2013-2028) and needs no SET_BASE.
+    #[test]
+    fn dispatch_indirect_absolute_address_form_needs_no_base() {
+        let mem = BufMem {
+            base: 0x6000,
+            words: vec![2, 3, 4],
+        };
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(4, pm4::IT_DISPATCH_INDIRECT, pm4::R_ZERO),
+            0x6000,
+            0,
+            1, // mode
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("absolute indirect dispatch");
+        assert_eq!(sink.dispatches.len(), 1);
+        let (groups, mode, ..) = sink.dispatches[0];
+        assert_eq!(groups, [2, 3, 4]);
+        assert_eq!(mode, 1);
+    }
+
+    /// Without a programmed dispatch base (or without a memory reader) the
+    /// packet is a logged skip — the walk continues to the completion labels
+    /// behind it, mirroring the indirect-draw degrade policy.
+    #[test]
+    fn dispatch_indirect_without_base_or_memory_is_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // No SET_BASE at all.
+        let dcb = vec![header(3, pm4::IT_DISPATCH_INDIRECT, pm4::R_ZERO), 0, 0];
+        cp.run(&dcb, &mut sink).expect("skip without base");
+        assert!(sink.dispatches.is_empty());
+
+        // A DRAW base alone must not satisfy the dispatch form.
+        let dcb = vec![
+            header(4, pm4::IT_SET_BASE, pm4::R_ZERO),
+            1,
+            0x9000,
+            0,
+            header(3, pm4::IT_DISPATCH_INDIRECT, pm4::R_ZERO),
+            0,
+            0,
+        ];
+        let mem = BufMem {
+            base: 0x9000,
+            words: vec![1, 1, 1],
+        };
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("skip with only a draw base");
+        assert!(sink.dispatches.is_empty());
     }
 
     // ---- indirect registers -----------------------------------------------

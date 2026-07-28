@@ -64,16 +64,18 @@ top-down, update statuses in place, and keep it committed.**
     packets). MEASURED: GTA V render-path unresolved **83 → 0**; total 265 →
     88 (all online/dialog/input = item 3 territory). Attribution updated
     (THIRD_PARTY_NOTICES: KytyPS5 + Mesa; reference-port-ledger).
-  - [~] **B. Compute queue in the PM4 processor.** WAVE 2 IN PROGRESS
-    (gpu-pipeline agent, worktree, 2026-07-27). Phase B plan (from A):
-    (1) execute submitted ACBs — port KytyPS5 `GraphicsRunSubmitCompute`
-    incl. the 5-DW ACB descriptor indirection (magic 0x5533ccaa) in
-    `submit_acb`; (2) graphics↔compute ordering — port
-    `flush_pending_graphics_segment_before_acb` (agc.cpp:3698-3839), matching
-    ACB R_WAIT_MEM waits against pending RELEASE_MEM producers; integrate at
-    the cross-queue label latch in `raeen-gpu/src/agc_exec.rs`; (3)
-    queue-indexed execution context for DISPATCH/ACQUIRE_MEM/RELEASE_MEM/
-    WAIT/COND_EXEC arms already encoded in `kyty-graphics/src/run.rs`.
+  - [x] **B. DONE 2026-07-27** (gpu-pipeline agent worktree; kyty-graphics
+    480 green (+3), raeen-hle 486 green (+5), raeen-gpu 269 green (+1)).
+    Reality vs plan: ACBs already executed on a dedicated compute CP with
+    suspend/resume + cross-queue latch; what was missing and is now ported
+    from KytyPS5: (1) the 5-DW ACB descriptor indirection (magic 0x5533ccaa)
+    in Submit[Multi]Acbs — descriptor-form ACBs previously failed decode and
+    were dropped; (2) `flush_pending_graphics_segment_before_acb` + the
+    pending-segment tracker (DCB-submit re-track, `alloc_command_dwords`
+    growth, state on `OrbisKernel`) — unsubmitted graphics producers now
+    flush as a DCB before the waiting ACB, truncated to the awaited
+    RELEASE_MEM; (3) IT_DISPATCH_INDIRECT execution (both forms) + SET_BASE
+    shader-type split in run.rs. Ledger + THIRD_PARTY_NOTICES updated.
   - [~] **C. `libSceAmpr` (46 NIDs)** — WAVE 2 IN PROGRESS (hle-stubber
     agent, bundled with the abort/exit noreturn fix, 2026-07-27). Honest
     semantics (likely synchronous completion).

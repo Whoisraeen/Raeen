@@ -88,8 +88,20 @@ SOFTWARE.
   `DcbDrawIndexMultiInstanced`, `UpdatePrimState` (with
   `GraphicsPrimitiveTypeToGsOut`), `GetDataPacketPayloadRange`, the
   CondExec/QueueEndOfPipeAction/WaitRegMem/DmaData packet-patch family, and
-  the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. No C++ is
-  vendored or compiled into Raeen.
+  the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. The Phase B ACB
+  execution batch (2026-07-27) behaviorally re-implements three further
+  `src/libs/agc.cpp` mechanisms in `crates/raeen-hle/src/libsce_agc.rs`: the
+  5-DWORD ACB submission-descriptor indirection (`submit_acb`, magic
+  `0x5533ccaa`), the pending post-submit graphics-segment tracker
+  (`track_pending_graphics_segment_after_submit` /
+  `track_pending_graphics_allocation` in `CommandBuffer::AllocateDW`), and
+  `flush_pending_graphics_segment_before_acb` (ACB wait-address collection,
+  RELEASE_MEM producer matching, packet-boundary trimming, flush-as-DCB).
+  `crates/kyty-graphics/src/run.rs` additionally re-implements
+  `CpOpDispatchIndirect` (both the base+offset and absolute-address argument
+  forms, `pm4Handlers.cpp`/`graphicsRun.cpp`) and `CpOpSetBase`'s shader-type
+  split between the indirect-draw and indirect-dispatch argument bases. No
+  C++ is vendored or compiled into Raeen.
 
 ---
 
