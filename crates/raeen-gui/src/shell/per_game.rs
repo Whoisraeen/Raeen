@@ -67,6 +67,35 @@ pub enum GameOptionsClick {
     Row(usize),
 }
 
+/// Read-only per-title trophy summary shown in the Game Options overlay,
+/// computed from the local unlock store
+/// (`savedata/<title>-trophies.json`, [`raeen_core::trophies::TrophyStore`])
+/// when the overlay opens. Counts and times only — trophy *names/grades*
+/// live in the title's encrypted trophy pack, which Raeen cannot parse, so
+/// no name is ever shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrophySummary {
+    /// Locally unlocked trophy count.
+    pub unlocked: usize,
+    /// Unix-ms timestamp of the most recent unlock.
+    pub last_unlock_ms: Option<u64>,
+}
+
+impl TrophySummary {
+    /// The one-line display, e.g.
+    /// `Trophies: 3 unlocked · last 2026-07-27 18:22:05 UTC`.
+    pub fn line(&self) -> String {
+        match (self.unlocked, self.last_unlock_ms) {
+            (0, _) => "Trophies: none unlocked yet".to_owned(),
+            (n, Some(ms)) => format!(
+                "Trophies: {n} unlocked \u{00B7} last {}",
+                crate::crash_report::utc_display(ms / 1000)
+            ),
+            (n, None) => format!("Trophies: {n} unlocked"),
+        }
+    }
+}
+
 impl PerGameSettings {
     /// Every override is `None` — the title inherits the global config wholesale
     /// and therefore persists no file (mirrors SharpEmu `PerGameSettings.IsEmpty`).
@@ -312,6 +341,7 @@ pub fn draw(
     config: &EmulatorConfig,
     draft: &PerGameSettings,
     title: &str,
+    trophies: Option<&TrophySummary>,
 ) -> Option<GameOptionsClick> {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);
@@ -352,6 +382,22 @@ pub fn draw(
 
         for row in 0..ROW_COUNT {
             draw_row(ui, theme, nav, config, draft, row);
+        }
+
+        // Trophy summary — drawn *after* the option rows so the fixed
+        // pointer hit-rects above stay aligned with the painted rows.
+        // Display-only: counts/times from the local unlock store, never a
+        // trophy name (definitions are unavailable — see [`TrophySummary`]).
+        if let Some(summary) = trophies {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(54.0);
+                ui.label(
+                    RichText::new(summary.line())
+                        .color(theme.palette.text_dim)
+                        .size(13.0),
+                );
+            });
         }
 
         ui.add_space(20.0);
@@ -550,6 +596,39 @@ mod tests {
         assert_eq!(sanitize_id("CUSA/12345:v2"), "CUSA_12345_v2");
         assert_eq!(sanitize_id("   "), "UNKNOWN");
         assert_eq!(sanitize_id("ok.title-1_2"), "ok.title-1_2");
+    }
+
+    #[test]
+    fn trophy_summary_line_shows_counts_and_last_unlock_never_names() {
+        assert_eq!(
+            TrophySummary {
+                unlocked: 0,
+                last_unlock_ms: None
+            }
+            .line(),
+            "Trophies: none unlocked yet"
+        );
+        // 2026-07-27 00:00:00 UTC = 1_785_110_400 s.
+        assert_eq!(
+            TrophySummary {
+                unlocked: 3,
+                last_unlock_ms: Some(1_785_110_400_000)
+            }
+            .line(),
+            format!(
+                "Trophies: 3 unlocked \u{00B7} last {}",
+                crate::crash_report::utc_display(1_785_110_400)
+            )
+        );
+        // A count without a timestamp (defensive) still renders honestly.
+        assert_eq!(
+            TrophySummary {
+                unlocked: 2,
+                last_unlock_ms: None
+            }
+            .line(),
+            "Trophies: 2 unlocked"
+        );
     }
 
     #[test]

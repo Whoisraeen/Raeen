@@ -9,6 +9,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod logging;
 pub mod subsystems;
+pub mod trophies;
 pub mod types;
 
 /// Raeen version string.
