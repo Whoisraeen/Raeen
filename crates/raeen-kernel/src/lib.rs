@@ -24,6 +24,7 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 
+pub mod aio;
 pub mod filesystem;
 pub mod hypervisor;
 pub mod memory;
@@ -162,6 +163,11 @@ pub struct OrbisKernel {
     pub threads: Arc<threading::ThreadManager>,
     /// Virtual filesystem.
     pub filesystem: Arc<filesystem::VirtualFileSystem>,
+    /// Host-threadpool-backed kernel AIO engine (`sceKernelAio*`). Performs
+    /// its file I/O through [`Self::filesystem`] — the same descriptor table
+    /// the synchronous read/write path uses. Workers spawn lazily on the
+    /// first submit.
+    pub aio: aio::AioEngine,
     /// Stable, process-scoped HLE/wait/event/task/GPU event stream.
     pub diagnostics: Arc<DiagnosticRecorder>,
     /// Distinct unresolved callable imports observed by this guest process,
@@ -1211,11 +1217,13 @@ impl OrbisKernel {
     /// Create a new kernel instance with default configuration.
     pub fn new() -> Self {
         tracing::info!("Initializing Orbis kernel HLE");
+        let filesystem = Arc::new(filesystem::VirtualFileSystem::new());
         Self {
             console: Console::new(),
             memory: Arc::new(memory::VirtualMemoryManager::new()),
             threads: Arc::new(threading::ThreadManager::new()),
-            filesystem: Arc::new(filesystem::VirtualFileSystem::new()),
+            aio: aio::AioEngine::new(Arc::clone(&filesystem)),
+            filesystem,
             diagnostics: Arc::new(DiagnosticRecorder::from_env()),
             unresolved_nid_calls: DashMap::new(),
             started_at: std::time::Instant::now(),

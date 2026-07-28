@@ -187,9 +187,24 @@ top-down, update statuses in place, and keep it committed.**
   `crates/raeen-hle/src/libc.rs` consumers.
 
 ### 8. AIO infrastructure
-- [ ] The 5 skipped kernel AIO NIDs ("no infra — do not fake", ledger
-  2026-07-25). Implement a real host-threadpool-backed AIO with Orbis
-  semantics (submit/poll/wait/cancel) in `raeen-kernel`, then the HLE surface.
+- [x] DONE 2026-07-27 (hle-stubber agent, worktree branch). The 5 skipped
+  kernel AIO NIDs identified from phase1 coverage (Until Dawn + Dragon Ball
+  Sparking Zero import exactly: `sceKernelAioSubmitReadCommands`,
+  `SubmitWriteCommands`, `WaitRequest`, `PollRequests`, `DeleteRequest`) —
+  implemented REAL, plus the 7 sibling spellings (`*Multiple`,
+  plural/singular wait/poll/cancel/delete forms) that share the machinery.
+  Engine: `crates/raeen-kernel/src/aio.rs` — 2 lazy host worker threads over
+  the SAME VFS descriptor table as the sync path; submit returns ids
+  immediately; wait blocks on condvar with timeout; poll never blocks;
+  cancel aborts not-yet-started (in-flight finish normally, per Orbis
+  "PROCESSING = could not cancel"); delete retires final state into a
+  bounded ring so late polls still answer. Workers NEVER touch guest
+  memory: write payloads captured at submit, read completions staged host-
+  side and delivered through `ctx.mem` when the guest drains via the API
+  (`crates/raeen-hle/src/kernel_aio.rs`). Layouts re-derived from public C
+  decls, cross-checked vs shadPS4 aio.h (no code ported). Tests: kernel
+  53 (+10), hle 507 (+10 incl. struct-layout + delete-before-wait
+  delivery); clippy/fmt green.
 
 ---
 
