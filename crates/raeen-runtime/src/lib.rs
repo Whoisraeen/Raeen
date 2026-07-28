@@ -235,6 +235,29 @@ fn register_static_tls_layout(
     );
 }
 
+/// The guest thread id both `execute_linked` and `execute_process` hand
+/// `dispatch::run` for the initial thread.
+#[cfg(target_os = "windows")]
+const MAIN_GUEST_THREAD: u64 = 1;
+
+/// Publish the main thread's guest stack bounds so the HLE out-buffer guard can
+/// recognise a caller local.
+///
+/// The HLE needs "is this out-pointer inside the calling thread's stack?" to be
+/// answerable *exactly*, because an oversized out-struct write onto a caller
+/// frame is what smashes the caller's adjacent locals and its
+/// `__stack_chk_guard` canary — the crash GTA V and Until Dawn both die of.
+/// Registering the region costs one map insert per launch and removes the need
+/// for any address-range heuristic; `raeen_runtime::thread` does the same for
+/// each `scePthreadCreate` worker's own stack.
+#[cfg(target_os = "windows")]
+fn register_main_thread_stack(kernel: &OrbisKernel, arena: &arena::GuestArena) {
+    let (base, top) = arena.stack_region();
+    kernel
+        .guest_thread_stacks
+        .insert(MAIN_GUEST_THREAD, (base, top));
+}
+
 /// How a faulting guest instruction was touching the address it faulted on —
 /// decoded from `EXCEPTION_RECORD.ExceptionInformation[0]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +449,7 @@ pub fn execute_linked(
     };
     let static_tls_block = static_tls_block(tcb, &module.tls_layout);
     register_static_tls_layout(kernel, &module.tls_layout);
+    register_main_thread_stack(kernel, &arena);
 
     // Direct function/module execution enters no crt0, so the loader owns every
     // initializer this module carries, main included (EntryPolicy::
@@ -827,6 +851,7 @@ fn execute_process_mapped(
     };
     let static_tls_block = static_tls_block(tcb, &module.tls_layout);
     register_static_tls_layout(kernel, &module.tls_layout);
+    register_main_thread_stack(kernel, arena);
 
     // Lay out the process stack in the arena's stack region (design doc §2);
     // `process::build_process_stack` writes only through `&arena` (bounds-

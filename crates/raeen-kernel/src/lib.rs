@@ -205,6 +205,20 @@ pub struct OrbisKernel {
     /// spins in its own code and makes no HLE calls (the call ring goes blank).
     /// On Windows these are duplicated `HANDLE`s owned for the process lifetime.
     pub host_thread_handles: DashMap<u64, u64>,
+    /// Each live guest thread's stack as `[base, top)`, keyed by guest thread
+    /// id — the arena's stack region for the main thread, and the freshly
+    /// allocated stack for every `scePthreadCreate` worker. Registered by the
+    /// runtime as a thread starts and removed as it exits.
+    ///
+    /// This is what lets the HLE answer "is this out-pointer a caller local?"
+    /// **exactly** instead of guessing from an address range: a secondary
+    /// thread's stack comes out of the same arena heap as ordinary
+    /// allocations, so nothing about its address distinguishes it. The
+    /// out-buffer guard (`raeen_hle::out_buffer`) uses the answer to refuse
+    /// bulk-initializing a caller frame, which is the difference between an
+    /// oversized HLE write being harmless and it smashing the caller's
+    /// `__stack_chk_guard` canary.
+    pub guest_thread_stacks: DashMap<u64, (u64, u64)>,
     /// Per-guest-thread ring of the most recent HLE `library::function` calls,
     /// keyed by guest thread id. Populated only when diagnostics ask for it
     /// (the __cxa_throw trap), so a thread that throws can report the exact
@@ -1244,6 +1258,7 @@ impl OrbisKernel {
             thread_priorities: DashMap::new(),
             thread_sched_policies: DashMap::new(),
             host_thread_handles: DashMap::new(),
+            guest_thread_stacks: DashMap::new(),
             recent_hle_calls: DashMap::new(),
             in_flight_hle: DashMap::new(),
             proc_param_addr: std::sync::atomic::AtomicU64::new(0),

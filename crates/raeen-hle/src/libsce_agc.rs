@@ -1609,11 +1609,30 @@ fn hle_driver_trigger_capture(_ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `sceAgcDriverQueryResourceRegistrationUserMemoryRequirements(sizeOut,
 /// resourceCount, ownerCount)`: write the required backing-memory size.
+///
+/// Both counts are `uint32_t` in this family — the sibling
+/// `sceAgcDriverInitResourceRegistration` stores `ownerCount` into a `u32` and
+/// explicitly rejects anything wider. Taking them here as full 64-bit
+/// registers let a stale high half (the classic caller-clobbered-register
+/// hazard) inflate `required` into a plausible-looking multiple that the title
+/// then hands to its allocator — or, worse, to an `alloca`. An out-of-range
+/// count is now an argument error, so a polluted register fails loudly instead
+/// of producing a monstrous size.
 fn hle_driver_query_resource_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let size_out = args.first().copied().unwrap_or(0);
     let resource_count = args.get(1).copied().unwrap_or(0);
     let owner_count = args.get(2).copied().unwrap_or(0);
     if size_out == 0 || resource_count == 0 || owner_count == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    if resource_count > u64::from(u32::MAX) || owner_count > u64::from(u32::MAX) {
+        warn!(
+            resource_count = format_args!("{resource_count:#x}"),
+            owner_count = format_args!("{owner_count:#x}"),
+            "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements: a count \
+             exceeds uint32_t — rejecting rather than sizing an allocation from a \
+             possibly-polluted register"
+        );
         return SCE_ERROR_INVALID_ARGUMENT;
     }
     let required = resource_count
@@ -6691,6 +6710,22 @@ mod tests {
         // Query: required = resourceCount*0x118 + ownerCount*0x1E0.
         assert_eq!(hle_driver_query_resource_memory(&ctx, &[0x1E0, 2, 3]), 0);
         assert_eq!(read_u64(&ctx, 0x1E0), 2 * 0x118 + 3 * 0x1E0);
+        // Both counts are uint32_t. A wider value is a polluted register, not a
+        // real count: reject it instead of sizing an allocation (possibly an
+        // alloca) from it. The out slot must be left untouched.
+        let untouched = read_u64(&ctx, 0x1E0);
+        for args in [
+            [0x1E0u64, u64::from(u32::MAX) + 1, 3],
+            [0x1E0, 2, u64::from(u32::MAX) + 1],
+            [0x1E0, 0xDEAD_0000_0000_0002, 3],
+        ] {
+            assert_eq!(
+                hle_driver_query_resource_memory(&ctx, &args),
+                SCE_ERROR_INVALID_ARGUMENT,
+                "count wider than uint32_t must be rejected: {args:#x?}"
+            );
+            assert_eq!(read_u64(&ctx, 0x1E0), untouched);
+        }
     }
 
     /// M2 HLE seam: `SubmitDcb` remains a thin ABI adapter and forwards the

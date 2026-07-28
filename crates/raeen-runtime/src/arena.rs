@@ -993,6 +993,20 @@ impl GuestArena {
         self.base + STACK_OFFSET + STACK_SIZE
     }
 
+    /// The main-thread guest stack region as `[base, top)`.
+    ///
+    /// Published to the kernel so the HLE can tell a caller **local** from a
+    /// heap object when it is handed an out pointer — see
+    /// [`raeen_kernel::OrbisKernel::guest_thread_stacks`]. Without it, an HLE
+    /// export that bulk-initializes "the whole struct" cannot know it is about
+    /// to clear the caller's adjacent locals and stack-protector canary.
+    pub(crate) fn stack_region(&self) -> (u64, u64) {
+        (
+            self.base + STACK_OFFSET,
+            self.base + STACK_OFFSET + STACK_SIZE,
+        )
+    }
+
     /// Back `addr` with memory if it lies in a range the guest reserved but
     /// that was never committed. Returns whether the caller should retry the
     /// faulting access.
@@ -3640,6 +3654,18 @@ mod tests {
         assert_eq!(top % 16, 0, "stack_top must be 16-byte aligned");
         assert_eq!(top, GUEST_ARENA_BASE + STACK_OFFSET + STACK_SIZE);
         assert!(top > GUEST_ARENA_BASE + STACK_OFFSET);
+
+        // `stack_region` is the same region as a half-open pair — this is what
+        // the HLE out-buffer guard is handed so it can recognise a caller local
+        // and refuse to bulk-initialize a caller's frame.
+        let (base, region_top) = arena.stack_region();
+        assert_eq!(region_top, top, "the region must end at stack_top");
+        assert_eq!(base, GUEST_ARENA_BASE + STACK_OFFSET);
+        assert!(base < region_top);
+        // An initial RSP is inside the region it belongs to; the heap below the
+        // guard page is not.
+        assert!((base..region_top).contains(&(top - 8)));
+        assert!(!(base..region_top).contains(&(base - PAGE_SIZE)));
     }
 
     /// (g) construct, drop, construct again: the fixed base is reusable —

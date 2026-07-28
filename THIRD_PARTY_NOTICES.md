@@ -184,6 +184,24 @@ SOFTWARE.
   element-size guard mirrors its `BitLog2` refusal. Raeen's swizzle-equation
   tables were verified independently equivalent to SharpEmu's for the modes
   both implement (5/9/24/27) and were **not** changed by that comparison.
+  **Out-buffer / stack-canary discipline (2026-07-28).** SharpEmu's out-buffer
+  fix series supplied the *rule set* — write exactly the ABI struct size and
+  field width, never derive a write length from a guest register, bulk-initialize
+  only non-stack objects, do not write reserved/secondary out slots, do not round
+  up a size a guest may use as an `alloca` length — after auditing its
+  `SharpEmu.Libs/Audio/AudioOut2Exports.cs` (whose own comment records that
+  clearing 0x80 bytes "overwrote the caller's stack canary immediately following
+  the 0x40-byte parameter block") and `VideoOut/VideoOutExports.cs`. Raeen's
+  implementation is original and **structurally different**: SharpEmu detects a
+  stack out-pointer with an address-range heuristic over its own import-stack
+  window, while `crates/raeen-hle/src/out_buffer.rs` answers the question exactly
+  from per-guest-thread stack bounds the runtime registers in
+  `raeen_kernel::OrbisKernel::guest_thread_stacks`, falling back to a bounded
+  window above `HleContext::caller_rsp`. Two reference sizes were verified
+  against SharpEmu's live tree rather than a single commit (`VideoOut` output
+  options 0x40 and the `GetOutputStatus` 0x30 layout, which Raeen already
+  matched); the audit, the guard API, the Rust code, and all of its tests are
+  original. Findings recorded in `docs/sharpemu-port/outbuffer-audit.md`.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;

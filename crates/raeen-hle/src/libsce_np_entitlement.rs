@@ -99,9 +99,24 @@ fn hle_request_not_found(_ctx: &HleContext, _args: &[u64]) -> u64 {
 
 /// `sceNpEntitlementAccessInitialize(initParam, bootParam)`: when `bootParam`
 /// is non-null, its 0x20-byte block is zeroed; a fault there is reported.
+///
+/// The 0x20 size is not established by anything in-tree, and `bootParam` is a
+/// block the caller owns — routinely a stack local. Bulk-clearing it therefore
+/// goes through the out-buffer guard, which performs the clear only where the
+/// block provably is not a caller frame; on a frame it writes nothing rather
+/// than risk taking out the caller's neighbouring locals and stack-protector
+/// canary over a guessed struct size. Clearing a caller's own parameter block
+/// is a courtesy, never an ABI guarantee, so skipping it costs nothing.
 fn hle_initialize(ctx: &HleContext, args: &[u64]) -> u64 {
     let boot_param = args.get(1).copied().unwrap_or(0);
-    if boot_param != 0 && !ctx.mem.write(boot_param, &[0u8; BOOT_PARAM_CLEAR_SIZE]) {
+    if boot_param != 0
+        && !ctx.zero_out_object(
+            "libSceNpEntitlementAccess::sceNpEntitlementAccessInitialize",
+            boot_param,
+            BOOT_PARAM_CLEAR_SIZE,
+            0,
+        )
+    {
         return SCE_ERROR_MEMORY_FAULT;
     }
     OK
@@ -162,6 +177,20 @@ mod tests {
         assert_eq!(
             hle_initialize(&ctx, &[0x10, 0xFFFF_0000]),
             SCE_ERROR_MEMORY_FAULT
+        );
+
+        // A boot param that lives in the calling thread's stack is a caller
+        // frame: the guessed 0x20-byte clear must not touch it (the caller's
+        // neighbouring locals and `__stack_chk_guard` canary live there), and
+        // the call still succeeds.
+        kernel.guest_thread_stacks.insert(1, (0x80, 0x100));
+        assert!(mem.write(0x90, &[0xFFu8; BOOT_PARAM_CLEAR_SIZE]));
+        assert_eq!(hle_initialize(&ctx, &[0x10, 0x90]), OK);
+        let mut frame = [0u8; BOOT_PARAM_CLEAR_SIZE];
+        assert!(mem.read(0x90, &mut frame));
+        assert!(
+            frame.iter().all(|&b| b == 0xFF),
+            "a stack-resident bootParam must be left alone"
         );
     }
 

@@ -894,6 +894,19 @@ fn hle_fsync(ctx: &HleContext, args: &[u64]) -> u64 {
 /// backend yet — the honest model is "the init succeeded; requests complete
 /// immediately when they arrive". Zero the block (a clean, defined default)
 /// rather than leaving guest garbage the title might read back as a schedule.
+///
+/// # Why the zero-fill is conditional
+///
+/// `size` is a guest register, and this is the only place in this file that
+/// turns a caller-supplied size into a **write length** rather than into a gate
+/// (compare `sceKernelVirtualQuery`, which checks `info_size >= 72` and then
+/// writes exactly 72). A block that is really a caller *local* — or a register
+/// that is stale rather than a real size — would let this memset up to 64 KiB
+/// of the caller's frame, taking out its locals, saved registers, and
+/// `__stack_chk_guard` canary. So the bulk clear happens only for a block that
+/// is provably not a caller local ([`crate::out_buffer`]); on a stack block the
+/// HLE writes nothing and still reports success, because zeroing a parameter
+/// block the caller filled in itself is a write the ABI never promised.
 fn hle_aio_initialize_param(ctx: &HleContext, args: &[u64]) -> u64 {
     let param = args.first().copied().unwrap_or(0);
     let size = usize::try_from(args.get(1).copied().unwrap_or(0)).unwrap_or(0);
@@ -901,8 +914,7 @@ fn hle_aio_initialize_param(ctx: &HleContext, args: &[u64]) -> u64 {
     if param == 0 || size == 0 || size > 0x10000 {
         return SCE_KERNEL_ERROR_EINVAL;
     }
-    let bytes = vec![0u8; size];
-    if !ctx.mem.write(param, &bytes) {
+    if !ctx.zero_out_object("libkernel::sceKernelAioInitializeParam", param, size, 0) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK
@@ -1073,7 +1085,21 @@ fn hle_apr_submit_and_get_result(ctx: &HleContext, args: &[u64]) -> u64 {
     {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    if result_address != 0 && !ctx.mem.write(result_address, &0u64.to_le_bytes()) {
+    // The `resultAddress` slot: 8 zero bytes where the block is provably not a
+    // caller local, 4 where it is. No in-tree evidence pins this slot's width —
+    // the sibling `outSubmissionId` is a 4-byte `u32` (`appr_add_submission`
+    // returns `u32`), and an SCE completion code is an `int`, but the SharpEmu
+    // port this follows stores 8. The value is zero either way, so an off-stack
+    // block keeps exactly the behavior it had, while a caller local can no
+    // longer lose 4 bytes of the *next* local to a possibly-too-wide store.
+    if result_address != 0
+        && !ctx.zero_out_object(
+            "libkernel::sceKernelAprSubmitCommandBufferAndGetResult",
+            result_address,
+            8,
+            4,
+        )
+    {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     debug!(
@@ -1982,7 +2008,12 @@ pub fn register(registry: &HleRegistry) {
     // `pthread_thread` (real sched-param bookkeeping, which runs after this
     // function and wins) — the old hle_ok_stub here dropped the value, the
     // same lesson as scePthreadSetprio below.
-    registry.register("libScePosix", "fstat", hle_fstat);
+    // POSIX `fstat` returns -1 + errno; `sceKernelFstat` (below) returns an SCE
+    // code. Registering the same raw handler under both spellings gave both the
+    // wrong convention. Also registered under `libkernel`, which exports the
+    // plain POSIX spellings too (see `read`/`write` above).
+    registry.register("libScePosix", "fstat", hle_posix_fstat);
+    registry.register("libkernel", "fstat", hle_posix_fstat);
 
     // -- Measured Minecraft libc.prx / eboot imports (real PS5 export names,
     // each verified by NID hash against the title's import table; semantics
@@ -2153,7 +2184,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelChmod", hle_path_metadata_accept);
     registry.register("libkernel", "sceKernelUtimes", hle_path_metadata_accept);
     registry.register("libkernel", "sceKernelStat", hle_stat);
-    registry.register("libkernel", "sceKernelFstat", hle_fstat);
+    registry.register("libkernel", "sceKernelFstat", hle_sce_fstat);
     // Plain POSIX spellings of the same two metadata calls — different NIDs
     // from the sce* forms, registered under both providers (the measured
     // imports name `libScePosix`; `unlink`/`rmdir` above show libkernel
@@ -3505,11 +3536,14 @@ fn hle_posix_mprotect(ctx: &HleContext, args: &[u64]) -> u64 {
         "mprotect addr={addr:#x} len={len:#x} prot={prot:#x}"
     ));
     // Apply the protection when enforcement is on; a no-op otherwise (the arena
-    // default). POSIX `mprotect` returns 0 on success.
+    // default). POSIX `mprotect` returns 0 on success and **-1 with `errno`
+    // set** on failure — it used to return the internal `-22` raw, which a
+    // guest comparing against `-1` never recognised as an error, and `errno`
+    // stayed stale.
     if ctx.mem.protect(addr, len, prot) {
         0
     } else {
-        FILE_EINVAL
+        file_result_posix(ctx, FILE_EINVAL)
     }
 }
 
@@ -4389,6 +4423,16 @@ fn hle_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
 /// zero-sized character-like record for console fds. A directory posing as a
 /// zero-length regular file (the old behavior) breaks directory walkers that
 /// branch on `st_mode`.
+///
+/// Returns this module's internal `-errno` convention, like every other
+/// file-family primitive here, so [`file_result_posix`] and [`file_result_sce`]
+/// can adapt it per export name. It previously returned `-9` (a raw internal
+/// value) on a bad fd but `0x8002_000E` (an SCE code) on a fault, and was
+/// registered **raw** under both `libScePosix::fstat` and
+/// `libkernel::sceKernelFstat` — so the POSIX spelling never returned `-1`
+/// (a guest's `if (fstat(...) == -1)` could not fire, and `errno` was never
+/// set) and the SCE spelling reported `-9` instead of
+/// `SCE_KERNEL_ERROR_EBADF`.
 fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0);
     let stat_out = args.get(1).copied().unwrap_or(0);
@@ -4419,10 +4463,20 @@ fn hle_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
         let blksize: u32 = if directory { 0x8000 } else { 512 };
         stat[88..92].copy_from_slice(&blksize.to_le_bytes());
         if !ctx.mem.write(stat_out, &stat) {
-            return SCE_KERNEL_ERROR_EFAULT;
+            return FILE_EFAULT;
         }
     }
     SCE_OK
+}
+
+/// POSIX `fstat`: `-1` with `errno` set.
+fn hle_posix_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_fstat(ctx, args))
+}
+
+/// `sceKernelFstat`: a negative `SCE_KERNEL_ERROR_*` code.
+fn hle_sce_fstat(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_fstat(ctx, args))
 }
 
 /// `scePthreadGetaffinity(thread, mask_out)`: report the CPU cores this thread
@@ -4940,6 +4994,55 @@ mod tests {
         assert_eq!(u64::from_le_bytes(anon[16..24].try_into().unwrap()), 0);
         assert_eq!(i32::from_le_bytes(anon[28..32].try_into().unwrap()), 0);
         assert_eq!(anon[32] & IS_DIRECT, 0, "anonymous is not direct");
+    }
+
+    /// `sceKernelAioInitializeParam` must not memset a caller frame.
+    ///
+    /// Its `size` argument is a guest register, and the block it names is
+    /// frequently a caller local. Zeroing `size` bytes there — up to 64 KiB —
+    /// takes out the caller's neighbouring locals, its saved registers, and its
+    /// `__stack_chk_guard` canary, which is exactly the `__stack_chk_fail`
+    /// death GTA V hits. Off-stack (an engine-allocator block) the clear still
+    /// happens in full, because that is the useful behavior.
+    #[test]
+    fn aio_initialize_param_never_zeroes_a_caller_frame() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x2000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // Guest thread 1 (what the test scheduler reports) owns [0x1000, 0x2000)
+        // as its stack — the same registration the runtime performs per thread.
+        kernel.guest_thread_stacks.insert(1, (0x1000, 0x2000));
+
+        // A caller local at 0x1400 with live frame bytes above it.
+        assert!(mem.write(0x1400, &[0xAAu8; 0x400]));
+        assert_eq!(hle_aio_initialize_param(&ctx, &[0x1400, 0x400]), SCE_OK);
+        let mut frame = [0u8; 0x400];
+        assert!(mem.read(0x1400, &mut frame));
+        assert!(
+            frame.iter().all(|&b| b == 0xAA),
+            "a stack-resident param block must not be bulk-zeroed"
+        );
+
+        // The same call against a heap block still clears it.
+        assert!(mem.write(0x200, &[0xAAu8; 0x40]));
+        assert_eq!(hle_aio_initialize_param(&ctx, &[0x200, 0x40]), SCE_OK);
+        let mut heap = [0xFFu8; 0x40];
+        assert!(mem.read(0x200, &mut heap));
+        assert!(
+            heap.iter().all(|&b| b == 0),
+            "an off-stack param block keeps the defined-default zero fill"
+        );
+
+        // Argument validation is unchanged.
+        assert_eq!(
+            hle_aio_initialize_param(&ctx, &[0, 0x40]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(
+            hle_aio_initialize_param(&ctx, &[0x200, 0x20000]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
     }
 
     #[test]
