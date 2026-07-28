@@ -301,7 +301,10 @@ top-down, update statuses in place, and keep it committed.**
   `crates/raeen-gui/src/updater.rs` — release parsing (rejects plain-HTTP,
   bad JSON/tags), swap script (waits, swaps, relaunches, self-deletes),
   Inno Setup installer assets. Tests green in the 185-test raeen-gui suite.
-- [ ] Verify end-to-end against a real GitHub release when one exists.
+- [!] BLOCKED (external, 2026-07-27): end-to-end verification needs a real
+  GitHub release; `api.github.com/repos/Whoisraeen/Raeen/releases` returns
+  404 (private repo or no releases). Unit coverage (parse/swap-script) is
+  green; verify e2e when the first public release is published.
 
 ### 21. Video clip capture (stretch, after 18)
 - [ ] Rolling ring of recent frames → mp4 on hotkey. Only after screenshot +
