@@ -6876,7 +6876,6 @@ mod tests {
         assert_eq!(hle_cb_branch_get_size(&ctx, &[]), 14 * 4);
     }
 
-    /// DRAW_INDIRECT is the non-indexed sibling of DRAW_INDEX_INDIRECT: same
     // ---- Phase B: ACB execution (descriptor indirection + pre-ACB flush) ---
 
     /// Recording GPU stub for the ACB-execution tests: captures every
@@ -7127,6 +7126,7 @@ mod tests {
         );
     }
 
+    /// DRAW_INDIRECT is the non-indexed sibling of DRAW_INDEX_INDIRECT: same
     /// 5-DWORD shape, opcode 0x24.
     #[test]
     fn draw_indirect_emits_the_five_dword_packet() {
