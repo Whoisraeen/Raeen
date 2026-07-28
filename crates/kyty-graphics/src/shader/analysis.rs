@@ -618,57 +618,72 @@ pub fn scalar_load_target_address(load: &ScalarLoadRef, user_sgpr: &UserSgprInfo
 /// [`crate::shader::types::shader_instruction_format::Format::SdstSbaseSoffsetOffset`]
 /// for the rule and its two reference sources), so a load with a register
 /// soffset has a *dispatch-time* constant address exactly when that register's
-/// value is knowable. Two bounded shapes are accepted, both side-effect free:
+/// value is knowable. Proving that register is delegated to
+/// [`crate::shader::scalar_eval`] — a general compile-time interpreter of the
+/// scalar stream (ported from SharpEmu's `Gen5ShaderScalarEvaluator`) with a
+/// two-point known/unknown lattice. It subsumes the two shapes this function
+/// used to hard-code:
 ///
-/// * the register is **never written** before the load and names a captured
+/// * a register **never written** anywhere in the program that names a captured
 ///   live-in user-data slot (`user_sgpr.value[reg - shift]`) — the SRT/global
-///   table pointer ABI; `shift` is the NGG scalar rebase (8 for a gs-prolog
-///   vertex stage, 0 elsewhere, see `rebase_ngg_constant_sharps`);
-/// * the last writer before the load is `s_mov_b32`/`s_movk_i32` from a
-///   compile-time constant.
+///   table pointer ABI. `shift` is the NGG scalar rebase (8 for a gs-prolog
+///   vertex stage, 0 elsewhere, see `rebase_ngg_constant_sharps`). The
+///   evaluator checks the *whole* program rather than only the prefix, so this
+///   route is now sound independently of control flow;
+/// * a preceding `s_mov_b32`/`s_movk_i32` from a compile-time constant;
 ///
-/// Anything else (a computed offset, a lane-dependent value, `m0`, `vcc`)
-/// returns `None` so the caller keeps its named refusal instead of recording a
-/// wrong address.
+/// and adds every scalar-arithmetic form the interpreter can fold —
+/// `s_add_u32`, `s_sub_u32`, `s_lshl_b32`, `s_lshr_b32`, `s_and_b32`,
+/// `s_or_b32`, `s_mul_i32`, `s_bfe_u32`, `s_bfm_b32`, `s_cselect_b32`,
+/// `s_lshl4_add_u32`, the 64-bit bitwise/shift family, `s_getpc_b64`, … — each
+/// of which used to be an unresolvable case and therefore a skipped dispatch.
+///
+/// Anything the evaluator cannot prove (a value read out of guest memory, a
+/// lane-dependent value, `m0`, `vcc`, an undecidable branch, a loop) still
+/// returns `None`, so the caller keeps its named refusal instead of recording a
+/// wrong address. That asymmetry is deliberate: see the module docs on
+/// [`crate::shader::scalar_eval`].
 fn resolve_scalar_soffset_bytes(
-    prior: &[ShaderInstruction],
-    inst: &ShaderInstruction,
+    instructions: &[ShaderInstruction],
+    at: usize,
     user_sgpr: Option<&UserSgprInfo>,
     shift: i32,
 ) -> Option<u32> {
-    use ShaderInstructionType as T;
-
+    let inst = instructions.get(at)?;
     let Some(soffset) = crate::shader::types::smem_register_soffset(inst) else {
         return Some(0);
     };
     if soffset.type_ != ShaderOperandType::Sgpr {
         return None;
     }
-    let reg = soffset.register_id;
 
-    if let Some(writer) = prior.iter().rposition(|prior| writes_sgpr(prior, reg)) {
-        let writer = &prior[writer];
-        if !matches!(writer.type_, T::SMovB32 | T::SMovkI32)
-            || writer.dst.register_id != reg
-            || writer.dst.size > 1
-        {
-            return None;
-        }
-        return match writer.src[0].type_ {
-            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
-                Some(writer.src[0].constant.u)
+    match crate::shader::scalar_eval::resolve_sgpr_before(
+        instructions,
+        at,
+        soffset.register_id,
+        user_sgpr,
+        shift,
+    ) {
+        Ok(value) => {
+            if value.known().is_none() {
+                tracing::debug!(
+                    pc = inst.pc,
+                    soffset = soffset.register_id,
+                    "scalar evaluator ran but the soffset register is not a dispatch-time constant"
+                );
             }
-            _ => None,
-        };
+            value.known()
+        }
+        Err(refusal) => {
+            tracing::debug!(
+                pc = inst.pc,
+                soffset = soffset.register_id,
+                ?refusal,
+                "scalar evaluator refused to fold the soffset register"
+            );
+            None
+        }
     }
-
-    // Never written in-shader: a live-in user-data register.
-    let user_sgpr = user_sgpr?;
-    let slot = usize::try_from(reg - shift).ok()?;
-    if slot >= UserSgprInfo::SGPRS_MAX || slot >= user_sgpr.count as usize {
-        return None;
-    }
-    Some(user_sgpr.value[slot])
 }
 
 /// Does `inst` write scalar register `reg` (via either destination)?
@@ -807,7 +822,7 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
         // snapshot the wrong dwords, which is worse than the named refusal the
         // recompiler keeps for an unresolved soffset).
         let Some(soffset_bytes) =
-            resolve_scalar_soffset_bytes(&instructions[..at], load, Some(user_sgpr), shift)
+            resolve_scalar_soffset_bytes(instructions, at, Some(user_sgpr), shift)
         else {
             continue;
         };
@@ -1039,9 +1054,10 @@ pub fn shader_detect_embedded_constant_loads(
             _ => continue,
         };
         // A register soffset adds a runtime term. There is no user-data file
-        // here (the base is PC-relative), so only an in-shader constant move
-        // can prove it; anything else is skipped and keeps its refusal.
-        let Some(soffset_bytes) = resolve_scalar_soffset_bytes(&insts[..i], load, None, 0) else {
+        // here (the base is PC-relative), so only in-shader arithmetic rooted
+        // in constants — `s_getpc_b64` included — can prove it; anything else
+        // is skipped and keeps its refusal.
+        let Some(soffset_bytes) = resolve_scalar_soffset_bytes(insts, i, None, 0) else {
             continue;
         };
         let Some(base_addr) = pc_relative_base_address(&insts[..i], load.src[0].register_id) else {
@@ -7062,12 +7078,15 @@ mod tests {
         );
     }
 
+    /// The whole point of the scalar evaluator: a soffset **computed** from a
+    /// live-in user-data register is a dispatch-time constant and must now
+    /// resolve. Before the evaluator this shape was the named
+    /// `unresolved register soffset` refusal — a skipped dispatch.
     #[test]
-    fn computed_register_soffset_is_never_captured() {
+    fn computed_register_soffset_resolves_through_the_scalar_evaluator() {
         use crate::shader::types::ShaderInstructionType as T;
 
-        // s4 comes out of an ALU op — a genuinely per-dispatch value this pass
-        // cannot prove. Capturing anything here would snapshot wrong dwords.
+        // s4 = s5 << 2 = 6 << 2 = 0x18; address = 0x0050_0000 + 0x18.
         let mut alu = ShaderInstruction {
             pc: 0x10,
             type_: T::SLshlB32,
@@ -7082,11 +7101,77 @@ mod tests {
         code.get_instructions_mut()
             .extend([alu, register_soffset_load(0x20, 12, 4, 0)]);
 
+        let payload = [0xc0de_0000, 0xc0de_0001, 0xc0de_0002, 0xc0de_0003];
         let mem = TestMem {
-            regions: vec![(0x0050_0000, vec![7u32; 8])],
+            regions: vec![(0x0050_0018, payload.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        // s4's live-in is deliberately wrong: the in-shader computation wins.
+        user_sgpr.set(4, 0xffff_ffff, UserSgprType::Unknown);
+        user_sgpr.set(5, 6, UserSgprType::Unknown);
+        user_sgpr.set(12, 0x0050_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+        assert_eq!(
+            bind.embedded_constant_loads
+                .find(0x20)
+                .expect("s_lshl_b32 off a live-in resolves")
+                .values[..4],
+            payload,
+            "the evaluator must fold `s_lshl_b32 s4, s5, 2` into the address"
+        );
+    }
+
+    /// The soundness half of the same change: when the soffset is computed from
+    /// a value that came out of **guest memory**, the evaluator must say unknown
+    /// and the load must stay on the recompiler's named refusal path. Folding
+    /// the immediate alone here would snapshot the wrong descriptor dwords —
+    /// the failure mode that has already produced a `VK_ERROR_DEVICE_LOST`.
+    #[test]
+    fn a_soffset_computed_from_guest_memory_is_never_captured() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+
+        // s_load_dword s5, s[12:13], 0x100  — s5 is runtime memory.
+        let mut load_index = ShaderInstruction {
+            pc: 0x10,
+            type_: T::SLoadDword,
+            format: F::SdstSbaseSoffset,
+            ..Default::default()
+        };
+        load_index.dst = sgpr_op(5, 1);
+        load_index.src[0] = sgpr_op(12, 2);
+        load_index.src[1] = imm_op(0x100);
+        load_index.src_num = 2;
+
+        // s_lshl_b32 s4, s5, 2 — a computed offset rooted in that load.
+        let mut alu = ShaderInstruction {
+            pc: 0x18,
+            type_: T::SLshlB32,
+            ..Default::default()
+        };
+        alu.dst = sgpr_op(4, 1);
+        alu.src[0] = sgpr_op(5, 1);
+        alu.src[1] = imm_op(2);
+        alu.src_num = 2;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().extend([
+            load_index,
+            alu,
+            register_soffset_load(0x20, 12, 4, 0),
+        ]);
+
+        // Memory is mapped at every address the pass could wrongly pick, so a
+        // silent fold would be observable as a capture rather than a miss.
+        let mem = TestMem {
+            regions: vec![(0x0050_0000, vec![7u32; 256])],
         };
         let mut user_sgpr = UserSgprInfo::default();
         user_sgpr.set(4, 0, UserSgprType::Unknown);
+        user_sgpr.set(5, 0, UserSgprType::Unknown);
         user_sgpr.set(12, 0x0050_0000, UserSgprType::Unknown);
         user_sgpr.set(13, 0, UserSgprType::Unknown);
 
@@ -7094,7 +7179,68 @@ mod tests {
         shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
         assert!(
             bind.embedded_constant_loads.find(0x20).is_none(),
-            "an unprovable soffset must fall through to the recompiler's named refusal"
+            "a memory-dependent soffset must fall through to the recompiler's named refusal"
+        );
+    }
+
+    /// A soffset written inside a loop cannot be described by one per-PC
+    /// snapshot even when every value in sight is a constant: the load runs
+    /// again with a different offset.
+    #[test]
+    fn a_soffset_advanced_by_a_loop_is_never_captured() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+
+        let mut mov = ShaderInstruction {
+            pc: 0x00,
+            type_: T::SMovB32,
+            ..Default::default()
+        };
+        mov.dst = sgpr_op(4, 1);
+        mov.src[0] = imm_op(0);
+        mov.src_num = 1;
+
+        let mut advance = ShaderInstruction {
+            pc: 0x28,
+            type_: T::SAddU32,
+            ..Default::default()
+        };
+        advance.dst = sgpr_op(4, 1);
+        advance.src[0] = sgpr_op(4, 1);
+        advance.src[1] = imm_op(16);
+        advance.src_num = 2;
+
+        // s_cbranch_scc1 back to the load at 0x20.
+        let mut back = ShaderInstruction {
+            pc: 0x2c,
+            type_: T::SCbranchScc1,
+            format: F::Label,
+            ..Default::default()
+        };
+        back.src[0] = imm_op((0x20i32 - 0x2c - 4) as u32);
+        back.src[0].type_ = ShaderOperandType::LiteralConstant;
+        back.src_num = 1;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().extend([
+            mov,
+            register_soffset_load(0x20, 12, 4, 0),
+            advance,
+            back,
+        ]);
+
+        let mem = TestMem {
+            regions: vec![(0x0050_0000, vec![7u32; 64])],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(12, 0x0050_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+        assert!(
+            bind.embedded_constant_loads.find(0x20).is_none(),
+            "a loop-carried soffset has no single dispatch-time value"
         );
     }
 

@@ -19837,4 +19837,169 @@ mod tests {
         let module = spirv_run(&source).expect("assemble");
         spirv_val_ok(&module, "full_chain_register_soffset");
     }
+
+    /// The scalar-evaluator acceptance case: real GCN bytes whose scalar load
+    /// soffset is **computed** — not a live-in and not a single constant move —
+    /// must now resolve all the way to spirv-val-clean SPIR-V.
+    ///
+    /// ```text
+    /// s_lshl_b32     s4, s5, 2                    8F048205
+    /// s_add_u32      s4, s4, 16                   80049004
+    /// s_load_dwordx4 s[16:19], s[12:13], s4 off:16 F4080406 08000010
+    /// s_endpgm
+    /// ```
+    ///
+    /// With the live-in `s5 = 6` the address is `ptr + (6 << 2) + 16 + 16`.
+    /// Before `shader::scalar_eval` the analysis pass could not prove `s4` (its
+    /// last writer was `s_add_u32`, not `s_mov_b32`), so nothing was captured
+    /// and `sload_dword_extended` refused the load by name — "unresolved
+    /// register soffset" — dropping the whole dispatch.
+    #[test]
+    fn full_chain_computed_soffset_bytes_to_validated_spirv() {
+        use std::borrow::Cow;
+
+        struct Mem(u64, Vec<u32>);
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                (addr >= self.0 && (addr - self.0) % 4 == 0)
+                    .then(|| ((addr - self.0) / 4) as usize)
+                    .filter(|start| *start < self.1.len())
+                    .map(|start| Cow::Borrowed(&self.1[start..]))
+            }
+        }
+
+        let words = vec![
+            0x8F04_8205, // pc 0x00: s_lshl_b32 s4, s5, 2
+            0x8004_9004, // pc 0x04: s_add_u32  s4, s4, 16
+            0xF408_0406, // pc 0x08: s_load_dwordx4 s[16:19], s[12:13], s4
+            0x0800_0010, //          offset:16
+            S_ENDPGM,    // pc 0x10
+        ];
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true)
+            .expect("computed-soffset fixture must parse");
+        assert_eq!(
+            code.get_instructions()[0].type_,
+            ShaderInstructionType::SLshlB32,
+            "the fixture really contains scalar arithmetic, not a constant move"
+        );
+        assert_eq!(
+            code.get_instructions()[2].format,
+            F::Sdst4SbaseSoffsetOffset
+        );
+
+        // ptr(s12:s13) = 0x0080_0000; s5 = 6 -> s4 = 6<<2 = 0x18, +16 = 0x28;
+        // plus the 16-byte immediate -> 0x0080_0038.
+        let payload = vec![0x1111_2222u32, 0x3333_4444, 0x5555_6666, 0x7777_8888];
+        let mem = Mem(0x0080_0038, payload.clone());
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(5, 6, crate::shader::hw_regs::UserSgprType::Unknown);
+        user_sgpr.set(
+            12,
+            0x0080_0000,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user_sgpr.set(13, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            &mut input_info.bind,
+        );
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(0x08)
+                .expect("a computed soffset must now resolve")
+                .values[..4],
+            payload[..],
+            "the evaluator must fold s_lshl_b32 + s_add_u32 into the address"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("full chain recompiles");
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "full_chain_computed_soffset");
+    }
+
+    /// The other side of the same gate: when the soffset is genuinely
+    /// unprovable the recompiler must still refuse **by name**, not emit a
+    /// module built on a guessed address.
+    ///
+    /// ```text
+    /// s_load_dword   s5, s[12:13], 0x100          F400_0146 0000_0100
+    /// s_lshl_b32     s4, s5, 2                    8F04_8205
+    /// s_load_dwordx4 s[16:19], s[12:13], s4 off:16 F408_0406 0800_0010
+    /// s_endpgm
+    /// ```
+    ///
+    /// `s5` comes out of guest memory, so `s4` has no dispatch-time value; the
+    /// evaluator says unknown and nothing is captured for the second load.
+    #[test]
+    fn a_memory_dependent_soffset_keeps_the_named_refusal() {
+        use std::borrow::Cow;
+
+        struct Mem(u64, Vec<u32>);
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                (addr >= self.0 && (addr - self.0) % 4 == 0)
+                    .then(|| ((addr - self.0) / 4) as usize)
+                    .filter(|start| *start < self.1.len())
+                    .map(|start| Cow::Borrowed(&self.1[start..]))
+            }
+        }
+
+        let words = vec![
+            0xF400_0146, // pc 0x00: s_load_dword s5, s[12:13], ...
+            0x0000_0100, //          offset:0x100 (NULL soffset)
+            0x8F04_8205, // pc 0x08: s_lshl_b32 s4, s5, 2
+            0xF408_0406, // pc 0x0c: s_load_dwordx4 s[16:19], s[12:13], s4
+            0x0800_0010, //          offset:16
+            S_ENDPGM,    // pc 0x14
+        ];
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true)
+            .expect("memory-dependent fixture must parse");
+
+        // Every address the pass could wrongly land on is mapped, so a silent
+        // fold would show up as a capture instead of a refusal.
+        let mem = Mem(0x0080_0000, vec![0x2020_2020u32; 1024]);
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(5, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+        user_sgpr.set(
+            12,
+            0x0080_0000,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user_sgpr.set(13, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            &mut input_info.bind,
+        );
+        assert!(
+            input_info.bind.embedded_constant_loads.find(0x0c).is_none(),
+            "a memory-dependent soffset must not be captured"
+        );
+
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("an unprovable soffset must refuse, not guess");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unresolved register soffset"),
+            "the refusal must stay identifiable by name; got: {msg}"
+        );
+    }
 }

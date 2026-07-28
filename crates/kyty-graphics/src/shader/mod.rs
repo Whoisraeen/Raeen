@@ -21,6 +21,7 @@ pub mod analysis;
 pub mod parse;
 pub mod recompile;
 pub mod resources;
+pub mod scalar_eval;
 pub mod spirv;
 pub mod types;
 
@@ -55,6 +56,10 @@ pub use resources::{
     ShaderEudRawResources, ShaderGlobalMemResources, ShaderId, ShaderMappedData,
     ShaderPixelInputInfo, ShaderSamplerResource, ShaderSemantic, ShaderSharp,
     ShaderTextureResource, ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
+};
+pub use scalar_eval::{
+    ScalarEvalRefusal, ScalarState, ScalarValue, ScalarValue64, evaluate_before, live_in_sgpr,
+    resolve_sgpr_before,
 };
 pub use spirv::{
     PUSH_CONSTANT_SPILL_THRESHOLD, SampledClass, SampledDim, ShaderRecompileError, Spirv,

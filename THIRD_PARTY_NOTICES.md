@@ -190,11 +190,33 @@ SOFTWARE.
   `Shader/Gen5ShaderScalarEvaluator.cs` L1889-1900, whose evaluation is exactly
   `byteOffset = immediateOffset + dynamicOffset;`
   `address = (baseAddress + byteOffset) & ~3UL;` — i.e. both offsets are byte
-  quantities, they ADD, and the sum is dword-aligned by truncation. Raeen's
-  soffset resolution is bounded and its own (an unwritten live-in user-data
-  register, or a preceding `s_mov_b32`/`s_movk_i32` constant); SharpEmu's
-  general abstract scalar interpreter is not ported. Anything unresolved keeps a
-  named refusal carrying the width and format. No C# is copied.
+  quantities, they ADD, and the sum is dword-aligned by truncation. That batch's
+  soffset resolution was bounded and its own (an unwritten live-in user-data
+  register, or a preceding `s_mov_b32`/`s_movk_i32` constant); the general
+  evaluator landed in the following batch. Anything unresolved keeps a named
+  refusal carrying the width and format. No C# is copied.
+- **Gen5 scalar-evaluator batch 2026-07-28**
+  (`docs/sharpemu-port/scalar-evaluator.md`):
+  `crates/kyty-graphics/src/shader/scalar_eval.rs` is a behavioral
+  re-implementation of `Shader/Gen5ShaderScalarEvaluator.cs` — the per-opcode
+  semantics of `TryExecuteScalarAlu` (L1118-1575: the SOP1/SOP2/SOPK arms, the
+  64-bit `WriteScalarPair` pair model, `SignedAddOverflow`/`SignedSubOverflow`,
+  `ReverseBits`, the `s_bfe_*`/`s_bfm_*` offset/width clamping, and which arms
+  publish SCC), `TryExecuteSaveExecScalarAlu` (L1577-1675),
+  `TryExecuteScalarCompare` (L1742-1803), and the operand model of
+  `TryEvaluateScalarOperand`/`TryEvaluateScalarOperand64`/
+  `TryDecodeInlineConstant` (L2249-2345 — including the 64-bit sign extension of
+  the negative inline-constant range and the VCCZ/EXECZ/SCC special sources).
+  Two deliberate deviations, both documented in the module: (1) SharpEmu runs a
+  **concrete** interpreter over a seeded 256-entry `uint[]` and errors out on
+  anything it cannot execute, whereas Raeen evaluates a two-point
+  **known/unknown lattice** so an unmodelled definition or a guest-memory read
+  degrades to `Unknown` rather than to a concrete guess — and consequently
+  Raeen does not seed `exec` with a full wave mask; (2) SharpEmu forks
+  supplemental paths at forward `s_branch` for resource discovery
+  (`QueuePath`/`ScalarPathKey`, L142-280), whereas Raeen follows only branches
+  whose condition it can prove and refuses undecidable branches, loops and
+  indirect PC writes by name. No C# is copied.
 - **Exception-delivery model 2026-07-28**
   (`docs/sharpemu-port/loading-blockers.md`): the queue-at-raise /
   deliver-at-the-target's-next-HLE-boundary model in
