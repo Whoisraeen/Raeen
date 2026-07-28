@@ -178,6 +178,14 @@ top-down, update statuses in place, and keep it committed.**
   `cp_op_it_dma_data` in kyty-graphics run.rs). Design notes in ledger
   2026-07-25/26 ITEM 4; steps 3–5 implementation in ledger 2026-07-27.
 
+- **A/B LIVE (2026-07-28 ~11:45pm):** `RAEEN_DEFER_GPU_SIDE_EFFECTS=1` on
+  Minecraft (release build w/ all merges): reaches the full menu with correct
+  rendering at 32 FPS; boot slower (~85 s vs ~50 s gate-off) — consistent with
+  the bounded event-delivery latency, but measured under heavy CPU contention
+  (9 agent builds running), so re-A/B on a quiet machine before considering
+  default-ON. No hang, no visual corruption. `RAEEN_UNIFIED_GPU_CLOCK` A/B on
+  ASTRO.BOT deferred until the machine is quiet (timing-sensitive).
+
 ### 6. Real Vulkan swapchain + GPU-resident present phase 2
 - [ ] Phase 2: cross-process image sharing (`VK_KHR_external_memory_win32` →
   wgpu-hal import on the Shell side) — kills the last CPU copy.
