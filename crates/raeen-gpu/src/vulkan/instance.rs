@@ -59,6 +59,10 @@ pub struct VulkanDevice {
     queue: vk::Queue,
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+    /// ABI-v3 submissions use one host-owned timeline semaphore. The plugin
+    /// records commands only; Raeen advances and signals it with the flush.
+    plugin_timeline: vk::Semaphore,
+    plugin_timeline_value: AtomicU64,
     /// Driver-side cache of compiled pipeline binaries, reused across draws.
     pipeline_cache: vk::PipelineCache,
     /// Exact generated cache file for this vendor/device/driver tuple.
@@ -227,6 +231,31 @@ impl VulkanDevice {
             }
         };
 
+        let plugin_timeline = if plugin_requirements.is_some() {
+            let mut timeline =
+                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+            let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
+            // SAFETY: timelineSemaphore was enabled for every active ABI-v3
+            // plugin and the returned handle is owned by this device.
+            match unsafe { device.create_semaphore(&semaphore_info, None) } {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    // SAFETY: no submissions exist; unwind the handles created
+                    // after physical-device selection.
+                    unsafe {
+                        device.destroy_command_pool(command_pool, None);
+                        device.destroy_device(None);
+                    }
+                    Self::destroy_partial(&instance, debug);
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "ABI-v3 timeline semaphore creation failed: {error}"
+                    )));
+                }
+            }
+        } else {
+            vk::Semaphore::null()
+        };
+
         // A process-wide pipeline cache so the driver reuses compiled shader
         // binaries across draws. A title re-binds the same pipelines thousands
         // of times a frame; without this each rebind recompiles from SPIR-V.
@@ -307,6 +336,8 @@ impl VulkanDevice {
             queue,
             queue_family_index,
             command_pool,
+            plugin_timeline,
+            plugin_timeline_value: AtomicU64::new(0),
             pipeline_cache,
             pipeline_cache_path,
             pipeline_cache_generation: AtomicU64::new(0),
@@ -370,6 +401,14 @@ impl VulkanDevice {
     #[must_use]
     pub fn max_push_constants_size(&self) -> u32 {
         self.max_push_constants_size
+    }
+
+    pub(crate) fn next_plugin_timeline(&self) -> Option<(vk::Semaphore, u64, u64)> {
+        if self.plugin_timeline == vk::Semaphore::null() {
+            return None;
+        }
+        let wait = self.plugin_timeline_value.fetch_add(1, Ordering::Relaxed);
+        Some((self.plugin_timeline, wait, wait + 1))
     }
 
     /// Name of the selected physical device, e.g. `NVIDIA GeForce RTX 4070`.
@@ -869,9 +908,13 @@ impl VulkanDevice {
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
-        let plugin_feature_flags = plugin_requirements
+        let mut plugin_feature_flags = plugin_requirements
             .map(|requirements| requirements.required_feature_flags)
             .unwrap_or(0);
+        if plugin_requirements.is_some() {
+            plugin_feature_flags |=
+                crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE;
+        }
 
         // Robustness features when the driver has them: RDNA T#/V# semantics
         // bound-check every buffer and image access in hardware
@@ -1153,6 +1196,9 @@ impl Drop for VulkanDevice {
                 }
                 self.device
                     .destroy_pipeline_cache(self.pipeline_cache, None);
+            }
+            if self.plugin_timeline != vk::Semaphore::null() {
+                self.device.destroy_semaphore(self.plugin_timeline, None);
             }
             self.device.destroy_command_pool(self.command_pool, None);
             // The allocator frees its heap blocks in its own Drop using its

@@ -207,6 +207,13 @@ pub struct PluginInfo {
     pub source: Option<std::path::PathBuf>,
 }
 
+/// Present-time configuration for an active ABI-v3 GPU plugin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GpuV3Request {
+    pub capabilities: Capabilities,
+    pub output_scale: f32,
+}
+
 /// The process-wide plugin registry: the set of registered plugins, which one
 /// (if any) is active, and the present-time upscale factor. `active == None`
 /// is the identity fast path.
@@ -230,6 +237,7 @@ impl Registry {
         };
         reg.insert(Box::new(builtin::Passthrough));
         reg.insert(Box::new(builtin::NearestUpscale));
+        reg.insert(Box::new(builtin::VulkanBlitUpscale::default()));
         reg
     }
 
@@ -267,6 +275,16 @@ impl Registry {
     fn active_vulkan_requirements_v3(&self) -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
         let name = self.active.as_ref()?;
         self.plugins.get(name)?.vulkan_requirements_v3()
+    }
+
+    fn active_gpu_v3_request(&self) -> Option<GpuV3Request> {
+        let name = self.active.as_ref()?;
+        let plugin = self.plugins.get(name)?;
+        plugin.vulkan_requirements_v3()?;
+        Some(GpuV3Request {
+            capabilities: plugin.capabilities(),
+            output_scale: self.output_scale,
+        })
     }
 
     fn initialize_active_gpu_v3(
@@ -354,6 +372,11 @@ pub fn active() -> Option<String> {
 #[must_use]
 pub fn active_vulkan_requirements_v3() -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
     registry().lock().active_vulkan_requirements_v3()
+}
+
+#[must_use]
+pub(crate) fn active_gpu_v3_request() -> Option<GpuV3Request> {
+    registry().lock().active_gpu_v3_request()
 }
 
 /// Initialize the selected ABI-v3 plugin against the newly-created Vulkan

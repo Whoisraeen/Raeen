@@ -881,7 +881,10 @@ impl PresentPlugin for DynamicPlugin {
         let (Some(vtable), false) = (self.vtable_v3, self.instance_v3.is_null()) else {
             return cabi_v3::RAEEN_V3_DECLINED;
         };
-        if let Err(error) = frame.validate() {
+        if let Err(error) = frame.validate_for_inputs(
+            self.capabilities.wants_depth,
+            self.capabilities.wants_motion_vectors,
+        ) {
             tracing::warn!(
                 plugin = %self.name,
                 ?error,

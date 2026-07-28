@@ -298,6 +298,25 @@ pub(crate) struct PersistentTarget {
     pub layout: TargetLayout,
 }
 
+/// Cached host-owned destination for an ABI-v3 GPU present pass.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct GpuPresentKey {
+    pub source_base: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: i32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GpuPresentTarget {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub readback_buffer: vk::Buffer,
+    pub readback_memory: vk::DeviceMemory,
+    pub layout: vk::ImageLayout,
+}
+
 /// Identity of one guest depth/stencil surface. Like [`TargetKey`], creation
 /// parameters are part of the key so reprogramming an address cannot serve an
 /// incompatible Vulkan image.
@@ -506,6 +525,7 @@ pub(crate) struct DrawCaches {
     /// Keyed by linear-vs-nearest — the only sampler state decoded today.
     samplers: HashMap<SamplerState, vk::Sampler>,
     targets: HashMap<TargetKey, PersistentTarget>,
+    gpu_present_targets: HashMap<GpuPresentKey, GpuPresentTarget>,
     depth_targets: HashMap<DepthTargetKey, PersistentDepthTarget>,
     /// Persistent guest textures (stage D item 1) — see [`PersistentTexture`]
     /// for the invalidation contract.
@@ -1859,6 +1879,43 @@ impl DrawCaches {
         self.targets.get(key).copied()
     }
 
+    pub(crate) fn gpu_present_target(
+        &mut self,
+        dev: &VulkanDevice,
+        key: GpuPresentKey,
+        bytes_per_pixel: u32,
+    ) -> Result<GpuPresentTarget, GpuError> {
+        let stale: Vec<_> = self
+            .gpu_present_targets
+            .keys()
+            .filter(|candidate| candidate.source_base == key.source_base && **candidate != key)
+            .copied()
+            .collect();
+        for stale_key in stale {
+            if let Some(target) = self.gpu_present_targets.remove(&stale_key) {
+                // SAFETY: GPU present targets are used only by the synchronous
+                // flush, whose fence is waited before another flush can resize.
+                unsafe { destroy_gpu_present_target(dev.device(), &target) };
+            }
+        }
+        if let Some(target) = self.gpu_present_targets.get(&key) {
+            return Ok(*target);
+        }
+        let target = create_gpu_present_target(dev, key, bytes_per_pixel)?;
+        self.gpu_present_targets.insert(key, target);
+        Ok(target)
+    }
+
+    pub(crate) fn mark_gpu_present_layout(
+        &mut self,
+        key: &GpuPresentKey,
+        layout: vk::ImageLayout,
+    ) {
+        if let Some(target) = self.gpu_present_targets.get_mut(key) {
+            target.layout = layout;
+        }
+    }
+
     /// Degrade `key`'s content to [`TargetContent::Unknown`] (a flush failed:
     /// the image may or may not hold the batch's draws).
     pub(crate) fn mark_target_unknown(&mut self, key: &TargetKey) {
@@ -2271,6 +2328,9 @@ impl DrawCaches {
             }
             for (_, target) in self.targets.drain() {
                 destroy_target(device, &target);
+            }
+            for (_, target) in self.gpu_present_targets.drain() {
+                destroy_gpu_present_target(device, &target);
             }
             for (_, target) in self.depth_targets.drain() {
                 destroy_depth_target(device, &target);

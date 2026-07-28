@@ -344,6 +344,16 @@ fn validate_rect(
 
 impl RaeenPresentFrameV3 {
     pub fn validate(&self) -> Result<(), V3ValidationError> {
+        self.validate_for_inputs(true, true)
+    }
+
+    /// Validate the common GPU-frame contract and only the auxiliary inputs
+    /// advertised by the active plugin.
+    pub fn validate_for_inputs(
+        &self,
+        wants_depth: bool,
+        wants_motion_vectors: bool,
+    ) -> Result<(), V3ValidationError> {
         if self.struct_size as usize != std::mem::size_of::<Self>() {
             return Err(V3ValidationError::BadStructSize);
         }
@@ -351,8 +361,12 @@ impl RaeenPresentFrameV3 {
             return Err(V3ValidationError::MissingCommandBuffer);
         }
         validate_required_resource(&self.color, "color")?;
-        validate_required_resource(&self.depth, "depth")?;
-        validate_required_resource(&self.motion_vectors, "motion_vectors")?;
+        if wants_depth {
+            validate_required_resource(&self.depth, "depth")?;
+        }
+        if wants_motion_vectors {
+            validate_required_resource(&self.motion_vectors, "motion_vectors")?;
+        }
         validate_required_resource(&self.output, "output")?;
         validate_rect(self.render_rect, &self.color, "render_rect")?;
         validate_rect(self.output_rect, &self.output, "output_rect")?;
