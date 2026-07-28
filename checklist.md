@@ -1432,3 +1432,87 @@ exactly where the goal points next:
 | Dragon Ball Sparking Zero | timed_out / exited | (two entries; no blocker line) |
 
 Note none of these is a canary smash or an unresolved NID any more.
+
+---
+
+## ★ SECOND LIVE MEASUREMENT — 2026-07-28, build 2741d21 (all 23 fixes merged to main)
+
+Artifact: `artifacts/compat/post-shaderfix-validated-20260728.json`.
+Compared against `post-sweep-validated-20260728.json`.
+
+| Title | before | after | blocker now |
+|---|---|---|---|
+| Minecraft | timed_out, 10080 flips | timed_out, **12288 flips** | (none logged) |
+| Until Dawn | timed_out, 0 flips | timed_out, 0 flips | (none logged) |
+| GTA V | timed_out, 192 flips | timed_out, **256 flips** | `SLoadDwordx4 [Sdst4SbaseSoffset]` can't recompile |
+| ASTRO.BOT | rendering, 64 flips | rendering, **36 flips** | `smem: offset != 0 with register soffset` |
+| Avatar | timed_out, 141 flips | timed_out, **256 flips** | `SLoadDwordx16 [Sdst16SbaseSoffset]` can't recompile |
+| A Plague Tale | **crashed, exit 0xC0000094, silent** | **exited, exit 0, fully reported** | INTEGER DIVIDE FAULT (diagnosed, see below) |
+| Subnautica | timed_out, 0 flips, RaiseException WARN | timed_out, 0 flips | (none logged) |
+| Dragon Ball | exited, 0 flips | exited, 0 flips | (none logged) |
+
+### THE decisive finding: three titles, ONE root cause
+
+GTA V, Avatar and ASTRO.BOT now all stop on the **same** gap — SMEM scalar
+loads whose offset comes from a **register (soffset)** instead of an immediate:
+
+* Avatar: `can't recompile: SLoadDwordx16 [Sdst16SbaseSoffset] s[12:27], s[8:9], 0`
+* GTA V: `can't recompile: SLoadDwordx4 [Sdst4SbaseSoffset] s[20:23], s[12:13], 64`
+* ASTRO: `not implemented smem feature: offset != 0 with register soffset`
+
+GTA V's case is `SLoadDwordx4` — a long-supported *width* — which proves this is
+purely the **addressing mode**, not the width. The earlier pass added the x16
+width and the `Sdst{N}SbaseSoffset` formats to the parser, but the
+recompiler/SPIR-V side has no rows for the register-soffset forms and the parser
+still refuses immediate-offset-plus-register-soffset. One fix, three titles.
+Delegated as `port-smem-soffset`.
+
+### Each targeted fix is confirmed by its blocker MOVING
+
+* **GTA V vertex inputs** — the `WriteGlobalVariables invalid registers_num/input
+  format: 2/5` refusal is gone; flips 192 → 256. The two-component uint fix
+  worked and exposed the next layer.
+* **`s_load_dwordx16` (Avatar)** — the *parse* failure (`unknown smem
+  instruction`) is gone and became a *recompile* failure, i.e. it now decodes and
+  reached the next stage; flips 141 → 256 (+81%).
+* **`image_gather4_lz` dmasks (ASTRO)** — the `unknown mimg format 0x47` refusal
+  is gone; ASTRO holds stage `rendering` with a clean exit and now fails earlier
+  on the SMEM gap instead.
+* **`sceKernelRaiseException` (Subnautica)** — the "async delivery not
+  implemented" WARN is gone and **no error line is logged for the entire 180 s
+  run**. Delivery was necessary but not sufficient: still 0 flips, so something
+  further along blocks presentation. Honest partial result.
+* **Minecraft** — no regression; flips actually up 10080 → 12288 (+22%).
+
+### A Plague Tale: from invisible death to a named fault
+
+Before: `crashed`, exit `-1073741676` (`0xC0000094`), **no error line at all**.
+After: **clean exit 0** plus a full report. The divide-fault classifier turned an
+invisible host-level death into an actionable diagnosis:
+
+```
+INTEGER DIVIDE FAULT: guest code divided by a value that was zero...
+rip=0x10000174d29b cause=divide by zero origin=guest hle="<none>"
+rax=0xc000 rcx=0x0 rdx=0x0 rsi=0x0 ...
+instruction bytes: 48 f7 fe 41 89 47 0c ...
+```
+
+Decoded: the faulting instruction is `idiv rsi` (`48 f7 fe`), and three
+instructions earlier `8b 32` (`mov esi, [rdx]`) loads the divisor **from guest
+memory**. `hle="<none>"` — no HLE call was in flight, so the zero was already
+sitting in memory rather than being returned live. A 12-deep module-relative
+return chain is captured (`+0x246e637 <- ... <- +0x2538645`). Next step is to
+identify which structure field `[rdx]` points at; the report gives the exact
+site, register file, and call chain to do it from.
+
+### Honest caveats
+
+* **ASTRO's flip count fell 64 → 36.** Not necessarily a regression: ASTRO runs
+  at ~1 FPS so the absolute counts are tiny and run-to-run variance is large, and
+  its blocker moved to a *different* (earlier-firing) refusal. Worth re-checking
+  after the SMEM fix rather than treating either number as signal.
+* Until Dawn, Subnautica and Dragon Ball still present **0 frames**. Their
+  canary/exception blockers are gone and they log nothing, which means the next
+  obstacle is silent — these need a different instrument (frame-path tracing)
+  rather than another log read.
+* No title is playable. Every claim here is a stage/flip/blocker measurement.
