@@ -212,10 +212,15 @@ top-down, update statuses in place, and keep it committed.**
   (d87765a crash reporting groundwork).
 
 ### 13. Clippy debt: kyty-graphics recompile.rs (~91 clippy-1.97 lints)
-- [~] WAVE 2 IN PROGRESS (general agent, worktree, 2026-07-27). Includes the
-  `is_multiple_of` MSRV lint at analysis.rs:3195 flagged by the ACB agent.
-  Note: wave-1 agents ran clippy successfully in worktrees, so AppControl may
-  only block some exes — try locally, CI remains the gate of record.
+- [x] DONE 2026-07-27. `cargo clippy --workspace --all-targets -- -D warnings`
+  is GREEN end to end, verified locally (AppControl did not block this
+  session). Agent commit `aebb8f3` (merged `71eaea7`): kyty-graphics 87→0
+  (5 mechanical fixes + 2 module-scoped test-fixture allows with
+  justification), raeen-gpu 8→0 (3 fixes + 5 justified allows for phase-1
+  plumbing / pinned deprecated fixtures). Main-session commits `d030259`
+  (analysis.rs MSRV lint) + `ba870f7` (last six: raeen-gui ×4, raeen-input
+  ×1, raeen-hle test code ×2 from today's batches). Tests: kyty-graphics 477,
+  raeen-gpu 308, gui 185, input 18, hle 481 — all green; fmt clean.
 
 ---
 
