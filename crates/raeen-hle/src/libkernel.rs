@@ -6633,7 +6633,7 @@ mod tests {
                 u16::from_le_bytes(block[offset + 4..offset + 6].try_into().unwrap()) as usize;
             let namlen = block[offset + 7] as usize;
             assert!(matches!(block[offset + 6], 4 | 8));
-            assert!(reclen >= 8 + namlen + 1, "d_reclen covers the record");
+            assert!(reclen > 8 + namlen, "d_reclen covers the record");
             assert!(
                 offset + reclen <= block.len(),
                 "d_reclen must stay inside the returned payload"

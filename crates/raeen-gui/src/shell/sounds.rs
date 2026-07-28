@@ -109,8 +109,8 @@ impl SoundPack {
 
 /// Decode a WAV file to interleaved-stereo f32 at its native rate. Supports
 /// 16/24/32-bit integer and 32-bit float PCM; mono is duplicated to stereo,
-/// >2 channels take the first two. Clips are capped at ~5 s — a UI cue, not a
-/// soundtrack.
+/// more than two channels take the first two. Clips are capped at ~5 s — a
+/// UI cue, not a soundtrack.
 fn decode_wav(path: &PathBuf) -> Result<(u32, Vec<f32>), String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
@@ -196,9 +196,10 @@ fn resample_clip_to_48k(rate: u32, stereo: Vec<f32>) -> (u32, Vec<f32>) {
     let available = out[0].len().min(out[1].len()).saturating_sub(delay);
     let out_frames = expected.min(available);
     let mut interleaved = Vec::with_capacity(out_frames * 2);
-    for i in delay..delay + out_frames {
-        interleaved.push(out[0][i]);
-        interleaved.push(out[1][i]);
+    let range = delay..delay + out_frames;
+    for (l, r) in out[0][range.clone()].iter().zip(&out[1][range]) {
+        interleaved.push(*l);
+        interleaved.push(*r);
     }
     (TARGET_RATE, interleaved)
 }

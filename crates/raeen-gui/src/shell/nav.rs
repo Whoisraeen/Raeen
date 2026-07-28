@@ -1425,7 +1425,7 @@ mod tests {
                 proptest::prop_assert!(nav.rail_index < nav.rail_len.max(1));
                 proptest::prop_assert!(nav.pill_index < PILL_COUNT);
                 proptest::prop_assert!(nav.cc_index < 5);
-                proptest::prop_assert!(nav.cc_option_index < 3.max(1));
+                proptest::prop_assert!(nav.cc_option_index < 3);
                 proptest::prop_assert!(nav.settings_section < counts.len());
                 proptest::prop_assert!(
                     nav.settings_row < counts[nav.settings_section].max(1)

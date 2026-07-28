@@ -6540,12 +6540,12 @@ mod tests {
                 compare_addr, // compare address
                 mask,
                 reference,
-                2,        // cache policy 1 (stack)
-                buffer1,  // then-buffer
-                0x123,    // then-size
-                3,        // cache policy 2
-                buffer2,  // else-buffer
-                0x456_78, // else-size
+                2,           // cache policy 1 (stack)
+                buffer1,     // then-buffer
+                0x123,       // then-size
+                3,           // cache policy 2
+                buffer2,     // else-buffer
+                0x0004_5678, // else-size
             ],
         );
         assert_eq!(ret, 0x400);

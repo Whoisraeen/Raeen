@@ -57,9 +57,10 @@ pub(crate) fn record_dev_env_overrides() {
 /// it — so turning an Advanced toggle Off in Settings really turns the dump
 /// off for the next launch even though the Shell's own environment still
 /// carries the startup bridge's value.
-fn runner_env() -> &'static Mutex<Vec<(String, Option<String>)>> {
-    static ENV: std::sync::OnceLock<Mutex<Vec<(String, Option<String>)>>> =
-        std::sync::OnceLock::new();
+type RunnerEnv = Mutex<Vec<(String, Option<String>)>>;
+
+fn runner_env() -> &'static RunnerEnv {
+    static ENV: std::sync::OnceLock<RunnerEnv> = std::sync::OnceLock::new();
     ENV.get_or_init(|| Mutex::new(Vec::new()))
 }
 

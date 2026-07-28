@@ -395,6 +395,9 @@ mod tests {
 
     /// Build a 64-byte USB (0x01) input report with the given payload bytes at
     /// their documented offsets (payload starts at index 1).
+    // One positional arg per report byte keeps call sites aligned with the
+    // documented report layout; a params struct would obscure that mapping.
+    #[allow(clippy::too_many_arguments)]
     fn usb_report(
         lx: u8,
         ly: u8,
