@@ -1035,3 +1035,49 @@ address-range heuristic. (In flight.)
   Round-2 item 29 (inject a mock clock) covers the first; the second needs the
   same treatment. Suite runs 1.1 s clean vs 4–12 s with failures under
   contention.
+
+### Also on `integration/sharpemu-sweep` (wave 3 — the ASTRO shader cluster)
+
+- **`2c65008` — Gen5 3D images + the entire VOP3P family** (SharpEmu #587,
+  #466, #460, #420). **ASTRO acceptance MET:** a mixed 2D + 3D `Rgba16f`
+  storage-image shader now emits two distinct `OpTypeImage` types at distinct
+  bindings with a `v3uint` coordinate for the 3D store, gated on real
+  spirv-val (Vulkan 1.3). kyty-graphics **494**, raeen-gpu **294**, green.
+  Three findings that matter more than the port itself:
+  1. **The SPIR-V half of #587 was already in tree** (`storage_key_*` +
+     `route_storage_ids` already decoded per binding). What was missing was
+     *proof* — hence the acceptance test.
+  2. **The real bug was on the HOST, not in the shader.** It derived "is this a
+     volume?" from the slice count (`depth > 1`) while the recompiler derives
+     `Dim3D` from the T# TYPE nibble alone. A type-10 descriptor with
+     `DEPTH == 0` is a legal ONE-SLICE volume, so Raeen built a `TYPE_2D` image
+     and view under a `Dim3D` image type — an emit/bind divergence, **the same
+     class that already cost a device loss for arrays** (which is exactly why
+     `TextureUpload::array` is type-driven). Now type-driven via a `volume`
+     flag through all four create/view sites and both cache keys. This is a
+     strong candidate for what poisons the Vulkan device on ASTRO, and it is
+     independent of the RefCell/VEH 409 mechanism — they could both be live.
+  3. **Raeen had NO VOP3P support at all** — no `0x33` arm, so a single packed
+     word returned `UnknownEncoding` and **dropped the whole shader**. Added
+     `shader_parse_vop3p` + `Vop3pControl` + eight lowering rows
+     (`v_pk_fma/add/mul/min/max_f16`, `v_fma_mix_f32/_mixlo_f16/_mixhi_f16`).
+  - Two named deviations: f16↔f32 uses GLSL `Un/PackHalf2x16` (matching the
+    crate's existing `VCvtF32F16`), and `v_pk_fma_f16` skips #420's
+    round-to-odd 2Sum because that sequence is only error-free under per-op
+    `NoContraction`, which this generator cannot emit per-body — an uncorrected
+    2Sum decays to the double-rounded answer anyway. Last-f16-bit divergence on
+    midpoints; the shader translating at all is the win.
+  - **naga cannot gate this path:** it rejects EVERY `OpImageWrite` storage
+    module this generator emits with `InvalidImage`, including a homogeneous
+    2D-only one (verified with a 2D/3D/mixed probe). A known false negative,
+    sibling of the existing `InvalidArrayBaseType` carve-out — spirv-val is the
+    gate.
+  - Verdicts: #545/#556/#558/#535/#395/#553 ALREADY-HAVE; #514 N/A (no
+    program-size cap exists to raise); #465 DEFERRED with scope measured —
+    `v_cndmask_b32` is already correct, the residual is 22 exec-predicated body
+    tails testing the whole `exec_lo` word instead of its lane bit (misreads as
+    active after `s_not_b64 exec`). 22 hand-written sites with golden-text
+    assertions needs its own red test first; filed rather than half-done.
+  - Caveats: the 3D `vkCreateImage`/`vkCreateImageView` path still has **no
+    device-level test** (every `TextureUpload` literal in the gpu tests sets
+    `depth: 1`), and tiled volumes outside tile mode 0 remain a named refusal.
