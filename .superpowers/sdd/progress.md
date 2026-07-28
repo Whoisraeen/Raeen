@@ -1,5 +1,5 @@
 - SYNCHRONOUS GUEST CALLBACKS — checklist item 7 (2026-07-27; worktree agent,
-  commit ba3c123, branch worktree-agent-a8a0f93f4ac611946; raeen-runtime 77
+  commit 6ff4132, branch worktree-agent-a8a0f93f4ac611946; raeen-runtime 77
   lib + 56 execute
   (+6 new, 1 pre-existing ignored bench) + 1 m3 green; raeen-hle 500/500
   (+3 new); raeen-firmware 125/125; fmt clean; clippy --all-targets

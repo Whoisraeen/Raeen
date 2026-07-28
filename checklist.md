@@ -170,7 +170,7 @@ top-down, update statuses in place, and keep it committed.**
   (the phased plan), `crates/raeen-gpu/` present path + `present_plugin`.
 
 ### 7. Synchronous guest callbacks (call back INTO guest from HLE)
-- [x] MECHANISM DONE 2026-07-27 (worktree agent, commit `ba3c123` on branch
+- [x] MECHANISM DONE 2026-07-27 (worktree agent, commit `6ff4132` on branch
   `worktree-agent-a8a0f93f4ac611946`; raeen-runtime 77 lib + 56 execute
   (+6 new) + 1 m3 green, raeen-hle 500 (+3 new), raeen-firmware 125, fmt
   clean, clippy `-D warnings` green on both touched crates).
