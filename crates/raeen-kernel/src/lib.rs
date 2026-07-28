@@ -1068,6 +1068,16 @@ pub struct PosixSem {
 #[derive(Debug)]
 pub struct GuestWaiter {
     thread: u64,
+    /// Lock-free mirror of `signaled`, stored **first** in [`Self::wake`].
+    ///
+    /// This is what [`Self::spin_for_signal`] polls: a freshly granted waiter
+    /// observes its wake with a single atomic load instead of a host park /
+    /// unpark round trip. It is a fast-path hint only — the mutex-protected
+    /// `signaled` bool below remains the single source of truth for the park
+    /// path, so the spin phase cannot introduce a lost wake: a waiter that
+    /// gives up spinning falls into [`Self::wait_for_signal`], which re-checks
+    /// `signaled` under its lock before ever sleeping.
+    signaled_fast: std::sync::atomic::AtomicBool,
     signaled: parking_lot::Mutex<bool>,
     changed: parking_lot::Condvar,
 }
@@ -1076,12 +1086,19 @@ impl GuestWaiter {
     fn new(thread: u64) -> Self {
         Self {
             thread,
+            signaled_fast: std::sync::atomic::AtomicBool::new(false),
             signaled: parking_lot::Mutex::new(false),
             changed: parking_lot::Condvar::new(),
         }
     }
 
     fn wake(&self) {
+        // Release-store the fast flag before taking the waiter's lock: a
+        // spinning waiter that Acquire-loads it true is guaranteed to see
+        // every write the waker made before waking (e.g. the mutex ownership
+        // transfer `try_grant_head` performed under the state lock).
+        self.signaled_fast
+            .store(true, std::sync::atomic::Ordering::Release);
         *self.signaled.lock() = true;
         self.changed.notify_one();
     }
@@ -1108,6 +1125,74 @@ impl GuestWaiter {
         }
         *signaled
     }
+
+    /// Bounded busy-wait for this waiter's grant **before** falling back to
+    /// [`Self::wait_for_signal`] — the adaptive-mutex spin phase.
+    ///
+    /// The measured problem this exists for: Minecraft's libc allocator lock
+    /// is held for sub-microsecond critical sections at very high frequency
+    /// (MAIN alone: 138k `scePthreadMutexLock` calls in ~15 s, ~5.3 s inside
+    /// them). Under strict park-per-contention every handoff costs a host
+    /// wakeup — microseconds to tens of microseconds — thousands of times per
+    /// second, serialized through one FIFO. Spinning a few microseconds first
+    /// lets a waiter observe the granting side's flag store without any kernel
+    /// transition, exactly like glibc's `PTHREAD_MUTEX_ADAPTIVE_NP`.
+    ///
+    /// Returns `true` once the grant is observed; `false` when the budget is
+    /// exhausted (the caller must then park — a wake landing in that
+    /// transition is still observed by `wait_for_signal`'s locked flag check).
+    /// The ladder: the first [`SPIN_BEFORE_YIELD`] iterations are pure
+    /// `spin_loop` pauses; past that, every 64th iteration escalates to
+    /// `yield_now` so an oversubscribed host makes progress.
+    ///
+    /// FIFO order, anti-barging, timeouts, and cancellation are untouched:
+    /// spinning only changes *how* the already-selected waiter notices its
+    /// grant, never *who* is selected.
+    #[must_use]
+    pub fn spin_for_signal(&self, budget: u32) -> bool {
+        /// Iterations of pure `spin_loop` before the yield ladder kicks in.
+        const SPIN_BEFORE_YIELD: u32 = 1024;
+        for iteration in 0..budget {
+            if self
+                .signaled_fast
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return true;
+            }
+            if iteration < SPIN_BEFORE_YIELD || !iteration.is_multiple_of(64) {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        self.signaled_fast
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Default pre-park spin budget for contended guest locks, in
+/// [`GuestWaiter::spin_for_signal`] iterations. ~2000 pause-hinted loads is on
+/// the order of tens of microseconds on a Zen-class core — comparable to a
+/// single park/unpark round trip, so the spin phase never costs meaningfully
+/// more than the park it replaces, while a sub-microsecond malloc-class
+/// critical section is caught in the first few iterations.
+pub const DEFAULT_GUEST_WAITER_SPIN: u32 = 2000;
+
+/// Parse an `RAEEN_MUTEX_SPIN` override. `0` disables spinning entirely
+/// (restoring pure park-per-contention); unparseable values keep the default.
+fn parse_spin_budget(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_GUEST_WAITER_SPIN)
+}
+
+/// The process-wide pre-park spin budget for guest lock waiters, read once
+/// from `RAEEN_MUTEX_SPIN` (iterations; `0` disables spinning, absent/invalid
+/// = [`DEFAULT_GUEST_WAITER_SPIN`]). Env-overridable so a live soak can A/B
+/// spin budgets without a rebuild.
+#[must_use]
+pub fn guest_waiter_spin_budget() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| parse_spin_budget(std::env::var("RAEEN_MUTEX_SPIN").ok().as_deref()))
 }
 
 /// Host-backed FIFO wait queue of [`GuestWaiter`]s.
@@ -1441,6 +1526,81 @@ mod pthread_mutex_handoff_tests {
         assert!(live.is_signaled());
         assert_eq!(state.owner_acquire_site, 0x1000_0202);
         assert_eq!(state.owner_acquire_rsp, 0x2000_0202);
+    }
+}
+
+#[cfg(test)]
+mod guest_waiter_spin_tests {
+    use super::{DEFAULT_GUEST_WAITER_SPIN, GuestWaitQueue, PthreadMutex, parse_spin_budget};
+
+    /// The spin→park transition regression: a grant that lands exactly after
+    /// the spin gives up and before the park must not be lost. The zero-length
+    /// timeout proves it is `wait_for_signal`'s locked flag check — not a
+    /// condvar notification — that observes the wake.
+    #[test]
+    fn grant_landing_at_the_spin_to_park_transition_is_not_lost() {
+        let queue = GuestWaitQueue::default();
+        let waiter = queue.enqueue_waiter(7);
+
+        // Spin exhausts its budget with no grant in sight.
+        assert!(!waiter.spin_for_signal(64));
+
+        // The grant lands in the spin→park window...
+        assert!(queue.signal_one());
+
+        // ...and the park path still observes it without ever sleeping.
+        assert!(waiter.wait_for_signal(std::time::Duration::ZERO));
+    }
+
+    /// A wake completed on another host thread is visible to the very first
+    /// spin iteration (Release store in `wake`, Acquire load in the spin).
+    #[test]
+    fn completed_wake_is_visible_to_the_first_spin_iteration() {
+        let queue = GuestWaitQueue::default();
+        let waiter = queue.enqueue_waiter(7);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| assert!(queue.signal_one()))
+                .join()
+                .expect("waker thread");
+        });
+        assert!(waiter.spin_for_signal(1));
+        assert!(waiter.is_signaled(), "the park-path flag is set too");
+    }
+
+    /// The mutex FIFO's direct handoff is observable by a spinning waiter:
+    /// `try_grant_head` transfers ownership under the state lock and its
+    /// `wake` makes that transfer visible to the spin without any park.
+    #[test]
+    fn mutex_handoff_grant_is_observable_by_a_spinning_waiter() {
+        const MUTEX_NORMAL: i32 = 3;
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+        let waiter = state.enqueue_waiter(0x201, 0, 0);
+
+        assert!(!waiter.spin_for_signal(16), "no grant while owned");
+
+        state.owner = 0;
+        state.recursion = 0;
+        assert_eq!(state.try_grant_head(), Some(0x201));
+        assert!(waiter.spin_for_signal(1));
+        assert_eq!(state.owner, 0x201);
+    }
+
+    /// `RAEEN_MUTEX_SPIN` parsing: 0 disables, integers override, garbage and
+    /// absence keep the default.
+    #[test]
+    fn spin_budget_env_parsing() {
+        assert_eq!(parse_spin_budget(None), DEFAULT_GUEST_WAITER_SPIN);
+        assert_eq!(parse_spin_budget(Some("0")), 0);
+        assert_eq!(parse_spin_budget(Some(" 500 ")), 500);
+        assert_eq!(
+            parse_spin_budget(Some("not-a-number")),
+            DEFAULT_GUEST_WAITER_SPIN
+        );
+        assert_eq!(parse_spin_budget(Some("-3")), DEFAULT_GUEST_WAITER_SPIN);
     }
 }
 

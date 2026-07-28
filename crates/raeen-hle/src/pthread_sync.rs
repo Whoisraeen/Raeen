@@ -549,7 +549,6 @@ fn lock_core(
     };
 
     let current = ctx.guest_threads.current_thread();
-    let spin_start = std::time::Instant::now();
     let Some(shared) = ctx
         .kernel
         .pthread_mutexes
@@ -607,7 +606,20 @@ fn lock_core(
         }
         (waiter, state.owner)
     };
-    let mut owner_since = std::time::Instant::now();
+    // Spin-then-park (adaptive mutex). The FIFO position above is already
+    // taken, so fairness and anti-barging are unchanged — spinning only lets
+    // this already-enqueued waiter observe its direct handoff without a host
+    // park/unpark round trip. Measured motivation: the title's libc allocator
+    // lock is held sub-microsecond at 100k+ locks per 15 s, so parking on
+    // every contention serialized the whole frame behind host wakeup latency
+    // (worst frozen window 24.7 s, 1–2 FPS while streaming).
+    // `RAEEN_MUTEX_SPIN=0` restores strict park-per-contention for A/B.
+    let spin_budget = raeen_kernel::guest_waiter_spin_budget();
+    if spin_budget > 0 && waiter.spin_for_signal(spin_budget) {
+        return OK;
+    }
+    let park_start = std::time::Instant::now();
+    let mut owner_since = park_start;
     let mut owner_changes = 0u64;
     let mut reported_contention = false;
     let mut reported_deadlock = false;
@@ -622,7 +634,7 @@ fn lock_core(
                 tracing::info!(
                     mutex = format_args!("{key:#x}"),
                     waiter = current,
-                    wait_ms = spin_start.elapsed().as_millis(),
+                    wait_ms = park_start.elapsed().as_millis(),
                     owner_changes,
                     "scePthreadMutexLock acquired after long contention"
                 );
@@ -659,7 +671,7 @@ fn lock_core(
         // Minecraft's streaming lock has measured rotating owners: a convoy
         // that eventually acquires. Only one owner observed continuously for
         // 30 s is elevated to the soak harness's probable-deadlock signal.
-        let total_wait = spin_start.elapsed();
+        let total_wait = park_start.elapsed();
         let stable_owner_wait = owner_since.elapsed();
         if let Some(diagnostic) = classify_mutex_wait(
             total_wait,
@@ -1907,5 +1919,207 @@ mod tests {
             }
             assert!(found, "{name} is not registered under any provider");
         }
+    }
+
+    /// Multithreaded stress: N host threads with distinct guest thread ids
+    /// hammer `lock`/`unlock` through the real HLE entry points with tiny
+    /// critical sections — the exact malloc-class workload the spin-then-park
+    /// phase exists for. Mutual exclusion is proven by a deliberately
+    /// non-atomic read-modify-write counter that only sums correctly if no two
+    /// threads are ever inside the critical section at once. No timing is
+    /// asserted (this is a correctness test that happens to exercise the spin
+    /// fast path, not a benchmark).
+    #[test]
+    fn contended_lock_unlock_stress_preserves_mutual_exclusion() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Thread-safe [`crate::GuestMemory`] double (the crate-wide
+        /// `TestMemory` is `RefCell`-backed and single-threaded).
+        struct SharedMemory(std::sync::Mutex<Vec<u8>>);
+        impl crate::GuestMemory for SharedMemory {
+            fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
+                let buf = self.0.lock().expect("test memory lock");
+                let Ok(addr) = usize::try_from(guest_addr) else {
+                    return false;
+                };
+                let Some(end) = addr.checked_add(out.len()) else {
+                    return false;
+                };
+                if end > buf.len() {
+                    return false;
+                }
+                out.copy_from_slice(&buf[addr..end]);
+                true
+            }
+            fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
+                let mut buf = self.0.lock().expect("test memory lock");
+                let Ok(addr) = usize::try_from(guest_addr) else {
+                    return false;
+                };
+                let Some(end) = addr.checked_add(data.len()) else {
+                    return false;
+                };
+                if end > buf.len() {
+                    return false;
+                }
+                buf[addr..end].copy_from_slice(data);
+                true
+            }
+        }
+
+        /// Thread-safe bump allocator double.
+        struct AtomicBump(AtomicU64);
+        impl AtomicBump {
+            fn bump(&self, size: u64, align: u64) -> Option<u64> {
+                let align = align.max(1);
+                let mut aligned = 0;
+                self.0
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        aligned = cur.checked_add(align - 1)? & !(align - 1);
+                        aligned.checked_add(size)
+                    })
+                    .ok()
+                    .map(|_| aligned)
+            }
+        }
+        impl crate::GuestAllocator for AtomicBump {
+            fn alloc(&self, size: u64, align: u64) -> Option<u64> {
+                self.bump(size, align)
+            }
+            fn free(&self, _addr: u64) {}
+            fn realloc(&self, _addr: u64, new_size: u64) -> Option<u64> {
+                self.bump(new_size, 1)
+            }
+            fn mmap(&self, length: u64, align: u64) -> Option<u64> {
+                self.bump(length, align)
+            }
+            fn munmap(&self, _addr: u64, _length: u64) {}
+        }
+
+        /// Per-host-thread scheduler double: a fixed distinct guest thread id.
+        struct StressThread(u64);
+        impl crate::GuestThreadScheduler for StressThread {
+            fn create(&self, _thread_out: u64, _attr: u64, _entry: u64, _arg: u64) -> u64 {
+                0x8002_000B
+            }
+            fn join(&self, _thread: u64, _retval_out: u64) -> u64 {
+                0x8002_0003
+            }
+            fn detach(&self, _thread: u64) -> u64 {
+                0x8002_0003
+            }
+            fn request_exit(&self, _retval: u64) -> bool {
+                false
+            }
+            fn current_thread(&self) -> u64 {
+                self.0
+            }
+            fn request_process_exit(&self, _code: u64) {}
+            fn process_is_terminating(&self) -> bool {
+                false
+            }
+        }
+
+        struct NoCalls;
+        impl crate::GuestCallScheduler for NoCalls {
+            fn request(&self, _request: crate::GuestCallRequest) -> bool {
+                false
+            }
+        }
+
+        struct NoGpu;
+        impl crate::GpuSubmissionSubsystem for NoGpu {
+            fn submit(&self, _words: Vec<u32>, _queue: raeen_core::subsystems::GpuQueue) {}
+            fn map_shader_metadata(
+                &self,
+                _code_address: u64,
+                _data: raeen_core::subsystems::ShaderMappedData,
+            ) {
+            }
+            fn present_scanout(
+                &self,
+                _address: u64,
+                _descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
+            ) {
+            }
+            fn wait_idle(&self) {}
+            fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
+                raeen_core::subsystems::GpuSubmissionStats::default()
+            }
+        }
+
+        /// The mutual-exclusion witness: a torn or lost increment is only
+        /// possible if two threads are inside the critical section at once.
+        struct RacyCounter(std::cell::UnsafeCell<u64>);
+        // SAFETY: every access happens inside the guest mutex's critical
+        // section; proving that is the purpose of this test.
+        unsafe impl Sync for RacyCounter {}
+
+        const THREADS: u64 = 4;
+        const ITERATIONS: u64 = 2000;
+        const MUTEX: u64 = 0x100;
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = SharedMemory(std::sync::Mutex::new(vec![0u8; 0x4000]));
+        let alloc = AtomicBump(AtomicU64::new(0x1000));
+        let no_calls = NoCalls;
+        let gpu = NoGpu;
+        let counter = RacyCounter(std::cell::UnsafeCell::new(0));
+
+        std::thread::scope(|scope| {
+            for tid in 1..=THREADS {
+                let kernel = &kernel;
+                let mem = &mem;
+                let alloc = &alloc;
+                let no_calls = &no_calls;
+                let gpu = &gpu;
+                let counter = &counter;
+                scope.spawn(move || {
+                    let scheduler = StressThread(tid);
+                    let ctx = HleContext {
+                        kernel,
+                        services: kernel,
+                        gpu,
+                        mem,
+                        alloc,
+                        guest_calls: no_calls,
+                        guest_threads: &scheduler,
+                        caller_return_addr: 0,
+                        caller_rsp: 0,
+                        float_args: [0; 8],
+                        caller_gprs: None,
+                    };
+                    for _ in 0..ITERATIONS {
+                        assert_eq!(hle_mutex_lock(&ctx, &[MUTEX]), OK);
+                        // SAFETY: guarded by the guest mutex under test — see
+                        // `RacyCounter`.
+                        unsafe {
+                            let cell = counter.0.get();
+                            let value = cell.read();
+                            std::hint::spin_loop();
+                            cell.write(value + 1);
+                        }
+                        assert_eq!(hle_mutex_unlock(&ctx, &[MUTEX]), OK);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            unsafe { *counter.0.get() },
+            THREADS * ITERATIONS,
+            "a torn increment means two threads were inside the critical section"
+        );
+
+        // The mutex ends free with an empty FIFO.
+        let key = kernel
+            .pthread_mutexes
+            .contains_key(&MUTEX)
+            .then_some(MUTEX)
+            .expect("the implicitly created mutex is registered");
+        let shared = Arc::clone(kernel.pthread_mutexes.get(&key).unwrap().value());
+        let state = shared.state.lock();
+        assert_eq!(state.owner, 0);
+        assert_eq!(state.waiter_count(), 0);
     }
 }
