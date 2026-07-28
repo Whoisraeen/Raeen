@@ -486,10 +486,13 @@ impl VirtualFileSystem {
 
     /// Open a file, honoring the `open`-flag subset in [`open_flags`].
     ///
-    /// Write confinement: a guest path containing a `..` component is
-    /// rejected (`PermissionDenied`) so a writable open can't escape its
-    /// mount's host directory via traversal — guest paths are otherwise
-    /// untrusted. Read-only opens of existing files are unaffected.
+    /// Write confinement is enforced by [`combine_within_mount`], which
+    /// normalizes `..` with a clamp at the mount root and then proves lexical
+    /// and canonical containment. There is deliberately no extra "reject any
+    /// path containing `..`" guard here: that rule denied the
+    /// `../../../`-prefixed paths every Unreal Engine title uses for its own
+    /// content and save trees, while adding no confinement the resolver does not
+    /// already guarantee. An unresolvable path still fails closed below.
     pub fn open(&self, path: &str, flags: i32, _mode: u32) -> Result<Fd, std::io::Error> {
         use open_flags::*;
 
@@ -497,17 +500,6 @@ impl VirtualFileSystem {
         let create = flags & O_CREAT != 0;
         let truncate = flags & O_TRUNC != 0;
         let append = flags & O_APPEND != 0;
-
-        // Reject path traversal on any writable open (defense against a guest
-        // writing outside its mount via "../"). Read-only opens don't persist
-        // anything, so they don't need this guard.
-        if writable && path.split(['/', '\\']).any(|c| c == "..") {
-            warn!("VFS open: refusing writable open of traversing path '{path}'");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "path traversal",
-            ));
-        }
 
         if matches!(path, "/dev/random" | "/dev/urandom") {
             if writable {
@@ -1323,9 +1315,29 @@ const MAX_HOST_NAME_LEN: usize = 255;
 /// does not follow symlinks/junctions, so a reparse point planted inside the
 /// mount could redirect out of it.
 ///
+/// # Why `..` is normalized rather than refused (UE4/UE5 boot)
+///
+/// Refusing any path with a `..` component is a *stricter* rule than SharpEmu's
+/// and it breaks Unreal Engine titles outright. A UE game's base directory is
+/// `<app>/binaries/<platform>`, so the engine addresses its own content with
+/// `../../../`-prefixed paths that, on real hardware, land back inside `/app0`.
+/// Denying them means the title enumerates nothing and never finds its `.pak`
+/// files — SharpEmu measured exactly that (`NormalizeMountRelativePath`,
+/// GPL-2.0: *"Combining those raw against the app0 root walked out of the game
+/// folder entirely, so the title enumerated an unrelated host directory and
+/// never found its .pak files."*). Until Dawn is a UE5 title.
+///
+/// So `..` **pops** the last resolved segment and is **silently dropped at the
+/// mount root** — the resolved path is clamped to the mount, never escaping it.
+/// This is not a weakening: popping can only ever shorten the segment list, so
+/// the by-construction lexical containment below is unchanged, and the
+/// drive-qualifier, reparse-point, and canonical-containment defenses all still
+/// run on the normalized result.
+///
 /// Defense, in order:
-/// 1. Sanitize each segment — refuse `..` (traversal), any absolute segment, any
-///    segment containing `:` (drive/ADS qualifier), and NUL/over-long names.
+/// 1. Sanitize each segment — normalize `.`/`..` with a clamp at the mount root,
+///    refuse any absolute segment, any segment containing `:` (drive/ADS
+///    qualifier), and NUL/over-long names.
 ///    After this the assembled path is lexically contained *by construction*.
 /// 2. Walk each already-existing component from the root down and refuse
 ///    symlinks/reparse points; components that do not exist yet (an `O_CREAT`
@@ -1351,8 +1363,13 @@ fn combine_within_mount(mount_root: &Path, ps5_path: &str, relative: &str) -> Op
             continue;
         }
         if segment == ".." {
-            warn!("VFS resolve: refusing traversing guest path '{ps5_path}'");
-            return None;
+            // Pop one resolved segment, or drop the `..` when already at the
+            // mount root (the clamp). `Vec::pop` on an empty vec is a no-op, so
+            // no amount of leading `..` can walk above the root — which is what
+            // makes a UE title's `../../../Content/...` resolve back INTO the
+            // mount instead of being denied.
+            segments.pop();
+            continue;
         }
         // A ':' is a Windows drive or alternate-data-stream qualifier, and an
         // absolute segment would make `Path::join` discard the mount root; both
@@ -1781,14 +1798,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A writable open of a traversing path is **confined**, not refused: the
+    /// `..` clamps at the mount root, so the write lands inside the mount. With
+    /// no game directory mounted there is nothing to resolve against, so it
+    /// still fails closed — just not with a blanket traversal rejection that
+    /// would also have denied every Unreal `Saved/` write.
     #[test]
-    fn writable_open_of_traversing_path_is_refused() {
+    fn writable_open_of_traversing_path_is_confined_not_refused() {
         use open_flags::*;
+        let dir = temp_dir("traverse-write");
         let vfs = VirtualFileSystem::new();
-        let err = vfs
+        vfs.set_game_directory(&dir);
+
+        let fd = vfs
             .open("/app0/../../escape.bin", O_WRONLY | O_CREAT, 0o644)
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            .expect("clamped writable open must succeed");
+        vfs.write(fd, b"x").unwrap();
+        vfs.close(fd).unwrap();
+        assert!(
+            dir.join("escape.bin").is_file(),
+            "the write must be clamped INTO the mount, not escape above it"
+        );
+        assert!(
+            !dir.parent().unwrap().join("escape.bin").exists(),
+            "nothing may be created above the mount root"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2156,7 +2191,11 @@ mod tests {
             Some(nested.join("index.bin"))
         );
         assert_eq!(vfs.resolve_path("/temp01/file.bin"), None);
-        assert_eq!(vfs.resolve_path("/temp0/../escape.bin"), None);
+        // `..` clamps at the mount root instead of escaping (or being denied).
+        assert_eq!(
+            vfs.resolve_path("/temp0/../escape.bin"),
+            Some(root.join("escape.bin"))
+        );
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(nested);
@@ -2282,14 +2321,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `..` is normalized with a clamp at the mount root, not refused — so a
+    /// traversing tail resolves back INSIDE the mount rather than escaping it
+    /// and rather than being denied. Denial is the wrong contract: it breaks
+    /// every Unreal title (see `combine_within_mount`'s UE section).
     #[test]
-    fn parent_traversal_tail_is_denied() {
+    fn parent_traversal_tail_is_clamped_to_the_mount_root() {
         let dir = temp_dir("sandbox-traverse");
         let vfs = VirtualFileSystem::new();
         vfs.set_game_directory(&dir);
-        assert!(vfs.resolve_path("/app0/../escape.bin").is_none());
-        assert!(vfs.resolve_path("/app0/a/../../escape.bin").is_none());
-        assert!(vfs.resolve_path("/app0/..\\escape.bin").is_none());
+        // `resolve_path` returns the mount root joined with the normalized
+        // segments (not canonicalized), so compare against `dir` as mounted.
+        let root = dir.clone();
+
+        for guest in [
+            "/app0/../escape.bin",
+            "/app0/a/../../escape.bin",
+            "/app0/..\\escape.bin",
+            "/app0/../../../../../../escape.bin",
+        ] {
+            let resolved = vfs
+                .resolve_path(guest)
+                .unwrap_or_else(|| panic!("{guest} must resolve (clamped), not be denied"));
+            assert_eq!(
+                resolved,
+                root.join("escape.bin"),
+                "{guest} must clamp to the mount root, landing inside it"
+            );
+            assert!(
+                resolved.starts_with(&root),
+                "{guest} escaped the mount root: {resolved:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **UE4/UE5 boot acceptance (SharpEmu daeb-family fix).** An Unreal title
+    /// runs with its base directory at `<app>/binaries/<platform>` and addresses
+    /// its own content with `../../../`-prefixed paths. Those must resolve back
+    /// into `/app0` and actually find the file, or the title enumerates nothing
+    /// and never loads its `.pak`s. Until Dawn is UE5.
+    #[test]
+    fn unreal_project_relative_paths_resolve_back_into_app0() {
+        let dir = temp_dir("sandbox-unreal");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        // Lay down the content the engine is looking for.
+        let pak_dir = dir.join("Project").join("Content").join("Paks");
+        std::fs::create_dir_all(&pak_dir).unwrap();
+        std::fs::write(pak_dir.join("pakchunk0.pak"), b"PAK!").unwrap();
+
+        // Exactly the shape UE emits from binaries/<platform>.
+        let guest = "/app0/binaries/prospero/../../../Project/Content/Paks/pakchunk0.pak";
+        let resolved = vfs
+            .resolve_path(guest)
+            .expect("UE project-relative path must resolve, not be denied");
+        assert_eq!(resolved, pak_dir.join("pakchunk0.pak"));
+        assert_eq!(
+            std::fs::read(&resolved).unwrap(),
+            b"PAK!",
+            "the clamped path must reach the real content file"
+        );
+
+        // And the same shape must work for a writable open (UE's Saved/ tree),
+        // which a blanket "reject any `..`" guard used to refuse outright.
+        use open_flags::*;
+        let fd = vfs
+            .open(
+                "/app0/binaries/prospero/../../../Project/Saved/save.dat",
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0o644,
+            )
+            .expect("UE-relative writable open must be permitted (clamped, not escaping)");
+        assert_eq!(vfs.write(fd, b"SAVE").unwrap(), 4);
+        vfs.close(fd).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("Project").join("Saved").join("save.dat")).unwrap(),
+            b"SAVE",
+            "the write must land inside the mount, at the clamped location"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

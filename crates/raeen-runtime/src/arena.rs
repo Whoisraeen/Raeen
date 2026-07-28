@@ -435,21 +435,20 @@ const TCB_SIZE: u64 = 0x800; // 2 KiB
 /// whenever stack-protector is enabled (M1-B, wall #2).
 const CANARY_TCB_OFFSET: usize = 0x28;
 
-/// A per-process stack-protector canary value: derived from
-/// [`std::collections::hash_map::RandomState`]'s per-process random keys
-/// (no new dependency), with the low byte forced to zero (glibc's
-/// "terminator canary" convention — a NUL so string functions can't leak
-/// it) and guaranteed nonzero (the m1-homebrew anti-pattern: a zero canary
-/// would let stack-protected code "work" by coincidence against a zeroed
-/// TCB rather than proving a real install).
+/// The process's stack-protector canary, installed at `fs:0x28` in **every**
+/// guest TCB this module builds.
+///
+/// It is deliberately the *same* word
+/// [`raeen_firmware::stack_chk_guard`] publishes as libkernel's
+/// `__stack_chk_guard` global, and deliberately identical across threads.
+/// Both properties are load-bearing, not tidiness: a frame whose prologue
+/// loaded one guard and whose epilogue compares the other — because the title
+/// mixes `-mstack-protector-guard=global` and `tls` objects, or because a job
+/// system resumed the frame on another worker — must still compare equal, or
+/// the guest calls `__stack_chk_fail` on a stack that was never corrupted.
+/// See that function for the measured GTA V / UE5 evidence.
 fn stack_canary() -> u64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(0x5A_FE_57_AC_C4_AA_2D_00);
-    let masked = hasher.finish() & !0xFF;
-    if masked == 0 { 0x100 } else { masked }
+    raeen_firmware::stack_chk_guard()
 }
 
 /// Round `align` up to a power of two no smaller than 16 (the minimum
@@ -2559,6 +2558,59 @@ mod tests {
             IMAGE_SIZE,
             raeen_firmware::GUEST_IMAGE_REGION_BYTES,
             "firmware's image budget must equal the arena's image region"
+        );
+    }
+
+    /// **GTA V / UE5 canary-smash regression.** Every guest thread's
+    /// `fs:0x28` must hold the *same* word, and it must be the same word
+    /// `raeen-firmware` publishes as libkernel's `__stack_chk_guard` global.
+    ///
+    /// Before this was pinned, `setup_main_tcb` randomized a fresh canary per
+    /// call, so the main thread, every worker, and the global each held a
+    /// different value. Any frame whose prologue read one guard and whose
+    /// epilogue compared another — a title mixing
+    /// `-mstack-protector-guard=global` with the default `tls`, or a job
+    /// system resuming a frame on a different worker — then called
+    /// `__stack_chk_fail` on a perfectly intact stack. That is the measured
+    /// GTA V thread-31 smash (`docs/gta5-blocker-analysis-2026-07-27.md`) and
+    /// the Until Dawn one.
+    #[test]
+    fn every_tcb_and_the_global_share_one_stack_chk_guard() {
+        let _lock = crate::dispatch::call_lock();
+        let image = vec![0x90u8; 16];
+        let arena = GuestArena::new(&image).expect("fixed-base reservation should succeed");
+
+        // No PT_TLS: the TCB sits at the allocation base, canary at +0x28.
+        let main_tcb = arena.setup_main_tcb(&[]).expect("main TCB");
+        let worker_tcb = arena.setup_thread_tcb(&[]).expect("worker TCB");
+        assert_ne!(
+            main_tcb, worker_tcb,
+            "each thread must get its own TCB allocation"
+        );
+
+        let read_canary = |tcb: u64| {
+            let mut bytes = [0u8; 8];
+            assert!(
+                arena.read(tcb + CANARY_TCB_OFFSET as u64, &mut bytes),
+                "the canary slot must be readable guest memory"
+            );
+            u64::from_le_bytes(bytes)
+        };
+        let main = read_canary(main_tcb);
+        let worker = read_canary(worker_tcb);
+
+        assert_ne!(main, 0, "no zero-canary soft-success");
+        assert_eq!(main & 0xFF, 0, "glibc-style NUL terminator byte");
+        assert_eq!(
+            main, worker,
+            "a canary spilled on one guest thread and verified on another must \
+             compare equal; per-TCB randomization is the GTA V/UE5 smash"
+        );
+        assert_eq!(
+            main,
+            raeen_firmware::stack_chk_guard(),
+            "fs:0x28 must equal libkernel's __stack_chk_guard global, or a \
+             mixed global/tls guard image mismatches on every return"
         );
     }
 

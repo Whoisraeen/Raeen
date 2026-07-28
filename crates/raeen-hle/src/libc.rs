@@ -2052,6 +2052,41 @@ fn ctype_case_map(c: i32, to_lower: bool) -> u16 {
     (mapped as u32 & 0xFFFF) as u16
 }
 
+/// Byte offset, inside a table built by [`ctype_class_table_bytes`], of the
+/// `c == 0` entry — i.e. how far into the allocation the pointer a guest
+/// indexes with `table[c]` must sit. 128 negative entries × 2 bytes.
+pub const CTYPE_TABLE_ZERO_SLOT_OFFSET: u64 = (-CTYPE_TABLE_LOWER) as u64 * 2;
+
+/// The C-locale Dinkumware **classification** table as raw little-endian
+/// bytes: 384 `u16` entries covering codes `-128..=255`.
+///
+/// This is the one generator behind both spellings of the table, so they can
+/// never disagree:
+///
+/// * `_Getpctype()` — the *function* form, which copies these bytes into the
+///   guest heap on demand (see [`write_ctype_table`]); and
+/// * `_Ctype` — the *data-object* form, which `raeen-firmware` embeds in the
+///   HLE data page so a data relocation can point straight at it.
+///
+/// A guest that reaches the table either way must see identical bytes; a title
+/// that resolves `_Ctype` in one translation unit and calls `_Getpctype()` in
+/// another would otherwise classify the same character two different ways.
+/// Callers publishing this as `_Ctype` must offset the exported symbol address
+/// by [`CTYPE_TABLE_ZERO_SLOT_OFFSET`].
+pub fn ctype_class_table_bytes() -> Vec<u8> {
+    ctype_table_bytes(ctype_flags)
+}
+
+/// Serialize one 384-entry `u16` table from `f`, in guest (little-endian)
+/// byte order, indexed from [`CTYPE_TABLE_LOWER`].
+fn ctype_table_bytes(f: impl Fn(i32) -> u16) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CTYPE_TABLE_BYTES as usize);
+    for i in 0..CTYPE_TABLE_ENTRIES as i32 {
+        bytes.extend_from_slice(&f(i + CTYPE_TABLE_LOWER).to_le_bytes());
+    }
+    bytes
+}
+
 /// The three process-global C-locale classification/conversion tables.
 #[derive(Clone, Copy, Default)]
 struct CtypeTables {
@@ -2068,16 +2103,13 @@ static CTYPE_TABLES: std::sync::LazyLock<dashmap::DashMap<u64, CtypeTables>> =
 /// Allocate one 384-entry u16 guest table from `f` and return the guest
 /// address of its c==0 slot (or `None` on allocation/write failure).
 fn write_ctype_table(ctx: &HleContext, f: impl Fn(i32) -> u16) -> Option<u64> {
-    let mut bytes = Vec::with_capacity(CTYPE_TABLE_BYTES as usize);
-    for i in 0..CTYPE_TABLE_ENTRIES as i32 {
-        bytes.extend_from_slice(&f(i + CTYPE_TABLE_LOWER).to_le_bytes());
-    }
+    let bytes = ctype_table_bytes(f);
     let base = ctx.alloc.alloc(CTYPE_TABLE_BYTES, 2)?;
     if !ctx.mem.write(base, &bytes) {
         ctx.alloc.free(base);
         return None;
     }
-    Some(base + (-CTYPE_TABLE_LOWER) as u64 * 2)
+    Some(base + CTYPE_TABLE_ZERO_SLOT_OFFSET)
 }
 
 /// The process's ctype tables, built once and then validated on every call

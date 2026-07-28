@@ -326,24 +326,60 @@ struct ModuleRequest {
     path: Option<std::path::PathBuf>,
 }
 
-/// A per-process stack-protector canary: derived from
-/// [`std::collections::hash_map::RandomState`]'s per-process random keys (no
-/// new dependency), low byte forced to zero (glibc's "terminator canary"
-/// convention, so string functions can't leak it) and guaranteed nonzero — a
-/// zero canary would let stack-protected code "work" against zeroed memory
-/// rather than proving a real install.
-///
-/// Deliberately mirrors `raeen_runtime`'s `fs:0x28` canary rather than sharing
-/// it: the two are independent ABIs (see [`build_hle_data_page`]), and the
-/// runtime's is private to that crate.
-fn stack_canary() -> u64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
+/// The process's single stack-protector canary value, computed at most once.
+static STACK_CHK_GUARD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(0x5A_FE_57_AC_C4_AA_2D_01);
-    let masked = hasher.finish() & !0xFF;
-    if masked == 0 { 0x100 } else { masked }
+/// **The** process-wide stack-protector canary — the one value every
+/// stack-protector surface in the emulator must serve, whichever ABI the
+/// guest reads it through:
+///
+/// * libkernel's `__stack_chk_guard` **global**, published in the HLE data
+///   page by [`build_hle_data_page`]; and
+/// * the **`fs:0x28` TCB slot** of *every* guest thread, written by
+///   `raeen_runtime`'s `GuestArena::setup_main_tcb`/`setup_thread_tcb`.
+///
+/// # Why one value, process-wide (measured)
+///
+/// It is tempting to treat the global and the TCB slot as independent ABIs on
+/// the theory that compiled code reads the same one in its prologue and its
+/// epilogue, so the two never meet. Two real title behaviours break that
+/// theory, and both end in `__stack_chk_fail`:
+///
+/// 1. **Mixed guards in one image.** A title links objects and middleware
+///    built with `-mstack-protector-guard=global` alongside others built with
+///    the default `tls` (`fs:0x28`). Inlining across those boundaries puts a
+///    prologue that loaded the global in the same frame as an epilogue that
+///    compares `fs:0x28` (or the reverse). Two independent random values then
+///    *always* mismatch.
+/// 2. **A frame that spans threads.** GTA V's job system and UE5's task graph
+///    both hand a suspended frame to a different worker. A canary spilled on
+///    one thread and verified on another must still compare equal — which a
+///    freshly randomized per-TCB value can never do. This is the shape of the
+///    measured smash (`docs/gta5-blocker-analysis-2026-07-27.md`: canary fail
+///    on guest thread 31, no HLE call having reported an error first).
+///
+/// Real hardware has no such divergence to begin with: Orbis libkernel picks
+/// one guard word and copies *that* word into each thread's TCB, so the global
+/// and every `fs:0x28` always agree. SharpEmu reaches the same conclusion from
+/// the other direction — its `__stack_chk_guard` export writes one shared
+/// value into both the guard object and `fs:0x28`
+/// (`KernelRuntimeCompatExports.cs`, GPL-2.0).
+///
+/// The value is derived from [`std::collections::hash_map::RandomState`]'s
+/// per-process random keys (no new dependency), with the low byte forced to
+/// zero (glibc's "terminator canary" convention, so string functions cannot
+/// leak it) and guaranteed nonzero — a zero canary would let stack-protected
+/// code "work" against zeroed memory instead of proving a real install.
+pub fn stack_chk_guard() -> u64 {
+    *STACK_CHK_GUARD.get_or_init(|| {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(0x5A_FE_57_AC_C4_AA_2D_01);
+        let masked = hasher.finish() & !0xFF;
+        if masked == 0 { 0x100 } else { masked }
+    })
 }
 
 /// Build the process's **HLE data page** and register its symbols as LLE
@@ -370,10 +406,10 @@ fn stack_canary() -> u64 {
 /// what is already registered — which is why the page is reserved at a known
 /// offset up front rather than appended afterwards.
 ///
-/// `__stack_chk_guard` is independent of the runtime's `fs:0x28` canary: they
-/// are two different stack-protector ABIs (global-variable vs TCB-slot), and
-/// compiled code reads the same one in both prologue and epilogue, so the two
-/// values need not agree.
+/// `__stack_chk_guard` holds exactly the same word the runtime installs at
+/// every thread's `fs:0x28`: both come from [`stack_chk_guard`]. The two are
+/// two spellings of one guard, not two independent ABIs — see that function
+/// for the two measured title behaviours that make divergence fatal.
 fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) -> Vec<u8> {
     let mut page: Vec<u8> = Vec::new();
     let mut exports: Vec<dynlib::SymbolExport> = Vec::new();
@@ -394,7 +430,7 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
 
     add(
         "__stack_chk_guard",
-        &stack_canary().to_le_bytes(),
+        &stack_chk_guard().to_le_bytes(),
         &mut page,
         &mut exports,
     );
@@ -420,6 +456,32 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
         &mut page,
         &mut exports,
     );
+
+    // `_Ctype` is Dinkumware's ctype **classification table** in its
+    // data-object spelling — the same table `_Getpctype()` returns, but reached
+    // by a data relocation instead of a call. Titles that link the non-DLL
+    // Dinkumware headers index `_Ctype[c]` directly, so the exported symbol
+    // must address the `c == 0` slot, not the start of the array (negative
+    // indices, from a signed `char`, read the 128 entries below it).
+    //
+    // The bytes come from `raeen_hle`'s single generator, so the data and
+    // function spellings cannot drift apart. Serving it here is what makes
+    // `_Ctype` resolvable at all: as a *data* import it can never be an HLE
+    // trampoline, and leaving it unresolved makes the guest dereference a
+    // marker address on its first `isalpha`/`printf` directive.
+    {
+        while !page.len().is_multiple_of(8) {
+            page.push(0);
+        }
+        let table_offset = page.len() as u64;
+        page.extend_from_slice(&raeen_hle::libc::ctype_class_table_bytes());
+        let zero_slot = table_offset + raeen_hle::libc::CTYPE_TABLE_ZERO_SLOT_OFFSET;
+        exports.push(dynlib::SymbolExport {
+            nid: dynlib::nid::nid_of("_Ctype"),
+            value: zero_slot,
+        });
+        tracing::debug!("HLE data export _Ctype at {:#x}", page_base + zero_slot);
+    }
 
     // `Need_sceLibcInternal` is libSceLibcInternal's exported `int` flag: a
     // nonzero value tells the title's own libc/CRT glue that the internal
@@ -453,7 +515,10 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
             value: export.value,
         })
         .collect();
-    let libc_internal_nids = [dynlib::nid::nid_of("Need_sceLibcInternal")];
+    let libc_internal_nids = [
+        dynlib::nid::nid_of("Need_sceLibcInternal"),
+        dynlib::nid::nid_of("_Ctype"),
+    ];
     let libc_internal_exports: Vec<dynlib::SymbolExport> = exports
         .iter()
         .filter(|export| libc_internal_nids.contains(&export.nid))
@@ -462,9 +527,22 @@ fn build_hle_data_page(registry: &mut registry::ModuleRegistry, page_base: u64) 
             value: export.value,
         })
         .collect();
+    // `_Ctype` is a libc symbol, and a title may name either provider view —
+    // the same pair `raeen_hle::libc::register_abi` registers every function
+    // under (`libc` + `libSceLibcInternal`).
+    let libc_nids = [dynlib::nid::nid_of("_Ctype")];
+    let libc_exports: Vec<dynlib::SymbolExport> = exports
+        .iter()
+        .filter(|export| libc_nids.contains(&export.nid))
+        .map(|export| dynlib::SymbolExport {
+            nid: export.nid,
+            value: export.value,
+        })
+        .collect();
     registry.register_module_exports_at("libkernel", &exports, page_base);
     registry.register_module_exports_at("libSceNet", &net_exports, page_base);
     registry.register_module_exports_at("libSceLibcInternal", &libc_internal_exports, page_base);
+    registry.register_module_exports_at("libc", &libc_exports, page_base);
     tracing::info!(
         "HLE data page: {} symbol(s), {:#x} bytes at {page_base:#x}",
         exports.len(),
@@ -487,6 +565,8 @@ pub fn hle_data_page_export_names() -> &'static [(&'static str, &'static str)] {
         ("libSceNet", "in6addr_any"),
         ("libSceNet", "in6addr_loopback"),
         ("libSceLibcInternal", "Need_sceLibcInternal"),
+        ("libSceLibcInternal", "_Ctype"),
+        ("libc", "_Ctype"),
     ]
 }
 
@@ -1765,6 +1845,88 @@ mod tests {
         let mut expected = [0u8; 16];
         expected[15] = 1;
         assert_eq!(&page[loopback_offset..loopback_offset + 16], &expected);
+    }
+
+    /// **GTA V / UE5 canary-smash regression.** The `__stack_chk_guard` global
+    /// the data page publishes must be one stable process-wide word — the same
+    /// one `raeen-runtime` installs at every thread's `fs:0x28`. Two load
+    /// paths build the page (`compose_process` and the dependency path); if
+    /// each minted a fresh random guard, a title that reads the global in one
+    /// frame and the TCB slot in another calls `__stack_chk_fail` on an intact
+    /// stack. See [`stack_chk_guard`] for the measured evidence.
+    #[test]
+    fn hle_data_page_publishes_the_one_process_wide_stack_chk_guard() {
+        let hle = raeen_hle::HleRegistry::new();
+        let expected = super::stack_chk_guard();
+        assert_ne!(expected, 0, "no zero-canary soft-success");
+        assert_eq!(expected & 0xFF, 0, "glibc-style NUL terminator byte");
+
+        // Build the page twice, at two different bases, exactly as the two
+        // load paths do — the value must not move.
+        for base in [0x1000u64, 0x2_0000u64] {
+            let mut registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+            let page = super::build_hle_data_page(&mut registry, base);
+            let addr = match registry.resolve(&hle, "libkernel", nid_of("__stack_chk_guard")) {
+                Resolver::Lle { addr, .. } => addr,
+                other => panic!("__stack_chk_guard must resolve as guest data, got {other:?}"),
+            };
+            let offset = usize::try_from(addr - base).expect("page-relative address");
+            let published = u64::from_le_bytes(page[offset..offset + 8].try_into().unwrap());
+            assert_eq!(
+                published, expected,
+                "the guard global must be the one process-wide canary, not a \
+                 fresh random word per page build"
+            );
+        }
+    }
+
+    /// `_Ctype` — a **data-object** import, so it can never be an HLE
+    /// trampoline — must resolve to guest data holding the Dinkumware ctype
+    /// classification table, with the exported address at the `c == 0` slot so
+    /// `_Ctype[c]` works for signed and unsigned `char` alike.
+    #[test]
+    fn hle_data_page_exports_ctype_table_at_the_zero_slot() {
+        let hle = raeen_hle::HleRegistry::new();
+        let mut registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+        let base = 0x1000;
+        let page = super::build_hle_data_page(&mut registry, base);
+
+        // Pin the identity: this is the NID in `nid_names.txt`, i.e. the one a
+        // real title's `PT_SCE_DYNLIBDATA` imports it by.
+        assert_eq!(nid_of("_Ctype"), 0x7ae9_7630_2de0_698b);
+
+        // Resolvable under both libc provider views a title may name.
+        for provider in ["libc", "libSceLibcInternal"] {
+            let addr = match registry.resolve(&hle, provider, nid_of("_Ctype")) {
+                Resolver::Lle { addr, .. } => addr,
+                other => panic!("{provider}::_Ctype must resolve as guest data, got {other:?}"),
+            };
+            let zero_slot = usize::try_from(addr - base).expect("page-relative address");
+            let table_start =
+                zero_slot - usize::try_from(raeen_hle::libc::CTYPE_TABLE_ZERO_SLOT_OFFSET).unwrap();
+
+            // Byte-for-byte the same table `_Getpctype()` serves.
+            let expected = raeen_hle::libc::ctype_class_table_bytes();
+            assert_eq!(
+                &page[table_start..table_start + expected.len()],
+                &expected[..],
+                "{provider}::_Ctype must be the same bytes as _Getpctype's table"
+            );
+
+            // Spot-check the indexing contract through the exported address.
+            let entry = |c: i32| -> u16 {
+                let at = (zero_slot as i64 + i64::from(c) * 2) as usize;
+                u16::from_le_bytes(page[at..at + 2].try_into().unwrap())
+            };
+            // 'A' is upper + hex digit (Dinkumware _UP|_XD == 0x002|0x001).
+            assert_eq!(entry(b'A' as i32), 0x003);
+            // 'z' is lower only (_LO == 0x010).
+            assert_eq!(entry(b'z' as i32), 0x010);
+            // '5' is digit + hex digit (_DI|_XD == 0x020|0x001).
+            assert_eq!(entry(b'5' as i32), 0x021);
+            // A negative index (signed char) must stay inside the table.
+            assert_eq!(entry(-1), 0);
+        }
     }
 
     /// The static `(provider, symbol)` view [`hle_data_page_export_names`]
