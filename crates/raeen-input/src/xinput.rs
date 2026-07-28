@@ -85,9 +85,12 @@ pub fn translate(pad: &XPadRaw) -> ControllerState {
 #[cfg(windows)]
 mod imp {
     use super::{ControllerState, XPadRaw, translate};
+    use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
+    use windows_sys::Win32::UI::Input::XboxController::{
+        XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
+    };
 
     const ERROR_SUCCESS: u32 = 0;
     const SLOT_COUNT: u32 = 4;
@@ -95,16 +98,56 @@ mod imp {
     /// Latest snapshot of the first connected XInput slot, or `None`.
     pub type Shared = Arc<Mutex<Option<ControllerState>>>;
 
-    /// Spawn the background reader thread and return the shared cache. The
-    /// thread idle-polls the four XInput slots and never needs joining.
+    /// The XInput backend: latest input snapshot plus the active slot for
+    /// rumble output.
+    pub struct XInputPads {
+        pub input: Shared,
+        /// The slot the reader is currently polling, or -1 when no XInput
+        /// pad is connected. `XInputSetState` is thread-safe, so rumble is
+        /// sent directly from the caller's thread against this slot.
+        active_slot: Arc<AtomicI64>,
+    }
+
+    impl XInputPads {
+        /// Send a rumble command to the connected pad, mapping the Orbis
+        /// 0..=255 motor bytes onto XInput's 0..=65535 motor speeds (large =
+        /// left/low-frequency, small = right/high-frequency — the same motor
+        /// roles as the DualSense). No-op when no pad is connected.
+        pub fn set_rumble(&self, large: u8, small: u8) {
+            let slot = self.active_slot.load(Ordering::Relaxed);
+            if slot < 0 {
+                return;
+            }
+            let vibration = XINPUT_VIBRATION {
+                // 255 * 257 = 65535: exact full-scale expansion.
+                wLeftMotorSpeed: large as u16 * 257,
+                wRightMotorSpeed: small as u16 * 257,
+            };
+            // SAFETY: `vibration` is a valid POD in-param. A stale or
+            // out-of-range slot merely returns an error, which is ignored
+            // (the pad may have just disconnected — the reader clears the
+            // slot on its next poll).
+            unsafe {
+                XInputSetState(slot as u32, &vibration);
+            }
+        }
+    }
+
+    /// Spawn the background reader thread and return the shared endpoints.
+    /// The thread idle-polls the four XInput slots and never needs joining.
     #[must_use]
-    pub fn spawn() -> Shared {
+    pub fn spawn() -> XInputPads {
         let shared: Shared = Arc::new(Mutex::new(None));
+        let active_slot = Arc::new(AtomicI64::new(-1));
         let worker = shared.clone();
+        let worker_slot = active_slot.clone();
         let _ = std::thread::Builder::new()
             .name("xinput-reader".into())
-            .spawn(move || read_loop(&worker));
-        shared
+            .spawn(move || read_loop(&worker, &worker_slot));
+        XInputPads {
+            input: shared,
+            active_slot,
+        }
     }
 
     fn poll_slot(slot: u32) -> Option<XPadRaw> {
@@ -131,19 +174,22 @@ mod imp {
         (0..SLOT_COUNT).find(|&slot| poll_slot(slot).is_some())
     }
 
-    fn read_loop(shared: &Shared) {
+    fn read_loop(shared: &Shared, active_slot: &AtomicI64) {
         loop {
             let Some(slot) = find_slot() else {
+                active_slot.store(-1, Ordering::Relaxed);
                 *shared.lock().unwrap() = None;
                 std::thread::sleep(Duration::from_millis(1000));
                 continue;
             };
             tracing::info!(slot, "XInput (Xbox-compatible) controller connected");
+            active_slot.store(slot as i64, Ordering::Relaxed);
             while let Some(raw) = poll_slot(slot) {
                 *shared.lock().unwrap() = Some(translate(&raw));
                 std::thread::sleep(Duration::from_millis(8));
             }
             tracing::info!(slot, "XInput controller disconnected");
+            active_slot.store(-1, Ordering::Relaxed);
             *shared.lock().unwrap() = None;
             std::thread::sleep(Duration::from_millis(1000));
         }
@@ -151,7 +197,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{Shared, spawn};
+pub use imp::{Shared, XInputPads, spawn};
 
 #[cfg(test)]
 mod tests {

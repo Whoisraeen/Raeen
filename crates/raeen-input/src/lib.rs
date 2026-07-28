@@ -9,6 +9,7 @@ pub mod dualsense;
 pub mod haptics;
 pub mod hid;
 pub mod native;
+pub mod rumble;
 pub mod scripted;
 pub mod xinput;
 

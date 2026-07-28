@@ -331,8 +331,38 @@ fn hle_pad_read_state(ctx: &HleContext, args: &[u64]) -> u64 {
     1 // one ScePadData written
 }
 
-fn hle_pad_set_vibration(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!("scePadSetVibration(handle={}, ...)", args[0]);
+/// `scePadSetVibration(handle, const ScePadVibrationParam *param)`: route the
+/// title's motor request to the host. `ScePadVibrationParam` is two bytes —
+/// `{ uint8_t largeMotor; uint8_t smallMotor; }` (0 = off, 255 = full) —
+/// cross-checked against shadPS4 `OrbisPadVibrationParam` (`pad.h`) and
+/// SharpEmu `PadExports.PadSetVibration` (NID `yFVnOdGxvZY`), which agree on
+/// both the layout and the semantics (invalid handle / NULL param / unreadable
+/// param are rejected; the request otherwise persists until the next call).
+///
+/// The request lands on the session kernel ([`raeen_kernel::OrbisKernel::
+/// set_pad_rumble`]), where the host input pipeline picks it up each frame:
+/// the Shell reads it directly for in-process sessions, and the isolated
+/// runner's input thread forwards it over the frame IPC. Hardware delivery
+/// (DualSense HID output report / XInput) and the Settings ▸ DualSense
+/// Features gate live host-side — this function is testable without hardware
+/// by asserting the kernel channel state.
+fn hle_pad_set_vibration(ctx: &HleContext, args: &[u64]) -> u64 {
+    let handle = args.first().copied().unwrap_or(0);
+    let param_ptr = args.get(1).copied().unwrap_or(0);
+    if handle != PRIMARY_PAD_HANDLE {
+        return PAD_ERROR_INVALID_HANDLE;
+    }
+    if param_ptr == 0 {
+        return PAD_ERROR_INVALID_ARG;
+    }
+    let mut param = [0u8; 2];
+    if !ctx.mem.read(param_ptr, &mut param) {
+        warn!("scePadSetVibration: param ptr {param_ptr:#x} not readable");
+        return PAD_ERROR_INVALID_ARG;
+    }
+    let [large, small] = param;
+    debug!("scePadSetVibration(handle={handle}, large={large}, small={small})");
+    ctx.kernel.set_pad_rumble(large, small);
     0
 }
 
@@ -464,6 +494,67 @@ mod tests {
 
         assert_eq!(hle_pad_close(&ctx, &[1]), 0);
         assert_eq!(hle_pad_close(&ctx, &[5]), PAD_ERROR_INVALID_HANDLE);
+    }
+
+    /// `scePadSetVibration` reads the 2-byte `{largeMotor, smallMotor}` param
+    /// from guest memory and lands it on the kernel's rumble channel — the
+    /// guest → host plumbing the Shell polls each frame. Every call bumps the
+    /// sequence (even with identical values) so the host can distinguish a
+    /// refreshed vibration from a stale one.
+    #[test]
+    fn pad_set_vibration_routes_motors_to_the_kernel_channel() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(
+            kernel.pad_rumble(),
+            (0, 0, 0),
+            "no vibration before any call"
+        );
+
+        // ScePadVibrationParam { largeMotor = 255, smallMotor = 128 }.
+        assert!(mem.write(0x100, &[255u8, 128u8]));
+        assert_eq!(hle_pad_set_vibration(&ctx, &[1, 0x100]), 0);
+        assert_eq!(kernel.pad_rumble(), (1, 255, 128));
+
+        // Repeating the same values still bumps the sequence — that is a
+        // title's keep-alive refresh, and the host auto-stop keys off it.
+        assert_eq!(hle_pad_set_vibration(&ctx, &[1, 0x100]), 0);
+        assert_eq!(kernel.pad_rumble(), (2, 255, 128));
+
+        // Clearing the vibration.
+        assert!(mem.write(0x200, &[0u8, 0u8]));
+        assert_eq!(hle_pad_set_vibration(&ctx, &[1, 0x200]), 0);
+        assert_eq!(kernel.pad_rumble(), (3, 0, 0));
+    }
+
+    /// Error semantics match shadPS4/SharpEmu: bad handle, NULL param, and an
+    /// unreadable param are rejected without touching the rumble channel.
+    #[test]
+    fn pad_set_vibration_rejects_bad_handle_and_bad_param() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert!(mem.write(0x100, &[9u8, 9u8]));
+        assert_eq!(
+            hle_pad_set_vibration(&ctx, &[7, 0x100]),
+            PAD_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(hle_pad_set_vibration(&ctx, &[1, 0]), PAD_ERROR_INVALID_ARG);
+        assert_eq!(
+            hle_pad_set_vibration(&ctx, &[1, 0xDEAD_0000]),
+            PAD_ERROR_INVALID_ARG,
+            "unreadable guest param"
+        );
+        assert_eq!(
+            kernel.pad_rumble(),
+            (0, 0, 0),
+            "rejected calls never reach the channel"
+        );
     }
 
     #[test]

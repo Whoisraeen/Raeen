@@ -235,6 +235,15 @@ pub struct OrbisKernel {
     /// pad. The Shell updates this each frame from its `InputManager`; the
     /// HLE `scePadReadState` reads it. See [`set_pad_state`](Self::set_pad_state).
     pad_state: parking_lot::Mutex<Option<[u8; 12]>>,
+    /// The title's newest `scePadSetVibration` request as `(sequence,
+    /// largeMotor, smallMotor)`. The sequence starts at 0 (= never set) and
+    /// increments on every guest call — including calls that repeat the same
+    /// motor values, because a repeated call is how a title refreshes its
+    /// vibration on real hardware and the host router keys its safety
+    /// auto-stop off that freshness. Read by the host each frame (Shell
+    /// in-process, or the isolated runner's input thread which forwards it
+    /// over the frame IPC). See [`set_pad_rumble`](Self::set_pad_rumble).
+    pad_rumble: parking_lot::Mutex<(u64, u8, u8)>,
     /// Whether libSceUserService has delivered this process's initial login
     /// event. A new guest process gets a fresh kernel and therefore a fresh
     /// event; keeping this here avoids a host-global flag leaking across
@@ -1242,6 +1251,7 @@ impl OrbisKernel {
             process_argv: std::sync::atomic::AtomicU64::new(0),
             unwind_modules: RwLock::new(Vec::new()),
             pad_state: parking_lot::Mutex::new(None),
+            pad_rumble: parking_lot::Mutex::new((0, 0, 0)),
             user_service_login_event_delivered: std::sync::atomic::AtomicBool::new(false),
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
@@ -1620,6 +1630,23 @@ impl OrbisKernel {
     /// live input yet (the HLE then reports a neutral pad).
     pub fn pad_state(&self) -> Option<[u8; 12]> {
         *self.pad_state.lock()
+    }
+
+    /// Record a guest `scePadSetVibration` request. Every call bumps the
+    /// sequence — even with unchanged motor values — so the host can tell a
+    /// refreshed vibration from a stale one (the safety auto-stop keys off
+    /// this freshness). Called by the HLE `hle_pad_set_vibration`.
+    pub fn set_pad_rumble(&self, large: u8, small: u8) {
+        let mut rumble = self.pad_rumble.lock();
+        rumble.0 = rumble.0.wrapping_add(1);
+        rumble.1 = large;
+        rumble.2 = small;
+    }
+
+    /// The newest vibration request as `(sequence, largeMotor, smallMotor)`.
+    /// Sequence 0 means no title ever called `scePadSetVibration`.
+    pub fn pad_rumble(&self) -> (u64, u8, u8) {
+        *self.pad_rumble.lock()
     }
 
     /// Record the guest address of the main module's process-parameter block

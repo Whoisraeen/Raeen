@@ -7,11 +7,16 @@
 //! `ReadFile`; the fixed input report is parsed at documented offsets. Handles
 //! both USB (report id `0x01`) and Bluetooth (extended report id `0x31`).
 //!
-//! Only input is implemented — rumble / lightbar output reports are a
-//! deliberately-omitted follow-up (see the module notes in the crate).
+//! Input **and rumble output** are implemented; haptics / adaptive triggers /
+//! lightbar output remain follow-ups. Output reports go out on a dedicated
+//! writer thread over a second handle to the same device path (SharpEmu's
+//! design), so the blocking reader never serializes against a write. The
+//! transport (USB vs Bluetooth) is detected from the first parsed input
+//! report; Bluetooth output frames carry the required CRC-32.
 //!
-//! The pure [`parse_report`] function carries the whole mapping and is
-//! unit-tested without a device; the Windows FFI in `imp` only feeds it.
+//! The pure [`parse_report`] / [`build_output_report`] functions carry the
+//! whole mapping and are unit-tested without a device; the Windows FFI in
+//! `imp` only feeds them.
 
 use crate::ControllerState;
 
@@ -109,9 +114,73 @@ pub fn parse_report(report: &[u8]) -> Option<ControllerState> {
     })
 }
 
+/// One step of the standard reflected CRC-32 (poly `0xEDB88320`), ported from
+/// SharpEmu `WindowsDualSenseReader.Crc32Update`.
+fn crc32_update(mut crc: u32, value: u8) -> u32 {
+    crc ^= value as u32;
+    for _ in 0..8 {
+        crc = (crc >> 1) ^ (0xEDB8_8320 & ((crc & 1).wrapping_neg()));
+    }
+    crc
+}
+
+/// CRC-32 over a seed byte followed by `data` — the DualSense Bluetooth
+/// output-report checksum, which is seeded with `0xA2` (the HID "output
+/// report" BT header byte that is not itself part of the report buffer).
+/// Ported from SharpEmu `WindowsDualSenseReader.Crc32`.
+#[must_use]
+fn output_crc32(seed: u8, data: &[u8]) -> u32 {
+    let mut crc = crc32_update(0xFFFF_FFFF, seed);
+    for &value in data {
+        crc = crc32_update(crc, value);
+    }
+    !crc
+}
+
+/// Build a DualSense rumble output report (SharpEmu
+/// `BuildOutputReportLocked`, rumble-only subset; offsets are the layout
+/// shared with Linux `hid-playstation`).
+///
+/// The 47-byte common payload sets `valid_flag0 = 0x03` (compatible-vibration
+/// plus haptics-select — required for classic rumble on the haptics-native
+/// DualSense), leaves `valid_flag1 = 0` so the lightbar / player LEDs are
+/// untouched, and carries `motor_right` (small/weak) then `motor_left`
+/// (large/strong). USB wraps it as report id `0x02` (48 bytes); Bluetooth as
+/// report id `0x31` with a 4-bit rolling sequence tag, a `0x10` data tag, and
+/// a trailing CRC-32 over `0xA2` plus the first 74 bytes (78 bytes total —
+/// without the CRC the pad silently discards the frame).
+#[must_use]
+pub fn build_output_report(bluetooth: bool, bt_seq: u8, large: u8, small: u8) -> Vec<u8> {
+    let mut common = [0u8; 47];
+    common[0] = 0x01 | 0x02; // valid_flag0: compatible vibration + haptics select
+    common[1] = 0x00; // valid_flag1: leave lightbar / player LEDs alone
+    common[2] = small; // motor_right (weak / high-frequency)
+    common[3] = large; // motor_left (strong / low-frequency)
+
+    if !bluetooth {
+        let mut report = vec![0u8; 48];
+        report[0] = 0x02;
+        report[1..48].copy_from_slice(&common);
+        return report;
+    }
+
+    let mut report = vec![0u8; 78];
+    report[0] = 0x31;
+    report[1] = (bt_seq & 0x0F) << 4;
+    report[2] = 0x10;
+    report[3..50].copy_from_slice(&common);
+    let crc = output_crc32(0xA2, &report[..74]);
+    report[74..78].copy_from_slice(&crc.to_le_bytes());
+    report
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::{ControllerState, DUALSENSE_EDGE_PID, DUALSENSE_PID, SONY_VID, parse_report};
+    use super::{
+        ControllerState, DUALSENSE_EDGE_PID, DUALSENSE_PID, SONY_VID, build_output_report,
+        parse_report,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -124,7 +193,7 @@ mod imp {
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
     };
     use windows_sys::core::GUID;
 
@@ -134,40 +203,101 @@ mod imp {
     /// Latest DualSense snapshot, or `None` when none is connected.
     pub type Shared = Arc<Mutex<Option<ControllerState>>>;
 
-    /// Spawn the background reader thread and return the shared cache. The
-    /// thread hot-plug-retries and never needs joining.
-    #[must_use]
-    pub fn spawn() -> Shared {
-        let shared: Shared = Arc::new(Mutex::new(None));
-        let worker = shared.clone();
-        let _ = std::thread::Builder::new()
-            .name("dualsense-hid-reader".into())
-            .spawn(move || read_loop(&worker));
-        shared
+    /// The connected device as the writer thread needs it: its path (for a
+    /// second, write-side handle) and its transport (USB vs Bluetooth output
+    /// framing). `generation` bumps on every reconnect so the writer knows a
+    /// fresh pad starts with silent motors.
+    #[derive(Clone)]
+    struct Route {
+        path: Vec<u16>,
+        bluetooth: bool,
+        generation: u64,
     }
 
-    fn read_loop(shared: &Shared) {
+    type SharedRoute = Arc<Mutex<Option<Route>>>;
+
+    /// Host → controller rumble target. `large<<8 | small`, both `0..=255`;
+    /// the writer thread only touches the device when this differs from what
+    /// the connected pad already has, so callers may set it every frame.
+    #[derive(Clone)]
+    pub struct RumbleTx(Arc<AtomicU32>);
+
+    impl RumbleTx {
+        pub fn set(&self, large: u8, small: u8) {
+            self.0
+                .store(((large as u32) << 8) | small as u32, Ordering::Relaxed);
+        }
+    }
+
+    /// The DualSense backend: latest input snapshot + rumble output target.
+    pub struct DualSense {
+        pub input: Shared,
+        rumble: RumbleTx,
+    }
+
+    impl DualSense {
+        /// Set the desired motor state; a no-op (beyond an atomic store) when
+        /// no DualSense is connected or the value is unchanged.
+        pub fn set_rumble(&self, large: u8, small: u8) {
+            self.rumble.set(large, small);
+        }
+    }
+
+    /// Spawn the background reader + rumble-writer threads and return their
+    /// shared endpoints. The threads hot-plug-retry and never need joining.
+    #[must_use]
+    pub fn spawn() -> DualSense {
+        let shared: Shared = Arc::new(Mutex::new(None));
+        let route: SharedRoute = Arc::new(Mutex::new(None));
+        let rumble = RumbleTx(Arc::new(AtomicU32::new(0)));
+        let reader_shared = shared.clone();
+        let reader_route = route.clone();
+        let _ = std::thread::Builder::new()
+            .name("dualsense-hid-reader".into())
+            .spawn(move || read_loop(&reader_shared, &reader_route));
+        let writer_target = rumble.0.clone();
+        let _ = std::thread::Builder::new()
+            .name("dualsense-hid-writer".into())
+            .spawn(move || write_loop(&writer_target, &route));
+        DualSense {
+            input: shared,
+            rumble,
+        }
+    }
+
+    fn read_loop(shared: &Shared, route: &SharedRoute) {
         let mut announced = false;
+        let mut generation = 0u64;
         loop {
-            if let Some(handle) = open_dualsense() {
+            if let Some((handle, path)) = open_dualsense() {
                 if !announced {
                     tracing::info!("DualSense controller connected (raw HID)");
                     announced = true;
                 }
-                read_device(handle, shared);
+                generation += 1;
+                read_device(handle, shared, route, path, generation);
                 if announced {
                     tracing::info!("DualSense controller disconnected");
                     announced = false;
                 }
             }
+            *route.lock().unwrap() = None;
             *shared.lock().unwrap() = None;
             std::thread::sleep(Duration::from_millis(1000));
         }
     }
 
     /// Read reports from an open device until it errors/unplugs; closes the
-    /// handle before returning.
-    fn read_device(handle: HANDLE, shared: &Shared) {
+    /// handle before returning. The first parsed report identifies the
+    /// transport (`0x31` = Bluetooth), which publishes the device to the
+    /// rumble writer thread.
+    fn read_device(
+        handle: HANDLE,
+        shared: &Shared,
+        route: &SharedRoute,
+        path: Vec<u16>,
+        generation: u64,
+    ) {
         // Bluetooth quirk: requesting feature report 0x05 switches the pad into
         // the full 0x31 input report. Harmless (and ignored) over USB.
         let mut feature = [0u8; 41];
@@ -210,6 +340,17 @@ mod imp {
                 );
             }
             if let Some(state) = parsed {
+                // First parsed report: the transport is now known, so the
+                // rumble writer can build correctly-framed output reports.
+                if route.lock().unwrap().is_none() {
+                    let bluetooth = buffer[0] == 0x31;
+                    tracing::info!(bluetooth, "DualSense rumble output route ready");
+                    *route.lock().unwrap() = Some(Route {
+                        path: path.clone(),
+                        bluetooth,
+                        generation,
+                    });
+                }
                 *shared.lock().unwrap() = Some(state);
             }
         }
@@ -220,9 +361,82 @@ mod imp {
         }
     }
 
-    /// Enumerate present HID interfaces, returning the first whose VID/PID is a
-    /// DualSense; opens it read+write (falling back to read-only).
-    fn open_dualsense() -> Option<HANDLE> {
+    /// The rumble writer thread: watches the target motor word and the reader
+    /// thread's device route, and sends an output report over its own handle
+    /// whenever the connected pad's motors differ from the target. A fresh
+    /// route generation is assumed silent, so a reconnect re-applies a live
+    /// vibration and an idle pad costs zero writes. Write failures drop the
+    /// cached handle and retry on the next tick (the reader owns
+    /// disconnect/reconnect detection).
+    fn write_loop(target: &AtomicU32, route: &SharedRoute) {
+        let mut handle = INVALID_HANDLE_VALUE;
+        let mut open_generation = 0u64;
+        let mut written: u32 = 0;
+        let mut bt_seq: u8 = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+            let Some(current) = route.lock().unwrap().clone() else {
+                if handle != INVALID_HANDLE_VALUE {
+                    // SAFETY: `handle` came from CreateFileW and is dropped here.
+                    unsafe { CloseHandle(handle) };
+                    handle = INVALID_HANDLE_VALUE;
+                }
+                continue;
+            };
+            if current.generation != open_generation {
+                if handle != INVALID_HANDLE_VALUE {
+                    // SAFETY: as above — the old device's handle is stale.
+                    unsafe { CloseHandle(handle) };
+                    handle = INVALID_HANDLE_VALUE;
+                }
+                open_generation = current.generation;
+                written = 0; // a freshly connected pad has silent motors
+            }
+            let want = target.load(Ordering::Relaxed);
+            if want == written {
+                continue;
+            }
+            if handle == INVALID_HANDLE_VALUE {
+                handle = create_file(&current.path, GENERIC_READ | GENERIC_WRITE);
+                if handle == INVALID_HANDLE_VALUE {
+                    handle = create_file(&current.path, GENERIC_WRITE);
+                }
+                if handle == INVALID_HANDLE_VALUE {
+                    continue; // device busy/gone: retry next tick
+                }
+            }
+            let report =
+                build_output_report(current.bluetooth, bt_seq, (want >> 8) as u8, want as u8);
+            if current.bluetooth {
+                bt_seq = (bt_seq + 1) & 0x0F;
+            }
+            let mut sent: u32 = 0;
+            // SAFETY: `handle` is a live HID handle owned by this thread;
+            // `report` is a valid buffer of the passed length; synchronous
+            // write (null OVERLAPPED).
+            let ok = unsafe {
+                WriteFile(
+                    handle,
+                    report.as_ptr(),
+                    report.len() as u32,
+                    &mut sent,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 && sent as usize == report.len() {
+                written = want;
+            } else {
+                // SAFETY: the failed handle is closed exactly once here.
+                unsafe { CloseHandle(handle) };
+                handle = INVALID_HANDLE_VALUE;
+            }
+        }
+    }
+
+    /// Enumerate present HID interfaces, returning the first whose VID/PID is
+    /// a DualSense (opened read+write, falling back to read-only) along with
+    /// its device path, which the rumble writer uses for its own handle.
+    fn open_dualsense() -> Option<(HANDLE, Vec<u16>)> {
         for path in enumerate_hid_paths() {
             // Probe VID/PID with a query-only (access = 0) handle.
             let probe = create_file(&path, 0);
@@ -249,7 +463,7 @@ mod imp {
                 handle = create_file(&path, GENERIC_READ);
             }
             if handle != INVALID_HANDLE_VALUE {
-                return Some(handle);
+                return Some((handle, path));
             }
         }
         None
@@ -387,7 +601,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{Shared, spawn};
+pub use imp::{DualSense, RumbleTx, Shared, spawn};
 
 #[cfg(test)]
 mod tests {
@@ -489,6 +703,50 @@ mod tests {
         let d = parse_report(&neutral).unwrap().to_orbis_pad_data();
         assert_eq!(d[4], 128);
         assert_eq!(d[5], 128);
+    }
+
+    /// USB rumble output report: id 0x02, 48 bytes, valid_flag0 selects
+    /// compatible vibration + haptics, motors at payload offsets 2 (small/
+    /// right) and 3 (large/left), lightbar untouched.
+    #[test]
+    fn usb_output_report_carries_motors_at_documented_offsets() {
+        let r = build_output_report(false, 0, 200, 55);
+        assert_eq!(r.len(), 48);
+        assert_eq!(r[0], 0x02, "USB output report id");
+        assert_eq!(r[1], 0x03, "valid_flag0: compatible vibration + haptics");
+        assert_eq!(r[2], 0x00, "valid_flag1: lightbar/LEDs untouched");
+        assert_eq!(r[3], 55, "motor_right = small motor");
+        assert_eq!(r[4], 200, "motor_left = large motor");
+        assert!(r[5..].iter().all(|&b| b == 0), "rest of the payload silent");
+    }
+
+    /// Bluetooth rumble output report: id 0x31, rolling sequence tag in the
+    /// high nibble of byte 1, data tag 0x10, same payload shifted to offset
+    /// 3, and a trailing little-endian CRC-32 over 0xA2 + bytes 0..74 —
+    /// without which the pad silently discards the frame.
+    #[test]
+    fn bluetooth_output_report_is_sequenced_and_crc_terminated() {
+        let r = build_output_report(true, 5, 10, 20);
+        assert_eq!(r.len(), 78);
+        assert_eq!(r[0], 0x31, "BT output report id");
+        assert_eq!(r[1], 5 << 4, "sequence tag in the high nibble");
+        assert_eq!(r[2], 0x10, "data tag");
+        assert_eq!(r[3], 0x03, "valid_flag0 at the shifted payload offset");
+        assert_eq!(r[5], 20, "motor_right = small motor");
+        assert_eq!(r[6], 10, "motor_left = large motor");
+        let crc = u32::from_le_bytes(r[74..78].try_into().unwrap());
+        assert_eq!(crc, output_crc32(0xA2, &r[..74]), "trailing CRC-32");
+        // The sequence tag wraps within its nibble.
+        assert_eq!(build_output_report(true, 0x1F, 0, 0)[1], 0xF0);
+    }
+
+    /// The CRC is the standard reflected CRC-32: check against a known
+    /// vector ("123456789" -> 0xCBF43926) by feeding the seed as the first
+    /// data byte.
+    #[test]
+    fn output_crc32_matches_the_standard_crc32_check_vector() {
+        let data = b"123456789";
+        assert_eq!(output_crc32(data[0], &data[1..]), 0xCBF4_3926);
     }
 
     #[test]

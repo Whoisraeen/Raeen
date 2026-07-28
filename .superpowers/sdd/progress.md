@@ -5186,3 +5186,59 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   flip cadence, equeue-driven frame loops; (3) RAEEN_UNIFIED_GPU_CLOCK=1
   alone on ASTRO.BOT — watch the render-thread timestamp-fence park;
   (4) both gates together; only then discuss defaults.
+## 2026-07-28 — Item 19: DualSense rumble passthrough (worktree agent)
+* checklist item 19 (rumble half) CODE DONE — guest vibration now reaches the
+  physical controller end-to-end. Haptics/adaptive triggers/lightbar remain
+  open (scePadSetTriggerEffect is still validate-and-ack).
+* Guest → host: `scePadSetVibration` implemented for real in
+  raeen-hle/libsce_pad.rs (was a log-and-OK stub). 2-byte
+  `ScePadVibrationParam { largeMotor, smallMotor }` + error semantics
+  (invalid handle / NULL / unreadable param) cross-checked against shadPS4
+  pad.cpp and SharpEmu PadExports (NID yFVnOdGxvZY). Lands on
+  `OrbisKernel::set_pad_rumble` — the sequence bumps on EVERY call (even
+  unchanged values) because a repeated call is the title's keep-alive
+  refresh; testable without hardware by asserting the kernel channel.
+* Transport: new `raeen_input::rumble` module — `RumbleState`,
+  encode/decode of the one-u64 rumble word (seq<<16|large<<8|small, seq 0 =
+  never set), and `RumbleRouter` (pure, Duration-injected state machine:
+  settings gate, write dedup, immediate silence on session end, 5 s
+  no-refresh safety auto-stop). Child → Shell crossing is a single AtomicU64
+  at frame-IPC header offset 104 (reverse direction of the pad-input
+  channel; deliberately NO protocol VERSION bump — the field lives in
+  previously-zeroed padding, so mismatched peers degrade to "no rumble",
+  not "no video"). Runner child forwards the word from its input thread;
+  bridgeless `--run-eboot` runs drive their own NativeGamepads through the
+  same router rules.
+* Host output path chosen: direct DualSense HID output reports + direct
+  XInputSetState — NOT gilrs ff (gilrs's Windows backend is XInput-only, so
+  ff would cover Xbox pads at best and never the raw-HID DualSense the Shell
+  reads natively; zero new deps either way). hid.rs (SharpEmu
+  WindowsDualSenseReader port, extended): pure `build_output_report` — USB
+  id 0x02/48 B; BT id 0x31/78 B with rolling seq nibble + CRC-32 (0xA2
+  seed) without which the pad drops the frame; valid_flag0=0x03
+  (compatible-vibration + haptics-select), lightbar/LED bytes untouched.
+  Dedicated `dualsense-hid-writer` thread on a second handle to the same
+  device path (never serializes against the blocking reader); transport
+  detected from the first parsed input report; reconnect generation counter
+  re-applies live rumble to a re-plugged pad. xinput.rs: active-slot atomic
+  + `XInputSetState` (255→65535 exact 257× expansion). NativeGamepads::
+  set_rumble fans out to both sinks (each no-ops when absent).
+* Shell: `tick_rumble` each frame after push_pad_state — source = frame-IPC
+  word (isolated runner) else in-process session kernel; RumbleRouter
+  applies Settings ▸ Controllers ▸ DualSense Features live (ON routes, OFF
+  drops), silences on quit/crash/session-None, dedupes hardware writes.
+  Settings toggle UN-RESERVED (2026-07-27 audit debt): hint rewritten to
+  the honest behavior; toggle already existed at (2,0) and persists via
+  config.toml (new round-trip + old-config-defaults-ON test).
+* Real-hardware note: shadPS4 passes SDL_RumbleGamepad duration -1
+  (persist until changed) — i.e. real firmware persists an output report
+  indefinitely. The 5 s auto-stop is deliberately stricter (no stuck motors
+  after a guest hang/kill); every guest SetVibration call refreshes it.
+* Tests (all green): raeen-input 27 (18 baseline + 6 rumble router/wire +
+  3 HID output report/CRC), raeen-hle +2 (SetVibration channel + error
+  paths), raeen-gpu +1 (IPC rumble word round-trip), raeen-core +1
+  (dualsense_features persistence), raeen-kernel/raeen-gui suites green.
+  fmt green; clippy clean on touched crates.
+* LIVE VERIFY pending (needs the user's controller): DualSense USB, then
+  BT, then an Xbox pad in a rumbling title; toggle OFF mid-rumble (stops);
+  PS-hold quit mid-rumble (stops). See checklist item 19.

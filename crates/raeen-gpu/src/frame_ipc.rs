@@ -46,8 +46,12 @@ mod platform {
     // only the padding after them grew — but a v5 peer would read pixels at
     // the wrong offset, so the version gate must reject it.
     const VERSION: u32 = 6;
-    // Input occupies bytes 48..60 and the timing counters run to 104; the rest
-    // of this page is padding.
+    // Input occupies bytes 48..60, the timing counters run to 104, and the
+    // child → Shell rumble word sits at 104..112; the rest of this page is
+    // padding. (Adding the rumble word did NOT bump VERSION: it lives in
+    // previously-zeroed padding, no existing field moved, and a peer without
+    // it simply reads/writes 0 — which decodes as "no rumble source" — so
+    // mismatched builds degrade to "no rumble" instead of "no video".)
     //
     // A FULL PAGE, not the 104 B the fields need, so that each pixel slot
     // begins on a page boundary. `VK_EXT_external_memory_host` can only import
@@ -90,6 +94,10 @@ mod platform {
     const FENCE_WAIT_US_OFFSET: usize = 80;
     const READBACK_US_OFFSET: usize = 88;
     const SRGB_ENCODE_US_OFFSET: usize = 96;
+    /// Child → Shell vibration request: one atomic `u64` in the wire format
+    /// of `raeen_input::rumble::encode_word` (seq<<16 | large<<8 | small).
+    /// A single aligned atomic needs no seqlock; 0 means "never set".
+    const RUMBLE_WORD_OFFSET: usize = 104;
 
     struct Mapping {
         handle: HANDLE,
@@ -237,6 +245,7 @@ mod platform {
                 FENCE_WAIT_US_OFFSET,
                 READBACK_US_OFFSET,
                 SRGB_ENCODE_US_OFFSET,
+                RUMBLE_WORD_OFFSET,
             ] {
                 mapping.atomic_u64(offset).store(0, Ordering::Relaxed);
             }
@@ -408,6 +417,32 @@ mod platform {
             Some(frame)
         }
 
+        /// The child guest's newest vibration request as an encoded rumble
+        /// word (`raeen_input::rumble` wire format), or `None` when the
+        /// mapping is not a live protocol peer. `Some(0)` means the peer is
+        /// alive but no title ever called `scePadSetVibration` — the decoder
+        /// treats that as "no rumble source".
+        pub fn latest_rumble_word(&self) -> Option<u64> {
+            if self
+                .mapping
+                .atomic_u32(MAGIC_OFFSET)
+                .load(Ordering::Acquire)
+                != MAGIC
+                || self
+                    .mapping
+                    .atomic_u32(VERSION_OFFSET)
+                    .load(Ordering::Relaxed)
+                    != VERSION
+            {
+                return None;
+            }
+            Some(
+                self.mapping
+                    .atomic_u64(RUMBLE_WORD_OFFSET)
+                    .load(Ordering::Acquire),
+            )
+        }
+
         /// Child VideoOut flips observed across the process boundary. Unlike
         /// the frame-slot sequence, this advances even when the newest complete
         /// image is byte-identical to the prior one or presentation temporarily
@@ -516,6 +551,16 @@ mod platform {
             }
             *cached = Some((second, state));
             Some(state)
+        }
+
+        /// Publish the child guest's newest vibration request for the Shell
+        /// (the reverse direction of this bidirectional pad channel). The
+        /// word is the `raeen_input::rumble` wire format; publishing the
+        /// same word repeatedly is idempotent and cheap (one atomic store).
+        pub fn publish_rumble_word(&self, word: u64) {
+            self.mapping
+                .atomic_u64(RUMBLE_WORD_OFFSET)
+                .store(word, Ordering::Release);
         }
     }
 
@@ -662,8 +707,12 @@ mod platform {
             // at compile time; both operands are constants).
             const {
                 assert!(
-                    SRGB_ENCODE_US_OFFSET + 8 <= HEADER_BYTES,
+                    RUMBLE_WORD_OFFSET + 8 <= HEADER_BYTES,
                     "header fields overflow the padded header"
+                );
+                assert!(
+                    RUMBLE_WORD_OFFSET >= SRGB_ENCODE_US_OFFSET + 8,
+                    "rumble word overlaps the timing counters"
                 );
             }
         }
@@ -778,6 +827,27 @@ mod platform {
             receiver.publish_pad_state([0; INPUT_BYTES]);
             assert_eq!(reader.latest(), Some([0; INPUT_BYTES]));
         }
+
+        /// The reverse pad channel: the child's guest vibration word reaches
+        /// the Shell through the same mapping. A live-but-silent peer reads
+        /// as `Some(0)` ("never set"), never `None`.
+        #[test]
+        fn child_rumble_word_round_trips_to_shell() {
+            let receiver = FrameIpcReceiver::create().expect("create mapping");
+            let reader = FrameIpcInputReader {
+                mapping: Mapping::open(receiver.name()).expect("open child mapping"),
+                cached: Mutex::new(None),
+            };
+            assert_eq!(receiver.latest_rumble_word(), Some(0), "never set");
+
+            // seq=1, large=255, small=128 in the rumble wire format.
+            let word = (1u64 << 16) | (255 << 8) | 128;
+            reader.publish_rumble_word(word);
+            assert_eq!(receiver.latest_rumble_word(), Some(word));
+
+            reader.publish_rumble_word(2 << 16);
+            assert_eq!(receiver.latest_rumble_word(), Some(2 << 16));
+        }
     }
 }
 
@@ -809,6 +879,10 @@ mod platform {
         }
 
         pub fn publish_pad_state(&self, _state: [u8; 12]) {}
+
+        pub fn latest_rumble_word(&self) -> Option<u64> {
+            None
+        }
     }
 
     pub struct FrameIpcInputReader;
@@ -821,6 +895,8 @@ mod platform {
         pub fn latest(&self) -> Option<[u8; 12]> {
             None
         }
+
+        pub fn publish_rumble_word(&self, _word: u64) {}
     }
 
     pub(crate) struct FrameIpcPublisher;
@@ -878,6 +954,16 @@ pub fn latest_remote_present_count() -> Option<u64> {
         .read()
         .as_ref()
         .and_then(|receiver| receiver.present_count())
+}
+
+/// Latest child guest vibration request as an encoded rumble word
+/// (`raeen_input::rumble` wire format), or `None` when no isolated-runner
+/// bridge is installed. `Some(0)` = bridge alive, no vibration ever set.
+pub fn latest_remote_rumble_word() -> Option<u64> {
+    active_receiver()
+        .read()
+        .as_ref()
+        .and_then(|receiver| receiver.latest_rumble_word())
 }
 
 /// Publish one merged Shell controller snapshot to the active isolated title.

@@ -221,6 +221,14 @@ pub struct Shell {
     /// state ahead of gilrs and the keyboard, so pads gilrs rejects with an
     /// all-zeros UUID (Steam Input / DS4Windows / generic HID) still work.
     native_input: raeen_input::NativeGamepads,
+    /// Guest vibration → physical controller arbiter: consumes the running
+    /// session's newest `scePadSetVibration` request each frame (frame-IPC
+    /// word for the isolated runner, session kernel in-process), applies the
+    /// Settings ▸ Controllers ▸ DualSense Features gate and the 5 s
+    /// no-refresh safety auto-stop, and de-duplicates hardware writes.
+    rumble_router: raeen_input::rumble::RumbleRouter,
+    /// Epoch for the router's monotonic timestamps.
+    rumble_epoch: std::time::Instant,
     /// Latched left-stick state so analog flicks navigate menus like the
     /// D-pad, one step per flick (see [`StickNav`]).
     stick_nav: StickNav,
@@ -403,6 +411,8 @@ impl Shell {
             frame_view: present::GameFrameView::default(),
             gilrs,
             native_input: raeen_input::NativeGamepads::start(),
+            rumble_router: raeen_input::rumble::RumbleRouter::new(),
+            rumble_epoch: std::time::Instant::now(),
             stick_nav: StickNav::default(),
             sound_pack: sounds::SoundPack::load(
                 std::path::Path::new(SOUNDS_ROOT),
@@ -575,6 +585,7 @@ impl Shell {
         self.tick_library_watcher(ctx);
         self.poll_session();
         self.push_pad_state(ctx);
+        self.tick_rumble();
         self.tick_session_quit(ctx);
         self.tick_animations(ctx);
         self.draw(ctx);
@@ -1435,6 +1446,41 @@ impl Shell {
             kernel.set_pad_state(encoded);
         }
         raeen_gpu::frame_ipc::publish_pad_state(encoded);
+    }
+
+    /// Route the running guest's newest `scePadSetVibration` request to the
+    /// physical controller — the return direction of `push_pad_state`. The
+    /// source is the isolated runner's frame-IPC rumble word when a child
+    /// bridge is live, else the in-process session kernel; with no session
+    /// the router silences the motors immediately (no stuck rumble after a
+    /// quit or crash). Settings ▸ Controllers ▸ DualSense Features gates
+    /// hardware delivery (OFF drops vibration); the router also enforces the
+    /// 5 s no-refresh safety auto-stop and de-duplicates writes, so an idle
+    /// guest costs nothing here.
+    fn tick_rumble(&mut self) {
+        let source = self.session.as_ref().and_then(|session| {
+            raeen_gpu::frame_ipc::latest_remote_rumble_word()
+                .and_then(raeen_input::rumble::decode_word)
+                .or_else(|| {
+                    session.kernel.as_ref().and_then(|kernel| {
+                        let (seq, large, small) = kernel.pad_rumble();
+                        (seq != 0)
+                            .then(|| (seq, raeen_input::rumble::RumbleState::new(large, small)))
+                    })
+                })
+        });
+        if let Some(command) = self.rumble_router.update(
+            self.rumble_epoch.elapsed(),
+            source,
+            self.config.input.dualsense_features,
+        ) {
+            tracing::debug!(
+                large = command.large,
+                small = command.small,
+                "routing guest vibration to controller"
+            );
+            self.native_input.set_rumble(command.large, command.small);
+        }
     }
 
     /// Capture the currently published guest frame to `screenshots/
