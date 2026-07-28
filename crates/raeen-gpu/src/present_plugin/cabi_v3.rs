@@ -29,6 +29,13 @@ pub const RAEEN_V3_QUEUE_GRAPHICS: u32 = 1 << 0;
 pub const RAEEN_V3_QUEUE_COMPUTE: u32 = 1 << 1;
 pub const RAEEN_V3_QUEUE_OPTICAL_FLOW: u32 = 1 << 2;
 
+pub const RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE: u64 = 1 << 0;
+pub const RAEEN_V3_FEATURE_DESCRIPTOR_INDEXING: u64 = 1 << 1;
+pub const RAEEN_V3_FEATURE_BUFFER_DEVICE_ADDRESS: u64 = 1 << 2;
+pub const RAEEN_V3_KNOWN_FEATURES: u64 = RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE
+    | RAEEN_V3_FEATURE_DESCRIPTOR_INDEXING
+    | RAEEN_V3_FEATURE_BUFFER_DEVICE_ADDRESS;
+
 pub const RAEEN_V3_RESOURCE_BORROWED: u32 = 1 << 0;
 pub const RAEEN_V3_RESOURCE_HOST_OWNS_LAYOUT: u32 = 1 << 1;
 
@@ -131,7 +138,9 @@ impl RaeenVulkanRequirementsV3 {
         }
         let known_queues =
             RAEEN_V3_QUEUE_GRAPHICS | RAEEN_V3_QUEUE_COMPUTE | RAEEN_V3_QUEUE_OPTICAL_FLOW;
-        if self.required_queue_flags & !known_queues != 0 || self.required_feature_flags != 0 {
+        if self.required_queue_flags & !known_queues != 0
+            || self.required_feature_flags & !RAEEN_V3_KNOWN_FEATURES != 0
+        {
             return Err(V3ValidationError::UnknownRequiredCapability);
         }
         Ok(())
@@ -217,7 +226,7 @@ pub struct RaeenFrameSyncV3 {
 }
 
 /// Temporal constants use Vulkan clip-space conventions. Matrices are
-/// column-major. Motion-vector scale converts stored motion texels into pixels.
+/// row-major. Motion-vector scale converts stored motion texels into pixels.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RaeenTemporalDataV3 {
@@ -546,6 +555,21 @@ mod tests {
         assert_eq!(
             requirements.validate(),
             Err(V3ValidationError::BadExtensionName)
+        );
+    }
+
+    #[test]
+    fn known_vulkan_feature_requirements_are_explicit() {
+        let mut requirements = RaeenVulkanRequirementsV3::empty();
+        requirements.required_feature_flags = RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE
+            | RAEEN_V3_FEATURE_DESCRIPTOR_INDEXING
+            | RAEEN_V3_FEATURE_BUFFER_DEVICE_ADDRESS;
+        assert_eq!(requirements.validate(), Ok(()));
+
+        requirements.required_feature_flags |= 1 << 63;
+        assert_eq!(
+            requirements.validate(),
+            Err(V3ValidationError::UnknownRequiredCapability)
         );
     }
 }

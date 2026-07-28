@@ -20,6 +20,12 @@
 extern "C" {
 #endif
 
+#if defined(_WIN32) && defined(RAEEN_PLUGIN_BUILD)
+#define RAEEN_PLUGIN_API __declspec(dllexport)
+#else
+#define RAEEN_PLUGIN_API
+#endif
+
 #define RAEEN_PLUGIN_ABI_VERSION_V3 3u
 #define RAEEN_V3_OK 0
 #define RAEEN_V3_DECLINED 1
@@ -32,6 +38,10 @@ extern "C" {
 #define RAEEN_V3_QUEUE_GRAPHICS (1u << 0)
 #define RAEEN_V3_QUEUE_COMPUTE (1u << 1)
 #define RAEEN_V3_QUEUE_OPTICAL_FLOW (1u << 2)
+
+#define RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE (UINT64_C(1) << 0)
+#define RAEEN_V3_FEATURE_DESCRIPTOR_INDEXING (UINT64_C(1) << 1)
+#define RAEEN_V3_FEATURE_BUFFER_DEVICE_ADDRESS (UINT64_C(1) << 2)
 
 #define RAEEN_V3_RESOURCE_BORROWED (1u << 0)
 #define RAEEN_V3_RESOURCE_HOST_OWNS_LAYOUT (1u << 1)
@@ -112,7 +122,7 @@ typedef struct RaeenFrameSyncV3 {
 } RaeenFrameSyncV3;
 
 /*
- * Vulkan clip-space conventions; matrices are column-major. Motion-vector
+ * Vulkan clip-space conventions; matrices are row-major. Motion-vector
  * scale converts stored vector values to render-resolution pixels.
  */
 typedef struct RaeenTemporalDataV3 {
@@ -172,7 +182,7 @@ typedef struct RaeenPluginV3 {
     uintptr_t reserved[8];
 } RaeenPluginV3;
 
-const RaeenPluginV3 *raeen_plugin_v3(void);
+RAEEN_PLUGIN_API const RaeenPluginV3 *raeen_plugin_v3(void);
 
 #ifdef __cplusplus
 }

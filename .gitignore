@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 **/*.rs.bk
+*.obj
 
 # Installer packaging outputs, and the bundled Microsoft VC++ redist
 # (fetched at package time — see installer/redist/README.md, never committed).

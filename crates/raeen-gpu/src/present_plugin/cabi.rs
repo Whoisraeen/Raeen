@@ -1181,6 +1181,40 @@ fn manifest_entry(manifest_path: &Path) -> Result<PathBuf, LoadError> {
 /// Executes arbitrary native code from `path` inside this process — see the
 /// module-level trust boundary. Only call this on a path the *user* supplied.
 pub unsafe fn load_from_path(path: &Path) -> Result<DynamicPlugin, LoadError> {
+    #[cfg(windows)]
+    let library = {
+        use libloading::os::windows::{
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
+        };
+
+        // Resolve the entry point to a full path, then constrain dependency
+        // lookup to the plugin package directory plus Windows' safe default
+        // directories. Package-local runtime DLLs can therefore live beside
+        // the manifest entry without adding the package to PATH or searching
+        // Raeen's current working directory.
+        let load_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|directory| directory.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        let load_path = PathBuf::from(load_path.as_os_str().to_string_lossy().replace('/', "\\"));
+        // SAFETY: delegated to the caller: loading runs library initializers.
+        let native = unsafe {
+            Library::load_with_flags(
+                &load_path,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        }
+        .map_err(|source| LoadError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        libloading::Library::from(native)
+    };
+
+    #[cfg(not(windows))]
     // SAFETY: delegated to the caller — this is exactly the trust boundary the
     // `unsafe` on this function marks. Loading runs the library's initializers.
     let library = unsafe { libloading::Library::new(path) }.map_err(|source| LoadError::Open {

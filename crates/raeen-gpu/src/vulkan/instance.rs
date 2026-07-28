@@ -869,6 +869,9 @@ impl VulkanDevice {
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
+        let plugin_feature_flags = plugin_requirements
+            .map(|requirements| requirements.required_feature_flags)
+            .unwrap_or(0);
 
         // Robustness features when the driver has them: RDNA T#/V# semantics
         // bound-check every buffer and image access in hardware
@@ -888,6 +891,9 @@ impl VulkanDevice {
             r2_buffer,
             r2_image,
             r2_null,
+            timeline_semaphore,
+            descriptor_indexing,
+            buffer_device_address,
         ) = unsafe {
             let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut supported13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -910,13 +916,54 @@ impl VulkanDevice {
                 supported_r2.robust_buffer_access2 == vk::TRUE,
                 supported_r2.robust_image_access2 == vk::TRUE,
                 supported_r2.null_descriptor == vk::TRUE,
+                supported12.timeline_semaphore == vk::TRUE,
+                supported12.descriptor_indexing == vk::TRUE,
+                supported12.buffer_device_address == vk::TRUE,
             )
         };
+        for (flag, supported, name) in [
+            (
+                crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE,
+                timeline_semaphore,
+                "timelineSemaphore",
+            ),
+            (
+                crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_DESCRIPTOR_INDEXING,
+                descriptor_indexing,
+                "descriptorIndexing",
+            ),
+            (
+                crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_BUFFER_DEVICE_ADDRESS,
+                buffer_device_address,
+                "bufferDeviceAddress",
+            ),
+        ] {
+            if plugin_feature_flags & flag != 0 && !supported {
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "active plugin requires unavailable Vulkan feature {name}"
+                )));
+            }
+        }
         // Vulkan 1.3 core features — dynamicRendering is the whole point of
         // targeting 1.3 (no render-pass/framebuffer objects); robustImageAccess
         // is the image half of the RDNA out-of-bounds contract above.
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge);
+            .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge)
+            .timeline_semaphore(
+                plugin_feature_flags
+                    & crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_TIMELINE_SEMAPHORE
+                    != 0,
+            )
+            .descriptor_indexing(
+                plugin_feature_flags
+                    & crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_DESCRIPTOR_INDEXING
+                    != 0,
+            )
+            .buffer_device_address(
+                plugin_feature_flags
+                    & crate::present_plugin::cabi_v3::RAEEN_V3_FEATURE_BUFFER_DEVICE_ADDRESS
+                    != 0,
+            );
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .robust_image_access(robust_image_access);

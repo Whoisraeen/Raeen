@@ -373,7 +373,8 @@ also export `raeen_plugin_v3`; its complete C header is
 
 V3 adds the pieces that cannot be safely inferred from a finished CPU image:
 
-- bounded pre-device Vulkan extension and queue requirements;
+- bounded pre-device Vulkan extension, queue, and core-feature requirements
+  (timeline semaphores, descriptor indexing, and buffer device addresses);
 - host-owned color, depth, motion, exposure, and output images;
 - a host-owned recording command buffer (the plugin never submits Raeen's
   queue);
@@ -386,6 +387,11 @@ Every image is borrowed only for the duration of `process`; the plugin must not
 destroy it or retain its handles. Raeen validates sizes, subrects, finite
 temporal values, resource flags, and advancing synchronization before calling
 foreign code. Unknown required capabilities are refused rather than guessed.
+
+On Windows, package-local dependencies may sit beside the manifest entry DLL.
+Raeen loads that entry with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` plus Windows'
+safe default directories; it does not add the package to `PATH` or search the
+process working directory for dependencies.
 
 The runner loads and selects plugins before its lazy Vulkan device is created.
 If the selected plugin exports v3, its declared instance/device extensions are
