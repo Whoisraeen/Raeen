@@ -5253,13 +5253,24 @@ impl<'a> Spirv<'a> {
             self.source += TBUFFER_STORE_FORMAT_XYZW;
         }
 
-        if self.code.has_any_of(&[
-            T::SBufferLoadDword,
-            T::SBufferLoadDwordx2,
-            T::SBufferLoadDwordx4,
-            T::SBufferLoadDwordx8,
-            T::SBufferLoadDwordx16,
-        ]) {
+        // `has_buffers` gates these for the same reason as the MUBUF helpers
+        // above: `sbuffer_load_dword*` index `%buf`, which only exists when a
+        // storage buffer is bound. This used to be unreachable — with
+        // `buffers_num == 0` every `recompile_sbuffer_load_*` returned `false`
+        // and translation failed before assembly. Now that a V#-based
+        // `s_buffer_load` can be served from the per-PC capture
+        // (`shader_capture_vsharp_buffer_loads`) with no descriptor bound at
+        // all, emitting the helper text would fail assembly on an undefined
+        // `%buf`.
+        if has_buffers
+            && self.code.has_any_of(&[
+                T::SBufferLoadDword,
+                T::SBufferLoadDwordx2,
+                T::SBufferLoadDwordx4,
+                T::SBufferLoadDwordx8,
+                T::SBufferLoadDwordx16,
+            ])
+        {
             self.source += SBUFFER_LOAD_DWORD;
             self.source += SBUFFER_LOAD_DWORD_2;
             self.source += SBUFFER_LOAD_DWORD_4;
@@ -5430,6 +5441,23 @@ impl<'a> Spirv<'a> {
                     self.add_constant_uint(base_dw + i);
                 }
             }
+        }
+        // Beyond Kyty: the combined SMEM addressing mode (register soffset AND
+        // a non-zero immediate) adds the two byte offsets at runtime, in the
+        // UINT domain (`sbuffer_load_dwords`). `add_constant` files an
+        // `IntegerInlineConstant` — which is what the SMEM parser produces for
+        // the sign-extended imm21 — as Int only, so without this the immediate
+        // would resolve to `unknown_uint_constant` for any value outside the
+        // seeded 0..=32 range and assembly would fail.
+        let combined_offsets: Vec<u32> = self
+            .code
+            .get_instructions()
+            .iter()
+            .filter(|inst| crate::shader::types::smem_has_combined_offset(inst))
+            .map(|inst| inst.src[2].constant.u)
+            .collect();
+        for imm in combined_offsets {
+            self.add_constant_uint(imm);
         }
         // Beyond Kyty: PC-relative embedded-constant scalar loads materialize
         // their captured dwords directly as uint constants (see

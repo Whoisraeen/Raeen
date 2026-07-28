@@ -217,6 +217,35 @@ SOFTWARE.
   (`QueuePath`/`ScalarPathKey`, L142-280), whereas Raeen follows only branches
   whose condition it can prove and refuses undecidable branches, loops and
   indirect PC writes by name. No C# is copied.
+  quantities, they ADD, and the sum is dword-aligned by truncation. Raeen's
+  soffset resolution is bounded and its own (an unwritten live-in user-data
+  register, or a preceding `s_mov_b32`/`s_movk_i32` constant); SharpEmu's
+  general abstract scalar interpreter is not ported. Anything unresolved keeps a
+  named refusal carrying the width and format. No C# is copied.
+- **V#-based buffer loads 2026-07-28**
+  (`docs/sharpemu-port/vsharp-buffer-loads.md`): the addressing rule for
+  `s_buffer_load*` — whose base is a 4-dword buffer resource descriptor (V#)
+  rather than a pointer pair — is established from
+  `Shader/Gen5ShaderScalarEvaluator.cs::TryExecuteScalarLoad` L1875-1902, which
+  runs the pointer and descriptor families through ONE body where only
+  `baseAddress` differs (`hasBufferDescriptor ? bufferDescriptor.BaseAddress :
+  <sgpr pair>`) while `byteOffset = immediateOffset + dynamicOffset` and
+  `address = (baseAddress + byteOffset) & ~3UL` are shared — i.e. the V#
+  contributes only its base address, and the combined soffset+immediate rule
+  transfers unchanged. `TryDecodeBufferDescriptor` L2163-2216 supplies the field
+  layout (`base48`, `stride = (word1 >> 16) & 0x3FFF`,
+  `sizeBytes = stride == 0 ? word2 : stride * word2`, the `word3 >> 30` buffer
+  type check, and the `(word3 >> 12) & 0x7F` unified format), which Raeen uses as
+  a BOUND and a format selector, never as an address term. Corroborated by
+  KytyPS5 (MIT) `MemoryOps.cpp::DecodeSmem` L218-256 and
+  `spirvEmitter/spirvEmitterMemory.cpp::EmitBufferByteAddress` /
+  `EmitBufferAddressFromParts` L212-278, whose `index * stride` term is gated on
+  `idxen` — a flag SMEM does not carry. Raeen's descriptor capture
+  (`shader_capture_vsharp_buffer_loads`) is its own bounded pass over live-in
+  user SGPRs; SharpEmu's general abstract scalar interpreter and its
+  `Gen5GlobalMemoryBinding` machinery are not ported. Unresolved forms keep a
+  named refusal carrying type, format, width, descriptor register, soffset and
+  immediate. No C# is copied.
 - **Exception-delivery model 2026-07-28**
   (`docs/sharpemu-port/loading-blockers.md`): the queue-at-raise /
   deliver-at-the-target's-next-HLE-boundary model in

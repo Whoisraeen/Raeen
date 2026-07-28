@@ -803,6 +803,112 @@ fn recompile_buffer_load_format_x_vdata1(
     Ok(false)
 }
 
+/// Beyond Kyty (no upstream row): `buffer_load_format_xyzw v[d:d+3], vindex,
+/// s[r:r+3], soffset idxen` — the four-channel MUBUF twin of
+/// `Recompile_BufferLoadFormatX_Vdata1VaddrSvSoffsIdxen` (ShaderSpirv.cpp
+/// L1937). Measured first blocker of Avatar: Frontiers of Pandora
+/// (`can't recompile (no table entry for
+/// BufferLoadFormatXyzw/Vdata4VaddrSvSoffsIdxen): ... v[0:3], v5, s[12:15], 0,
+/// idxen` — 2398 shader errors in a 180 s window).
+///
+/// This is the composition of two rows that already exist, not a new rule:
+///
+/// * addressing and the `stride` / `buffer_index` operands come from the
+///   `BufferLoadFormatX` idxen row. `idxen`-only means
+///   `byte_offset = vindex * stride + inst_offset` with no `offen` voffset term
+///   — KytyPS5 `spirvEmitterMemory.cpp::EmitBufferByteAddress` (L255-278) takes
+///   the index from the first address source only when `inst.memory.idxen`, and
+///   `EmitBufferAddressFromParts` (L212-253) forms `index * stride + offset` for
+///   the non-swizzled case;
+/// * the four-channel unpack comes from
+///   `Recompile_TBufferLoadFormatXyzw_Vdata4VaddrSvSoffsIdxenFloat4` (L4765).
+///
+/// The one difference between the MUBUF and MTBUF forms is where the format
+/// comes from: MTBUF carries `dfmt`/`nfmt` in the instruction (the `Float4`
+/// suffix hardcodes 119), while MUBUF takes it from the descriptor —
+/// `unified_format = (V#.dword3 >> 12) & 0x7f`, exactly as SharpEmu
+/// `Gen5ShaderScalarEvaluator.cs::TryDecodeBufferDescriptor` (L2205) reads it,
+/// and exactly what the `BufferLoadFormatX` row already does.
+///
+/// `tbuffer_load_format_xyzw` serves the 32_32_32_32_float encoding (119) and
+/// leaves the destination registers untouched for any other, which is Kyty's
+/// upstream behavior for the typed helper. That is a *narrower* result than a
+/// correct fetch, but it is not a guess, and it replaces a refusal that failed
+/// the entire shader.
+fn recompile_buffer_load_format_xyzw_vdata4(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferLoadFormatXyzw_Vdata4VaddrSvSoffsIdxen";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[2]) {
+                return Err(not_supported(FUNC, "src2 is not a constant"));
+            }
+
+            let dst_value: Vec<_> = (0..4)
+                .map(|i| operand_variable_to_str_shift(inst.dst, i))
+                .collect();
+            let src0_value = operand_variable_to_str(inst.src[0]);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+            let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
+            let offset = spirv.get_constant(inst.src[2]);
+
+            if dst_value.iter().any(|v| v.type_ != SpirvType::Float)
+                || src0_value.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src1_value1.type_ != SpirvType::Uint
+                || src1_value3.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            const TEXT: &str = r#"
+        %t100_<index> = OpLoad %float %<src0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_1 %t101_<index>
+        %t148_<index> = OpLoad %uint %<src1_value1>
+        %t150_<index> = OpShiftRightLogical %uint %t148_<index> %int_16
+        %t152_<index> = OpBitwiseAnd %uint %t150_<index> %uint_0x00003fff
+        %t153_<index> = OpBitcast %int %t152_<index>
+               OpStore %temp_int_3 %t153_<index>
+        %t155_<index> = OpLoad %uint %<src1_value0>
+        %t156_<index> = OpBitcast %int %t155_<index>
+               OpStore %temp_int_4 %t156_<index>
+               OpStore %temp_int_2 %<offset>
+        %t206_<index> = OpLoad %uint %<src1_value3>
+        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
+        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
+        %t211_<index> = OpBitcast %int %t210_<index>
+               OpStore %temp_int_5 %t211_<index>
+        %t110_<index> = OpFunctionCall %void %tbuffer_load_format_xyzw %<p0> %<p1> %<p2> %<p3> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0>", &src0_value.value)
+                .replace("<offset>", &offset)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value1>", &src1_value1.value)
+                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<p0>", &dst_value[0].value)
+                .replace("<p1>", &dst_value[1].value)
+                .replace("<p2>", &dst_value[2].value)
+                .replace("<p3>", &dst_value[3].value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Kyty: `Recompile_Exp_Mrt0OffOffComprVmDone` (ShaderSpirv.cpp L2278).
 fn recompile_exp_mrt0_off_off_compr_vm_done(
     index: u32,
@@ -1348,6 +1454,168 @@ fn recompile_exp_prim(
     Ok(vs_info.is_some_and(|v| v.gs_prolog))
 }
 
+/// Shared body of every `Recompile_SBufferLoadDword{,x2,x4,x8,x16}_Sdst*SvSoffset*`
+/// row (Kyty ShaderSpirv.cpp L3794/L3831/L3872/L3928/L3976 — identical upstream
+/// apart from N and the `sbuffer_load_dword_N` callee).
+///
+/// Three lowerings are tried in order:
+///
+/// 1. **Per-PC capture.** `shader_capture_vsharp_buffer_loads` resolved the V#
+///    base out of live-in user data, added the immediate + register soffset, and
+///    snapshotted the dwords from guest memory. Materialize them straight into
+///    the destination SGPRs — the same mechanism `sload_dword_extended` uses for
+///    pointer-based loads. This is what makes a V#-based `s_buffer_load` work in
+///    a shader that declares no storage-buffer slot at all (measured first
+///    blocker of Grand Theft Auto V: `can't recompile: SBufferLoadDwordx8
+///    [Sdst8SvSoffset] s[24:31], s[20:23], 0`, where
+///    `storage_buffers.buffers_num == 0` made every width return `false`).
+/// 2. **Bound storage buffer** (Kyty's path). The V# was bound as a descriptor,
+///    so only the byte offset is needed. All widths now accept a runtime offset
+///    the way `x4` always did, plus the combined
+///    `soffset_register + immediate` form — the two terms simply sum, see
+///    [`Format::SdstSvSoffsetOffset`] for the rule and its sources.
+/// 3. **Named refusal.** Kyty's bare `return false` produced only
+///    `can't recompile: <disassembly>`; this states which of the two lowerings
+///    was missing, with the width and the descriptor register, so a measured log
+///    line identifies the exact gap.
+fn sbuffer_load_dwords(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    n: usize,
+    callee: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let inst = inst_at(code, index, func)?;
+    let Some(bind_info) = spirv.get_bind_info() else {
+        return Err(not_supported(
+            func,
+            format!(
+                "no bind info: {:?} [{:?}] x{n} dwords, V#=s{}, pc={:#x}",
+                inst.type_, inst.format, inst.src[0].register_id, inst.pc,
+            ),
+        ));
+    };
+
+    // 1. The analysis-side V# capture (see `shader_capture_vsharp_buffer_loads`).
+    if let Some(load) = bind_info.embedded_constant_loads.find(inst.pc) {
+        let count = (load.dwords_num as usize).min(n);
+        for i in 0..count {
+            let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
+            if dst_value.type_ != SpirvType::Uint {
+                return Err(not_supported(func, "unexpected embedded-load dst type"));
+            }
+            *dst_source += &format!(
+                "               OpStore %{reg} %{val}\n",
+                reg = dst_value.value,
+                val = spirv.get_constant_uint(load.values[i]),
+            );
+        }
+        return Ok(true);
+    }
+
+    if bind_info.storage_buffers.buffers_num > 0 {
+        let dst_value: Vec<_> = (0..n)
+            .map(|i| operand_variable_to_str_shift(inst.dst, i as i32))
+            .collect();
+        let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
+
+        if dst_value[0].type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
+            return Err(not_supported(func, "unexpected operand types"));
+        }
+        if operand_is_exec(inst.dst) {
+            return Err(not_supported(func, "exec destination"));
+        }
+
+        let index_str = format!("{index}");
+
+        // The byte offset is `soffset + immediate`. In the two-operand form one
+        // of the two is absent and `src[1]` alone carries it (a constant when
+        // the soffset field was NULL, an SGPR otherwise); in the combined form
+        // `src[1]` is the register and `src[2]` the immediate, and both are
+        // live. Emitting the add here keeps ONE offset expression for the
+        // callee, which only ever sees a byte offset.
+        let mut offset_src = String::new();
+        if !operand_load_uint(
+            spirv,
+            inst.src[1],
+            "t1_<index>",
+            &index_str,
+            &mut offset_src,
+            -1,
+        )? {
+            return Err(not_supported(
+                func,
+                format!(
+                    "offset operand {:?} has no uint load form (pc={:#x})",
+                    inst.src[1].type_, inst.pc,
+                ),
+            ));
+        }
+        let mut offset_id = format!("t1_{index_str}");
+        if crate::shader::types::smem_has_combined_offset(&inst) {
+            // Combined form: add the immediate to the register value.
+            let imm = crate::shader::types::smem_offset_operand(&inst);
+            if !operand_is_constant(imm) {
+                return Err(not_supported(
+                    func,
+                    format!(
+                        "combined-form immediate is not a constant (pc={:#x})",
+                        inst.pc
+                    ),
+                ));
+            }
+            let imm_id = spirv.get_constant_uint(imm.constant.u);
+            // `operand_load_uint` leaves its last line UNTERMINATED (the caller's
+            // template supplies the newline), so open a new line before adding.
+            offset_src +=
+                &format!("\n        %t1sum_{index_str} = OpIAdd %uint %t1_{index_str} %{imm_id}");
+            offset_id = format!("t1sum_{index_str}");
+        }
+
+        const TEXT: &str = r#"
+        <offset_src>
+        %t100_<index> = OpLoad %uint %<src0_value0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_2 %t101_<index>
+        %t102_<index> = OpBitcast %int %<offset_id>
+               OpStore %temp_int_1 %t102_<index>
+        %t110_<index> = OpFunctionCall %void %<callee> <regs> %temp_int_1 %temp_int_2
+"#;
+        let regs: Vec<String> = dst_value.iter().map(|v| format!("%{}", v.value)).collect();
+
+        *dst_source += &TEXT
+            .replace("<offset_src>", &offset_src)
+            .replace("<callee>", callee)
+            .replace("<regs>", &regs.join(" "))
+            .replace("<src0_value0>", &src0_value0.value)
+            .replace("<offset_id>", &offset_id)
+            .replace("<index>", &index_str);
+
+        return Ok(true);
+    }
+
+    Err(not_supported(
+        func,
+        format!(
+            "no storage buffer bound for the V# and no resolved capture: {:?} [{:?}] x{n} \
+             dwords, V#=s[{base}:{base_end}], soffset={}, imm={:#x}, pc={:#x}",
+            inst.type_,
+            inst.format,
+            match crate::shader::types::smem_register_soffset(&inst) {
+                Some(op) if op.type_ == ShaderOperandType::Sgpr => format!("s{}", op.register_id),
+                Some(op) => format!("{:?}", op.type_),
+                None => "none".to_string(),
+            },
+            crate::shader::types::smem_offset_operand(&inst).constant.u,
+            inst.pc,
+            base = inst.src[0].register_id,
+            base_end = inst.src[0].register_id + 3,
+        ),
+    ))
+}
+
 /// Kyty: `Recompile_SBufferLoadDword_SdstSvSoffset` (ShaderSpirv.cpp L3794).
 fn recompile_sbuffer_load_dword(
     index: u32,
@@ -1357,45 +1625,15 @@ fn recompile_sbuffer_load_dword(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SBufferLoadDword_SdstSvSoffset";
-    let inst = inst_at(code, index, FUNC)?;
-
-    if let Some(bind_info) = spirv.get_bind_info() {
-        if bind_info.storage_buffers.buffers_num > 0 {
-            if !operand_is_constant(inst.src[1]) {
-                return Err(not_supported(FUNC, "src1 is not a constant"));
-            }
-
-            let dst_value = operand_variable_to_str(inst.dst);
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let offset = spirv.get_constant(inst.src[1]);
-
-            if dst_value.type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
-                return Err(not_supported(FUNC, "unexpected operand types"));
-            }
-            if operand_is_exec(inst.dst) {
-                return Err(not_supported(FUNC, "exec destination"));
-            }
-
-            const TEXT: &str = r#"
-        %t100_<index> = OpLoad %uint %<src0_value0>
-        %t101_<index> = OpBitcast %int %t100_<index>
-               OpStore %temp_int_2 %t101_<index>
-        %t102_<index> = OpBitcast %int %<offset>
-               OpStore %temp_int_1 %t102_<index>
-        %t110_<index> = OpFunctionCall %void %sbuffer_load_dword %<p0> %temp_int_1 %temp_int_2
-"#;
-            *dst_source += &TEXT
-                .replace("<index>", &format!("{index}"))
-                .replace("<offset>", &offset)
-                .replace("<src0_value0>", &src0_value0.value)
-                .replace("<p0>", &dst_value.value);
-
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    sbuffer_load_dwords(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_SBufferLoadDword_SdstSvSoffset",
+        1,
+        "sbuffer_load_dword",
+    )
 }
 
 /// Kyty: `Recompile_SBufferLoadDwordx4_Sdst4SvSoffset` (ShaderSpirv.cpp
@@ -1408,54 +1646,15 @@ fn recompile_sbuffer_load_dwordx4(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SBufferLoadDwordx4_Sdst4SvSoffset";
-    let inst = inst_at(code, index, FUNC)?;
-
-    if let Some(bind_info) = spirv.get_bind_info() {
-        if bind_info.storage_buffers.buffers_num > 0 {
-            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
-            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
-            let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
-            let dst_value3 = operand_variable_to_str_shift(inst.dst, 3);
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-
-            if dst_value0.type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
-                return Err(not_supported(FUNC, "unexpected operand types"));
-            }
-            if operand_is_exec(inst.dst) {
-                return Err(not_supported(FUNC, "exec destination"));
-            }
-
-            let index_str = format!("{index}");
-
-            let mut load1 = String::new();
-            if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
-                return Ok(false);
-            }
-
-            const TEXT: &str = r#"
-        <load1>
-        %t100_<index> = OpLoad %uint %<src0_value0>
-        %t101_<index> = OpBitcast %int %t100_<index>
-               OpStore %temp_int_2 %t101_<index>
-        %t102_<index> = OpBitcast %int %t1_<index>
-               OpStore %temp_int_1 %t102_<index>
-        %t110_<index> = OpFunctionCall %void %sbuffer_load_dword_4 %<p0> %<p1> %<p2> %<p3> %temp_int_1 %temp_int_2
-"#;
-            *dst_source += &TEXT
-                .replace("<load1>", &load1)
-                .replace("<src0_value0>", &src0_value0.value)
-                .replace("<p0>", &dst_value0.value)
-                .replace("<p1>", &dst_value1.value)
-                .replace("<p2>", &dst_value2.value)
-                .replace("<p3>", &dst_value3.value)
-                .replace("<index>", &index_str);
-
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    sbuffer_load_dwords(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_SBufferLoadDwordx4_Sdst4SvSoffset",
+        4,
+        "sbuffer_load_dword_4",
+    )
 }
 
 /// Kyty: `Recompile_SBranch_Label` (ShaderSpirv.cpp L4047).
@@ -8807,105 +9006,15 @@ fn recompile_sbuffer_load_dwordx2(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SBufferLoadDwordx2_Sdst2SvSoffset";
-    let inst = inst_at(code, index, FUNC)?;
-
-    if let Some(bind_info) = spirv.get_bind_info() {
-        if bind_info.storage_buffers.buffers_num > 0 {
-            if !operand_is_constant(inst.src[1]) {
-                return Err(not_supported(FUNC, "src1 is not a constant"));
-            }
-
-            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
-            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let offset = spirv.get_constant(inst.src[1]);
-
-            if dst_value0.type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
-                return Err(not_supported(FUNC, "unexpected operand types"));
-            }
-            if operand_is_exec(inst.dst) {
-                return Err(not_supported(FUNC, "exec destination"));
-            }
-
-            const TEXT: &str = r#"
-        %t100_<index> = OpLoad %uint %<src0_value0>
-        %t101_<index> = OpBitcast %int %t100_<index>
-               OpStore %temp_int_2 %t101_<index>
-        %t102_<index> = OpBitcast %int %<offset>
-               OpStore %temp_int_1 %t102_<index>
-        %t110_<index> = OpFunctionCall %void %sbuffer_load_dword_2 %<p0> %<p1> %temp_int_1 %temp_int_2
-"#;
-            *dst_source += &TEXT
-                .replace("<index>", &format!("{index}"))
-                .replace("<offset>", &offset)
-                .replace("<src0_value0>", &src0_value0.value)
-                .replace("<p0>", &dst_value0.value)
-                .replace("<p1>", &dst_value1.value);
-
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-/// Shared body of `Recompile_SBufferLoadDwordx8/x16_Sdst*SvSoffset`
-/// (ShaderSpirv.cpp L3928/L3976) — identical upstream except for N and the
-/// `sbuffer_load_dword_N` callee.
-fn sbuffer_load_dword_n(
-    index: u32,
-    code: &ShaderCode,
-    dst_source: &mut String,
-    spirv: &Spirv<'_>,
-    func: &'static str,
-    n: usize,
-    callee: &'static str,
-) -> Result<bool, ShaderRecompileError> {
-    let inst = inst_at(code, index, func)?;
-
-    if let Some(bind_info) = spirv.get_bind_info() {
-        if bind_info.storage_buffers.buffers_num > 0 {
-            if !operand_is_constant(inst.src[1]) {
-                return Err(not_supported(func, "src1 is not a constant"));
-            }
-
-            let dst_value: Vec<_> = (0..n)
-                .map(|i| operand_variable_to_str_shift(inst.dst, i as i32))
-                .collect();
-
-            let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
-            let offset = spirv.get_constant(inst.src[1]);
-
-            if dst_value[0].type_ != SpirvType::Uint || src0_value0.type_ != SpirvType::Uint {
-                return Err(not_supported(func, "unexpected operand types"));
-            }
-            if operand_is_exec(inst.dst) {
-                return Err(not_supported(func, "exec destination"));
-            }
-
-            const TEXT: &str = r#"
-        %t100_<index> = OpLoad %uint %<src0_value0>
-        %t101_<index> = OpBitcast %int %t100_<index>
-               OpStore %temp_int_2 %t101_<index>
-        %t102_<index> = OpBitcast %int %<offset>
-               OpStore %temp_int_1 %t102_<index>
-        %t110_<index> = OpFunctionCall %void %<callee> <regs> %temp_int_1 %temp_int_2
-"#;
-            let regs: Vec<String> = dst_value.iter().map(|v| format!("%{}", v.value)).collect();
-
-            *dst_source += &TEXT
-                .replace("<callee>", callee)
-                .replace("<regs>", &regs.join(" "))
-                .replace("<index>", &format!("{index}"))
-                .replace("<offset>", &offset)
-                .replace("<src0_value0>", &src0_value0.value);
-
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    sbuffer_load_dwords(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_SBufferLoadDwordx2_Sdst2SvSoffset",
+        2,
+        "sbuffer_load_dword_2",
+    )
 }
 
 /// Kyty: `Recompile_SBufferLoadDwordx8_Sdst8SvSoffset` (ShaderSpirv.cpp
@@ -8918,7 +9027,7 @@ fn recompile_sbuffer_load_dwordx8(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    sbuffer_load_dword_n(
+    sbuffer_load_dwords(
         index,
         code,
         dst_source,
@@ -8939,7 +9048,7 @@ fn recompile_sbuffer_load_dwordx16(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    sbuffer_load_dword_n(
+    sbuffer_load_dwords(
         index,
         code,
         dst_source,
@@ -10617,6 +10726,9 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3SvSoffs, p1("")),
     f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3VaddrSvSoffsOffen, p1("")),
     f(recompile_buffer_load_format_x_vdata1, T::BufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxen, p1("")),
+    // Beyond Kyty: four-channel MUBUF typed fetch with index-enable addressing.
+    // Measured first blocker of Avatar: Frontiers of Pandora.
+    f(recompile_buffer_load_format_xyzw_vdata4, T::BufferLoadFormatXyzw, F::Vdata4VaddrSvSoffsIdxen, p1("")),
     f(recompile_buffer_store_dword_vdata1, T::BufferStoreDword, F::Vdata1VaddrSvSoffsIdxen, p1("")),
     // Wired from the staged set for ASTRO.BOT's formatted stores (the parse
     // gate no longer blanket-rejects MUBUF addressing modes).
@@ -10752,6 +10864,15 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_sbuffer_load_dwordx4, T::SBufferLoadDwordx4, F::Sdst4SvSoffset, p1("")),
     f(recompile_sbuffer_load_dwordx8, T::SBufferLoadDwordx8, F::Sdst8SvSoffset, p1("")),
     f(recompile_sbuffer_load_dwordx16, T::SBufferLoadDwordx16, F::Sdst16SvSoffset, p1("")),
+    // Beyond Kyty: the combined addressing mode (register soffset AND a
+    // non-zero immediate offset both live). Same lowering — the two byte
+    // offsets sum, see `Format::SdstSvSoffsetOffset`. Measured first blocker of
+    // ASTRO.BOT, which died in the PARSER before reaching a table row at all.
+    f(recompile_sbuffer_load_dword,   T::SBufferLoadDword,   F::SdstSvSoffsetOffset,  p1("")),
+    f(recompile_sbuffer_load_dwordx2, T::SBufferLoadDwordx2, F::Sdst2SvSoffsetOffset, p1("")),
+    f(recompile_sbuffer_load_dwordx4, T::SBufferLoadDwordx4, F::Sdst4SvSoffsetOffset, p1("")),
+    f(recompile_sbuffer_load_dwordx8, T::SBufferLoadDwordx8, F::Sdst8SvSoffsetOffset, p1("")),
+    f(recompile_sbuffer_load_dwordx16, T::SBufferLoadDwordx16, F::Sdst16SvSoffsetOffset, p1("")),
 
     f(recompile_scbranch_xxx_label, T::SCbranchExecz, F::Label, p2("%cc_u_<index> = OpLoad %uint %execz",  "%cc_b_<index> = OpINotEqual %bool %cc_u_<index> %uint_0")),
     f(recompile_scbranch_xxx_label, T::SCbranchScc0,  F::Label, p2("%cc_u_<index> = OpLoad %uint %scc",    "%cc_b_<index> = OpIEqual    %bool %cc_u_<index> %uint_0")),
@@ -11458,7 +11579,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            358,
+            364,
             "the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
              VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
              the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),            the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
@@ -11493,11 +11614,15 @@ mod tests {
              and the measured VCmpxLeU32 + DsAddRtnU32 rows, and the \
              instruction-coverage batch: ImageGather4Lz dmask2/4/8 (the dmask \
              bit index is the SPIR-V gather Component operand) and \
-             SLoadDwordx16 (SMEM/SMRD opcode 0x04), and the SMEM              register-soffset batch: the five Sdst/2/4/8/16-SbaseSoffsetOffset              rows (RDNA2 `base + soffset + imm`)"
+             SLoadDwordx16 (SMEM/SMRD opcode 0x04), and the SMEM              register-soffset batch: the five Sdst/2/4/8/16-SbaseSoffsetOffset              rows (RDNA2 `base + soffset + imm`), \
+             and the V#-buffer-load batch: the five \
+             Sdst/2/4/8/16-SvSoffsetOffset rows (the same combined addressing \
+             through a V# base, ASTRO.BOT) plus BufferLoadFormatXyzw \
+             [Vdata4VaddrSvSoffsIdxen] (Avatar: Frontiers of Pandora)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 350,
+            implemented, 356,
             "the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
@@ -11528,6 +11653,8 @@ mod tests {
               and SLoadDwordx16, \
               and the SMEM register-soffset batch: five \
               Sdst/2/4/8/16-SbaseSoffsetOffset rows, \
+              and the V#-buffer-load batch: five Sdst/2/4/8/16-SvSoffsetOffset \
+              rows and BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen], \
               and the exp-null row: EXP target 9 accepted and dropped)"
         );
         assert_eq!(
@@ -19836,6 +19963,384 @@ mod tests {
             .expect("full chain recompiles");
         let module = spirv_run(&source).expect("assemble");
         spirv_val_ok(&module, "full_chain_register_soffset");
+    }
+
+    /// A guest-memory stub for the V#-based `s_buffer_load` tests: dwords are
+    /// readable from `base` onwards.
+    struct VsharpMem(u64, Vec<u32>);
+    impl crate::shader::analysis::ShaderMemory for VsharpMem {
+        fn dwords_at(&self, addr: u64) -> Option<std::borrow::Cow<'_, [u32]>> {
+            (addr >= self.0 && (addr - self.0) % 4 == 0)
+                .then(|| ((addr - self.0) / 4) as usize)
+                .filter(|start| *start < self.1.len())
+                .map(|start| std::borrow::Cow::Borrowed(&self.1[start..]))
+        }
+    }
+
+    /// A buffer resource descriptor (V#): base48 in dwords 0..1, `stride` in
+    /// dword1 bits 16..29, `num_records` in dword2, and a buffer-typed dword3
+    /// (`(dw3 >> 28) & 0xF < 8`, `sharp_dword3_is_buffer`). Field layout from
+    /// SharpEmu `Gen5ShaderScalarEvaluator.cs::TryDecodeBufferDescriptor`
+    /// (L2163-2216).
+    fn vsharp(base: u64, stride: u32, num_records: u32) -> [u32; 4] {
+        [
+            (base & 0xffff_ffff) as u32,
+            (((base >> 32) as u32) & 0xffff) | ((stride & 0x3fff) << 16),
+            num_records,
+            // unified format 7 in bits 12..18, type 0 (buffer) in bits 30..31.
+            7 << 12,
+        ]
+    }
+
+    /// The whole chain for a **V#-based** scalar buffer load, from real encoded
+    /// SMEM bytes: **ISA words -> parse -> `shader_capture_vsharp_buffer_loads`
+    /// -> recompile -> assemble -> spirv-val (Vulkan 1.3)**.
+    ///
+    /// This is Grand Theft Auto V's measured first blocker on build 36a9b18:
+    /// `can't recompile: SBufferLoadDwordx8 [Sdst8SvSoffset] s[24:31],
+    /// s[20:23], 0`. The shader declares **no storage buffer at all**
+    /// (`storage_buffers.buffers_num == 0`), so Kyty's descriptor path returned
+    /// `false` and the whole shader died. The V# is plain live-in user data, so
+    /// analysis can decode `base48` and snapshot the dwords instead.
+    #[test]
+    fn full_chain_vsharp_sbuffer_load_x8_bytes_to_validated_spirv() {
+        // s_buffer_load_dwordx8 s[24:31], s[20:23], 0
+        //   b0 = 0x3d << 26 | opcode 0x0b << 18 | sdst 24 << 6 | sbase 10
+        //        (sbase is in SGPR *pairs*: 10 * 2 = s20)
+        //   b1 = soffset NULL (125, i.e. 0x7d) << 25 | offset 0
+        const SBUFFER: [u32; 2] = [0xF42C_060A, 0xFA00_0000];
+        // Twice, so `s_endpgm` is not instruction 0 or 1 (Kyty
+        // `Recompile_SEndpgm_Empty` refuses those).
+        let mut words = Vec::new();
+        words.extend_from_slice(&SBUFFER);
+        words.extend_from_slice(&SBUFFER);
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true)
+            .expect("V#-based s_buffer_load must parse");
+        let inst = code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SBufferLoadDwordx8);
+        assert_eq!(inst.format, F::Sdst8SvSoffset);
+        assert_eq!(
+            (inst.src[0].register_id, inst.src[0].size),
+            (20, 4),
+            "the base is the four-SGPR V# quad s[20:23]"
+        );
+
+        const BASE: u64 = 0x0090_0000;
+        let payload: Vec<u32> = (0..8).map(|i| 0xc0de_0000 + i).collect();
+        let mem = VsharpMem(BASE, payload.clone());
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        for (i, field) in vsharp(BASE, 0, 1024).into_iter().enumerate() {
+            user_sgpr.set(
+                20 + i as u32,
+                field,
+                crate::shader::hw_regs::UserSgprType::Vsharp,
+            );
+        }
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        // No storage buffer is bound — the whole point of the measured failure.
+        assert_eq!(input_info.bind.storage_buffers.buffers_num, 0);
+
+        crate::shader::analysis::shader_capture_vsharp_buffer_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            0,
+            &mut input_info.bind,
+        );
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(0)
+                .expect("the V# base48 resolves and the eight dwords are captured")
+                .values[..8],
+            payload[..]
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("full chain recompiles with no storage buffer bound");
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "full_chain_vsharp_sbuffer_load_x8");
+    }
+
+    /// The combined V# addressing mode end to end: **register soffset AND a
+    /// non-zero immediate offset**, which build 36a9b18 refused in the PARSER
+    /// (`not implemented smem feature: offset != 0 with register soffset on an
+    /// s_buffer_load (V# base)`) — ASTRO.BOT's measured first blocker, so no
+    /// module was produced at all.
+    ///
+    /// The two byte offsets simply sum on top of `V#.base48`; the read here
+    /// lands at `base + 0x20 (soffset s4) + 0x10 (imm)`.
+    #[test]
+    fn full_chain_vsharp_sbuffer_load_combined_offset_to_validated_spirv() {
+        // s_buffer_load_dwordx4 s[24:27], s[20:23], s4 offset:16
+        //   b0 = 0x3d << 26 | opcode 0x0a << 18 | sdst 24 << 6 | sbase 10
+        //   b1 = soffset s4 << 25 | offset 16
+        const SBUFFER: [u32; 2] = [0xF428_060A, 0x0800_0010];
+        let mut words = Vec::new();
+        words.extend_from_slice(&SBUFFER);
+        words.extend_from_slice(&SBUFFER);
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true)
+            .expect("combined V# addressing must parse");
+        assert_eq!(code.get_instructions()[0].format, F::Sdst4SvSoffsetOffset);
+
+        const BASE: u64 = 0x00a0_0000;
+        // Readable window starts at base + 0x30 = the exact resolved address.
+        let payload = vec![0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        let mem = VsharpMem(BASE + 0x30, payload.clone());
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(4, 0x20, crate::shader::hw_regs::UserSgprType::Unknown);
+        for (i, field) in vsharp(BASE, 16, 64).into_iter().enumerate() {
+            user_sgpr.set(
+                20 + i as u32,
+                field,
+                crate::shader::hw_regs::UserSgprType::Vsharp,
+            );
+        }
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        crate::shader::analysis::shader_capture_vsharp_buffer_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            0,
+            &mut input_info.bind,
+        );
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(0)
+                .expect("base48 + soffset + imm resolves")
+                .values[..4],
+            payload[..],
+            "the soffset register and the immediate both contribute bytes"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("full chain recompiles");
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "full_chain_vsharp_sbuffer_combined");
+    }
+
+    /// The V# `num_records`/`stride` fields bound the read; they never enter the
+    /// address (SharpEmu `TryDecodeBufferDescriptor`:
+    /// `sizeBytes = stride == 0 ? word2 : stride * word2`). A load past that
+    /// bound is NOT captured — the recompiler keeps its named refusal rather
+    /// than snapshotting whatever follows the buffer in guest memory.
+    #[test]
+    fn vsharp_sbuffer_load_past_num_records_is_not_captured() {
+        const SBUFFER: [u32; 2] = [0xF42C_060A, 0xFA00_0000]; // x8 s[24:31], s[20:23], 0
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &[SBUFFER[0], SBUFFER[1], S_ENDPGM], &mut code, true)
+            .expect("parse");
+
+        const BASE: u64 = 0x00b0_0000;
+        let mem = VsharpMem(BASE, vec![0xdead_beef; 64]);
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        // stride 0, num_records 16 => size 16 bytes; the x8 load wants 32.
+        for (i, field) in vsharp(BASE, 0, 16).into_iter().enumerate() {
+            user_sgpr.set(
+                20 + i as u32,
+                field,
+                crate::shader::hw_regs::UserSgprType::Vsharp,
+            );
+        }
+
+        let mut bind = crate::shader::resources::ShaderBindResources::default();
+        crate::shader::analysis::shader_capture_vsharp_buffer_loads(
+            &code, &mem, &user_sgpr, 0, &mut bind,
+        );
+        assert!(
+            bind.embedded_constant_loads.find(0).is_none(),
+            "a read past the descriptor's own bound must not be captured"
+        );
+
+        // A V# with a BOUND storage buffer keeps the live descriptor path: this
+        // capture must never shadow it with a translate-time snapshot, or a
+        // per-draw constant buffer would freeze at frame 1.
+        let mut bound = crate::shader::resources::ShaderBindResources::default();
+        bound.storage_buffers.buffers_num = 1;
+        bound.storage_buffers.start_register[0] = 20;
+        let ok_mem = VsharpMem(BASE, vec![0x1234_5678; 64]);
+        let mut ok_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        for (i, field) in vsharp(BASE, 0, 4096).into_iter().enumerate() {
+            ok_sgpr.set(
+                20 + i as u32,
+                field,
+                crate::shader::hw_regs::UserSgprType::Vsharp,
+            );
+        }
+        crate::shader::analysis::shader_capture_vsharp_buffer_loads(
+            &code, &ok_mem, &ok_sgpr, 0, &mut bound,
+        );
+        assert!(
+            bound.embedded_constant_loads.find(0).is_none(),
+            "a bound descriptor must not be shadowed by a baked snapshot"
+        );
+
+        // And the refusal names the instruction, format, width and registers.
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("an unresolved V# load still fails the shader");
+        let text = err.to_string();
+        for want in [
+            "SBufferLoadDwordx8",
+            "Sdst8SvSoffset",
+            "x8 dwords",
+            "s[20:23]",
+        ] {
+            assert!(text.contains(want), "refusal must name {want}, got: {text}");
+        }
+    }
+
+    /// The combined V# addressing mode through the **bound storage buffer**
+    /// path (the other half of `sbuffer_load_dwords`): the descriptor is live,
+    /// so the module must compute `soffset_register + immediate` at runtime
+    /// rather than bake anything. The immediate here (0x50) is outside the
+    /// seeded 0..=32 uint-constant range, which is exactly the case that needs
+    /// `find_constants` to register combined-form immediates as UINT — the
+    /// parser files an `IntegerInlineConstant` as Int only, so without that the
+    /// operand resolves to `unknown_uint_constant` and assembly fails.
+    #[test]
+    fn vsharp_sbuffer_load_combined_offset_adds_at_runtime_through_bound_buffer() {
+        // s_buffer_load_dwordx2 s[24:25], s[8:11], s4 offset:0x50
+        //   b0 = 0x3d << 26 | opcode 0x09 << 18 | sdst 24 << 6 | sbase 4
+        //   b1 = soffset s4 << 25 | offset 0x50
+        const SBUFFER: [u32; 2] = [0xF424_0604, 0x0800_0050];
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        crate::shader::parse::shader_parse(
+            0,
+            &[SBUFFER[0], SBUFFER[1], SBUFFER[0], SBUFFER[1], S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse");
+        assert_eq!(code.get_instructions()[0].format, F::Sdst2SvSoffsetOffset);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 48;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 8;
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("the bound-descriptor path lowers the combined form");
+        assert!(
+            source.contains("OpIAdd %uint %t1_0 %uint_"),
+            "the soffset register and the immediate must be summed at runtime, \
+             not folded: {source}"
+        );
+        assert!(
+            !source.contains("unknown_uint_constant"),
+            "the combined immediate must be a registered uint constant: {source}"
+        );
+        assert!(
+            source.contains("%sbuffer_load_dword_2"),
+            "the width-2 callee is used: {source}"
+        );
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "vsharp_sbuffer_combined_bound_buffer");
+    }
+
+    /// Every `s_buffer_load` width lowers through the bound-descriptor path
+    /// with a plain constant offset, and each reaches its own
+    /// `sbuffer_load_dword_N` callee. Before this batch, x1/x2/x8/x16 each had
+    /// their own copy of the body (only x4 accepted a runtime offset); they now
+    /// share `sbuffer_load_dwords`, so one test covers the set.
+    #[test]
+    fn every_sbuffer_load_width_lowers_through_a_bound_descriptor() {
+        for (opcode, callee) in [
+            (0x08u32, "%sbuffer_load_dword "),
+            (0x09, "%sbuffer_load_dword_2 "),
+            (0x0a, "%sbuffer_load_dword_4 "),
+            (0x0b, "%sbuffer_load_dword_8 "),
+            (0x0c, "%sbuffer_load_dword_16 "),
+        ] {
+            // sdst = s32, sbase field 4 => s[8:11], soffset NULL (125), imm 16.
+            let b0 = 0xF400_0000 | (opcode << 18) | (32 << 6) | 4;
+            let b1 = 0xFA00_0000 | 16;
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Pixel);
+            crate::shader::parse::shader_parse(0, &[b0, b1, b0, b1, S_ENDPGM], &mut code, true)
+                .unwrap_or_else(|e| panic!("opcode {opcode:#04x}: {e}"));
+
+            let mut input_info = ShaderPixelInputInfo::default();
+            input_info.target_output_mode[0] = 4;
+            input_info.bind.push_constant_size = 48;
+            input_info.bind.storage_buffers.buffers_num = 1;
+            input_info.bind.storage_buffers.start_register[0] = 8;
+
+            let source = spirv_generate_source(&code, None, Some(&input_info), None)
+                .unwrap_or_else(|e| panic!("opcode {opcode:#04x} must lower: {e}"));
+            assert!(
+                source.contains(callee),
+                "opcode {opcode:#04x} must call {callee}: {source}"
+            );
+            let module =
+                spirv_run(&source).unwrap_or_else(|e| panic!("opcode {opcode:#04x} assemble: {e}"));
+            spirv_val_ok(&module, "every_sbuffer_load_width");
+        }
+    }
+
+    /// Avatar: Frontiers of Pandora's measured first blocker — a four-channel
+    /// MUBUF typed fetch with index-enable addressing had **no dispatch row at
+    /// all** (`can't recompile (no table entry for
+    /// BufferLoadFormatXyzw/Vdata4VaddrSvSoffsIdxen)`, 2398 shader errors per
+    /// 180 s window). Real MUBUF bytes -> parse -> recompile -> assemble ->
+    /// spirv-val.
+    #[test]
+    fn full_chain_buffer_load_format_xyzw_idxen_to_validated_spirv() {
+        // buffer_load_format_xyzw v[4:7], v0, s[4:7], 0 idxen
+        // (the exact encoding `mubuf_buffer_load_format_xyzw` in parse.rs
+        // asserts decodes to BufferLoadFormatXyzw/Vdata4VaddrSvSoffsIdxen)
+        let words = [
+            0xE00C_2000u32,
+            0x8001_0400,
+            0xE00C_2000,
+            0x8001_0400,
+            S_ENDPGM,
+        ];
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true).expect("parse");
+        let inst = code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferLoadFormatXyzw);
+        assert_eq!(inst.format, F::Vdata4VaddrSvSoffsIdxen);
+        // A dispatch row now exists (build 36a9b18 had none).
+        assert!(
+            recomp_func(inst.type_, inst.format).is_some(),
+            "BufferLoadFormatXyzw/Vdata4VaddrSvSoffsIdxen needs a table row"
+        );
+
+        // The typed helpers index %buf, so one storage buffer must be bound.
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 48;
+        input_info.bind.storage_buffers.buffers_num = 1;
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("full chain recompiles");
+        assert!(
+            source.contains("%tbuffer_load_format_xyzw"),
+            "the four-channel typed helper must be called: {source}"
+        );
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "full_chain_buffer_load_format_xyzw_idxen");
     }
 
     /// The scalar-evaluator acceptance case: real GCN bytes whose scalar load

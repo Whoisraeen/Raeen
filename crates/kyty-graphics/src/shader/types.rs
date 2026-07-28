@@ -714,6 +714,44 @@ pub mod shader_instruction_format {
         Sdst16SbaseSoffsetOffset = format_define(&[DA16, S0A2, S1, S2]),
         Sdst8SvSoffset = format_define(&[DA8, S0A4, S1]),
         SdstSvSoffset = format_define(&[D, S0A4, S1]),
+        // Beyond Kyty: the same combined addressing mode as the
+        // `Sdst*SbaseSoffsetOffset` rows above, but for the `s_buffer_load`
+        // family — the base is a four-SGPR **buffer resource descriptor (V#)**
+        // rather than a 64-bit pointer pair:
+        //
+        //   addr = V#.base48 + zext(SGPR[soffset]) + sext21(imm)
+        //   addr &= !3 ;  dword index = addr >> 2
+        //
+        // Both offset terms are BYTES and they simply SUM; the V# `stride` and
+        // `num_records` fields do NOT enter the address for a scalar buffer
+        // load (they bound it). Established, not guessed:
+        //   * SharpEmu `Gen5ShaderScalarEvaluator.cs::TryExecuteScalarLoad`
+        //     (L1875-1902) runs `s_load*` and `s_buffer_load*` through ONE
+        //     body: only `baseAddress` differs
+        //     (`hasBufferDescriptor ? bufferDescriptor.BaseAddress : sgpr
+        //     pair`), while `byteOffset = immediateOffset + dynamicOffset` and
+        //     `address = (baseAddress + byteOffset) & ~3UL` are shared. Its
+        //     `TryDecodeBufferDescriptor` (L2163) only uses stride/num_records
+        //     for `SizeBytes` (the bound), never for the offset.
+        //   * KytyPS5 `MemoryOps.cpp::DecodeSmem` (L218-256) gives both
+        //     families the identical operand shape and comments that
+        //     "scalar-buffer loads still use the same pair index; their
+        //     descriptor operand consumes four SGPRs from that base".
+        //   * KytyPS5 `spirvEmitterMemory.cpp::EmitBufferAddressFromParts`
+        //     (L212-253) adds `soffset` to the buffer offset as its last term,
+        //     and its `index * stride` term is driven by `idxen` — absent for
+        //     SMEM, so the scalar form reduces to `offset + soffset`.
+        //
+        // Operand shape mirrors the pointer rows: `src[0]` = the V# quad,
+        // `src[1]` = the soffset register, `src[2]` = the immediate byte
+        // offset. Measured as the first blocker of ASTRO.BOT (`parse: not
+        // implemented smem feature: offset != 0 with register soffset on an
+        // s_buffer_load (V# base)`).
+        SdstSvSoffsetOffset = format_define(&[D, S0A4, S1, S2]),
+        Sdst2SvSoffsetOffset = format_define(&[DA2, S0A4, S1, S2]),
+        Sdst4SvSoffsetOffset = format_define(&[DA4, S0A4, S1, S2]),
+        Sdst8SvSoffsetOffset = format_define(&[DA8, S0A4, S1, S2]),
+        Sdst16SvSoffsetOffset = format_define(&[DA16, S0A4, S1, S2]),
         SmaskVsrc0Vsrc1 = format_define(&[DA2, S0, S1]),
         Ssrc0Ssrc1 = format_define(&[S0, S1]),
         SVdstSVsrc0 = format_define(&[D, S0]),
@@ -1118,9 +1156,37 @@ pub fn smem_offset_operand(inst: &ShaderInstruction) -> ShaderOperand {
         | F::Sdst2SbaseSoffsetOffset
         | F::Sdst4SbaseSoffsetOffset
         | F::Sdst8SbaseSoffsetOffset
-        | F::Sdst16SbaseSoffsetOffset => inst.src[2],
+        | F::Sdst16SbaseSoffsetOffset
+        | F::SdstSvSoffsetOffset
+        | F::Sdst2SvSoffsetOffset
+        | F::Sdst4SvSoffsetOffset
+        | F::Sdst8SvSoffsetOffset
+        | F::Sdst16SvSoffsetOffset => inst.src[2],
         _ => inst.src[1],
     }
+}
+
+/// Beyond Kyty: is this a scalar-memory instruction in the **combined**
+/// addressing form, where a register soffset AND a non-zero immediate offset are
+/// both live? Those are the only formats that put the immediate in `src[2]`
+/// (`src[1]` stays the soffset register); every other SMEM/SMRD form carries a
+/// single offset term in `src[1]`.
+#[must_use]
+pub fn smem_has_combined_offset(inst: &ShaderInstruction) -> bool {
+    use shader_instruction_format::Format as F;
+    matches!(
+        inst.format,
+        F::SdstSbaseSoffsetOffset
+            | F::Sdst2SbaseSoffsetOffset
+            | F::Sdst4SbaseSoffsetOffset
+            | F::Sdst8SbaseSoffsetOffset
+            | F::Sdst16SbaseSoffsetOffset
+            | F::SdstSvSoffsetOffset
+            | F::Sdst2SvSoffsetOffset
+            | F::Sdst4SvSoffsetOffset
+            | F::Sdst8SvSoffsetOffset
+            | F::Sdst16SvSoffsetOffset
+    )
 }
 
 /// Beyond Kyty: the soffset operand when it is a **runtime register** rather

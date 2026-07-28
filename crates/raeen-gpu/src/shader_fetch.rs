@@ -1023,6 +1023,22 @@ impl ShaderTranslateCache {
                     mem,
                     &mut cs_info.bind,
                 );
+                // Beyond Kyty: resolve `s_buffer_load*` through a V# that lives
+                // in live-in user data. The VS/PS stages get this from
+                // `shader_capture_runtime_scalar_loads*` (which chains it); the
+                // compute stage never called that entry point, so the pass has
+                // to be invoked directly here. ASTRO.BOT's measured first
+                // blocker is exactly this shape in three COMPUTE shaders
+                // (`offset != 0 with register soffset on an s_buffer_load
+                // (V# base)`); compute user SGPRs are not NGG-rebased, so
+                // `shift = 0`.
+                kyty_graphics::shader::shader_capture_vsharp_buffer_loads(
+                    &code,
+                    mem,
+                    &cs.cs_user_sgpr,
+                    0,
+                    &mut cs_info.bind,
+                );
                 kyty_graphics::shader::shader_measure_constant_buffer_accesses(
                     &code,
                     &mut cs_info.bind,
