@@ -383,12 +383,28 @@ pub fn register(registry: &HleRegistry) {
 
 /// Write the command-buffer struct fields (self/data/size/aux) and set the
 /// write cursor to `write_offset`.
+///
+/// The three load-bearing fields (`self`, `data`, `size`) are always written:
+/// every later call reads `data`/`size` back out of the guest struct. The two
+/// **aux** slots at 0x18/0x20 are different — nothing in Raeen ever reads them,
+/// they exist only to zero what SharpEmu zeroes, and `sizeof(SceAmprCommandBuffer)`
+/// is not established by anything in-tree. Titles declare the buffer as a stack
+/// local (`SceAmprCommandBuffer cb; sceAmprCommandBufferConstructor(&cb, …);`),
+/// so if the real struct ends at 0x18 or 0x20 those speculative stores land on
+/// the caller's frame — every construct and every reset, i.e. once per command
+/// buffer per frame. They are therefore written only where the struct provably
+/// is not a caller frame ([`crate::out_buffer`]); on a frame the two slots are
+/// left alone, which is exactly as informative as zeroing them.
 fn write_cb(ctx: &HleContext, cb: u64, buffer: u64, size: u64, write_offset: u64) -> bool {
     let ok = ctx.mem.write(cb + CB_SELF_OFFSET, &cb.to_le_bytes())
         && ctx.mem.write(cb + CB_DATA_OFFSET, &buffer.to_le_bytes())
         && ctx.mem.write(cb + CB_SIZE_OFFSET, &size.to_le_bytes())
-        && ctx.mem.write(cb + CB_AUX0_OFFSET, &0u64.to_le_bytes())
-        && ctx.mem.write(cb + CB_AUX1_OFFSET, &0u64.to_le_bytes());
+        && ctx.zero_out_object(
+            "libSceAmpr::sceAmprCommandBufferConstructor(aux)",
+            cb + CB_AUX0_OFFSET,
+            (CB_AUX1_OFFSET - CB_AUX0_OFFSET + 8) as usize,
+            0,
+        );
     if ok {
         ctx.kernel.ampr_write_offsets.insert(cb, write_offset);
         // Construct/reset both rewind through here: the appended-record count

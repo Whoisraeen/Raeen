@@ -77,6 +77,7 @@ pub mod libsce_user_service;
 pub mod libsce_video_out;
 pub mod libsce_voice;
 pub mod libsce_web_browser_dialog;
+pub mod out_buffer;
 pub mod posix_sem;
 pub mod pthread_attr;
 pub mod pthread_cond;

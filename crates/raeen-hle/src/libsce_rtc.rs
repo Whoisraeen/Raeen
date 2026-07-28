@@ -38,6 +38,18 @@ const MICROSECONDS_PER_HOUR: u64 = 60 * MICROSECONDS_PER_MINUTE;
 const MICROSECONDS_PER_DAY: u64 = 24 * MICROSECONDS_PER_HOUR;
 const MICROSECONDS_PER_WEEK: u64 = 7 * MICROSECONDS_PER_DAY;
 
+/// `SCE_RTC_STRING_BUFSIZE`: the exact size of the `char *` buffer
+/// `sceRtcFormatRFC3339`/`Precise`/`LocalTime` render into. Callers declare it
+/// as a stack local, so every byte past this is a caller local, a saved
+/// register, or the stack-protector canary.
+const RFC3339_BUFSIZE: usize = 32;
+
+/// The largest legal `timeZoneMinutes` magnitude: ±14 h, RFC 3339's maximum
+/// UTC offset. The value arrives in a guest register, so bounding it is what
+/// keeps the rendered suffix two digits wide (`±hh:mm`) instead of however many
+/// digits an arbitrary `int` needs.
+const MAX_TZ_OFFSET_MINUTES: i32 = 14 * 60;
+
 /// Register the libSceRtc HLE functions.
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceRtc", "sceRtcInit", hle_ok);
@@ -415,12 +427,32 @@ fn hle_set_time_t(ctx: &HleContext, args: &[u64]) -> u64 {
 /// timezone offset in minutes is added to the tick before breakdown and then
 /// rendered as the offset suffix (`Z` when 0); the fractional part is two
 /// digits (centiseconds), always present.
+///
+/// # Buffer safety
+///
+/// The out buffer is exactly [`RFC3339_BUFSIZE`] bytes and is nearly always a
+/// caller **stack local**, so the rendered text — terminator included — must
+/// fit. Two inputs could previously push it past 32 bytes and smash the
+/// caller's frame:
+///
+/// * `timeZoneMinutes` arrives in a guest register and was formatted with
+///   `{:02}`, which is a *minimum* width: `i32::MAX` rendered a
+///   `+35791394:07` suffix (12 chars) and produced a 36-byte string.
+/// * A tick far in the future breaks down to a 5-digit year.
+///
+/// Both are now rejected as argument errors (a real RFC 3339 offset cannot
+/// exceed ±14 h, and the ABI's `SceRtcTick` range ends at year 9999), and the
+/// store itself goes through the out-buffer guard so the ABI size is enforced
+/// even if a future edit reintroduces a longer rendering.
 fn hle_format_rfc3339(ctx: &HleContext, args: &[u64]) -> u64 {
     let out_ptr = args.first().copied().unwrap_or(0);
     let tick_ptr = args.get(1).copied().unwrap_or(0);
     let tz_minutes = args.get(2).copied().unwrap_or(0) as i32;
     if out_ptr == 0 {
         return ERR_INVALID_POINTER;
+    }
+    if !(-MAX_TZ_OFFSET_MINUTES..=MAX_TZ_OFFSET_MINUTES).contains(&tz_minutes) {
+        return ERR_INVALID_ARG;
     }
     let tick = if tick_ptr == 0 {
         current_tick()
@@ -437,6 +469,11 @@ fn hle_format_rfc3339(ctx: &HleContext, args: &[u64]) -> u64 {
         tick.saturating_sub(tz_minutes.unsigned_abs() as u64 * MICROSECONDS_PER_MINUTE)
     };
     let dt = tick_to_datetime(shifted);
+    if dt.year > 9999 {
+        // A 5-digit year would widen the string past the ABI buffer; the
+        // `SceRtcTick` range the ABI documents ends at 9999-12-31.
+        return ERR_INVALID_VALUE;
+    }
     let mut text = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:02}",
         dt.year,
@@ -455,7 +492,14 @@ fn hle_format_rfc3339(ctx: &HleContext, args: &[u64]) -> u64 {
         text.push_str(&format!("{sign}{:02}:{:02}", abs / 60, abs % 60));
     }
     text.push('\0');
-    if !ctx.mem.write(out_ptr, text.as_bytes()) {
+    // Exactly the ABI buffer, never more: the guard clamps (and logs once) if
+    // the rendering ever outgrows `SCE_RTC_STRING_BUFSIZE` again.
+    if !ctx.write_out_struct(
+        "libSceRtc::sceRtcFormatRFC3339",
+        out_ptr,
+        RFC3339_BUFSIZE,
+        text.as_bytes(),
+    ) {
         return ERR_INVALID_POINTER;
     }
     OK
@@ -958,6 +1002,67 @@ mod tests {
         assert!(ctx.mem.write(0x200, b"not-a-date\0"));
         assert_eq!(hle_parse_rfc3339(&ctx, &[0x60, 0x200]), ERR_INVALID_VALUE);
         assert_eq!(hle_parse_rfc3339(&ctx, &[0, 0x200]), ERR_INVALID_POINTER);
+    }
+
+    /// `sceRtcFormatRFC3339` must never write past `SCE_RTC_STRING_BUFSIZE`.
+    ///
+    /// The caller's buffer is a 32-byte **stack local** (`char
+    /// buf[SCE_RTC_STRING_BUFSIZE]`), and `timeZoneMinutes` arrives in a guest
+    /// register. `{:02}` is a MINIMUM field width, so an out-of-range offset
+    /// renders as many digits as it needs: `i32::MAX` minutes formats an
+    /// `+35791394:07` suffix, pushing the string to 36 bytes and dropping 4
+    /// bytes onto the caller's saved registers / `__stack_chk_guard` canary.
+    /// A real offset cannot exceed ±14 h, so an out-of-range one is an
+    /// argument error — never a longer string.
+    #[test]
+    fn rfc3339_format_never_writes_past_the_32_byte_abi_buffer() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let tick = datetime_to_tick(&DateTime {
+            year: 2026,
+            month: 7,
+            day: 17,
+            hour: 20,
+            minute: 36,
+            second: 0,
+            micro: 120_000,
+        });
+        assert!(ctx.mem.write(0x40, &tick.to_le_bytes()));
+        // Poison the 8 bytes immediately after the caller's 32-byte buffer:
+        // these stand in for the canary and the saved registers above it.
+        const CANARY: [u8; 8] = [0xCA; 8];
+        assert!(ctx.mem.write(0x100 + RFC3339_BUFSIZE as u64, &CANARY));
+
+        for tz in [i32::MAX, i32::MIN, 841, -841, 100_000] {
+            assert_eq!(
+                hle_format_rfc3339(&ctx, &[0x100, 0x40, tz as u32 as u64]),
+                ERR_INVALID_ARG,
+                "an out-of-range timeZoneMinutes ({tz}) must be rejected"
+            );
+            let mut after = [0u8; 8];
+            assert!(ctx.mem.read(0x100 + RFC3339_BUFSIZE as u64, &mut after));
+            assert_eq!(
+                after, CANARY,
+                "formatting must not touch a byte past the 32-byte ABI buffer"
+            );
+        }
+
+        // The widest legal offset (±14:00) still fits, terminator included.
+        for tz in [840i32, -840] {
+            assert_eq!(
+                hle_format_rfc3339(&ctx, &[0x100, 0x40, tz as u32 as u64]),
+                OK
+            );
+            let mut buf = [0u8; RFC3339_BUFSIZE];
+            assert!(ctx.mem.read(0x100, &mut buf));
+            assert!(
+                buf.contains(&0),
+                "the rendered string must be NUL-terminated inside the buffer"
+            );
+            let mut after = [0u8; 8];
+            assert!(ctx.mem.read(0x100 + RFC3339_BUFSIZE as u64, &mut after));
+            assert_eq!(after, CANARY);
+        }
     }
 
     #[test]

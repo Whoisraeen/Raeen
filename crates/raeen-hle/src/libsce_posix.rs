@@ -65,16 +65,41 @@ pub fn register(registry: &HleRegistry) {
 }
 
 /// Turn an SCE return (`0` on success, negative error code on failure) into the
-/// POSIX convention (`0` on success, `-1` on failure).
+/// POSIX convention (`0` on success, `-1` **with `errno` set** on failure).
 ///
-/// `errno` is deliberately **not** set: Raeen has no guest `errno` yet, and
-/// inventing one that never updates would be worse than leaving it — a caller
-/// that checks `errno` after a `-1` would read stale memory and misbehave in a
-/// way far harder to trace than a missing symbol. Callers that only test the
-/// return value (the overwhelming majority, and every caller seen so far in the
-/// measured title) get correct behaviour.
-fn sce_to_posix(rc: u64) -> u64 {
-    if (rc as i64) < 0 { (-1i64) as u64 } else { 0 }
+/// `errno` used to be deliberately skipped because Raeen had no guest `errno`.
+/// It does now — `libkernel::set_guest_errno` writes the per-thread
+/// `__error()` slot — so a POSIX-named export leaving it stale is a defect, not
+/// a conservative choice: a caller that tests `-1` and then reads `errno` sees
+/// whatever a previous call left there. An `SCE_KERNEL_ERROR_*` code carries
+/// the errno in its low 16 bits (`0x8002_xxxx`); a bare internal `-errno`
+/// negative is used directly. `EINVAL` backs anything unrecognisable, since a
+/// wrong-but-defined errno still beats a stale one.
+///
+/// Failure is judged on the **32-bit** sign as well as the 64-bit one, because
+/// an `int`-returning export's error reaches the guest in EAX: `0x8002_000E` is
+/// a positive `i64` but a negative `int`.
+fn sce_to_posix(ctx: &HleContext, rc: u64) -> u64 {
+    const EINVAL: i32 = 22;
+    let signed = rc as i64;
+    // An `int`-returning handler's failure reaches the guest in EAX, so the
+    // sign that matters is the **32-bit** one: `SCE_KERNEL_ERROR_EFAULT`
+    // (`0x8002_000E`) is a positive `i64` but a negative `int`. Testing only
+    // `(rc as i64) < 0` — as this did — mapped every `0x8002_xxxx` failure to
+    // POSIX *success*, so `gettimeofday` reported 0 while writing nothing.
+    let narrow = rc as u32 as i32;
+    if signed >= 0 && narrow >= 0 {
+        return 0;
+    }
+    let errno = if rc & 0xffff_0000 == 0x8002_0000 {
+        i32::try_from(rc & 0xffff).unwrap_or(EINVAL)
+    } else if (-4095..0).contains(&signed) {
+        (-signed) as i32
+    } else {
+        EINVAL
+    };
+    libkernel::set_guest_errno(ctx, if errno == 0 { EINVAL } else { errno });
+    (-1i64) as u64
 }
 
 /// POSIX `gettimeofday(struct timeval *tp, struct timezone *tzp)`.
@@ -84,7 +109,7 @@ fn sce_to_posix(rc: u64) -> u64 {
 /// ignored — it is obsolete in POSIX and every real caller passes NULL.
 fn posix_gettimeofday(ctx: &HleContext, args: &[u64]) -> u64 {
     debug!("gettimeofday(tp={:#x})", args.first().copied().unwrap_or(0));
-    sce_to_posix(libkernel::hle_gettimeofday(ctx, args))
+    sce_to_posix(ctx, libkernel::hle_gettimeofday(ctx, args))
 }
 
 /// POSIX `clock_gettime(clockid_t clk_id, struct timespec *tp)`.
@@ -94,13 +119,13 @@ fn posix_clock_gettime(ctx: &HleContext, args: &[u64]) -> u64 {
         args.first().copied().unwrap_or(0),
         args.get(1).copied().unwrap_or(0)
     );
-    sce_to_posix(libkernel::hle_clock_gettime(ctx, args))
+    sce_to_posix(ctx, libkernel::hle_clock_gettime(ctx, args))
 }
 
 /// POSIX `usleep(useconds_t usec)` — really sleeps, bounded, via the libkernel
 /// implementation.
 fn posix_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
-    sce_to_posix(libkernel::hle_usleep(ctx, args))
+    sce_to_posix(ctx, libkernel::hle_usleep(ctx, args))
 }
 
 /// POSIX `sleep(unsigned int seconds)`: really sleeps the host thread,
@@ -220,11 +245,37 @@ mod tests {
     }
 
     #[test]
-    fn sce_to_posix_maps_error_to_minus_one_and_success_to_zero() {
-        assert_eq!(sce_to_posix(0), 0);
-        assert_eq!(sce_to_posix((-9i64) as u64), (-1i64) as u64);
+    fn sce_to_posix_maps_error_to_minus_one_and_sets_errno() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        // A non-zero allocator base: `__error()` treats a zero address as
+        // allocation failure, so a bump allocator starting at 0 has no slot.
+        let alloc = crate::TestAllocator::new(0x100);
+        let ctx = crate::test_ctx(&kernel, &mem, &alloc);
+        let errno_slot = libkernel::hle_error_addr(&ctx, &[]);
+        assert_ne!(errno_slot, 0, "the per-thread errno slot must exist");
+        let read_errno = || {
+            let mut buf = [0u8; 4];
+            assert!(crate::GuestMemory::read(&mem, errno_slot, &mut buf));
+            i32::from_le_bytes(buf)
+        };
+
+        assert_eq!(sce_to_posix(&ctx, 0), 0);
         // A positive SCE return is still success.
-        assert_eq!(sce_to_posix(5), 0);
+        assert_eq!(sce_to_posix(&ctx, 5), 0);
+
+        // A bare internal `-errno`.
+        assert_eq!(sce_to_posix(&ctx, (-9i64) as u64), (-1i64) as u64);
+        assert_eq!(read_errno(), 9, "EBADF must reach the guest errno slot");
+
+        // An `SCE_KERNEL_ERROR_*` code carries errno in its low 16 bits.
+        assert_eq!(sce_to_posix(&ctx, 0x8002_0016), (-1i64) as u64);
+        assert_eq!(read_errno(), 22, "EINVAL from 0x80020016");
+
+        // Anything unrecognisable still leaves a DEFINED errno, never a stale
+        // one — that is the whole point of setting it.
+        assert_eq!(sce_to_posix(&ctx, 0x9999_9999), (-1i64) as u64);
+        assert_eq!(read_errno(), 22);
     }
 
     #[test]

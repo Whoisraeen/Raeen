@@ -15,6 +15,7 @@
 
 use crate::{HleContext, HleRegistry};
 use std::sync::atomic::Ordering;
+use tracing::warn;
 
 const OK: u64 = 0;
 // libSceFiber error codes.
@@ -111,10 +112,28 @@ fn hle_fiber_initialize(ctx: &HleContext, args: &[u64]) -> u64 {
     w32(0x50, 0); // flags (SetFpuRegs is applied by fiber.rs first-run seed)
     w32(0x68, 0xb375_92a0); // magic_end
     // Stamp the stack guard at the base of the context buffer (fiber.cpp:212).
+    //
+    // Bounded by the caller's OWN declared `size_context`: the stamp is 8 bytes
+    // and a context buffer smaller than that (or a zero size paired with a
+    // non-null pointer) would put those bytes past the end of the caller's
+    // buffer — which for a fiber context is very often a stack local, so the
+    // overrun lands on the caller's frame. shadPS4 rejects a context smaller
+    // than `SCE_FIBER_CONTEXT_MINIMUM_SIZE` before stamping for the same
+    // reason; Raeen does not model the minimum, so it simply refuses to write
+    // outside what the caller declared.
     if addr_context != 0 {
-        let _ = ctx
-            .mem
-            .write(addr_context, &0x7149_f2ca_7149_f2cau64.to_le_bytes());
+        const GUARD: u64 = 0x7149_f2ca_7149_f2ca;
+        if size_context >= 8 {
+            let _ = ctx.mem.write(addr_context, &GUARD.to_le_bytes());
+        } else {
+            warn!(
+                addr_context = format_args!("{addr_context:#x}"),
+                size_context,
+                "_sceFiberInitializeImpl: context buffer is smaller than the 8-byte \
+                 stack-guard stamp — skipping the stamp rather than writing past the \
+                 caller's buffer"
+            );
+        }
     }
     OK
 }
@@ -241,5 +260,34 @@ mod tests {
         assert_eq!(hle_start_context_size_check(&ctx, &[0]), FIBER_ERROR_STATE);
         assert_eq!(hle_stop_context_size_check(&ctx, &[]), OK);
         assert_eq!(hle_stop_context_size_check(&ctx, &[]), FIBER_ERROR_STATE);
+    }
+
+    /// The 8-byte context stack-guard stamp is bounded by the caller's own
+    /// `size_context`. A fiber context is usually a stack local, so stamping
+    /// past a too-small buffer writes onto the caller's frame.
+    #[test]
+    fn initialize_stamps_the_context_guard_only_within_the_declared_size() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x200);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        const GUARD: u64 = 0x7149_f2ca_7149_f2ca;
+        // A declared context of 4 bytes cannot hold the 8-byte stamp: the
+        // bytes past it must survive untouched.
+        assert!(crate::GuestMemory::write(&mem, 0x120, &[0xEEu8; 8]));
+        assert_eq!(
+            hle_fiber_initialize(&ctx, &[0x80, 0, 0x1000, 0, 0x120, 4]),
+            OK
+        );
+        let mut seen = [0u8; 8];
+        assert!(crate::GuestMemory::read(&mem, 0x120, &mut seen));
+        assert_eq!(seen, [0xEE; 8], "no stamp fits in a 4-byte context");
+        // A context at least as large as the stamp still gets it.
+        assert_eq!(
+            hle_fiber_initialize(&ctx, &[0x80, 0, 0x1000, 0, 0x120, 0x100]),
+            OK
+        );
+        assert!(crate::GuestMemory::read(&mem, 0x120, &mut seen));
+        assert_eq!(u64::from_le_bytes(seen), GUARD);
     }
 }

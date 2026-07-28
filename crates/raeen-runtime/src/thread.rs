@@ -635,6 +635,18 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     format!("entry={entry:#x}"),
                 );
                 record_host_thread_handle(&process.kernel, handle);
+                // Publish this worker's stack bounds so the HLE out-buffer
+                // guard can tell a caller local from a heap object. A
+                // secondary thread's stack is an ordinary arena allocation,
+                // so nothing about its ADDRESS distinguishes it — without
+                // this registration the guard would have to fall back to a
+                // window around `caller_rsp`, and an oversized out-struct
+                // write deep in a frame would go unnoticed until it landed
+                // on the caller's `__stack_chk_guard` canary.
+                process
+                    .kernel
+                    .guest_thread_stacks
+                    .insert(handle, (stack_base, stack_base + stack_size));
                 // SAFETY: all process resources are Arc-owned by this worker;
                 // entry and stack were validated in the live identity-mapped
                 // arena, and dispatch installs this OS thread's TLS context
@@ -709,6 +721,12 @@ impl GuestThreadScheduler for GuestProcessHandle {
                             true
                         }
                     });
+                // Drop the stack registration BEFORE the stack memory is
+                // returned to the arena: once freed, the same address range can
+                // be handed out as an ordinary heap object, and a stale
+                // registration would make the guard misclassify that object as
+                // a caller frame and refuse to initialize it.
+                process.kernel.guest_thread_stacks.remove(&handle);
                 process.arena.free(tcb_base);
                 process.arena.free(stack_base);
                 release_host_thread_handle(&process.kernel, handle);

@@ -4316,18 +4316,35 @@ fn hle_strftime(ctx: &HleContext, args: &[u64]) -> u64 {
 /// Real `localeconv()`: the C locale's `struct lconv` — `decimal_point` is
 /// ".", every other string empty, and every char field CHAR_MAX ("value not
 /// available in the C locale"), exactly what the C standard specifies.
-/// Layout (LP64): ten char* fields at 0..80, then the eight char fields at
-/// 80..88; the two strings live right after the struct in the same guest
-/// allocation.
+///
+/// Layout (LP64): **ten** `char *` fields at 0..80, then **fourteen** `char`
+/// fields at 80..94 — `int_frac_digits`, `frac_digits`, `p_cs_precedes`,
+/// `p_sep_by_space`, `n_cs_precedes`, `n_sep_by_space`, `p_sign_posn`,
+/// `n_sign_posn`, then the six `int_*` variants C99 added
+/// (`int_p_cs_precedes`, `int_n_cs_precedes`, `int_p_sep_by_space`,
+/// `int_n_sep_by_space`, `int_p_sign_posn`, `int_n_sign_posn`) — padded to 96.
+/// The two strings live **after** the struct, never inside it: an earlier
+/// version treated the char block as eight fields ending at 88 and put `"."`
+/// at offset 88, which is `int_p_cs_precedes`. A guest reading that field saw
+/// `'.'` (46) instead of `CHAR_MAX`, and a guest *writing* any `int_*` field
+/// (they are the caller's to modify in a copied `lconv`) corrupted the
+/// `decimal_point` string the struct still pointed at.
 fn hle_localeconv(ctx: &HleContext, _args: &[u64]) -> u64 {
-    const LCONV_BYTES: u64 = 96;
-    let Some(base) = ctx.alloc.alloc(LCONV_BYTES, 8) else {
+    /// `sizeof(struct lconv)`: 94 bytes of fields, padded to the 8-byte
+    /// alignment its leading pointers require.
+    const LCONV_BYTES: usize = 96;
+    /// `"." NUL` + `"" NUL`.
+    const STRING_BYTES: usize = 3;
+    let Some(base) = ctx.alloc.alloc((LCONV_BYTES + STRING_BYTES) as u64, 8) else {
         warn!("localeconv: guest arena exhausted for struct lconv");
         return 0;
     };
-    let dot = base + 88;
-    let empty = base + 90;
-    let mut bytes = vec![0u8; LCONV_BYTES as usize];
+    // Both strings sit past the end of the struct: `"."` then the shared empty
+    // string (the NUL terminating `"."` is not reused, so a guest that walks
+    // `empty` backwards cannot reach `'.'`).
+    let dot = base + LCONV_BYTES as u64;
+    let empty = dot + 2;
+    let mut bytes = vec![0u8; LCONV_BYTES + STRING_BYTES];
     for (i, ptr) in [
         dot, empty, empty, empty, empty, empty, empty, empty, empty, empty,
     ]
@@ -4336,10 +4353,11 @@ fn hle_localeconv(ctx: &HleContext, _args: &[u64]) -> u64 {
     {
         bytes[i * 8..i * 8 + 8].copy_from_slice(&ptr.to_le_bytes());
     }
-    for byte in &mut bytes[80..88] {
+    // All fourteen char fields, `int_*` variants included.
+    for byte in &mut bytes[80..94] {
         *byte = 0x7F; // CHAR_MAX: "not available in the C locale"
     }
-    bytes[88] = b'.';
+    bytes[LCONV_BYTES] = b'.';
     if !ctx.mem.write(base, &bytes) {
         warn!("localeconv: guest buffer {base:#x} not writable");
         ctx.alloc.free(base);
@@ -6354,6 +6372,22 @@ mod tests {
         let mut frac = [0u8; 1];
         assert!(mem.read(lconv + 81, &mut frac));
         assert_eq!(frac[0], 0x7F, "frac_digits is CHAR_MAX in the C locale");
+
+        // All FOURTEEN char fields are CHAR_MAX — the six C99 `int_*` variants
+        // at 88..94 included. They used to hold the `"."` string, so
+        // `int_p_cs_precedes` read back as `'.'` and a guest writing those
+        // fields corrupted `decimal_point`.
+        let mut chars = [0u8; 14];
+        assert!(mem.read(lconv + 80, &mut chars));
+        assert!(
+            chars.iter().all(|&b| b == 0x7F),
+            "lconv's char block is 80..94, not 80..88: {chars:?}"
+        );
+        // The strings therefore live past the struct, not inside it.
+        assert!(
+            u64::from_le_bytes(ptr) >= lconv + 96,
+            "lconv strings must sit after sizeof(struct lconv)"
+        );
     }
 
     /// Every name in the NID-fill batch resolves under both provider views.
