@@ -2197,7 +2197,8 @@ mod tests {
             local[1],
             local[2],
         ];
-        module.resize(words.max(module.len()), (1 << 16) | 0);
+        // Pad with OpNop: word count 1 in the high half, opcode 0 in the low.
+        module.resize(words.max(module.len()), 1 << 16);
         module
     }
 

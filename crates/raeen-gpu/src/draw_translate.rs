@@ -1698,6 +1698,38 @@ fn texture_view_kind(ty: u8) -> Result<(bool, bool, bool), DrawError> {
 pub static MIP_VIEW_BASE_LEVEL_IGNORED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Count of `decode_texture` calls whose T# carries a mip chain (`MAX_MIP > 0`).
+///
+/// Before SharpEmu #470 this was the SILENT failure: `base_level == 0` with
+/// `MAX_MIP > 0` took the bytes at the descriptor base, which on GFX10 is the
+/// mip TAIL, not mip 0 — no warning fired at all. Every one of these now goes
+/// through [`crate::texture::tiling::base_mip_placement`].
+pub static MIP_CHAIN_TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count of mip-chain textures whose mip 0 could NOT be located — an unsupported
+/// swizzle mode/element size, or an in-tail sub-rectangle that did not fit its
+/// block. These still read at the descriptor base (the pre-#470 bytes) and are
+/// the ones to look at when a mipped texture renders scrambled.
+pub static MIP_CHAIN_PLACEMENT_UNKNOWN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Mip levels the ALLOCATION carries, from `MAX_MIP` (RDNA2 table 45) clamped to
+/// the most an extent of this size can hold.
+///
+/// `MAX_MIP` describes the resource; `BASE_LEVEL`/`LAST_LEVEL` describe one
+/// view of it. Sizing the chain from a view is wrong — another descriptor for
+/// the same allocation may expose a different subset. The clamp is what keeps a
+/// malformed or stale `MAX_MIP` (all-ones descriptors do exist) from computing a
+/// chain offset far past the real allocation.
+///
+/// Ported from SharpEmu `TextureDescriptor.ResourceMipLevels` /
+/// `GetMaximumMipLevels` (#470, commit 6ee445f, GPL-2.0-or-later).
+fn resource_mip_levels(max_mip: u8, width: u32, height: u32, depth: u32) -> u32 {
+    let largest = width.max(height).max(depth).max(1);
+    let maximum = 1 + largest.ilog2();
+    (u32::from(max_mip) + 1).clamp(1, maximum)
+}
+
 /// Name the miss when a T# asks for a view starting at a non-zero mip.
 ///
 /// `ShaderTextureResource::base_level()` is decoded but **consumed nowhere**:
@@ -1709,49 +1741,85 @@ pub static MIP_VIEW_BASE_LEVEL_IGNORED: std::sync::atomic::AtomicU64 =
 ///
 /// ## Why this counts instead of correcting
 ///
-/// Correcting it means locating mip N inside the guest mip chain.
-/// [`crate::texture::tiling::tiled_byte_count_for_mode`] can size an individual
-/// level, so a per-level sum gets close — but real GFX10 chains pack the small
-/// levels into a **mip tail** where that sum is wrong, and the tail threshold is
-/// not derivable from anything in this tree. Emitting a guessed offset would
-/// sample unrelated memory: strictly worse than the current wrong-but-consistent
-/// mip 0, and worse than saying so.
+/// Correcting it means locating mip N inside the guest mip chain. Since SharpEmu
+/// #470 this tree *can* locate mip **0** in a chain
+/// ([`crate::texture::tiling::base_mip_placement`]), but an arbitrary level N
+/// also needs the per-level tail slot, which that port does not carry. Emitting a
+/// guessed offset would sample unrelated memory: strictly worse than a
+/// wrong-but-consistent mip 0, and worse than saying so.
 ///
 /// It is also **unmeasured**: no tracked title is known to set `base_level > 0`.
 /// This counter is how that gets decided — run a title, read the count, and
 /// implement the addressing only if it fires. Same discipline the tile-mode
 /// refusal diagnostic established (port gated on measurement, not assumption).
 ///
-/// Rate-limited per `(base_level, last_level)` pair so a hot draw loop cannot
-/// flood the log; the counter still increments on every call.
+/// ## Also fires for `MAX_MIP > 0`
+///
+/// `base_level == 0` with `MAX_MIP > 0` — an ordinary view of a mipped texture —
+/// is the COMMON case and used to be completely silent while taking the mip
+/// tail's bytes as if they were mip 0. It now warns and counts
+/// ([`MIP_CHAIN_TEXTURES`]) whether or not the relocation succeeds, so a title
+/// log says how many mipped textures a frame binds; the tiled decode then counts
+/// the ones it could not place ([`MIP_CHAIN_PLACEMENT_UNKNOWN`]).
+///
+/// Rate-limited per `(base_level, last_level, max_mip)` triple so a hot draw loop
+/// cannot flood the log; the counters still increment on every call.
 fn note_mip_view_base_level(t: &kyty_graphics::shader::ShaderTextureResource) {
     let base_level = t.base_level();
-    if base_level == 0 {
+    let max_mip = t.max_mip();
+    if base_level == 0 && max_mip == 0 {
         return;
     }
-    MIP_VIEW_BASE_LEVEL_IGNORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if base_level > 0 {
+        MIP_VIEW_BASE_LEVEL_IGNORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if max_mip > 0 {
+        MIP_CHAIN_TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     use std::collections::HashSet;
     use std::sync::Mutex;
-    static WARNED: Mutex<Option<HashSet<(u8, u8)>>> = Mutex::new(None);
-    let key = (base_level, t.last_level());
+    static WARNED: Mutex<Option<HashSet<(u8, u8, u8)>>> = Mutex::new(None);
+    let key = (base_level, t.last_level(), max_mip);
     let first = WARNED
         .lock()
         .map(|mut set| set.get_or_insert_with(HashSet::new).insert(key))
         .unwrap_or(false);
-    if first {
+    if !first {
+        return;
+    }
+    let width = u32::from(t.width5()) + 1;
+    let height = u32::from(t.height5()) + 1;
+    if base_level > 0 {
         tracing::warn!(
             base_level,
             last_level = t.last_level(),
+            max_mip,
             base = format_args!("{:#x}", t.base40()),
-            width = u32::from(t.width5()) + 1,
-            height = u32::from(t.height5()) + 1,
+            width,
+            height,
             tile_mode = t.tile_mode(),
-            "T# selects a non-zero mip as its view base, but mip addressing is \
-             NOT implemented — serving mip 0 at mip 0's extent, so this draw \
-             samples the WRONG LOD (degrade, not refuse). Further hits on this \
-             (base_level, last_level) pair are silent; see \
+            "T# selects a non-zero mip as its view base, but per-level mip \
+             addressing is NOT implemented — serving mip 0 at mip 0's extent, so \
+             this draw samples the WRONG LOD (degrade, not refuse). Further hits \
+             on this (base_level, last_level, max_mip) triple are silent; see \
              MIP_VIEW_BASE_LEVEL_IGNORED for the total."
+        );
+    } else {
+        tracing::warn!(
+            max_mip,
+            last_level = t.last_level(),
+            base = format_args!("{:#x}", t.base40()),
+            width,
+            height,
+            tile_mode = t.tile_mode(),
+            resource_levels = resource_mip_levels(max_mip, width, height, 1),
+            "T# carries a mip chain (MAX_MIP > 0). A GFX10 chain is stored \
+             SMALLEST-FIRST, so mip 0 is at the END of the allocation, not at the \
+             descriptor base — the tiled decode relocates the read (SharpEmu \
+             #470). Further hits on this (base_level, last_level, max_mip) triple \
+             are silent; see MIP_CHAIN_TEXTURES and \
+             MIP_CHAIN_PLACEMENT_UNKNOWN for the totals."
         );
     }
 }
@@ -1932,6 +2000,43 @@ fn decode_texture(
             };
             let face_tiled = face_tiled as usize;
             let face_linear = (elements_wide * elements_high * bpp) as usize;
+            // Mip 0 is NOT at the descriptor base for a mipped surface: a GFX10
+            // AddrLib chain is stored SMALLEST-FIRST — the small levels pack into
+            // the first swizzle block (the mip tail), the rest follow in
+            // decreasing size, and mip 0 lands at the END of the allocation. So
+            // reading `base40()` for a MAX_MIP > 0 texture decodes the TAIL at
+            // mip 0's extent (SharpEmu #470 saw scrambled menu text and repeated
+            // icons). `None` = nothing to relocate (single level, or a placement
+            // this port cannot compute) — then keep the base and count it.
+            let mip_placement = if crate::diagnostics::gpu_env().no_mip_chain {
+                None
+            } else {
+                crate::texture::tiling::base_mip_placement(
+                    mode,
+                    elements_wide,
+                    elements_high,
+                    bpp_log2,
+                    resource_mip_levels(t.max_mip(), width, height, depth),
+                )
+            };
+            if t.max_mip() > 0 && mip_placement.is_none() {
+                MIP_CHAIN_PLACEMENT_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let mip0_offset = mip_placement.map_or(0, |p| p.byte_offset);
+            // A mipped array layer strides by its WHOLE chain, not by mip 0's
+            // block grid.
+            let layer_stride = mip_placement
+                .and_then(|p| usize::try_from(p.chain_slice_bytes).ok())
+                .filter(|stride| *stride >= face_tiled)
+                .unwrap_or(face_tiled);
+            let mip_tail_element = mip_placement.and_then(|p| p.tail_element);
+            // Bytes this decode depends on, measured from the descriptor base —
+            // the cache key stays the allocation base while the content hash
+            // covers everything up to and including mip 0. Identical to
+            // `face_tiled * layers` whenever there is no chain to relocate.
+            let source_span = |layers: u32| {
+                mip0_offset + layer_stride as u64 * u64::from(layers - 1) + face_tiled as u64
+            };
             // Array-upload OOM guard (SharpEmu #476 / 224a36e): if a previous
             // draw's multi-layer read of this address overran its allocation,
             // never retry — drop to a single base layer up front. layers == 1
@@ -1942,7 +2047,7 @@ fn decode_texture(
             let probe = |layers: u32| {
                 texture_cache_probe(
                     t.base40(),
-                    face_tiled as u64 * u64::from(layers),
+                    source_span(layers),
                     width,
                     height,
                     layers,
@@ -1957,8 +2062,33 @@ fn decode_texture(
             if let Some(upload) = hit {
                 return Ok(upload);
             }
-            let src_len = face_tiled as u64 * u64::from(layers);
-            let tiled = match read_guest_bytes_unaligned(t.base40(), src_len, "texture") {
+            // One layer's linear elements from that layer's tiled bytes. Mip 0 is
+            // either a block grid of its own, or — when the whole chain fits the
+            // tail block — a sub-rectangle of that one detiled block.
+            let detile_face = |src: &[u8]| match mip_tail_element {
+                Some((tail_x, tail_y)) => crate::texture::tiling::detile_mip_tail_base(
+                    mode,
+                    src,
+                    elements_wide,
+                    elements_high,
+                    bpp_log2,
+                    tail_x,
+                    tail_y,
+                ),
+                None => crate::texture::tiling::detile_64kb(
+                    mode,
+                    src,
+                    elements_wide,
+                    elements_high,
+                    bpp_log2,
+                ),
+            };
+            // Mip 0 is `mip0_offset` past the base, and each array layer strides
+            // by its whole chain. Both are 0 / `face_tiled` for an unmipped
+            // surface, so this is the previous single contiguous read verbatim.
+            let read_base = t.base40() + mip0_offset;
+            let src_len = layer_stride as u64 * u64::from(layers - 1) + face_tiled as u64;
+            let tiled = match read_guest_bytes_unaligned(read_base, src_len, "texture") {
                 Ok(tiled) => tiled,
                 // A CUBE view REQUIRES a multiple-of-6 layer_count; the array
                 // "drop to one base layer" path below would recreate the very
@@ -1968,16 +2098,18 @@ fn decode_texture(
                 Err(_) if cube => {
                     let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
                     for layer in 0..layers as usize {
-                        let face_addr = t.base40() + (layer * face_tiled) as u64;
+                        let face_addr = read_base + (layer * layer_stride) as u64;
                         if let Ok(single) =
                             read_guest_bytes_unaligned(face_addr, face_tiled as u64, "texture")
                         {
-                            let face = crate::texture::tiling::detile_64kb(
-                                mode, &single, width, height, bpp_log2,
-                            )
-                            .expect("table-checked above");
-                            pixels[layer * face_linear..(layer + 1) * face_linear]
-                                .copy_from_slice(&face);
+                            // Element extents, not texel ones: a BC face's linear
+                            // size is `elements_wide * elements_high * bpp`, and
+                            // detiling at texel extents would produce a 16x
+                            // longer buffer than the destination slice.
+                            if let Some(face) = detile_face(&single) {
+                                pixels[layer * face_linear..(layer + 1) * face_linear]
+                                    .copy_from_slice(&face);
+                            }
                         }
                     }
                     return Ok(texture_upload_from(
@@ -1995,10 +2127,15 @@ fn decode_texture(
                         return Ok(upload);
                     }
                     let single =
-                        read_guest_bytes_unaligned(t.base40(), face_tiled as u64, "texture")?;
-                    let face =
-                        crate::texture::tiling::detile_64kb(mode, &single, width, height, bpp_log2)
-                            .expect("table-checked above");
+                        read_guest_bytes_unaligned(read_base, face_tiled as u64, "texture")?;
+                    let Some(face) = detile_face(&single) else {
+                        return Err(err(format!(
+                            "texture tile mode {mode} mip-0 detile failed for a single layer \
+                             (base={:#x} {width}x{height} format={})",
+                            t.base40(),
+                            t.format()
+                        )));
+                    };
                     let mut pixels = alloc_zeroed(face_linear, "texture decode")?;
                     pixels[..face_linear].copy_from_slice(&face);
                     return Ok(texture_upload_from(
@@ -2021,15 +2158,16 @@ fn decode_texture(
             };
             let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
             for layer in 0..layers as usize {
-                let src = &tiled[layer * face_tiled..(layer + 1) * face_tiled];
-                let face = crate::texture::tiling::detile_64kb(
-                    mode,
-                    src,
-                    elements_wide,
-                    elements_high,
-                    bpp_log2,
-                )
-                .expect("mode and element size both checked above");
+                let start = layer * layer_stride;
+                let src = &tiled[start..start + face_tiled];
+                let Some(face) = detile_face(src) else {
+                    return Err(err(format!(
+                        "texture tile mode {mode} mip-0 detile failed for layer {layer} \
+                         (base={:#x} {width}x{height} format={})",
+                        t.base40(),
+                        t.format()
+                    )));
+                };
                 pixels[layer * face_linear..(layer + 1) * face_linear].copy_from_slice(&face);
             }
             (pixels, hash)
@@ -7442,6 +7580,122 @@ mod tests {
             MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed),
             before,
             "base_level 0 is the ordinary case and must not be counted"
+        );
+    }
+
+    /// `MAX_MIP + 1` is the ALLOCATION's level count, clamped to the most an
+    /// extent of that size can carry — never taken from a view's LAST_LEVEL.
+    #[test]
+    fn resource_mip_levels_clamps_max_mip_to_the_extent() {
+        assert_eq!(
+            resource_mip_levels(0, 512, 512, 1),
+            1,
+            "MAX_MIP 0 = 1 level"
+        );
+        assert_eq!(resource_mip_levels(9, 512, 512, 1), 10);
+        assert_eq!(
+            resource_mip_levels(15, 64, 64, 1),
+            7,
+            "a 64x64 surface holds 7 levels; a stale/all-ones MAX_MIP must not \
+             compute a chain offset past the real allocation"
+        );
+        assert_eq!(
+            resource_mip_levels(9, 1, 1, 1),
+            1,
+            "a 1x1 surface has exactly one level"
+        );
+        assert_eq!(
+            resource_mip_levels(9, 8, 4, 32),
+            6,
+            "a volume's largest dimension can be its depth"
+        );
+    }
+
+    /// SharpEmu #470: a GFX10 mip chain is stored SMALLEST-FIRST, so mip 0 lives
+    /// at the END of the allocation. Reading the descriptor base for a mipped
+    /// texture decodes the mip TAIL at mip 0's extent — measured by SharpEmu as
+    /// scrambled menu text and repeated icons.
+    ///
+    /// The fixture is exact: a 128x128 RGBA8 `SW_64KB_S` surface with 4 levels
+    /// has a 128x64 tail extent, so mip 0 (128x128) and nothing else sits outside
+    /// the tail. Its chain is therefore `[tail 64 KiB][mip 0 64 KiB]` and mip 0
+    /// begins 65536 B past the base. The tail half of the blob is filled with a
+    /// DIFFERENT pattern, so serving it would fail loudly.
+    #[test]
+    fn mip_chain_reads_mip_zero_from_the_end_of_the_allocation() {
+        use std::sync::atomic::Ordering;
+
+        let (w, h, bpp_log2) = (128u32, 128u32, 2u32);
+        let mip0: Vec<u8> = (0..(w * h) as usize * 4).map(|i| (i % 251) as u8).collect();
+        let mip0_tiled = crate::texture::tiling::tile_64kb_s(&mip0, w, h, bpp_log2);
+        assert_eq!(mip0_tiled.len(), 65_536, "one 64 KiB swizzle block");
+
+        let placement = crate::texture::tiling::base_mip_placement(9, w, h, bpp_log2, 4)
+            .expect("128x128 with 4 levels places");
+        assert_eq!(placement.byte_offset, 65_536);
+        assert_eq!(placement.tail_element, None);
+
+        // [mip tail 64 KiB, filled 0xA5][mip 0, tiled], 256-aligned for base40().
+        let chain_len = placement.byte_offset as usize + mip0_tiled.len();
+        let mut blob = vec![0xA5u8; chain_len + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off + placement.byte_offset as usize..off + chain_len].copy_from_slice(&mip0_tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 10 << 20; // unified format 10 = 8_8_8_8 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 9 << 20; // SWIZZLE_MODE 9 = SW_64KB_S
+        t.fields[3] |= 9 << 28; // type = Texture2D
+        t.fields[3] |= 3 << 16; // last_level = 3 (a view of the whole chain)
+        t.fields[5] |= 3 << 4; // MAX_MIP = 3 -> a 4-level ALLOCATION
+        assert_eq!(t.max_mip(), 3, "the fixture must really set MAX_MIP");
+        assert_eq!(t.base_level(), 0, "the COMMON case: an ordinary mip-0 view");
+
+        let ranges = [(blob.as_ptr() as u64, blob.len())];
+        let before_chain = MIP_CHAIN_TEXTURES.load(Ordering::Relaxed);
+        let before_unknown = MIP_CHAIN_PLACEMENT_UNKNOWN.load(Ordering::Relaxed);
+        let before_view = MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed);
+        let tex = crate::guest_mem::with_test_ranges(&ranges, || decode_texture(&t))
+            .expect("a mipped T# must decode");
+        assert_eq!(
+            tex.pixels, mip0,
+            "mip 0 must come from the END of the chain, not the descriptor base"
+        );
+        assert_eq!(
+            MIP_CHAIN_TEXTURES.load(Ordering::Relaxed),
+            before_chain + 1,
+            "MAX_MIP > 0 must be counted even with base_level == 0 — that silent \
+             case is exactly what took the tail's bytes before #470"
+        );
+        assert_eq!(
+            MIP_CHAIN_PLACEMENT_UNKNOWN.load(Ordering::Relaxed),
+            before_unknown,
+            "a placed chain is not an unknown placement"
+        );
+        assert_eq!(
+            MIP_VIEW_BASE_LEVEL_IGNORED.load(Ordering::Relaxed),
+            before_view,
+            "base_level is still 0: the view counter must not move"
+        );
+
+        // The same bytes with MAX_MIP = 0 is the pre-#470 read: it serves the
+        // 0xA5 tail block, which must NOT be what a mipped descriptor gets.
+        let mut unmipped = t;
+        unmipped.fields[5] = 0;
+        let tail = crate::guest_mem::with_test_ranges(&ranges, || decode_texture(&unmipped))
+            .expect("an unmipped T# still decodes at the base");
+        assert_ne!(
+            tail.pixels, mip0,
+            "reading at the descriptor base must be the WRONG bytes — otherwise \
+             the fixture does not reproduce the bug being fixed"
+        );
+        assert!(
+            tail.pixels.iter().all(|&byte| byte == 0xA5),
+            "the pre-fix read is the tail block verbatim"
         );
     }
 

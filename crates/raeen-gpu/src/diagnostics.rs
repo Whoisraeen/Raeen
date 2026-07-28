@@ -18,6 +18,7 @@ pub(crate) struct GpuEnv {
     pub no_defer: bool,
     pub no_defer_compute: bool,
     pub no_depth: bool,
+    pub no_mip_chain: bool,
     pub no_stencil: bool,
     pub no_tex_cache: bool,
     pub time_compute: bool,
@@ -49,6 +50,12 @@ impl GpuEnv {
             no_defer: on("RAEEN_NO_DEFER"),
             no_defer_compute: on("RAEEN_NO_DEFER_COMPUTE"),
             no_depth: on("RAEEN_NO_DEPTH"),
+            // A GFX10 mip chain is stored smallest-first, so mip 0 sits at the
+            // END of the allocation; `decode_texture` relocates its tiled read
+            // accordingly (SharpEmu #470). `RAEEN_NO_MIP_CHAIN=1` restores the
+            // read-at-descriptor-base behaviour for A/B bisecting a title whose
+            // MAX_MIP field turns out not to describe its allocation.
+            no_mip_chain: on("RAEEN_NO_MIP_CHAIN"),
             no_stencil: on("RAEEN_NO_STENCIL"),
             // Persistent sampled textures are the title-path default. A
             // 2026-07-25 Minecraft A/B after the compute-to-graphics

@@ -877,6 +877,224 @@ pub fn tile_64kb_into(
     true
 }
 
+// ---------------------------------------------------------------------------
+// GFX10 mip chains: mip 0 is NOT at the descriptor base.
+// ---------------------------------------------------------------------------
+
+/// Block extent in ELEMENTS for a swizzle mode at `bpp_log2` bytes/element, or
+/// `None` for a mode/element size with no ported equation. 64 KiB at 4 B/el →
+/// 128x128; the 4 KiB Standard block at 4 B/el → 32x32.
+///
+/// Ported from SharpEmu `GnmTiling.TryGetBlockElementDimensions`
+/// (`reference/sharpemu/src/SharpEmu.Libs/Agc/GnmTiling.cs`, GPL-2.0-or-later).
+pub fn block_element_dimensions(mode: u8, bpp_log2: u32) -> Option<(u32, u32)> {
+    let (_, block_bytes) = swizzle_table(mode)?;
+    if !bpp_log2_is_supported(bpp_log2) {
+        return None;
+    }
+    let dims = block_dimensions(block_bytes as u32, bpp_log2);
+    (dims.0 != 0 && dims.1 != 0).then_some(dims)
+}
+
+/// Where mip 0 of a GFX10 mip chain sits relative to the T#'s descriptor base.
+///
+/// AddrLib stores a GFX10 chain **smallest-first**
+/// (`Gfx10Lib::ComputeSurfaceInfoMacroTiled`): the small levels pack together
+/// into the *mip tail* occupying the FIRST swizzle block, the remaining levels
+/// follow in DECREASING size, and **mip 0 lands at the end of the allocation**.
+/// Reading a mipped surface at the descriptor base therefore decodes the mip
+/// tail as if it were a full-extent mip 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseMipPlacement {
+    /// Bytes from the descriptor base to mip 0's own block grid. Zero in the
+    /// [`Self::tail_element`] case (mip 0 lives inside the first block).
+    pub byte_offset: u64,
+    /// Bytes one array slice's WHOLE chain occupies — the array-layer stride,
+    /// which for a mipped surface is larger than mip 0's own block grid.
+    pub chain_slice_bytes: u64,
+    /// `Some((x, y))` when the entire chain fits inside the mip tail block: mip
+    /// 0 is then the sub-rectangle at that element coordinate of the *detiled*
+    /// block, not a block grid of its own.
+    pub tail_element: Option<(u32, u32)>,
+}
+
+/// Locate mip 0 in a GFX10 mip chain. `None` means "no relocation to apply":
+/// a single-level resource, an unsupported swizzle mode/element size, or a
+/// tail sub-rectangle that failed its bounds check (the caller then keeps the
+/// descriptor base, i.e. today's behaviour, and says so).
+///
+/// `resource_mip_levels` is the ALLOCATION's level count (`MAX_MIP + 1`), not a
+/// view's `BASE_LEVEL..=LAST_LEVEL` range.
+///
+/// Ported from SharpEmu `GnmTiling.TryGetBaseMipPlacement` (#470, commit
+/// 6ee445f, GPL-2.0-or-later).
+pub fn base_mip_placement(
+    mode: u8,
+    elements_wide: u32,
+    elements_high: u32,
+    bpp_log2: u32,
+    resource_mip_levels: u32,
+) -> Option<BaseMipPlacement> {
+    if resource_mip_levels <= 1 || elements_wide == 0 || elements_high == 0 {
+        return None;
+    }
+    let (_, block_bytes) = swizzle_table(mode)?;
+    if !bpp_log2_is_supported(bpp_log2) {
+        return None;
+    }
+    let (block_width, block_height) = block_dimensions(block_bytes as u32, bpp_log2);
+    let block_size_log2 = block_bytes.trailing_zeros();
+    if block_width == 0 || block_height == 0 || block_size_log2 < 8 {
+        return None;
+    }
+
+    // AddrLib caps a chain at 16 levels; `mip_sizes` is sized to match.
+    let mip_levels = resource_mip_levels.min(16);
+    // Levels the tail block can absorb (AddrLib `GetMipTailInfo`): a 256 B block
+    // has no tail, 512 B..2 KiB blocks scale with the block, and 4 KiB/64 KiB
+    // blocks take `log2(block) - 4` (8 and 12 levels).
+    let max_mips_in_tail = if block_size_log2 <= 8 {
+        0
+    } else if block_size_log2 <= 11 {
+        1 + (1u32 << (block_size_log2 - 9))
+    } else {
+        block_size_log2 - 4
+    };
+    // The tail starts at half a block: an odd `log2(block)` splits the extra bit
+    // into X, an even one into Y.
+    let (tail_width, tail_height) = if block_size_log2 & 1 != 0 {
+        (block_width >> 1, block_height)
+    } else {
+        (block_width, block_height >> 1)
+    };
+
+    let mut first_mip_in_tail = mip_levels;
+    let mut mip_sizes = [0u64; 16];
+    for i in 0..mip_levels {
+        let mip_width = (elements_wide >> i).max(1);
+        let mip_height = (elements_high >> i).max(1);
+        if max_mips_in_tail > 0
+            && mip_width <= tail_width
+            && mip_height <= tail_height
+            && mip_levels - i <= max_mips_in_tail
+        {
+            first_mip_in_tail = i;
+            break;
+        }
+        // Every non-tail level owns whole blocks in both directions.
+        let aligned_width = u64::from(mip_width.div_ceil(block_width) * block_width);
+        let aligned_height = u64::from(mip_height.div_ceil(block_height) * block_height);
+        mip_sizes[i as usize] = aligned_width * aligned_height * (1u64 << bpp_log2);
+    }
+
+    if first_mip_in_tail == 0 {
+        // The whole chain — mip 0 included — lives in the tail block. Mip 0 is a
+        // sub-rectangle of the detiled block at the tail slot's micro-block
+        // coordinate, recovered from the slot's Morton-scattered offset.
+        let (tail_x, tail_y) = mip_tail_element(max_mips_in_tail, block_size_log2, bpp_log2)?;
+        if tail_x + elements_wide > block_width || tail_y + elements_high > block_height {
+            return None;
+        }
+        return Some(BaseMipPlacement {
+            byte_offset: 0,
+            chain_slice_bytes: block_bytes,
+            tail_element: Some((tail_x, tail_y)),
+        });
+    }
+
+    // Smallest-first: [tail block][mip firstMipInTail-1] … [mip 1][mip 0].
+    let mut byte_offset = if first_mip_in_tail < mip_levels {
+        block_bytes
+    } else {
+        0
+    };
+    let mut chain_slice_bytes = byte_offset;
+    for i in (1..first_mip_in_tail).rev() {
+        byte_offset += mip_sizes[i as usize];
+    }
+    for i in 0..first_mip_in_tail {
+        chain_slice_bytes += mip_sizes[i as usize];
+    }
+    Some(BaseMipPlacement {
+        byte_offset,
+        chain_slice_bytes,
+        tail_element: None,
+    })
+}
+
+/// Element coordinate of the last tail slot inside the mip tail block.
+///
+/// AddrLib's tail slot offsets are `m << 8` for the first seven slots and
+/// `16 << m` beyond, and the slot's micro-block coordinate is that offset's
+/// Morton de-interleave above bit 8 (odd bits → X, even bits → Y).
+fn mip_tail_element(
+    max_mips_in_tail: u32,
+    block_size_log2: u32,
+    bpp_log2: u32,
+) -> Option<(u32, u32)> {
+    let m = max_mips_in_tail.checked_sub(1)?;
+    let mip_offset: u32 = if m > 6 { 16u32 << m } else { m << 8 };
+    let mut mip_x = ((mip_offset >> 9) & 1)
+        | ((mip_offset >> 10) & 2)
+        | ((mip_offset >> 11) & 4)
+        | ((mip_offset >> 12) & 8)
+        | ((mip_offset >> 13) & 16)
+        | ((mip_offset >> 14) & 32);
+    let mut mip_y = ((mip_offset >> 8) & 1)
+        | ((mip_offset >> 9) & 2)
+        | ((mip_offset >> 10) & 4)
+        | ((mip_offset >> 11) & 8)
+        | ((mip_offset >> 12) & 16)
+        | ((mip_offset >> 13) & 32);
+    if block_size_log2 & 1 != 0 {
+        std::mem::swap(&mut mip_x, &mut mip_y);
+        if bpp_log2 & 1 != 0 {
+            mip_y = (mip_y << 1) | (mip_x & 1);
+            mip_x >>= 1;
+        }
+    }
+    let (micro_width, micro_height) = block_dimensions(256, bpp_log2);
+    if micro_width == 0 || micro_height == 0 {
+        return None;
+    }
+    Some((mip_x * micro_width, mip_y * micro_height))
+}
+
+/// Detile the mip tail block and lift mip 0's sub-rectangle out of it, for the
+/// [`BaseMipPlacement::tail_element`] case. `tiled` must cover one whole
+/// swizzle block. `None` for an unsupported mode/element size, a short input,
+/// or a sub-rectangle that does not fit the block.
+pub fn detile_mip_tail_base(
+    mode: u8,
+    tiled: &[u8],
+    elements_wide: u32,
+    elements_high: u32,
+    bpp_log2: u32,
+    tail_element_x: u32,
+    tail_element_y: u32,
+) -> Option<Vec<u8>> {
+    let (_, block_bytes) = swizzle_table(mode)?;
+    let (block_width, block_height) = block_element_dimensions(mode, bpp_log2)?;
+    if tiled.len() < usize::try_from(block_bytes).ok()?
+        || tail_element_x + elements_wide > block_width
+        || tail_element_y + elements_high > block_height
+    {
+        return None;
+    }
+    // Deswizzle the FULL block: mip 0's rows are interleaved with the other tail
+    // levels in the tiled bytes, so they only become contiguous once linear.
+    let block = detile_64kb(mode, tiled, block_width, block_height, bpp_log2)?;
+    let bpp = 1usize << bpp_log2;
+    let row = elements_wide as usize * bpp;
+    let mut out = vec![0u8; row * elements_high as usize];
+    for y in 0..elements_high as usize {
+        let src =
+            ((tail_element_y as usize + y) * block_width as usize + tail_element_x as usize) * bpp;
+        out[y * row..(y + 1) * row].copy_from_slice(&block[src..src + row]);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,5 +1398,153 @@ mod tests {
         let tiled = tile_64kb_s(&linear, w, h, bpp_log2);
         let back = detile_64kb_s(&tiled, w, h, bpp_log2);
         assert_eq!(back, linear, "detile ∘ tile must be the identity");
+    }
+
+    /// A GFX10 chain is stored smallest-first, so mip 0 is at the END of the
+    /// allocation — the whole point of [`base_mip_placement`]. Worked by hand for
+    /// a 512x512 RGBA8 `SW_64KB_S` surface with 10 levels:
+    ///
+    /// * block = 65536 B → 128x128 elements, `log2(block)` = 16
+    /// * mips in tail = 16 - 4 = 12; tail extent = 128x64
+    /// * mip 0 (512x512) and mip 1 (256x256) are too tall for the tail; mip 2
+    ///   (128x128) is too tall as well; mip 3 (64x64) fits → the tail starts at 3
+    /// * layout = [tail 64 KiB][mip 2 = 64 KiB][mip 1 = 256 KiB][mip 0 = 1 MiB]
+    /// * so mip 0 begins 65536 + 65536 + 262144 = 393216 B (0x60000) past base
+    #[test]
+    fn base_mip_placement_puts_mip_zero_at_the_end_of_the_chain() {
+        let placement = base_mip_placement(9, 512, 512, 2, 10).expect("a 10-level chain places");
+        assert_eq!(placement.byte_offset, 393_216, "0x60000 past the T# base");
+        assert_eq!(placement.chain_slice_bytes, 1_441_792);
+        assert_eq!(placement.tail_element, None, "mip 0 has its own block grid");
+        // Mip 0 really is LAST: its own block grid ends exactly at the slice end.
+        assert_eq!(
+            placement.byte_offset + tiled_byte_count_for_mode(9, 512, 512, 2).unwrap(),
+            placement.chain_slice_bytes,
+            "offset + mip 0's block grid must be the whole slice"
+        );
+    }
+
+    /// The same math on the 4 KiB Standard block (mode 5), whose tail absorbs 8
+    /// levels of a 32x16-element tail extent: 256x256 RGBA8 with 9 levels packs
+    /// [tail 4 KiB][mip 3 = 4 KiB][mip 2 = 16 KiB][mip 1 = 64 KiB][mip 0 = 256 KiB],
+    /// so mip 0 begins 4096 + 4096 + 16384 + 65536 = 90112 B past the base.
+    #[test]
+    fn base_mip_placement_handles_the_4kib_block() {
+        let placement = base_mip_placement(5, 256, 256, 2, 9).expect("a 9-level chain places");
+        assert_eq!(placement.byte_offset, 90_112);
+        assert_eq!(placement.chain_slice_bytes, 352_256);
+        assert_eq!(
+            placement.byte_offset + tiled_byte_count_for_mode(5, 256, 256, 2).unwrap(),
+            placement.chain_slice_bytes
+        );
+    }
+
+    /// No relocation to apply is reported as `None`, never as a guessed offset:
+    /// the caller then keeps the descriptor base (today's behaviour) and says so.
+    #[test]
+    fn base_mip_placement_refuses_instead_of_guessing() {
+        assert_eq!(
+            base_mip_placement(9, 512, 512, 2, 1),
+            None,
+            "a single-level resource has no chain"
+        );
+        assert_eq!(
+            base_mip_placement(9, 512, 512, 2, 0),
+            None,
+            "MAX_MIP+1 can never be 0, but a malformed T# must not shift anything"
+        );
+        assert_eq!(
+            base_mip_placement(1, 512, 512, 2, 10),
+            None,
+            "swizzle mode 1 has no ported equation"
+        );
+        assert_eq!(
+            base_mip_placement(9, 512, 512, 5, 10),
+            None,
+            "32-byte elements are past the last swizzle-table row"
+        );
+        assert_eq!(base_mip_placement(9, 0, 512, 2, 10), None, "zero extent");
+    }
+
+    /// When the whole chain fits inside the tail block, mip 0 is a sub-rectangle
+    /// of the DETILED block rather than a block grid of its own. For 64 KiB at
+    /// 4 B/element the last tail slot's micro-block coordinate is (8, 0) and a
+    /// micro block is 8x8 elements, so the sub-rectangle starts at (64, 0).
+    #[test]
+    fn base_mip_placement_finds_the_in_tail_sub_rectangle() {
+        let placement = base_mip_placement(9, 64, 64, 2, 7).expect("64x64 with 7 levels is a tail");
+        assert_eq!(placement.tail_element, Some((64, 0)));
+        assert_eq!(
+            placement.byte_offset, 0,
+            "an in-tail mip 0 is inside the FIRST block"
+        );
+        assert_eq!(placement.chain_slice_bytes, 65_536, "one swizzle block");
+
+        // Slot (8, 0) scales with the element size: micro blocks are 16x16 at
+        // 1 B/element (block 256x256) and 4x4 at 16 B/element (block 64x64).
+        assert_eq!(
+            base_mip_placement(9, 64, 64, 0, 7).unwrap().tail_element,
+            Some((128, 0))
+        );
+        assert_eq!(
+            base_mip_placement(9, 32, 32, 4, 5).unwrap().tail_element,
+            Some((32, 0))
+        );
+    }
+
+    /// The in-tail sub-rectangle starts half a block in, so a mip 0 wider than
+    /// half the block cannot fit it. That is reported as `None` — read at the
+    /// descriptor base and warn — not as an out-of-block offset.
+    #[test]
+    fn base_mip_placement_refuses_an_in_tail_rect_that_does_not_fit() {
+        assert_eq!(
+            base_mip_placement(9, 128, 64, 2, 5),
+            None,
+            "128 elements wide + a 64-element tail offset overruns a 128-wide block"
+        );
+    }
+
+    /// Functional check of the in-tail path: tile a whole 128x128 block, then lift
+    /// the (64, 0) 64x64 sub-rectangle back out. Detiling the block first is what
+    /// makes mip 0's rows contiguous — in the tiled bytes they are interleaved
+    /// with the other tail levels.
+    #[test]
+    fn detile_mip_tail_base_lifts_the_sub_rectangle() {
+        let (bw, bh, bpp_log2) = (128u32, 128u32, 2u32);
+        let bpp = 1usize << bpp_log2;
+        let linear: Vec<u8> = (0..(bw * bh) as usize * bpp)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let tiled = tile_64kb_s(&linear, bw, bh, bpp_log2);
+
+        let (rx, ry, rw, rh) = (64u32, 0u32, 64u32, 64u32);
+        let got = detile_mip_tail_base(9, &tiled, rw, rh, bpp_log2, rx, ry)
+            .expect("the sub-rectangle fits the block");
+        let row = rw as usize * bpp;
+        let mut want = vec![0u8; row * rh as usize];
+        for y in 0..rh as usize {
+            let src = ((ry as usize + y) * bw as usize + rx as usize) * bpp;
+            want[y * row..(y + 1) * row].copy_from_slice(&linear[src..src + row]);
+        }
+        assert_eq!(got, want, "detiled block sub-rectangle");
+
+        assert_eq!(
+            detile_mip_tail_base(9, &tiled[..1024], rw, rh, bpp_log2, rx, ry),
+            None,
+            "a short block must be refused, not read as zeros"
+        );
+        assert_eq!(
+            detile_mip_tail_base(9, &tiled, 128, 64, bpp_log2, rx, ry),
+            None,
+            "a sub-rectangle past the block edge must be refused"
+        );
+    }
+
+    #[test]
+    fn block_element_dimensions_names_unsupported_inputs() {
+        assert_eq!(block_element_dimensions(9, 2), Some((128, 128)));
+        assert_eq!(block_element_dimensions(5, 2), Some((32, 32)));
+        assert_eq!(block_element_dimensions(9, 5), None, "past the last row");
+        assert_eq!(block_element_dimensions(2, 2), None, "no ported equation");
     }
 }
