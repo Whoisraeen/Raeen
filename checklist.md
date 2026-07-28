@@ -1081,3 +1081,55 @@ address-range heuristic. (In flight.)
   - Caveats: the 3D `vkCreateImage`/`vkCreateImageView` path still has **no
     device-level test** (every `TextureUpload` literal in the gpu tests sets
     `depth: 1`), and tiled volumes outside tile mode 0 remain a named refusal.
+
+### Also on `integration/sharpemu-sweep` (wave 4 — the out-pointer audit)
+
+- **`2ab84bd` — stack-out guard infrastructure + 12 more ABI bugs fixed.**
+  raeen-hle **553** green post-merge (was 525 pre-sweep), kernel 64, runtime
+  82 lib + 57 execute (green in parallel AND serialized).
+  - **Guard infra beats the reference, as predicted.** New
+    `crates/raeen-hle/src/out_buffer.rs` with `classify_out ->
+    OutRegion{Stack,NonStack,Unknown}`, `write_out_struct` (clamps + counts +
+    warns once per export), `zero_out_object` (bulk-init only off-stack),
+    `write_out_u8/u16/u32/i32/u64/i64`. Stack residency comes from **exact
+    registered bounds**, not SharpEmu's `0x7FF0…` address heuristic: new
+    `OrbisKernel::guest_thread_stacks`, published for thread 1 by both
+    `execute_linked` and `execute_process` and for each `scePthreadCreate`
+    worker as it starts — **and removed before `arena.free(stack_base)`**,
+    because a worker stack IS an arena heap allocation and a stale entry would
+    make a recycled heap block look like a frame. That is the exact case a
+    heuristic cannot get right. Fallback is a 64 KiB window above `caller_rsp`,
+    deliberately erring toward `NonStack` (a false Stack truncates a legitimate
+    heap init; a false NonStack only loses the diagnostic).
+    `clamped_write_count_for(export)` puts the offender's name in a crash report.
+  - **Bugs fixed** (full evidence table in `docs/sharpemu-port/outbuffer-audit.md`):
+    `sceRtcFormatRFC3339` wrote up to **36 B into a 32 B buffer** — the clearest
+    real smash, because `timeZoneMinutes` is a guest register and `{:02}` is a
+    *minimum* width, so `i32::MAX` rendered `+35791394:07`;
+    `sceKernelAioInitializeParam` could write **up to 64 KiB onto a frame**;
+    `localeconv` wrote `"."` over `int_p_cs_precedes` (char block is 80..94, not
+    80..88); `sceAgcDriverQueryResourceRegistrationUserMemoryRequirements` wrote
+    full 64-bit registers into `uint32_t` counts;
+    `sceKernelAprSubmitCommandBufferAndGetResult` (shape-by-residency);
+    `_sceFiberInitializeImpl` stamped 8 B unconditionally instead of the
+    caller's `size_context`; `sceNpEntitlementAccessInitialize` bulk-cleared
+    0x20 of caller INPUT; two `sceAmpr*Constructor`/`Reset` aux slots written
+    but never read (rule 6).
+  - **Four POSIX-convention bugs, one severe:** `libsce_posix`'s `sce_to_posix`
+    never set errno **and** judged failure on the 64-bit sign only, so every
+    `0x8002_xxxx` failure mapped to POSIX **success** — `gettimeofday` reported
+    0 while writing nothing. Also `hle_fstat` mixed `-9` and `0x8002_000E` in
+    one function and was registered RAW under both `libScePosix::fstat` and
+    `sceKernelFstat` (neither spelling had its own convention), and
+    `libScePosix::mprotect` returned `-22` raw. `lseek`/`pread`/`pwrite`/
+    `rename`/`stat` audited correct. `open`→EACCES maps correctly but is
+    unreachable for a writable open of a read-only host file (VFS gap, recorded).
+  - **Deliberately NOT changed, with evidence**: AJM batch descriptor/sideband,
+    `scePadDeviceClassGetExtendedInformation` 0x20, AGC interpolant mapping —
+    all on the proven Minecraft M4/M5 path with sizes no in-tree evidence
+    establishes. Two reference sizes verified against SharpEmu's **live tree**
+    per the revert-trap rule (VideoOut options 0x40, `GetOutputStatus` 0x30).
+  - **NOT a boot claim.** Neither GTA V nor Until Dawn was re-run. The next step
+    for those titles is to launch them and read `clamped_write_count()` plus the
+    once-per-export warn lines — the guard now *names* any remaining offender
+    instead of letting it corrupt a frame silently.
