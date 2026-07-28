@@ -197,10 +197,15 @@ top-down, update statuses in place, and keep it committed.**
   storage next to per-game config.
 
 ### 12. Symbolized / actionable crash report view
-- [~] WAVE 2 IN PROGRESS (shell-ui agent, worktree, 2026-07-27).
-- [ ] Pair `logs/crashes/*.dmp` (minidumper already wired) with guest context
-  we already have: faulting module+offset, last N HLE/NID calls, unresolved-NID
-  inventory, GPU state summary → one shareable report file + Shell view.
+- [x] DONE (shell-ui agent, worktree, 2026-07-27). One shareable file per
+  faulted session: `logs/crashes/<title-id>_<UTC>.report.md` — fault site
+  (module+offset+RIP bytes), recent HLE calls per thread, unresolved-NID
+  inventory, GPU counters, host info, paired `.dmp`/log paths. Rich report
+  written by the runner child (`--run-eboot` fault path); Shell writes a
+  fallback only when a minidump landed without one. Shell view: Settings ▸
+  System lists recent reports (Confirm opens; Open Folder / Copy to
+  Clipboard action rows). Core is pure + unit-tested
+  (`crates/raeen-gui/src/crash_report.rs`).
 - **Where:** `crates/raeen-gui` (view), runtime fault plumbing
   (d87765a crash reporting groundwork).
 

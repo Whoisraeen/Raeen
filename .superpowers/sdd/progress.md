@@ -1,3 +1,49 @@
+- ACTIONABLE CRASH REPORTS IN THE SHELL — checklist item 12 (2026-07-27;
+  shell-ui agent, worktree branch worktree-agent-ad777e259801c210c;
+  raeen-gui 195/195 [+10 over the 185 baseline], raeen-kernel 43/43,
+  raeen-hle 481/481, fmt clean; clippy clean on the new/touched code — the
+  remaining `-D warnings` failures are the on-record kyty-graphics MSRV
+  lint (item 13, in progress elsewhere) and two raeen-gpu dead-code/
+  type-complexity lints from the GPU-resident-present commit ea6efd0):
+  * CORE (`crates/raeen-gui/src/crash_report.rs`, NEW): pure, headless-
+    tested report assembly — `CrashReport::render` produces one
+    self-contained markdown file `logs/crashes/<title-id>_<UTC>.report.md`
+    with title id+version (param.json via `title_meta_for`, folder-name
+    fallback), session duration, fault one-liner (stable `- Fault: ` anchor
+    the list view parses back), fault site (module+offset+16 RIP bytes via
+    the pure `locate_fault`, shared with `main.rs::report_fault_site`),
+    last-10 HLE calls per guest thread, unresolved-NID inventory, GPU
+    counters, host sysinfo block, paired `.dmp`/log paths. UTC stamps are a
+    dependency-free `civil_from_days` (tested against epoch + the
+    billennium second). Listing/pairing helpers: `list_reports` (newest
+    first), `newest_dump_since` / `newest_report_since`.
+  * WRITERS: the runner child (`--run-eboot`) writes the rich report when
+    `execute_process` returns Err — the only process still holding the
+    kernel rings, the composed image, and the GPU session
+    (`main.rs::write_runner_crash_report`). The Shell
+    (`launcher.rs::run_isolated_child`) writes a fallback ONLY when a
+    minidump landed without a report (hard crash — abort path), so
+    launch-stage failures (missing eboot) do not spam junk reports; the
+    fault overlay message now names the report path either way
+    (`crash_report::ensure_report_for_crashed_runner`).
+  * KERNEL: `OrbisKernel::unresolved_nid_inventory()` (NEW, raeen-kernel) —
+    the sorted formatted lines; `log_unresolved_nid_inventory` now consumes
+    it so log and report can never drift. Inventory format pinned by test.
+  * SHELL VIEW (Settings ▸ System): recent reports newest-first (cap 8,
+    `MAX_CRASH_REPORT_ROWS`), one allocated row-card each (hit rect ==
+    painted rect, no bottom_up anywhere) — Confirm opens the report file;
+    trailing action rows "Open Crash Reports Folder" (opener) and "Copy
+    Newest Report to Clipboard" (`ctx.copy_text`), toasts on every action
+    (TopLeft anchor as configured). Row counts are live:
+    `settings_row_counts` gained a crash_report_count param
+    (SYSTEM = 2 fixed + N reports + 2 actions, tested); list refreshes on
+    every Settings open (`enter_settings`).
+  * Also fixed in passing: two pre-existing clippy-1.97 lints in
+    `shell/sounds.rs` (doc blockquote, needless range loop);
+    `crashdump.rs` now sources its dump dir from
+    `crash_report::REPORTS_DIR` so dumps and reports cannot diverge.
+  * NOT live-verified from the worktree (parallel-build isolation): the
+    Shell drive/screenshot pass is listed for the main session.
 - TIER-B OFFLINE-SEMANTICS SERVICE-LIB BATCH (2026-07-27; agent worktree
   branch, raeen-hle 463/463, raeen-firmware 125/125, fmt clean, clippy clean
   on raeen-hle itself — the only `-D warnings` failure is the pre-existing

@@ -90,6 +90,11 @@ struct ActiveSession {
 /// Cap on the Switcher's recent-titles history (spec §10).
 const MAX_RECENT_TITLES: usize = 6;
 
+/// Cap on the Settings ▸ System crash-report rows — newest first; older
+/// reports stay on disk under `logs/crashes/` behind the "Open Crash
+/// Reports Folder" row.
+const MAX_CRASH_REPORT_ROWS: usize = 8;
+
 /// User-supplied UI sound packs live under `sounds/<pack>/` (repo-root
 /// relative, like `themes/` and `Games/`).
 const SOUNDS_ROOT: &str = "sounds";
@@ -274,6 +279,11 @@ pub struct Shell {
     /// state so it can remain a pure, egui-free state machine.
     settings_new_folder_input: String,
     settings_key_provider_input: String,
+    /// Recent crash reports (newest first, capped at
+    /// [`MAX_CRASH_REPORT_ROWS`]), listed from `logs/crashes/` at
+    /// construction and re-listed every time Settings opens — backs the
+    /// System section's crash-report rows.
+    crash_reports: Vec<crate::crash_report::ReportListing>,
 
     /// The per-game overrides currently being edited in the Game Options
     /// overlay, and the library id they belong to. Loaded from disk when the
@@ -345,9 +355,11 @@ impl Shell {
         // caller ever hands the Shell a library without one, Confirm on
         // that index simply never matches and nothing opens Settings.
         let settings_tile_index = library.iter().position(|item| item.id == "settings");
+        let crash_reports = list_recent_crash_reports();
         let settings_row_counts = settings::settings_row_counts(
             config.paths.game_folders.len(),
             raeen_gpu::AgcGpuSession::present_plugins().len(),
+            crash_reports.len(),
         );
         let nav = NavState::with_cc_options(rail_len, cc_len, cc_option_counts)
             .with_settings(settings_tile_index, settings_row_counts)
@@ -407,6 +419,7 @@ impl Shell {
             hero_bg_to,
             settings_new_folder_input: String::new(),
             settings_key_provider_input,
+            crash_reports,
             game_options_draft: per_game::PerGameSettings::default(),
             game_options_target_id: None,
             session_quit_hold: QuitHold::default(),
@@ -732,6 +745,10 @@ impl Shell {
         self.settings_new_folder_input.clear();
         self.settings_key_provider_input =
             self.config.paths.key_provider_path.display().to_string();
+        // Fresh crash-report list every time Settings opens — a session that
+        // faulted since the last visit shows up without a restart.
+        self.crash_reports = list_recent_crash_reports();
+        self.refresh_settings_row_counts();
     }
 
     /// Back out of Settings: fold the KeyProvider path text field back into
@@ -1016,26 +1033,64 @@ impl Shell {
 
     /// Confirm within the System section. Row 0 (Version) is display-only;
     /// row 1 is the updater's action row — what it does depends on where
-    /// the state machine currently is.
+    /// the state machine currently is. After those come the crash-report
+    /// rows (Confirm opens the report file) and their two action rows
+    /// ("Open Crash Reports Folder", "Copy Newest Report to Clipboard").
     fn activate_system_row(&mut self, ctx: &egui::Context, row: usize) {
-        if row != 1 {
-            return;
-        }
-        match self.updater_state.clone() {
-            UpdaterState::Idle | UpdaterState::UpToDate { .. } | UpdaterState::Error(_) => {
-                self.start_update_check();
+        let report_rows =
+            settings::SYSTEM_FIXED_ROWS..settings::SYSTEM_FIXED_ROWS + self.crash_reports.len();
+        let folder_row = report_rows.end;
+        let copy_row = folder_row + 1;
+        if row == 1 {
+            match self.updater_state.clone() {
+                UpdaterState::Idle | UpdaterState::UpToDate { .. } | UpdaterState::Error(_) => {
+                    self.start_update_check();
+                }
+                UpdaterState::Staged { staged, .. } => match updater::apply_staged(&staged) {
+                    Ok(()) => {
+                        tracing::info!("update script launched — closing for swap");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to launch update script");
+                        self.updater_state = UpdaterState::Error(err);
+                    }
+                },
+                UpdaterState::Checking | UpdaterState::Downloading { .. } => {}
             }
-            UpdaterState::Staged { staged, .. } => match updater::apply_staged(&staged) {
-                Ok(()) => {
-                    tracing::info!("update script launched — closing for swap");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if report_rows.contains(&row) {
+            // Cloned so the report borrow ends before the toast call borrows
+            // `self` mutably.
+            let report = self.crash_reports[row - settings::SYSTEM_FIXED_ROWS].clone();
+            match opener::open(&report.path) {
+                Ok(()) => self
+                    .toasts
+                    .info(format!("Opened crash report — {}", report.title_id)),
+                Err(err) => self
+                    .toasts
+                    .error(format!("Could not open the crash report: {err}")),
+            };
+        } else if row == folder_row {
+            open_crash_reports_folder();
+        } else if row == copy_row {
+            match self.crash_reports.first().cloned() {
+                Some(newest) => match std::fs::read_to_string(&newest.path) {
+                    Ok(text) => {
+                        ctx.copy_text(text);
+                        self.toasts.success(format!(
+                            "Copied crash report to clipboard — {} {}",
+                            newest.title_id, newest.when
+                        ));
+                    }
+                    Err(err) => {
+                        self.toasts
+                            .error(format!("Could not read the crash report: {err}"));
+                    }
+                },
+                None => {
+                    self.toasts.info("No crash reports yet");
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to launch update script");
-                    self.updater_state = UpdaterState::Error(err);
-                }
-            },
-            UpdaterState::Checking | UpdaterState::Downloading { .. } => {}
+            }
         }
     }
 
@@ -1122,12 +1177,14 @@ impl Shell {
     }
 
     /// Re-derive the Settings nav's per-section row counts from the live
-    /// folder and plugin counts (both sections grow and shrink at runtime).
+    /// folder, plugin, and crash-report counts (all three sections grow and
+    /// shrink at runtime).
     fn refresh_settings_row_counts(&mut self) {
         self.nav
             .set_settings_row_counts(settings::settings_row_counts(
                 self.config.paths.game_folders.len(),
                 raeen_gpu::AgcGpuSession::present_plugins().len(),
+                self.crash_reports.len(),
             ));
     }
 
@@ -1665,6 +1722,7 @@ impl Shell {
             if self.nav.mode == NavMode::Settings {
                 let plugins = plugin_row_infos();
                 let plugin_failures = raeen_gpu::AgcGpuSession::present_plugin_load_failures();
+                let crash_reports = crash_report_row_infos(&self.crash_reports);
                 clicked_setting = settings::draw(
                     ui,
                     &theme,
@@ -1675,6 +1733,7 @@ impl Shell {
                     &self.updater_state,
                     &plugins,
                     &plugin_failures,
+                    &crash_reports,
                 );
                 return;
             }
@@ -1896,6 +1955,45 @@ fn open_plugins_folder() {
     }
     if let Err(err) = opener::open(dir) {
         tracing::warn!(error = %err, "could not open plugins/ in the file manager");
+    }
+}
+
+/// Pre-resolve the Shell's crash-report listings into the plain display rows
+/// [`settings::draw`] takes — label = title id + short UTC time, value = the
+/// fault one-liner cut to fit the row's value column.
+fn crash_report_row_infos(
+    reports: &[crate::crash_report::ReportListing],
+) -> Vec<settings::CrashReportRowInfo> {
+    reports
+        .iter()
+        .map(|report| settings::CrashReportRowInfo {
+            label: format!("{} · {}", report.title_id, report.when),
+            fault: crate::crash_report::one_liner(&report.fault, 56),
+        })
+        .collect()
+}
+
+/// List the crash reports under `logs/crashes/`, newest first, capped at
+/// [`MAX_CRASH_REPORT_ROWS`] for the Settings ▸ System rows. A missing
+/// directory (no crash yet) is an empty list.
+fn list_recent_crash_reports() -> Vec<crate::crash_report::ReportListing> {
+    let mut reports =
+        crate::crash_report::list_reports(std::path::Path::new(crate::crash_report::REPORTS_DIR));
+    reports.truncate(MAX_CRASH_REPORT_ROWS);
+    reports
+}
+
+/// Open the crash-reports directory (`logs/crashes/`) in the host's file
+/// manager, creating it first so the row works before the first crash.
+/// Failures are logged, never fatal — mirrors [`open_plugins_folder`].
+fn open_crash_reports_folder() {
+    let dir = std::path::Path::new(crate::crash_report::REPORTS_DIR);
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %err, "could not create logs/crashes/ directory");
+        return;
+    }
+    if let Err(err) = opener::open(dir) {
+        tracing::warn!(error = %err, "could not open logs/crashes/ in the file manager");
     }
 }
 

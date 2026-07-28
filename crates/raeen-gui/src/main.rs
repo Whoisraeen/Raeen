@@ -8,6 +8,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod crash_report;
 mod crashdump;
 mod launcher;
 mod library;
@@ -16,6 +17,7 @@ mod splash;
 mod theme;
 mod updater;
 
+use std::path::Path;
 use tracing::info;
 
 /// Say what the guest was executing when it faulted: which module the faulting
@@ -35,37 +37,132 @@ fn report_fault_site(
     deps: &[raeen_firmware::LoadedDependency],
     addr: u64,
 ) {
-    let Some(offset) = addr.checked_sub(raeen_runtime::GUEST_ARENA_BASE) else {
-        info!("        rip is below the guest image — not guest code");
-        return;
-    };
-    let Ok(offset) = usize::try_from(offset) else {
-        return;
-    };
-    if offset >= linked.image.len() {
-        info!(
-            "        rip is past the loaded image ({:#x} byte(s)) — not guest code",
-            linked.image.len()
-        );
-        return;
-    }
-
     // Dependencies are composed above the eboot at known offsets, so the last
-    // one at or below the rip owns it; below them all, it is the eboot's.
-    match deps
-        .iter()
-        .filter(|d| usize::try_from(d.image_offset).is_ok_and(|off| off <= offset))
-        .max_by_key(|d| d.image_offset)
-    {
-        Some(d) => info!(
-            "        module: {} at +{:#x}",
-            d.name,
-            offset as u64 - d.image_offset
-        ),
-        None => info!("        module: eboot.bin at +{offset:#x}"),
+    // one at or below the rip owns it; below them all, it is the eboot's —
+    // resolved by the same pure locator the crash report uses.
+    match crash_report::locate_fault(
+        &linked.image,
+        &dep_offset_pairs(deps),
+        raeen_runtime::GUEST_ARENA_BASE,
+        addr,
+    ) {
+        crash_report::FaultLocation::BelowImage => {
+            info!("        rip is below the guest image — not guest code");
+        }
+        crash_report::FaultLocation::PastImage { image_len } => {
+            info!("        rip is past the loaded image ({image_len:#x} byte(s)) — not guest code");
+        }
+        crash_report::FaultLocation::Site(site) => {
+            info!("        module: {} at +{:#x}", site.module, site.offset);
+            info!("        bytes at rip: {:02x?}", site.rip_bytes);
+        }
     }
-    let end = (offset + 16).min(linked.image.len());
-    info!("        bytes at rip: {:02x?}", &linked.image[offset..end]);
+}
+
+/// `(name, image offset)` pairs for the loaded dependencies — the shape the
+/// pure fault locator in [`crash_report`] takes.
+fn dep_offset_pairs(deps: &[raeen_firmware::LoadedDependency]) -> Vec<(String, u64)> {
+    deps.iter()
+        .map(|d| (d.name.clone(), d.image_offset))
+        .collect()
+}
+
+/// Assemble and write the actionable crash report for a `--run-eboot` session
+/// that ended in a runtime error. Runs in the guest-executing process, which
+/// is the only place the kernel's call rings, the composed image, and the GPU
+/// session are all still alive. Never fatal — a report that cannot be written
+/// is a warning, not a second failure.
+fn write_runner_crash_report(
+    eboot: &Path,
+    error: &raeen_runtime::RuntimeError,
+    linked: &raeen_firmware::LinkedModule,
+    deps: &[raeen_firmware::LoadedDependency],
+    kernel: &raeen_kernel::OrbisKernel,
+) {
+    let (fault, fault_site) = match error {
+        raeen_runtime::RuntimeError::Faulted { addr, access, kind } => (
+            format!("Guest fault at {addr:#x} ({kind} of {access:#x})"),
+            match crash_report::locate_fault(
+                &linked.image,
+                &dep_offset_pairs(deps),
+                raeen_runtime::GUEST_ARENA_BASE,
+                *addr,
+            ) {
+                crash_report::FaultLocation::Site(site) => Some(site),
+                _ => None,
+            },
+        ),
+        raeen_runtime::RuntimeError::UnimplementedImport { nid, library, .. } => (
+            format!(
+                "Unimplemented import: {} ({}) — nid {nid:#018x}",
+                raeen_firmware::dynlib::nid_names::describe(*nid),
+                library.as_deref().unwrap_or("<unknown library>")
+            ),
+            None,
+        ),
+        other => (format!("Runtime error: {other:?}"), None),
+    };
+
+    // Most-recent-first call ring per guest thread, labeled by thread name.
+    let mut recent_hle: Vec<(String, Vec<String>)> = kernel
+        .recent_hle_calls
+        .iter()
+        .map(|entry| {
+            let tid = *entry.key();
+            let name = kernel
+                .thread_names
+                .get(&tid)
+                .map_or_else(String::new, |n| n.clone());
+            let label = if name.is_empty() {
+                format!("t{tid}")
+            } else {
+                format!("t{tid} ({name})")
+            };
+            let calls: Vec<String> = entry
+                .value()
+                .lock()
+                .iter()
+                .rev()
+                .take(10)
+                .cloned()
+                .collect();
+            (label, calls)
+        })
+        .collect();
+    recent_hle.sort();
+
+    let gpu = raeen_gpu::AgcGpuSession::global();
+    let shader = gpu.shader_stats();
+    let gpu_summary = format!(
+        "draws={} presented_frames={} shaders: fetched={} translated_ok={} failed={} \
+         skipped_draws={}",
+        gpu.draw_count(),
+        gpu.present_epoch(),
+        shader.distinct_fetched,
+        shader.translated_ok,
+        shader.translate_failed,
+        gpu.shader_skip_count()
+    );
+
+    let (title_id, title, version) = crash_report::title_meta_for(eboot);
+    let report = crash_report::CrashReport {
+        title_id,
+        title,
+        version,
+        session_duration: Some(kernel.uptime()),
+        fault,
+        fault_site,
+        recent_hle,
+        unresolved_nids: kernel.unresolved_nid_inventory(),
+        gpu_summary: Some(gpu_summary),
+        host: Some(crash_report::HostInfo::collect()),
+        dump_path: None,
+        log_path: Some(std::path::PathBuf::from("logs/raeen.log")),
+    };
+    match report.write_now(Path::new(crash_report::REPORTS_DIR)) {
+        Ok(path) => info!("crash report written: {}", path.display()),
+        Err(error) => tracing::warn!(%error, "crash report could not be written"),
+    }
 }
 
 /// Reattach the parent process's console so CLI invocations (`--run-eboot`,
@@ -1542,6 +1639,20 @@ fn main() -> anyhow::Result<()> {
                 report_fault_site(&linked, &process.dependencies, *addr);
             }
             Err(e) => info!("RESULT: {e:?}"),
+        }
+        // The actionable crash report: everything above (fault site, call
+        // rings, unresolved inventory, GPU counters) folded into ONE file
+        // under logs/crashes/, next to any minidump. Written here — in the
+        // guest-executing process — because only this process still holds
+        // the kernel and the composed image.
+        if let Err(error) = &outcome {
+            write_runner_crash_report(
+                Path::new(path.as_str()),
+                error,
+                &linked,
+                &process.dependencies,
+                &kernel,
+            );
         }
         let console = kernel.console.contents();
         if console.is_empty() {
