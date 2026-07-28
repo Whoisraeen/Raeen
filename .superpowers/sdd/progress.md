@@ -5017,3 +5017,53 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   is_multiple_of MSRV lint (checklist item 13, another agent's wave).
 * NEXT: item 2D re-measure GTA V once 2B (compute-queue execution) merges;
   watch for titles depending on real AMPR counter/time values (currently 0).
+
+## 2026-07-27 — Ordered GPU side effects, steps 3-5 (gpu-pipeline agent, worktree)
+
+* ITEM 5 steps 3-5 CODE-COMPLETE, both new gates default OFF (zero behavior
+  change with no env vars — Minecraft M4/M5 state protected).
+* STEP 3 (unified timestamp clock, `RAEEN_UNIFIED_GPU_CLOCK=1`): the two
+  disagreeing RELEASE_MEM fence clocks (HLE eager = kernel session ns clock;
+  worker cp_op_release_mem = process-local 1,2,3 counter — same address
+  double-written from different domains) now share ONE authority under the
+  gate: `raeen_gpu::gpu_clock::next_unified_gpu_timestamp()` (monotonic ns,
+  strictly increasing, one AtomicU64). HLE `next_gpu_timestamp` delegates
+  under the gate (kernel session clock untouched, tested); the session CPs
+  get `CommandProcessor::set_timestamp_source` whose installed source
+  DECLINES per call when the gate is off (legacy counter bit-identical).
+  DO NOT default ON without live A/B — ASTRO timestamp-fence regression
+  territory; the flip stays with the main session.
+* STEPS 4-5 (events/EOP/flips in-stream, under RAEEN_DEFER_GPU_SIDE_EFFECTS):
+  kyty-graphics CP now RECORDS completion side effects in PM4 stream order
+  (`SideEffect`: EventWrite from IT_EVENT_WRITE — no longer consumed without
+  effect; EopInterrupt from the AGC RELEASE_MEM interrupt byte incl.
+  interrupt-only packets; Flip from R_FLIP — no longer consumed), drained via
+  `take_side_effects` (survives reset; a suspended walk records NOTHING past
+  its unmet wait — that is the step-5 ordering proof). raeen-gpu publishes
+  them to the process-global `ordered_side_effects` queue IFF the defer gate
+  is on (gate off would double-deliver the eager duplicates; publish site =
+  both CP run sites in execute_dcb_cp_authorized). raeen-hle gained
+  `apply_ordered_gpu_side_effects` (shared signal helpers with the eager
+  path, so gate flips change WHEN not WHAT) draining at the observation
+  points: submit_command_buffer entry, sceKernelWaitEqueue poll loop,
+  VideoOut GetFlipStatus/IsFlipPending/GetVblankStatus/WaitVblank. Eager
+  event/EOP/flip application at submit is now inside `if !defer`.
+  `defer_gpu_side_effects` has ONE reader
+  (raeen_gpu::ordered_side_effects; HLE delegates). SIDEFX_ENV_LOCK moved to
+  the raeen-hle crate root (kernel_equeue + video_out tests share it — the
+  queue is process-global, tests that touch it must serialize).
+* Tests: kyty-graphics 479 lib (+4: stream-order record, eager-decoder
+  parity negatives, flip-behind-unmet-wait, timestamp-source override) +1+4
+  = 484 total; raeen-gpu 273 lib (+2 gpu_clock, +2 ordered_side_effects) +
+  new tests/ordered_side_effects.rs session-level dual-policy test (state-
+  only DCB through the real CP, no Vulkan needed); raeen-hle 502 lib (+5:
+  eager-default events/EOP/flips, defer-gate defer+drain, unified-clock
+  same-clock interleave, WaitEqueue drains worker events, GetFlipStatus
+  drains worker flips); raeen-runtime 77+49+1+1 green; all raeen-gpu
+  integration suites green; fmt green; clippy -D warnings green on
+  kyty-graphics + raeen-gpu + raeen-hle (all targets).
+* NEXT (main session, live A/B checklist): (1) baseline run gates OFF;
+  (2) RAEEN_DEFER_GPU_SIDE_EFFECTS=1 on Minecraft — watch cross-queue waits,
+  flip cadence, equeue-driven frame loops; (3) RAEEN_UNIFIED_GPU_CLOCK=1
+  alone on ASTRO.BOT — watch the render-thread timestamp-fence park;
+  (4) both gates together; only then discuss defaults.

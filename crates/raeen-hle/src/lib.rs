@@ -1127,6 +1127,15 @@ impl GuestAllocator for TestAllocator {
     fn munmap(&self, _addr: u64, _length: u64) {}
 }
 
+/// Serializes every test that flips the process-wide ordered-GPU-side-effect
+/// env gates (`RAEEN_DEFER_GPU_SIDE_EFFECTS`, `RAEEN_UNIFIED_GPU_CLOCK`) or
+/// touches the process-global `raeen_gpu::ordered_side_effects` queue, so a
+/// parallel `cargo test` run cannot flip the gate — or steal a queued
+/// effect — under another test's assertions. Crate-root for the same reason
+/// as [`test_ctx`]: several submodules' test mods share it.
+#[cfg(test)]
+pub(crate) static SIDEFX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Build an [`HleContext`] over a test kernel, [`TestMemory`], and
 /// [`TestAllocator`]. Defined at the crate root (not inside `mod tests`) so
 /// every submodule's own `#[cfg(test)] mod tests` can reach it as
