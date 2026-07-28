@@ -1621,15 +1621,18 @@ fn record_and_read_flush(
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
         .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkBeginCommandBuffer: {e}")))?;
     let gpu_request = crate::present_plugin::active_gpu_v3_request().filter(|request| {
-        // Temporal plugins fail closed until the renderer supplies trustworthy
-        // depth/motion resources. Spatial ABI-v3 plugins can exercise the GPU
-        // path today without fabricating either input.
-        !request.capabilities.wants_depth && !request.capabilities.wants_motion_vectors
+        // Motion-vector extraction is not implemented yet. Keep temporal
+        // plugins fail-closed instead of fabricating zero vectors/history.
+        !request.capabilities.wants_motion_vectors
     });
     let plugin_sync = gpu_request.and_then(|_| dev.next_plugin_timeline());
     let mut plugin_readbacks = Vec::new();
+    let mut transitioned_plugin_depths = std::collections::HashSet::new();
     for (key, target, _) in &live {
-        let plugin_target = gpu_request.and_then(|request| {
+        let plugin_depth = caches.depth_target_for_color(key);
+        let target_gpu_request = gpu_request
+            .filter(|request| !request.capabilities.wants_depth || plugin_depth.is_some());
+        let plugin_target = target_gpu_request.and_then(|request| {
             let scale = request.output_scale.clamp(0.5, 8.0);
             let width = ((key.width as f32 * scale).round() as u32).clamp(1, 16_384);
             let height = ((key.height as f32 * scale).round() as u32).clamp(1, 16_384);
@@ -1744,6 +1747,65 @@ fn record_and_read_flush(
                     );
                 }
             }
+            if let Some((depth_key, depth_target)) = plugin_depth
+                && target_gpu_request.is_some_and(|request| request.capabilities.wants_depth)
+                && transitioned_plugin_depths.insert(depth_key)
+            {
+                let (old_layout, src_access, src_stage) = match depth_target.layout {
+                    DepthTargetLayout::Undefined => (
+                        vk::ImageLayout::UNDEFINED,
+                        vk::AccessFlags::empty(),
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                    ),
+                    DepthTargetLayout::TransferSrc => (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    ),
+                    DepthTargetLayout::DepthStencilAttachment => (
+                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    ),
+                    DepthTargetLayout::DepthStencilReadOnly => (
+                        vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                    ),
+                };
+                if old_layout != vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL {
+                    let barrier = vk::ImageMemoryBarrier::default()
+                        .old_layout(old_layout)
+                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                        .src_access_mask(src_access)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(depth_target.image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: depth_aspect_mask(vk::Format::from_raw(depth_key.format)),
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        });
+                    // SAFETY: the depth image is persistent and the tracked
+                    // layout was committed by its most recent draw.
+                    unsafe {
+                        device.cmd_pipeline_barrier(
+                            command_buffer,
+                            src_stage,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[barrier],
+                        );
+                    }
+                }
+            }
             let resource_flags = crate::present_plugin::cabi_v3::RAEEN_V3_RESOURCE_BORROWED
                 | crate::present_plugin::cabi_v3::RAEEN_V3_RESOURCE_HOST_OWNS_LAYOUT;
             let frame_index = GPU_PLUGIN_FRAME_INDEX.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1767,7 +1829,24 @@ fn record_and_read_flush(
                     queue_family: dev.queue_family_index(),
                     flags: resource_flags,
                 },
-                depth: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent(),
+                depth: if target_gpu_request.is_some_and(|request| request.capabilities.wants_depth)
+                {
+                    let (depth_key, depth_target) =
+                        plugin_depth.expect("depth capability was gated on a live target");
+                    crate::present_plugin::cabi_v3::RaeenVulkanResourceV3 {
+                        image: depth_target.image.as_raw(),
+                        image_view: depth_target.view.as_raw(),
+                        device_memory: depth_target.memory.as_raw(),
+                        vk_format: depth_key.format as u32,
+                        layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL.as_raw() as u32,
+                        width: depth_key.width,
+                        height: depth_key.height,
+                        queue_family: dev.queue_family_index(),
+                        flags: resource_flags,
+                    }
+                } else {
+                    crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent()
+                },
                 motion_vectors: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent(),
                 exposure: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3::absent(),
                 output: crate::present_plugin::cabi_v3::RaeenVulkanResourceV3 {
@@ -2021,6 +2100,9 @@ fn record_and_read_flush(
             })?;
     }
     let fence_wait_us = fence_wait_at.elapsed().as_micros() as u64;
+    for key in transitioned_plugin_depths {
+        caches.mark_depth_target_layout(&key, DepthTargetLayout::DepthStencilReadOnly);
+    }
 
     let readback_at = std::time::Instant::now();
     let mut images = Vec::with_capacity(live.len());
@@ -2821,7 +2903,8 @@ impl<'a> Resources<'a> {
             .usage(
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST,
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::SAMPLED,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
@@ -4616,6 +4699,11 @@ impl<'a> Resources<'a> {
                         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                             | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                     ),
+                    DepthTargetLayout::DepthStencilReadOnly => (
+                        vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                    ),
                 };
                 self.image_barrier_layers(
                     aspect,
@@ -4694,6 +4782,11 @@ impl<'a> Resources<'a> {
                         vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
                         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                             | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    ),
+                    DepthTargetLayout::DepthStencilReadOnly => (
+                        vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
                     ),
                 };
                 self.image_barrier_layers(
@@ -5188,8 +5281,12 @@ impl<'a> Resources<'a> {
         }
         self.commit_auxiliary_layouts(true);
         if let Some(key) = self.target_key {
-            self.caches
-                .commit_deferred_draw(res, key, TargetLayout::ColorAttachment);
+            self.caches.commit_deferred_draw(
+                res,
+                key,
+                self.depth_target_key,
+                TargetLayout::ColorAttachment,
+            );
         } else {
             // Depth-only work still belongs to the ordered batch and its
             // resources must live through the shared fence. No colour target

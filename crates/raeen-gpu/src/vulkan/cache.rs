@@ -277,6 +277,7 @@ pub(crate) enum DepthTargetLayout {
     Undefined,
     TransferSrc,
     DepthStencilAttachment,
+    DepthStencilReadOnly,
 }
 
 /// The device-side half of one guest render target: the attachment image and
@@ -525,6 +526,9 @@ pub(crate) struct DrawCaches {
     /// Keyed by linear-vs-nearest — the only sampler state decoded today.
     samplers: HashMap<SamplerState, vk::Sampler>,
     targets: HashMap<TargetKey, PersistentTarget>,
+    /// Most recently submitted depth attachment associated with each colour
+    /// target, used by the GPU presentation bridge.
+    target_depth: HashMap<TargetKey, DepthTargetKey>,
     gpu_present_targets: HashMap<GpuPresentKey, GpuPresentTarget>,
     depth_targets: HashMap<DepthTargetKey, PersistentDepthTarget>,
     /// Persistent guest textures (stage D item 1) — see [`PersistentTexture`]
@@ -1271,6 +1275,8 @@ impl DrawCaches {
             .copied()
             .collect();
         for key in stale {
+            self.target_depth
+                .retain(|_, associated_depth| *associated_depth != key);
             if let Some(target) = self.depth_targets.remove(&key) {
                 if self.batch_open() {
                     self.deferred_depth_target_destroys.push(target);
@@ -1912,6 +1918,18 @@ impl DrawCaches {
         }
     }
 
+    /// The depth image submitted with the most recent draw into `color`.
+    pub(crate) fn depth_target_for_color(
+        &self,
+        color: &TargetKey,
+    ) -> Option<(DepthTargetKey, PersistentDepthTarget)> {
+        let key = *self.target_depth.get(color)?;
+        self.depth_targets
+            .get(&key)
+            .copied()
+            .map(|target| (key, target))
+    }
+
     /// Degrade `key`'s content to [`TargetContent::Unknown`] (a flush failed:
     /// the image may or may not hold the batch's draws).
     pub(crate) fn mark_target_unknown(&mut self, key: &TargetKey) {
@@ -2051,11 +2069,17 @@ impl DrawCaches {
         &mut self,
         res: PendingDrawResources,
         key: TargetKey,
+        depth_key: Option<DepthTargetKey>,
         layout: TargetLayout,
     ) {
         self.pending.push(res);
         self.touched.retain(|k| *k != key);
         self.touched.push(key);
+        if let Some(depth_key) = depth_key {
+            self.target_depth.insert(key, depth_key);
+        } else {
+            self.target_depth.remove(&key);
+        }
         if let Some(target) = self.targets.get_mut(&key) {
             target.content = TargetContent::GpuNewer;
             target.layout = layout;
@@ -2218,6 +2242,7 @@ impl DrawCaches {
             .copied()
             .collect();
         for key in stale {
+            self.target_depth.remove(&key);
             if let Some(target) = self.targets.remove(&key) {
                 if self.batch_open() {
                     self.deferred_target_destroys.push(target);
@@ -2279,6 +2304,7 @@ impl DrawCaches {
                 device.free_command_buffers(command_pool, &[command_buffer]);
             }
             self.touched.clear();
+            self.target_depth.clear();
             for target in self.deferred_target_destroys.drain(..) {
                 destroy_target(device, &target);
             }
