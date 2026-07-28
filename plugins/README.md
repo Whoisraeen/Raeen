@@ -337,12 +337,12 @@ impl PresentPlugin for MyUpscaler {
 raeen_gpu::AgcGpuSession::register_present_plugin(Box::new(MyUpscaler::new()));
 ```
 
-## ABI v2 — GPU-capable frames (for real hardware upscalers)
+## ABI v2 — CPU compatibility and the reserved GPU-frame shape
 
 Real hardware upscalers and frame generators run as GPU passes and want a
-`VkImage`, not a CPU pixel buffer. **ABI v2** is the stable contract for that,
-designed so a plugin written today keeps working unchanged when Raeen's
-GPU-resident present path lands:
+`VkImage`, not a CPU pixel buffer. ABI v2 reserved that resource shape, but
+existing v2 plugins still receive CPU frames. New GPU plugins should use ABI
+v3, whose host-owned command buffer and synchronization contract is live:
 
 ```c
 const RaeenPluginV2 *raeen_plugin_v2(void);   // abi_version == 2
@@ -353,17 +353,18 @@ const RaeenPluginV2 *raeen_plugin_v2(void);   // abi_version == 2
 - `create` receives a `RaeenHostContextV2` (valid only during the call):
   `host_flags` says what this host delivers, and a `RaeenVulkanContext`
   (instance/physical device/device/queue as opaque `u64`s plus a
-  `vkGetInstanceProcAddr`) — **all zero today**, because the host does not yet
-  set `RAEEN_HOST_GPU_FRAMES`.
+  `vkGetInstanceProcAddr`) — all zero for the v2 compatibility path. Raeen
+  deliberately does not set `RAEEN_HOST_GPU_FRAMES` for a contract it cannot
+  safely submit.
 - Every `RaeenPresentFrameV2` carries a `kind`: `RAEEN_FRAME_KIND_CPU`
   (delivered today; `color`/`color_len` have exactly the v1 semantics) or
-  `RAEEN_FRAME_KIND_VULKAN` (a live `RaeenVulkanImage`, delivered once the
-  GPU-resident present path exists). A plugin that only supports one kind
+  `RAEEN_FRAME_KIND_VULKAN` (reserved; live GPU delivery uses v3). A plugin that
+  only supports one kind
   simply declines the other from `process` — a declined frame is presented
   unchanged, never an error.
 - Output is the v1 CPU output plus a reserved `produced_image` +
   `produced_kind`; the host reads the GPU output only when it advertised
-  `RAEEN_HOST_GPU_FRAMES` (never today — claiming a GPU output now is refused
+  `RAEEN_HOST_GPU_FRAMES` (not advertised for v2 — claiming a GPU output is refused
   with a named warning).
 - New capability bit: `RAEEN_CAP_GPU_FRAMES (1 << 4)` — "I can consume
   VULKAN-kind frames". Shown in Settings ▸ Plugins as `GPU`.
@@ -411,15 +412,19 @@ is what makes this an extension point rather than a copyleft-evasion device.
 
 ## Current limits
 
-- **CPU-kind frames only for now** — the host does not yet set
-  `RAEEN_HOST_GPU_FRAMES`; v2 plugins receive CPU buffers through v2 types
-  until the GPU-resident present path lands (see
-  `docs/superpowers/plans/2026-07-27-gpu-resident-present.md`).
-- **`depth` and `motion` are always NULL.** The fields and capability bits exist
-  so an MV-aware plugin can be written against a stable ABI now; PM4-side
-  extraction is the follow-up that populates them — and it is the structural
-  advantage: an external overlay must guess motion, Raeen owns the command
-  stream and can eventually hand plugins the title's real motion vectors.
+- **ABI v3 GPU processing is live for persistent Vulkan render targets.** The
+  `gpu-blit` reference plugin proves color-to-output recording, host submission,
+  timeline synchronization, scaled output readback, and presentation.
+- **Depth is live when the color draw used a persistent depth attachment.**
+  Raeen transitions that GPU image to read-only and supplies its real format,
+  extent, image, view, memory, and queue ownership. A plugin requesting depth
+  is skipped for frames without an associated depth surface.
+- **Motion vectors are not populated yet.** A plugin requesting them is
+  declined before invocation. PM4-side render-target identification, coordinate
+  normalization, and scale validation are the remaining temporal-input work;
+  zero vectors are not a valid substitute.
+- **ABI v2 remains CPU-only.** It does not set `RAEEN_HOST_GPU_FRAMES`; use v3
+  for live Vulkan command-buffer processing.
 - **`generated` frames are validated but not presented.** Frame-gen pacing is
   not implemented, so a frame generator can be developed and its output checked,
   but the extra frames are not yet scheduled for display.
