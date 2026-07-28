@@ -436,6 +436,9 @@ fn run_isolated_child(
             }
         }
     }
+    // Session-start wall clock, for pairing crash artifacts: only a report
+    // or minidump written AFTER this instant belongs to this session.
+    let session_started = std::time::SystemTime::now();
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -493,9 +496,22 @@ fn run_isolated_child(
                     code: status.code().unwrap_or(0),
                 }
             } else {
+                // The runner child writes the rich crash report itself when it
+                // can (it holds the kernel and the image); when it died too
+                // hard for that but a minidump landed, pair the dump with a
+                // fallback report here. Either way, name the report so the
+                // session overlay points at the actionable artifact.
+                let fault = format!("Isolated runner stopped with {status}");
+                let report_note = crate::crash_report::ensure_report_for_crashed_runner(
+                    path,
+                    session_started,
+                    &fault,
+                )
+                .map(|report| format!(" Crash report: {}", report.display()))
+                .unwrap_or_default();
                 SessionOutcome::Faulted(format!(
-                    "Isolated runner stopped with {status}; the Shell survived. See logs/raeen.log \
-                     for the guest fault and recent-HLE report."
+                    "{fault}; the Shell survived. See logs/raeen.log for the guest fault and \
+                     recent-HLE report.{report_note}"
                 ))
             };
         }

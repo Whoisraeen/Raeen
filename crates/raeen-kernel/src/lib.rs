@@ -1387,10 +1387,11 @@ impl OrbisKernel {
         (*entry == 1, *entry)
     }
 
-    /// Emit the complete process-local unresolved-call inventory as one
-    /// deterministic event. First-occurrence warnings remain useful when a
-    /// timed compatibility run is externally terminated before clean teardown.
-    pub fn log_unresolved_nid_inventory(&self) {
+    /// The process-local unresolved-call inventory as sorted, formatted
+    /// lines — one per distinct `(nid, function, library, caller)`, with call
+    /// counts. Consumed by the crash-report assembly as well as the log dump
+    /// below, so both say exactly the same thing.
+    pub fn unresolved_nid_inventory(&self) -> Vec<String> {
         let mut inventory = self
             .unresolved_nid_calls
             .iter()
@@ -1402,6 +1403,14 @@ impl OrbisKernel {
             })
             .collect::<Vec<_>>();
         inventory.sort();
+        inventory
+    }
+
+    /// Emit the complete process-local unresolved-call inventory as one
+    /// deterministic event. First-occurrence warnings remain useful when a
+    /// timed compatibility run is externally terminated before clean teardown.
+    pub fn log_unresolved_nid_inventory(&self) {
+        let inventory = self.unresolved_nid_inventory();
         if !inventory.is_empty() {
             tracing::warn!(
                 entries = inventory.len(),
@@ -1933,6 +1942,17 @@ mod subsystem_resource_tests {
             "a second calling module is a distinct compatibility gap"
         );
         assert_eq!(kernel.unresolved_nid_calls.len(), 2);
+        // The formatted inventory is sorted and carries the call counts —
+        // the exact lines the crash report and the log dump both emit.
+        assert_eq!(
+            kernel.unresolved_nid_inventory(),
+            vec![
+                "0x0000000000001234 sceExample library=libSceExample caller=eboot.bin calls=2"
+                    .to_string(),
+                "0x0000000000001234 sceExample library=libSceExample caller=plugin.prx calls=1"
+                    .to_string(),
+            ]
+        );
     }
 
     /// A guest worker torn down by a host-detected fault never runs its unlock

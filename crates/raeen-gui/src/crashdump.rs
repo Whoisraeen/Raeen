@@ -19,8 +19,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
 /// Where crash dumps are written, relative to the working directory (beside
-/// `logs/raeen.log`).
-const CRASH_DIR: &str = "logs/crashes";
+/// `logs/raeen.log`) — the same folder the assembled `.report.md` files use,
+/// so a dump and its report always pair up.
+const CRASH_DIR: &str = crate::crash_report::REPORTS_DIR;
 
 /// Domain-socket path shared by this Shell process and its runner children
 /// (`minidumper` speaks Unix domain sockets, which Windows supports too).

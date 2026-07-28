@@ -91,12 +91,25 @@ pub const PLUGIN_ACTION_ROWS: usize = 2;
 /// "Rescan Games".
 pub const GAME_FOLDER_ACTION_ROWS: usize = 3;
 
+/// Fixed rows at the top of the System section: Version and the updater's
+/// action row. Crash-report rows start at this index.
+pub const SYSTEM_FIXED_ROWS: usize = 2;
+
+/// Rows the System section appends after its per-report rows: "Open Crash
+/// Reports Folder" and "Copy Newest Report to Clipboard".
+pub const SYSTEM_ACTION_ROWS: usize = 2;
+
 /// Number of rows in each section, in `SETTINGS_SECTION_NAMES` order. The
 /// Game Folders section grows by one row per configured folder plus its
 /// three fixed action rows; the Plugins section grows by one row per
-/// registered present plugin plus its two fixed action rows — so this takes
-/// both live counts.
-pub fn settings_row_counts(game_folder_count: usize, plugin_count: usize) -> Vec<usize> {
+/// registered present plugin plus its two fixed action rows; the System
+/// section grows by one row per listed crash report plus its two fixed
+/// action rows — so this takes all three live counts.
+pub fn settings_row_counts(
+    game_folder_count: usize,
+    plugin_count: usize,
+    crash_report_count: usize,
+) -> Vec<usize> {
     vec![
         11,
         4,
@@ -105,9 +118,19 @@ pub fn settings_row_counts(game_folder_count: usize, plugin_count: usize) -> Vec
         1,
         2,
         plugin_count + PLUGIN_ACTION_ROWS,
-        2,
+        SYSTEM_FIXED_ROWS + crash_report_count + SYSTEM_ACTION_ROWS,
         9,
     ]
+}
+
+/// One crash report, pre-resolved by the Shell into plain display strings so
+/// this module stays free of the report types (mirrors [`PluginRowInfo`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashReportRowInfo {
+    /// Row label: title id + short UTC time.
+    pub label: String,
+    /// Row value: the fault one-liner, pre-truncated by the Shell.
+    pub fault: String,
 }
 
 /// One registered present plugin, pre-resolved by the Shell into plain display
@@ -422,6 +445,7 @@ pub fn draw(
     updater: &crate::updater::UpdaterState,
     plugins: &[PluginRowInfo],
     plugin_failures: &[String],
+    crash_reports: &[CrashReportRowInfo],
 ) -> Option<SettingsClick> {
     let screen = ui.max_rect();
     let painter = ui.painter().clone();
@@ -528,7 +552,7 @@ pub fn draw(
             SECTION_KEY_PROVIDER => draw_key_provider(ui, &mut rows, key_provider_input),
             SECTION_THEME => draw_theme(ui, &mut rows, config),
             SECTION_PLUGINS => draw_plugins(ui, &mut rows, plugins, plugin_failures),
-            SECTION_SYSTEM => draw_system(ui, &mut rows, updater),
+            SECTION_SYSTEM => draw_system(ui, &mut rows, updater, crash_reports),
             SECTION_ADVANCED => draw_debug(ui, &mut rows, config),
             _ => {}
         }
@@ -775,15 +799,52 @@ fn draw_plugins(
     }
 }
 
-/// System section: current version + the updater's single action row
+/// System section: current version, the updater's single action row
 /// ("Check for Updates" → "Download Update" → "Restart & Update" depending
-/// on [`crate::updater::UpdaterState`]).
-fn draw_system(ui: &mut egui::Ui, rows: &mut Rows, updater: &crate::updater::UpdaterState) {
+/// on [`crate::updater::UpdaterState`]), then the recent crash reports
+/// (newest first — Confirm opens one) and their two action rows.
+fn draw_system(
+    ui: &mut egui::Ui,
+    rows: &mut Rows,
+    updater: &crate::updater::UpdaterState,
+    crash_reports: &[CrashReportRowInfo],
+) {
     rows.row(ui, 0, "Version", format!("v{}", raeen_core::VERSION));
     rows.row(ui, 1, updater.action_label(), updater.status_line());
+
+    ui.add_space(14.0);
+    ui.label(
+        RichText::new("Crash Reports")
+            .color(rows.theme.palette.text)
+            .size(14.0)
+            .strong(),
+    );
+    ui.add_space(8.0);
+    for (i, report) in crash_reports.iter().enumerate() {
+        rows.row(
+            ui,
+            SYSTEM_FIXED_ROWS + i,
+            &report.label,
+            report.fault.clone(),
+        );
+    }
+    let action_base = SYSTEM_FIXED_ROWS + crash_reports.len();
+    rows.row(ui, action_base, "Open Crash Reports Folder", String::new());
+    rows.row(
+        ui,
+        action_base + 1,
+        "Copy Newest Report to Clipboard",
+        if crash_reports.is_empty() {
+            "No reports yet".to_string()
+        } else {
+            format!("{} report(s)", crash_reports.len())
+        },
+    );
     rows.hint(
         ui,
-        "Updates are fetched from GitHub Releases and applied on restart.",
+        "Updates are fetched from GitHub Releases and applied on restart. A crash report pairs \
+         the fault site, recent HLE calls, unresolved imports, and any minidump into one \
+         shareable file under logs/crashes/ — Confirm on a report opens it.",
     );
 }
 
@@ -850,7 +911,7 @@ mod tests {
     #[test]
     fn section_names_and_row_counts_stay_in_step() {
         assert_eq!(
-            settings_row_counts(0, 0).len(),
+            settings_row_counts(0, 0, 0).len(),
             SETTINGS_SECTION_NAMES.len()
         );
     }
@@ -871,28 +932,42 @@ mod tests {
     #[test]
     fn game_folders_row_count_tracks_the_configured_folder_count() {
         // Just the action rows: Add Folder, Browse & Add, Rescan Games.
-        assert_eq!(settings_row_counts(0, 0)[SECTION_GAME_FOLDERS], 3);
+        assert_eq!(settings_row_counts(0, 0, 0)[SECTION_GAME_FOLDERS], 3);
         // 2 folders + the three action rows.
-        assert_eq!(settings_row_counts(2, 0)[SECTION_GAME_FOLDERS], 5);
+        assert_eq!(settings_row_counts(2, 0, 0)[SECTION_GAME_FOLDERS], 5);
     }
 
     #[test]
     fn plugins_row_count_tracks_the_registered_plugin_count() {
         // No plugins: just the Rescan + Open Folder action rows.
-        assert_eq!(settings_row_counts(0, 0)[SECTION_PLUGINS], 2);
+        assert_eq!(settings_row_counts(0, 0, 0)[SECTION_PLUGINS], 2);
         // The built-in pair plus the action rows.
-        assert_eq!(settings_row_counts(0, 2)[SECTION_PLUGINS], 4);
+        assert_eq!(settings_row_counts(0, 2, 0)[SECTION_PLUGINS], 4);
+    }
+
+    #[test]
+    fn system_row_count_tracks_the_listed_crash_reports() {
+        // No reports: Version + updater + the two crash-report action rows.
+        assert_eq!(
+            settings_row_counts(0, 0, 0)[SECTION_SYSTEM],
+            SYSTEM_FIXED_ROWS + SYSTEM_ACTION_ROWS
+        );
+        // 3 reports + the fixed and action rows.
+        assert_eq!(
+            settings_row_counts(0, 0, 3)[SECTION_SYSTEM],
+            SYSTEM_FIXED_ROWS + 3 + SYSTEM_ACTION_ROWS
+        );
     }
 
     #[test]
     fn other_sections_row_counts_are_fixed() {
-        let counts = settings_row_counts(5, 3);
+        let counts = settings_row_counts(5, 3, 2);
         assert_eq!(counts[SECTION_VIDEO], 11); // + Frame Limit, GPU Device, Window W/H, Upscaler, Factor
         assert_eq!(counts[SECTION_AUDIO], 4); // + UI Sound Pack
         assert_eq!(counts[SECTION_CONTROLLER], 3);
         assert_eq!(counts[SECTION_KEY_PROVIDER], 1);
         assert_eq!(counts[SECTION_THEME], 2); // Theme + Wallpaper
-        assert_eq!(counts[SECTION_SYSTEM], 2); // version + updater action
+        assert_eq!(counts[SECTION_SYSTEM], 6); // version + updater + 2 reports + 2 actions
         assert_eq!(counts[SECTION_ADVANCED], 9); // + Performance HUD
         // The named HUD row is the section's last row.
         assert_eq!(ADVANCED_ROW_PERF_HUD, counts[SECTION_ADVANCED] - 1);
