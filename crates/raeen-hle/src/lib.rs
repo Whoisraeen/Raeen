@@ -487,10 +487,58 @@ pub struct GuestCallRequest {
     pub completion: Option<GuestCallCompletion>,
 }
 
+/// Why a synchronous guest call ([`GuestCallScheduler::call_guest`]) could
+/// not run. Deliberately small: a callback that *starts* and then faults or
+/// unwinds never reports here — the runtime's recovery machinery takes over
+/// and the requesting HLE handler is abandoned mid-flight, exactly like any
+/// other guest-fatal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestCallError {
+    /// This dispatch context cannot re-enter guest code synchronously: a test
+    /// double, or the runtime's direct leaf gateway (whose generated bridge
+    /// re-bases RSP to a fixed host-stack top on every entry, so nested
+    /// re-entry would clobber the live gateway frames — see
+    /// `raeen-runtime`'s `trampoline::direct_bridge_code`).
+    Unsupported,
+    /// The guest handed a null function pointer as the callback entry.
+    NullEntry,
+}
+
 /// Sink through which an HLE implementation can request one deferred guest
 /// call. A request returns `false` if this dispatch already has one pending.
 pub trait GuestCallScheduler {
     fn request(&self, request: GuestCallRequest) -> bool;
+
+    /// **Synchronously** call guest code at `entry` with up to six SysV
+    /// integer arguments, on the *current* guest thread, returning the
+    /// callback's RAX (checklist item 7 — qsort comparators, atexit chains,
+    /// module init/fini, and later VideoOut/GPU event callbacks).
+    ///
+    /// Contrast with [`Self::request`], which only *defers* one tail call to
+    /// run after the HLE handler has already returned: this method runs the
+    /// callback in the middle of the handler and hands its result back, so
+    /// the handler can branch on it (a comparator's ordering, an initializer's
+    /// status).
+    ///
+    /// Semantics the runtime implementation guarantees (see
+    /// `ActiveContext::call_guest` in `raeen-runtime` for the mechanism):
+    ///
+    /// * The callback may itself call HLE imports, and those handlers may
+    ///   call `call_guest` again — nesting is bounded only by guest stack
+    ///   space; depth 2 is covered by acceptance tests.
+    /// * A genuine fault in the callback, or a `request_exit` /
+    ///   process-termination triggered under it, unwinds the whole guest
+    ///   call — this method then **never returns**, so a fatal unwind can
+    ///   never be mistaken for a successful callback result.
+    /// * Integer/pointer returns only (RAX). Float-returning callbacks are
+    ///   not supported through this interface.
+    ///
+    /// The default declines: contexts without a live native runtime behind
+    /// them (unit-test doubles) cannot run guest code.
+    fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, GuestCallError> {
+        let _ = (entry, args);
+        Err(GuestCallError::Unsupported)
+    }
 }
 
 /// Runtime-owned guest pthread lifecycle. HLE knows the Orbis ABI, while the
@@ -1214,6 +1262,22 @@ pub(crate) fn test_ctx_with_gpu<'a>(
         caller_return_addr: 0,
         caller_rsp: 0,
         float_args: [0; 8],
+    }
+}
+
+/// [`test_ctx`] with a caller-supplied [`GuestCallScheduler`], for unit tests
+/// that exercise synchronous guest callbacks (`qsort`'s comparator) against a
+/// host-side comparator double instead of real guest code.
+#[cfg(test)]
+pub(crate) fn test_ctx_with_guest_calls<'a>(
+    kernel: &'a raeen_kernel::OrbisKernel,
+    mem: &'a TestMemory,
+    alloc: &'a TestAllocator,
+    guest_calls: &'a dyn GuestCallScheduler,
+) -> HleContext<'a> {
+    HleContext {
+        guest_calls,
+        ..test_ctx(kernel, mem, alloc)
     }
 }
 

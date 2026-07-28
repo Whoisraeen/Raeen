@@ -65,8 +65,8 @@ use windows_sys::Win32::System::Threading::{
 use raeen_core::subsystems::GpuSubmissionSubsystem;
 use raeen_firmware::{HleTrampoline, UnresolvedStub};
 use raeen_hle::{
-    GuestAllocator, GuestCallCompletion, GuestCallRequest, GuestCallScheduler, GuestMemory,
-    GuestThreadScheduler, HleContext, HleRegistry,
+    GuestAllocator, GuestCallCompletion, GuestCallError, GuestCallRequest, GuestCallScheduler,
+    GuestMemory, GuestThreadScheduler, HleContext, HleRegistry,
 };
 use raeen_kernel::OrbisKernel;
 
@@ -541,6 +541,17 @@ struct ActiveContext {
     retval: Cell<u64>,
     /// At most one guest callback can be requested by a single HLE handler.
     pending_guest_call: Cell<Option<GuestCallRequest>>,
+    /// Whether the HLE handler currently executing on this thread was
+    /// dispatched through [`direct_hle_gateway`] (the executable leaf bridge)
+    /// rather than the VEH. Set/restored around the gateway's `hle.call` so
+    /// [`ActiveContext::call_guest`] can refuse synchronous guest re-entry on
+    /// that path: the generated direct bridge re-bases RSP to a fixed private
+    /// host-stack top on *every* entry (`trampoline::direct_bridge_code`), so
+    /// a callback running on that stack that called another direct-dispatched
+    /// import would have its live frames clobbered. Save/restore (not a bare
+    /// set/clear) because a VEH-path callback may legitimately call a direct
+    /// leaf import, nesting a gateway dispatch inside a VEH dispatch.
+    direct_gateway_active: Cell<bool>,
     /// HLE currently executing on this OS thread. A GuestMemory write can
     /// itself fault (for example, when a bad output pointer names RX code),
     /// recursively entering the VEH before the call can be added to the
@@ -705,6 +716,131 @@ impl GuestCallScheduler for ActiveContext {
         }
         self.pending_guest_call.set(Some(request));
         true
+    }
+
+    /// Synchronous guest re-entry from inside an HLE handler (checklist item
+    /// 7): call `entry` with up to six SysV integer arguments **on the
+    /// current guest thread**, returning its RAX to the handler mid-call.
+    ///
+    /// # Stack strategy
+    ///
+    /// On the VEH dispatch path the handler is *already executing on the
+    /// guest stack*: Windows delivers vectored exceptions synchronously on
+    /// the faulting thread's current stack, and the guest was on its own
+    /// (arena-backed) stack when it called the import slot. A plain native
+    /// call from here therefore runs the callback on the guest stack, below
+    /// the trapped frame and the kernel's exception-dispatch frames, with
+    /// the compiler maintaining the SysV 16-byte call alignment. That is the
+    /// architecturally sound choice over a dedicated callback stack region
+    /// for two reasons: (a) the TLS re-arm and FS-rearm paths stage a tiny
+    /// return trampoline at `[rsp-16]` via `GuestMemory::write`, which is
+    /// bounds-checked against the arena — a callback on a host-allocated
+    /// side stack would make every re-arm under it fail; and (b) the guest
+    /// stack is exactly where the callback would have run on real hardware
+    /// (below its caller's frame), so guest stack-walking code sees a
+    /// plausible chain.
+    ///
+    /// # Nesting
+    ///
+    /// The callback may itself call HLE imports; each traps into a nested
+    /// VEH dispatch against this same `ActiveContext` (recovery context,
+    /// TLS/FS re-arm, on-demand commit, and terminating-function arms all
+    /// stay armed), and such a nested handler may call `call_guest` again.
+    /// Depth is bounded only by guest stack space; depth 2 (HLE → callback →
+    /// HLE → callback) is pinned by `nested_call_guest_composes_to_depth_two`
+    /// in `tests/execute.rs`.
+    ///
+    /// # Unwind composition
+    ///
+    /// A genuine fault in the callback, a `request_exit` from a nested HLE
+    /// handler (`__stack_chk_fail`, `abort`, `scePthreadExit`), a
+    /// terminating-function call (`exit`), or cooperative process
+    /// termination all longjmp to `run`'s recovery context exactly as they
+    /// do outside a callback. Control then **never returns here**, so the
+    /// interrupted HLE handler cannot mistake a fatal unwind for a
+    /// successful callback return. The longjmp abandons this Rust frame
+    /// without running its drops — the same established trade every HLE
+    /// handler already makes for faults raised under `GuestMemory` accesses;
+    /// nothing in this frame owns a resource beyond the saved cells below,
+    /// and those die with the run's `ActiveContext`.
+    ///
+    /// # Dispatch paths
+    ///
+    /// VEH only. The direct leaf gateway is refused loudly (see
+    /// `direct_gateway_active`): its generated bridge re-bases RSP to a
+    /// fixed private host-stack top on every entry, so a nested
+    /// direct-dispatched import called from a callback would clobber the
+    /// outer gateway's live frames, and re-arm staging writes would target
+    /// non-arena host memory. `trampoline::direct_dispatchable` deliberately
+    /// lists only imports that never re-enter guest code — an import that
+    /// needs callbacks belongs on the VEH path.
+    fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, GuestCallError> {
+        if self.direct_gateway_active.get() {
+            tracing::error!(
+                "synchronous guest callback to {entry:#x} requested from the direct leaf \
+                 gateway — refused: the direct bridge re-bases RSP to a fixed host stack \
+                 top on every entry, so re-entering guest code here is unsound. Route the \
+                 requesting import through the VEH path (remove it from \
+                 `direct_dispatchable`)."
+            );
+            return Err(GuestCallError::Unsupported);
+        }
+        if entry == 0 {
+            return Err(GuestCallError::NullEntry);
+        }
+        debug_assert!(
+            self.armed.get(),
+            "call_guest is only reachable from an HLE handler dispatched under an armed run"
+        );
+
+        // Preserve the interrupted call's per-thread dispatch state: a nested
+        // HLE call made by the callback overwrites `active_hle` (fault
+        // attribution would then name the wrong handler) and would consume a
+        // deferred `pending_guest_call` the *outer* handler already scheduled
+        // (attaching it to the nested call's return instead of the outer
+        // one's). Both are restored after the callback returns.
+        let saved_active_hle = self.active_hle.take();
+        let saved_pending_call = self.pending_guest_call.take();
+
+        // Diagnostic single-thread mode: guest native code is about to run on
+        // this thread, so hold the guest GIL for the callback's duration (the
+        // dispatching HLE arm released it via `GuestGilYield`). No-op unless
+        // RAEEN_SINGLE_THREAD_GUEST is set.
+        let gil = GuestGilHold::acquire();
+
+        // SAFETY: `entry` names guest-supplied code in the identity-mapped
+        // arena (or an executable import slot), exactly the class of address
+        // `stack::enter_guest` jumps to — and the same recovery machinery
+        // defines every outcome: this thread is inside an HLE handler
+        // dispatched by `run`, so the process VEH is installed, this
+        // thread's `ACTIVE_CONTEXT` names `self`, and `self.armed` is true
+        // with a populated `recovery_ctx`. If `entry` is not valid code the
+        // first instruction fetch faults outside the guard region and the
+        // genuine-fault arm longjmps to `run` (reported as `Err(Faulted)` —
+        // this call never returns); HLE imports the callback makes trap and
+        // are serviced by nested VEH dispatch; FS-base staleness re-arms on
+        // fault. The callback is assumed to follow the SysV ABI (callee-
+        // saved registers, DF=0) — the same assumption the runtime makes of
+        // all guest code it enters. The transmute itself only reinterprets
+        // an address as a `sysv64` function pointer; no lifetime or validity
+        // beyond "callable now, on this thread" is claimed.
+        let callback = unsafe {
+            core::mem::transmute::<
+                usize,
+                unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> u64,
+            >(entry as usize)
+        };
+        // SAFETY: discharged by the block above — armed recovery + VEH make
+        // this call's fault/exit/unwind behavior fully defined, and the
+        // current stack is the guest stack (VEH dispatch runs on the
+        // faulting thread's stack), so callback frames land below the
+        // trapped guest frame just as a native call there would.
+        let ret = unsafe { callback(args[0], args[1], args[2], args[3], args[4], args[5]) };
+        drop(gil);
+
+        self.pending_guest_call.set(saved_pending_call);
+        self.active_hle.set(saved_active_hle);
+        Ok(ret)
     }
 }
 
@@ -1002,9 +1138,17 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         };
         ctx.active_hle
             .set(Some((index, args[..6].try_into().unwrap())));
+        // Mark this dispatch as gateway-hosted for the duration of the
+        // handler, so a `call_guest` attempt from inside it is refused (see
+        // `ActiveContext::direct_gateway_active`). Save/restore rather than
+        // set/clear: this gateway may itself be nested under a VEH-path
+        // callback. The early longjmp exits below never restore the flag,
+        // but they abandon this whole ActiveContext with the run.
+        let prev_direct_gateway = ctx.direct_gateway_active.replace(true);
         let result = hle
             .call(&hle_ctx, &t.library, &t.function, &args)
             .unwrap_or(0);
+        ctx.direct_gateway_active.set(prev_direct_gateway);
         if timed {
             kernel.in_flight_hle.remove(&ctx.current_thread());
             let micros = started.map_or(0, |s| s.elapsed().as_micros());
@@ -1217,6 +1361,7 @@ pub(crate) unsafe fn run(
         returned: Cell::new(false),
         retval: Cell::new(0),
         pending_guest_call: Cell::new(None),
+        direct_gateway_active: Cell::new(false),
         active_hle: Cell::new(None),
         callback_frames: RefCell::new(Vec::new()),
         error: Cell::new(None),

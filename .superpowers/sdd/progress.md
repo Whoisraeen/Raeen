@@ -1,3 +1,64 @@
+- SYNCHRONOUS GUEST CALLBACKS — checklist item 7 (2026-07-27; worktree agent,
+  commit 6ff4132, branch worktree-agent-a8a0f93f4ac611946; raeen-runtime 77
+  lib + 56 execute
+  (+6 new, 1 pre-existing ignored bench) + 1 m3 green; raeen-hle 500/500
+  (+3 new); raeen-firmware 125/125; fmt clean; clippy --all-targets
+  -D warnings green on raeen-runtime + raeen-hle):
+  * MECHANISM: `GuestCallScheduler::call_guest(entry, [u64; 6]) ->
+    Result<u64, GuestCallError>` (raeen-hle lib.rs, default = Unsupported for
+    test doubles) implemented on `ActiveContext` (dispatch.rs). An HLE
+    handler calls back INTO guest code mid-call and receives its RAX on the
+    current guest thread — the synchronous complement to the existing
+    deferred `request()` tail-call.
+  * STACK STRATEGY: on the VEH path the handler already runs ON the guest
+    stack (Windows dispatches vectored exceptions on the faulting thread's
+    stack), so the callback is a plain native `extern "sysv64"` call —
+    frames land below the trapped guest frame, alignment kept by the
+    compiler, and the FS-rearm staging writes at [rsp-16] stay inside
+    arena-backed memory. No second stack region. All recovery machinery
+    (armed recovery ctx, TLS/FS re-arm, commit-on-demand, terminating arms)
+    stays live, so nested HLE imports from the callback trap normally as
+    nested VEH dispatches (a pattern the runtime already relied on).
+  * NESTING: bounded only by guest stack space; depth 2 (HLE → callback →
+    HLE → callback) pinned by `nested_call_guest_composes_to_depth_two`.
+    The interrupted handler's `active_hle` attribution and its deferred
+    `pending_guest_call` are saved/restored around the callback so nested
+    dispatches can't mis-attribute a fault or steal a deferred request.
+  * UNWIND COMPOSITION: callback faults genuinely → run returns
+    Err(Faulted) and the requesting handler NEVER resumes (longjmp to the
+    recovery ctx; pinned with a resumed-flag static). `request_exit` under
+    the callback (`__stack_chk_fail`, d818df9 lineage) → clean thread
+    unwind with the fatal code, handler provably never resumes. Terminating
+    functions and cooperative process exit compose identically (same
+    longjmp seam).
+  * DISPATCH PATHS: VEH = full support. Direct leaf gateway = REFUSED
+    LOUDLY (GuestCallError::Unsupported + error log): the generated bridge
+    re-bases RSP to the fixed private host-stack top on every entry
+    (trampoline.rs `mov rsp,[r11+8]`), so a nested direct import called
+    from a callback hosted there would clobber the outer gateway's live
+    frames. `direct_dispatchable` deliberately lists only never-re-enter
+    imports; the refusal is pinned by a test overriding libc::strlen with a
+    call_guest probe (returns Unsupported, dispatch itself unharmed). New
+    `ActiveContext::direct_gateway_active` save/restore around the
+    gateway's hle.call detects the path.
+  * CONSUMER RETIRED: `qsort` (libc.rs) — the ledger 2026-07-25 "needs a
+    synchronous guest callback" skip. Real in-place heapsort over guest
+    memory: every comparator call receives GENUINE pointers into the live
+    array (max ABI fidelity, no scratch allocs), swaps via bounds-checked
+    reads/writes, O(n log n), abortable mid-flight with honest logging
+    (refusal precedes the first swap; null comparator / overflow extents
+    untouched). End-to-end acceptance: guest fixture sorts a 6-elem u64
+    array through a REAL guest comparator that counts its own calls, guest
+    code verifies ascending order, returns the counter (≥ n-1 asserted).
+    Plus 3 hle unit tests (host-comparator double sorts through the trait;
+    Unsupported leaves array untouched; degenerate inputs are no-ops).
+  * NOT DONE (follow-ups now unblocked): atexit chain (needs a hook in the
+    VEH terminating-function arm BEFORE the exit longjmp — the exit HLE
+    handler never runs on the VEH path, it is intercepted by
+    TERMINATING_FUNCTIONS), module init/fini callbacks, VideoOut/GPU event
+    callbacks. Float-returning callbacks unsupported through this interface
+    (documented on the trait).
+
 - GTA V ACB PHASE B — COMPUTE-QUEUE EXECUTION (2026-07-27; gpu-pipeline agent
   worktree branch; kyty-graphics 480/480 (475 lib + 5 integration, +3 new),
   raeen-hle 486/486 (+5 new; one wall-clock vblank flake passed on isolated
