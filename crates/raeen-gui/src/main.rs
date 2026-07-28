@@ -8,6 +8,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod compat;
 mod crash_report;
 mod crashdump;
 mod launcher;

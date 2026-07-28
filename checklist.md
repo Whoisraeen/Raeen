@@ -302,11 +302,23 @@ top-down, update statuses in place, and keep it committed.**
 - **Why:** regression tripwire while AGC/stub work churns; feeds item 11.
 
 ### 11. Compatibility badges in the Shell library
-- [ ] Per-title status chip (Boots / Menu / In-game / Playable) derived from
-  local run history (baseline output + last-session outcome), shown on tiles
-  and in per-game overlay.
-- **Where:** `crates/raeen-gui/src/shell/` (tiles, per-game overlay),
-  storage next to per-game config.
+- [x] DONE 2026-07-27 (shell-ui agent, worktree; raeen-gui 202 green — 195
+  baseline + 7 new). New `crates/raeen-gui/src/compat.rs`: mirrors the
+  xtask baseline schema (source of truth `xtask/src/schema.rs`; stage order
+  mirrors `baseline.rs::stage_rank`), loads `artifacts/compat/latest.json`
+  (missing/malformed → no badges, never a crash), folds in the Shell's own
+  session ledger newest-wins (a newer fault → Broken "last session"; a newer
+  clean exit only ever *upgrades* to Boots — it can't disprove Playable).
+  Mapping: Refused/Detected/Launching/Crashed → Broken; ran-but-no-flips →
+  Boots; flips + render errors or fps<10 → Menu; clean flips fps≥10 →
+  In-game; fps≥30 → Playable; no data → Untested (no chip drawn, no noise).
+  Tile chip is painter-drawn at explicit rects (dark pill + theme-derived
+  status dot via `compat::badge_color` — semantic hue, theme accent's S/L);
+  per-game overlay shows badge + provenance on the title row. Matching:
+  `param.json` title id first, display title fallback. Badges refresh on
+  rescan and session exit; baseline index loads once per Shell start.
+- **Where:** `crates/raeen-gui/src/compat.rs`,
+  `crates/raeen-gui/src/shell/{mod,home,per_game}.rs`.
 
 ### 12. Symbolized / actionable crash report view
 - [x] DONE (shell-ui agent, worktree, 2026-07-27). One shareable file per

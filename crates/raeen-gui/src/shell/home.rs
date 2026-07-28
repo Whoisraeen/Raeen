@@ -20,6 +20,7 @@ use super::anim::lerp_color;
 use super::icons::{self, Glyph};
 use super::ledger;
 use super::nav::{self, NavMode, NavState, RailTab};
+use crate::compat;
 use crate::library::{
     ArtSource, GlyphKind, Gradient, ItemKind, LibraryItem, MetaCache, TileGradient,
 };
@@ -82,6 +83,7 @@ pub fn draw(
     anim: &HomeAnim,
     meta_cache: &MetaCache,
     ledgers: &HashMap<String, ledger::TitleLedger>,
+    badges: &HashMap<String, compat::TitleBadge>,
     background: Option<&egui::TextureHandle>,
     covers: &HashMap<String, egui::TextureHandle>,
     bg_from: Option<&egui::TextureHandle>,
@@ -143,7 +145,7 @@ pub fn draw(
         Pos2::new(screen.left(), screen.top() + RAIL_TOP + band_shift),
         vec2(screen.width(), focused_size + 16.0),
     );
-    let clicked_tile = draw_rail(ui, theme, rail_rect, items, nav, anim, covers);
+    let clicked_tile = draw_rail(ui, theme, rail_rect, items, nav, anim, covers, badges);
 
     draw_context_block(
         &painter,
@@ -443,6 +445,7 @@ fn draw_nav_pills(
     pill_rects
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_rail(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -451,6 +454,7 @@ fn draw_rail(
     nav: &NavState,
     anim: &HomeAnim,
     covers: &HashMap<String, egui::TextureHandle>,
+    badges: &HashMap<String, compat::TitleBadge>,
 ) -> Option<usize> {
     // Slightly expanded clip so the focused tile's offset ring isn't cut off.
     let painter = ui.painter_at(rect.expand(18.0));
@@ -609,6 +613,17 @@ fn draw_rail(
             }
         }
 
+        // Compatibility chip (checklist item 11): painter-drawn at an
+        // explicit rect on the tile's top-left corner — a dark pill wearing
+        // a theme-derived status dot plus the badge label. Only titles with
+        // real evidence get one (Untested = no chip, no noise); it follows
+        // the tile's passed-tile fade.
+        if item.kind == ItemKind::Game
+            && let Some(badge) = badges.get(item.id.as_str())
+        {
+            draw_badge_chip(&painter, theme, tile_rect, size, alpha, badge);
+        }
+
         if focused {
             // PS5 signature focus: a thin white line hugging the tile, with
             // only a whisper of accent halo behind it (the old thick blue
@@ -636,6 +651,53 @@ fn draw_rail(
         }
     }
     clicked
+}
+
+/// A small rounded compatibility chip on a tile's top-left corner: a dark
+/// translucent pill (theme ground + hairline), a status dot colored by
+/// [`compat::badge_color`] (theme-derived, never hardcoded hex), and the
+/// badge level label. Painted at explicit rects like everything else on
+/// Home — no nested layout scopes.
+fn draw_badge_chip(
+    painter: &egui::Painter,
+    theme: &Theme,
+    tile_rect: Rect,
+    tile_size: f32,
+    alpha: f32,
+    badge: &compat::TitleBadge,
+) {
+    let font = FontId::proportional((tile_size * 0.058).max(11.0));
+    let text_color = with_alpha(theme.palette.text, 0.92 * alpha);
+    let galley = painter.layout_no_wrap(badge.level.label().to_string(), font, text_color);
+    let text_size = galley.size();
+    let dot_r = (tile_size * 0.016).max(3.0);
+    let pad_x = 8.0;
+    let inset = tile_size * 0.05;
+    let h = text_size.y + 8.0;
+    let w = pad_x + dot_r * 2.0 + 6.0 + text_size.x + pad_x;
+    let chip = Rect::from_min_size(
+        Pos2::new(tile_rect.left() + inset, tile_rect.top() + inset),
+        vec2(w, h),
+    );
+    let radius = h / 2.0;
+    painter.rect_filled(chip, radius, with_alpha(theme.palette.ground, 0.72 * alpha));
+    painter.rect_stroke(
+        chip,
+        radius,
+        Stroke::new(1.0f32, theme.palette.line.gamma_multiply(alpha)),
+        StrokeKind::Inside,
+    );
+    let dot_c = Pos2::new(chip.left() + pad_x + dot_r, chip.center().y);
+    painter.circle_filled(
+        dot_c,
+        dot_r,
+        with_alpha(compat::badge_color(&theme.palette, badge.level), alpha),
+    );
+    painter.galley(
+        Pos2::new(dot_c.x + dot_r + 6.0, chip.center().y - text_size.y / 2.0),
+        galley,
+        text_color,
+    );
 }
 
 /// UV rect that center-crops `texture` to `target_aspect` (width/height):

@@ -21,6 +21,7 @@ pub(crate) mod screenshot;
 pub mod settings;
 pub mod sounds;
 
+use crate::compat;
 use crate::launcher::{GameLauncher, SessionHandle, SessionState};
 use crate::library::{Gradient, LaunchTarget, LibraryItem, MetaCache};
 use crate::theme::{self, Theme};
@@ -208,6 +209,15 @@ pub struct Shell {
     /// Real per-title play history (last played, time played, last fault),
     /// loaded once at startup and refreshed on every session launch/exit.
     ledgers: HashMap<String, ledger::TitleLedger>,
+    /// The digested compat baseline (`artifacts/compat/latest.json`), loaded
+    /// once at startup. Empty when the file is missing or malformed — badges
+    /// then come only from the session ledger, or not at all.
+    compat_index: compat::CompatIndex,
+    /// Resolved per-title compatibility badges (baseline folded with the
+    /// last local session, newest-wins), keyed by [`LibraryItem::id`].
+    /// Untested titles have no entry — no chip, no noise. Recomputed on
+    /// library rescan and on session launch/exit (the ledger fold inputs).
+    compat_badges: HashMap<String, compat::TitleBadge>,
     nav: NavState,
     screen: Screen,
     launcher: Box<dyn GameLauncher>,
@@ -357,6 +367,11 @@ impl Shell {
             .iter()
             .map(|item| (item.id.clone(), ledger::load(&ledger_dir, &item.id)))
             .collect();
+        // Compat badges: baseline report (if any) folded with the session
+        // ledger, newest-wins. Missing/malformed baseline = empty index.
+        let compat_index =
+            compat::CompatIndex::load(std::path::Path::new(compat::DEFAULT_BASELINE_PATH));
+        let compat_badges = compat::badges_for_library(&compat_index, &library, &ledgers);
 
         let library_media = media::media_items();
         // Settings is always one of the built-in apps (spec §10 SM2); if a
@@ -404,6 +419,8 @@ impl Shell {
             library_media,
             meta_cache,
             ledgers,
+            compat_index,
+            compat_badges,
             nav,
             screen: Screen::Boot(BootSequence::new()),
             launcher,
@@ -1181,6 +1198,7 @@ impl Shell {
         let settings_tile_index = library.iter().position(|item| item.id == "settings");
         self.nav.set_games_rail(library.len(), settings_tile_index);
         self.library = library;
+        self.refresh_compat_badges();
         // Old texture handles may be stale — force the hero refresh path in
         // `tick_animations` to re-resolve the focused tile's art.
         self.last_rail_index = usize::MAX;
@@ -1639,6 +1657,7 @@ impl Shell {
             title_ledger.last_faulted = session.faulted_seen;
             ledger::store(&ledger_dir, &session.item_id, &title_ledger);
             self.ledgers.insert(session.item_id.clone(), title_ledger);
+            self.refresh_compat_badges();
             self.nav.rail_index = session.target_index;
             self.session_quit_hold.reset();
             // Drop the last frame with the session, or the next launch opens on
@@ -1649,6 +1668,15 @@ impl Shell {
 
     fn ledger_dir(&self) -> PathBuf {
         ledger::store_dir(&self.config_path)
+    }
+
+    /// Re-fold the per-title compat badges after anything that changes a
+    /// fold input: the library list or a session ledger entry. The baseline
+    /// index itself is loaded once at startup — a new `latest.json` lands on
+    /// the next Shell start.
+    fn refresh_compat_badges(&mut self) {
+        self.compat_badges =
+            compat::badges_for_library(&self.compat_index, &self.library, &self.ledgers);
     }
 
     fn tick_animations(&mut self, ctx: &egui::Context) {
@@ -1754,6 +1782,10 @@ impl Shell {
                     .and_then(|id| self.library.iter().find(|item| &item.id == id))
                     .map(|item| item.title.clone())
                     .unwrap_or_default();
+                let badge = self
+                    .game_options_target_id
+                    .as_ref()
+                    .and_then(|id| self.compat_badges.get(id));
                 clicked_game_option = per_game::draw(
                     ui,
                     &theme,
@@ -1761,6 +1793,7 @@ impl Shell {
                     &self.config,
                     &self.game_options_draft,
                     &title,
+                    badge,
                 );
                 return;
             }
@@ -1799,6 +1832,7 @@ impl Shell {
                 &anim,
                 &self.meta_cache,
                 &self.ledgers,
+                &self.compat_badges,
                 self.background_texture.as_ref(),
                 &self.cover_textures,
                 self.hero_bg_from.as_ref(),
