@@ -2230,6 +2230,23 @@ impl GuestAllocator for GuestArena {
         GuestArena::commit_on_demand(self, addr)
     }
 
+    /// The VMA map answers this directly: [`VmaType::Foreign`] is precisely
+    /// "address space belonging to the host process — its DLLs, its heap, its
+    /// thread stacks, and every range we have simply never asked the OS for".
+    ///
+    /// A `true` here is what lets the fault handler say "our Rust code faulted"
+    /// instead of blaming the guest. It stays a positive claim: an address the
+    /// map cannot answer for (outside `[VMM_MIN, VMM_MAX)`, e.g. a guest jump to
+    /// `0x8`) is *not* reported as host-owned, so the existing guest-fault path
+    /// keeps every case it used to handle.
+    fn address_is_host_owned(&self, addr: u64) -> bool {
+        let state = self.lock_state();
+        state
+            .vmm
+            .find(addr)
+            .is_some_and(|vma| vma.kind == VmaType::Foreign)
+    }
+
     fn map_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
         let align = normalize_align(align.max(PAGE_SIZE))?;
         if addr % align != 0 {

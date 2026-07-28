@@ -662,21 +662,37 @@ impl GuestThreadScheduler for GuestProcessHandle {
                 // its C++ unlock/cleanup, so every lock it still held stays held
                 // forever. Now that mutexes and rwlocks truly block, its waiters
                 // hang indefinitely — the measured "scePthreadMutexLock stuck >3s
-                // — deadlock" cascade during ASTRO.BOT level transitions. Release
-                // the dead thread's locks so the title can limp on. Only the
-                // faulted/errored exit does this; a clean Returned/Exited already
-                // unlocked what it held.
-                if result.is_err() {
-                    let freed = process.kernel.release_locks_owned_by(handle);
-                    if freed.any() {
-                        tracing::warn!(
-                            guest_thread = handle,
-                            mutexes = freed.mutexes,
-                            rwlock_writers = freed.rwlock_writers,
-                            rwlock_read_holds = freed.rwlock_read_holds,
-                            "guest worker faulted holding locks; released them so waiters can proceed"
-                        );
-                    }
+                // — deadlock" cascade during ASTRO.BOT level transitions.
+                //
+                // This runs on EVERY exit path, not just the errored one. The
+                // "a clean Returned/Exited already unlocked what it held"
+                // assumption this code used to make is false in both directions:
+                //   * `Ok(Returned)` is also how `scePthreadExit` ends a worker.
+                //     A thread that calls it from inside a critical section — the
+                //     ordinary shape of a C++ worker that throws, catches, and
+                //     exits, or of any thread cancelled by its own logic — never
+                //     reaches its unlock either, and left the mutex held forever.
+                //   * `Ok(Exited)` is cooperative process termination: the VEH
+                //     abandons the guest stack at the next safe point, which is
+                //     just as abrupt as a fault, only tidier at the top.
+                // Unconditional is also cheap and idempotent: a thread holding
+                // nothing produces an all-zero summary and logs nothing.
+                let freed = process.kernel.release_locks_owned_by(handle);
+                if freed.any() {
+                    let exit = match &result {
+                        Ok(RunOutcome::Returned(_)) => "returned/pthread-exit",
+                        Ok(RunOutcome::Exited(_)) => "process-exit",
+                        Err(_) => "faulted",
+                    };
+                    tracing::warn!(
+                        guest_thread = handle,
+                        exit,
+                        mutexes = freed.mutexes,
+                        rwlock_writers = freed.rwlock_writers,
+                        rwlock_read_holds = freed.rwlock_read_holds,
+                        cond_waiters = freed.cond_waiters,
+                        "guest worker exited still holding sync state; released it so waiters can proceed"
+                    );
                 }
                 process
                     .kernel

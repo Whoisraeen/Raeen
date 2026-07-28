@@ -327,6 +327,44 @@ pub enum RuntimeError {
         stub_addr: u64,
         rip: u64,
     },
+    /// An access violation that happened while **host** (emulator) code was
+    /// running — not guest code. Our bug, not the title's.
+    ///
+    /// The VEH used to report every access violation on a guest-executing
+    /// thread as [`Self::Faulted`], including one raised by a null dereference
+    /// inside a Rust HLE handler (or a driver called from one). That laundered
+    /// an emulator bug into "guest fault at 0x7ff…", which reads as a title
+    /// problem and sends the investigation to the wrong place entirely.
+    ///
+    /// Classification (see `dispatch::classify_access_violation`): the faulting
+    /// `rip` is not guest-readable memory, is not an unresolved-import stub, and
+    /// the arena's VMA map positively attributes it to the host process
+    /// ([`crate::vmm::VmaType::Foreign`]) — plus the access is a read or write,
+    /// never an instruction fetch, because a *fetch* failure at an unmapped
+    /// address is the ordinary shape of a guest wild jump and stays a guest
+    /// fault.
+    ///
+    /// `hle` names the HLE call that was executing on this thread, when one was
+    /// (`library::function`) — filled in by `run` after recovery, since the VEH
+    /// itself must not allocate.
+    ///
+    /// One residual ambiguity, recorded rather than hidden: guest code that
+    /// jumps into an executable host page and then faults also lands here. The
+    /// reported `rip` and the call trace distinguish the two by inspection.
+    #[error(
+        "HOST fault in emulator code at rip {rip:#x} ({kind} {access:#x}){}",
+        match hle { Some(name) => format!(" during {name}"), None => String::new() }
+    )]
+    HostFaulted {
+        /// The host instruction pointer that faulted.
+        rip: u64,
+        /// The address the host instruction tried to touch.
+        access: u64,
+        /// How it was touching it (never `Execute` — see the type docs).
+        kind: FaultKind,
+        /// `library::function` of the HLE call in flight, if any.
+        hle: Option<String>,
+    },
     /// More than 6 integer/pointer arguments were requested — RT0 only
     /// marshals the SysV integer argument registers (design doc §3).
     #[error("more than 6 arguments requested (RT0 marshals only the SysV integer registers)")]

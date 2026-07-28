@@ -44,7 +44,7 @@
 //! unchanged.
 
 use core::ptr;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -560,7 +560,24 @@ struct ActiveContext {
     active_hle: Cell<Option<(u64, [u64; 6])>>,
     /// Nested guest callbacks are legal (an initializer may call another API
     /// that invokes guest code), so retain their original HLE return frames.
-    callback_frames: RefCell<Vec<GuestCallbackFrame>>,
+    ///
+    /// `Cell`, not `RefCell`, and for the same reason every other field here is
+    /// (see the discipline note on [`CallTrace`]) — but this one was measured
+    /// the hard way. Unwinding these frames writes each frame's completion word
+    /// to a **guest-controlled** address; that write can itself fault, which
+    /// re-enters the VEH *on this thread* and reaches the same unwind code. With
+    /// a `RefCell` the outer `borrow_mut()` was still live, so the inner borrow
+    /// panicked — a Rust panic inside a vectored exception handler, i.e. an
+    /// `abort` that Windows reports as `0xC0000409`
+    /// (`STATUS_STACK_BUFFER_OVERRUN`) with no fault report at all. A `Cell`
+    /// cannot fail: [`Cell::take`] moves the whole vector out before any guest
+    /// memory is touched, so a re-entrant handler simply finds it empty.
+    ///
+    /// Every access must therefore follow the same shape: `take()` (or
+    /// take/modify/`set()`) with **no guest access under the temporary**, then
+    /// touch guest memory. Taking leaves `Vec::new()`, which neither allocates
+    /// nor frees, so this stays VEH-safe.
+    callback_frames: Cell<Vec<GuestCallbackFrame>>,
     error: Cell<Option<RuntimeError>>,
     /// Register state and instruction bytes captured before a genuine guest
     /// fault is long-jumped back to the host recovery point.
@@ -707,6 +724,42 @@ struct GuestCallbackFrame {
     /// when the frame completes (see [`apply_hle_result`]).
     float_return: bool,
     completion: Option<GuestCallCompletion>,
+}
+
+impl ActiveContext {
+    /// Push one nested guest-callback frame.
+    ///
+    /// Take/modify/set rather than a borrow: see [`ActiveContext::callback_frames`].
+    /// Nothing between the take and the set may touch guest memory — a fault
+    /// there would re-enter the VEH and find the stack momentarily empty, losing
+    /// the outer frames' completion rollback.
+    fn push_callback_frame(&self, frame: GuestCallbackFrame) {
+        let mut frames = self.callback_frames.take();
+        frames.push(frame);
+        self.callback_frames.set(frames);
+    }
+
+    /// Pop the innermost nested guest-callback frame, if any.
+    fn pop_callback_frame(&self) -> Option<GuestCallbackFrame> {
+        let mut frames = self.callback_frames.take();
+        let frame = frames.pop();
+        self.callback_frames.set(frames);
+        frame
+    }
+
+    /// Take **every** nested callback frame, innermost first — the order in
+    /// which an abandoned guest stack must roll its completions back.
+    ///
+    /// The whole vector leaves the cell before the caller writes a single
+    /// completion word, which is the entire point (see
+    /// [`ActiveContext::callback_frames`]): those writes go to guest-controlled
+    /// addresses and may fault, re-entering this handler, and a re-entrant
+    /// unwind must find nothing left to unwind rather than a live borrow.
+    fn take_callback_frames_innermost_first(&self) -> std::vec::IntoIter<GuestCallbackFrame> {
+        let mut frames = self.callback_frames.take();
+        frames.reverse();
+        frames.into_iter()
+    }
 }
 
 impl GuestCallScheduler for ActiveContext {
@@ -1363,7 +1416,7 @@ pub(crate) unsafe fn run(
         pending_guest_call: Cell::new(None),
         direct_gateway_active: Cell::new(false),
         active_hle: Cell::new(None),
-        callback_frames: RefCell::new(Vec::new()),
+        callback_frames: Cell::new(Vec::new()),
         error: Cell::new(None),
         fault_snapshot: Cell::new(None),
         resumed: Cell::new(false),
@@ -1528,7 +1581,37 @@ pub(crate) unsafe fn run(
         return Ok(RunOutcome::Exited(ctx.exit_code.get()));
     }
     match ctx.error.take() {
-        Some(err) => {
+        Some(mut err) => {
+            // A host fault is an emulator bug that the VEH could only record as
+            // addresses. Name the HLE call that was in flight and say plainly
+            // whose fault it is — allocation and logging are safe here (the
+            // guest is stopped and this thread's context is cleared), which is
+            // exactly why the VEH left `hle: None` for us to fill in.
+            if let RuntimeError::HostFaulted {
+                rip,
+                access,
+                kind,
+                hle,
+            } = &mut err
+            {
+                *hle = ctx
+                    .active_hle
+                    .get()
+                    .and_then(|(idx, _)| trampolines.get(idx as usize))
+                    .map(|t| format!("{}::{}", t.library, t.function));
+                tracing::error!(
+                    rip = format_args!("{rip:#x}"),
+                    access = format_args!("{access:#x}"),
+                    kind = format_args!("{kind}"),
+                    hle = hle.as_deref().unwrap_or("<none>"),
+                    "HOST FAULT: emulator code faulted while a guest call was in \
+                     flight — this is a Raeen bug, not a guest fault. The guest run was \
+                     abandoned at its recovery point; host frames below the fault were \
+                     discarded without unwinding."
+                );
+                log_call_trace(&ctx, trampolines, &err);
+                return Err(err);
+            }
             // A fault that names nothing is usually our fault, not the guest's:
             // an HLE stub handed back a null (or a bogus handle) and the guest
             // dereferenced it later. The faulting instruction is in guest code
@@ -2076,6 +2159,75 @@ fn is_orbis_error(ret: u64) -> bool {
     ret <= u32::MAX as u64 && (ret as u32) & 0x8000_0000 != 0
 }
 
+/// Whose code was running when an access violation arrived, once the fast
+/// paths (HLE trampoline dispatch, FS-base re-arm, demand-commit) have all
+/// declined it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvOrigin {
+    /// Guest code faulted: a wild pointer, a null dereference, a jump into
+    /// data. The title's problem, recovered and reported as
+    /// [`RuntimeError::Faulted`].
+    Guest,
+    /// The fault names an unresolved-import stub, by `rip` (the guest CALLED a
+    /// missing import) or by access address (it READ a slot still pointing at
+    /// one). Reported as [`RuntimeError::UnimplementedImport`] — the runtime's
+    /// most actionable outcome, and the hot inventory path.
+    UnresolvedStub,
+    /// **Our** code faulted: a bad dereference inside a Rust HLE handler, or
+    /// inside something one called. Reported as
+    /// [`RuntimeError::HostFaulted`], never laundered as a guest fault.
+    Host,
+}
+
+/// Decide whose fault an access violation is.
+///
+/// Pure, so the rules can be pinned by table tests rather than by provoking
+/// real faults. Every input is a fact the VEH already has (or can get without
+/// allocating): the access type from `ExceptionInformation[0]`, whether `rip`
+/// reads back through [`GuestMemory`] (i.e. is guest-mapped, committed memory),
+/// whether the arena's VMA map positively attributes `rip` to the host process,
+/// and whether either address resolves to an unresolved-import stub.
+///
+/// # The rules, and why
+///
+/// 1. **Stub involvement wins.** Both the CALLED and the READ shapes must keep
+///    naming the missing NID; that reporting (and the non-strict resume-with-0
+///    inventory path) is unchanged by this classification.
+/// 2. **`rip` in guest memory ⇒ guest.** The overwhelmingly common case, and
+///    the one whose behaviour must not move at all.
+/// 3. **An instruction *fetch* failure is always the guest's.** A guest that
+///    `jmp`s to `0x8`, calls through a null function pointer, or returns into
+///    data faults with the access type `Execute` at an address that is by
+///    definition not executable — and therefore not guest-readable either. Host
+///    code cannot produce this shape: it is running, so its own page is mapped
+///    executable. Tests in `tests/execute.rs` deliberately observe `argc` by
+///    jumping to it (`Faulted { addr: 1 }`), so this rule is load-bearing.
+/// 4. **A read/write from host-owned `rip` is ours.** The faulting instruction
+///    was fetched and executed, so its page *is* mapped executable — and the
+///    map says the page belongs to the host process. Nothing else can be true
+///    of it.
+/// 5. **Anything else stays a guest fault.** Unknown access types, addresses
+///    the map cannot answer for: the pre-existing path, unchanged. Host
+///    attribution is a positive claim only.
+fn classify_access_violation(
+    kind: crate::FaultKind,
+    rip_is_guest_memory: bool,
+    rip_is_host_owned: bool,
+    rip_is_stub: bool,
+    access_is_stub: bool,
+) -> AvOrigin {
+    if rip_is_stub || access_is_stub {
+        return AvOrigin::UnresolvedStub;
+    }
+    if rip_is_guest_memory {
+        return AvOrigin::Guest;
+    }
+    if matches!(kind, crate::FaultKind::Read | crate::FaultKind::Write) && rip_is_host_owned {
+        return AvOrigin::Host;
+    }
+    AvOrigin::Guest
+}
+
 fn instruction_uses_fs(mem: &dyn GuestMemory, rip: u64) -> bool {
     let mut bytes = [0u8; 15];
     if !mem.read(rip, &mut bytes) {
@@ -2263,7 +2415,11 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                     access: fault_addr,
                     kind: crate::FaultKind::Execute,
                 }));
-                for frame in ctx.callback_frames.borrow_mut().drain(..).rev() {
+                // Frames OUT of the cell first, writes second: each
+                // `atomic_store_u32` targets a guest-controlled address and may
+                // fault straight back into this handler. See
+                // `ActiveContext::callback_frames`.
+                for frame in ctx.take_callback_frames_innermost_first() {
                     if let Some(completion) = frame.completion {
                         let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
                     }
@@ -2357,7 +2513,9 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     // extra guard slot. Finish its synchronization update and resume exactly
     // where the original import call would have returned.
     if fault_addr == ctx.callback_return_addr {
-        if let Some(frame) = ctx.callback_frames.borrow_mut().pop() {
+        // Popped out of the cell before any guest write below, for the reason
+        // documented on `ActiveContext::callback_frames`.
+        if let Some(frame) = ctx.pop_callback_frame() {
             // SAFETY: `ctx.mem` is the live guest memory view stored by `run`
             // for this guarded call; callback returns are delivered
             // synchronously on the same thread before `run` can tear it down.
@@ -2502,6 +2660,75 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         // `run` returns, so this read is sound.
         let stubs = unsafe { &*ctx.unresolved_stubs };
 
+        // Whose fault is this, actually? Every access violation delivered on a
+        // thread with an armed context used to be recorded as a *guest* fault at
+        // `Rip` — including one raised inside a Rust HLE handler, which then
+        // surfaced as "guest fault at 0x7ff…" and pointed the investigation at
+        // the title instead of at us. Classify first; only the `Host` verdict
+        // changes any behaviour (see `classify_access_violation`).
+        //
+        // SAFETY: `ctx.mem`/`ctx.alloc` are the live views installed by `run`
+        // for this guarded call, on this synchronously-faulting thread — the
+        // same invariant every other access in this arm relies on.
+        let probe_mem = unsafe { &*ctx.mem };
+        let mut probe = [0u8; 1];
+        let origin = classify_access_violation(
+            kind,
+            probe_mem.read(fault_addr, &mut probe),
+            unsafe { &*ctx.alloc }.address_is_host_owned(fault_addr),
+            stub::resolve(fault_addr, stubs).is_some(),
+            stub::resolve(access, stubs).is_some(),
+        );
+        if origin == AvOrigin::Host {
+            // Recover exactly as a guest fault does — the Shell survives and the
+            // run reports — but under a name that says whose bug it is. The HLE
+            // call is resolved to a name by `run`, not here: the VEH must not
+            // allocate, and `active_hle` already survives the longjmp.
+            ctx.error.set(Some(RuntimeError::HostFaulted {
+                rip: fault_addr,
+                access,
+                kind,
+                hle: None,
+            }));
+            ctx.fault_snapshot.set(Some(FaultSnapshot {
+                rip: context.Rip,
+                rsp: context.Rsp,
+                rbp: context.Rbp,
+                rax: context.Rax,
+                rbx: context.Rbx,
+                rcx: context.Rcx,
+                rdx: context.Rdx,
+                rsi: context.Rsi,
+                rdi: context.Rdi,
+                r8: context.R8,
+                r9: context.R9,
+                r10: context.R10,
+                r11: context.R11,
+                r12: context.R12,
+                r13: context.R13,
+                r14: context.R14,
+                r15: context.R15,
+                // The bytes come from guest memory, which by definition does not
+                // contain this instruction; report them as unread rather than
+                // printing whatever `read` left in the buffer.
+                bytes: [0u8; 16],
+                bytes_read: false,
+            }));
+            // Roll back abandoned callback completions for the same reason the
+            // guest-fault path does: the longjmp below discards the whole guest
+            // stack, nested callbacks included.
+            for frame in ctx.take_callback_frames_innermost_first() {
+                if let Some(completion) = frame.completion {
+                    let _ = probe_mem.atomic_store_u32(completion.address, completion.failure_u32);
+                }
+            }
+            // SAFETY: identical invariant to the genuine-fault recovery below —
+            // `recovery_ctx` points at `run`'s still-live stack snapshot on this
+            // same synchronously-faulting thread, and CONTEXT is Copy.
+            *context = unsafe { *ctx.recovery_ctx };
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         // An unresolved import can be reached two ways, and both must name it:
         //  * CALLED  — Rip *is* the stub (execution jumped there); or
         //  * READ    — the guest loaded/dereferenced the slot, so Rip is
@@ -2587,8 +2814,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         let mem = unsafe { &*ctx.mem };
         // A failed callback must release any once/in-progress state it owns.
         // Unwind every nested frame because the recovery jump abandons the
-        // whole guest stack, not merely the innermost callback.
-        for frame in ctx.callback_frames.borrow_mut().drain(..).rev() {
+        // whole guest stack, not merely the innermost callback. Frames come out
+        // of the cell before the first (guest-addressed, faultable) completion
+        // write — see `ActiveContext::callback_frames`.
+        for frame in ctx.take_callback_frames_innermost_first() {
             if let Some(completion) = frame.completion {
                 let _ = mem.atomic_store_u32(completion.address, completion.failure_u32);
             }
@@ -3005,7 +3234,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             && mem.read(context.Rsp, &mut original_return)
             && mem.write(context.Rsp, &ctx.callback_return_addr.to_le_bytes())
         {
-            ctx.callback_frames.borrow_mut().push(GuestCallbackFrame {
+            ctx.push_callback_frame(GuestCallbackFrame {
                 original_return: u64::from_le_bytes(original_return),
                 hle_result: result,
                 float_return,
@@ -3097,6 +3326,95 @@ mod tests {
         // SAFETY: same union-view reasoning.
         let xmm0 = unsafe { &context.Anonymous.FltSave.XmmRegisters[0] };
         assert_eq!(xmm0.Low, 0, "integer results leave guest XMM0 untouched");
+    }
+
+    use crate::FaultKind;
+
+    /// The overwhelmingly common case, and the one that must not move: guest
+    /// code dereferenced something bad. `rip` reads back through the arena, so
+    /// the guest was running.
+    #[test]
+    fn a_read_fault_in_guest_code_is_a_guest_fault() {
+        for kind in [FaultKind::Read, FaultKind::Write, FaultKind::Execute] {
+            assert_eq!(
+                classify_access_violation(kind, true, false, false, false),
+                AvOrigin::Guest,
+                "{kind} at a guest-mapped rip is the guest's"
+            );
+        }
+    }
+
+    /// The regression this classification exists to fix: a null dereference
+    /// inside a Rust HLE handler used to be reported as `Faulted { addr: <host
+    /// rip> }` — "guest fault at 0x7ff…" for an emulator bug.
+    #[test]
+    fn a_read_or_write_fault_in_host_owned_code_is_a_host_fault() {
+        for kind in [FaultKind::Read, FaultKind::Write] {
+            assert_eq!(
+                classify_access_violation(kind, false, true, false, false),
+                AvOrigin::Host,
+                "{kind} from a host-owned rip is ours, not the guest's"
+            );
+        }
+    }
+
+    /// A guest `jmp rax` into `argc`, a call through a null function pointer, a
+    /// `ret` into data: the *fetch* fails, so `rip` is unmapped by definition and
+    /// no host page is involved. `tests/execute.rs` observes `argc` exactly this
+    /// way (`Faulted { addr: 1 }`), so this rule is load-bearing — host code
+    /// cannot produce this shape, because it is running.
+    #[test]
+    fn an_instruction_fetch_failure_is_always_a_guest_fault() {
+        assert_eq!(
+            classify_access_violation(FaultKind::Execute, false, true, false, false),
+            AvOrigin::Guest,
+            "an execute fault is a wild guest jump even into host-owned space"
+        );
+        assert_eq!(
+            classify_access_violation(FaultKind::Execute, false, false, false, false),
+            AvOrigin::Guest,
+        );
+    }
+
+    /// Both unresolved-import shapes keep their existing reporting: CALLED
+    /// (`rip` is the stub) and READ (the access address is). This is the hot
+    /// inventory path — a host verdict must never shadow it.
+    #[test]
+    fn stub_addresses_keep_the_unresolved_import_path() {
+        assert_eq!(
+            classify_access_violation(FaultKind::Execute, false, false, true, false),
+            AvOrigin::UnresolvedStub,
+            "a CALLED unresolved import must still name its NID"
+        );
+        assert_eq!(
+            classify_access_violation(FaultKind::Read, false, false, false, true),
+            AvOrigin::UnresolvedStub,
+            "a READ through a stub-valued relocation must still name its NID"
+        );
+        // Even when the map calls the rip host-owned — an HLE handler
+        // dereferencing a stub-valued pointer the guest handed it still names the
+        // missing symbol, which is the actionable half of that report.
+        assert_eq!(
+            classify_access_violation(FaultKind::Read, false, true, false, true),
+            AvOrigin::UnresolvedStub,
+        );
+    }
+
+    /// Host attribution is a positive claim only. An address the VMA map cannot
+    /// answer for, or an access type Windows reports as something other than
+    /// read/write/execute (a `#GP` shape), stays on the pre-existing guest path.
+    #[test]
+    fn unattributed_addresses_stay_on_the_guest_path() {
+        assert_eq!(
+            classify_access_violation(FaultKind::Read, false, false, false, false),
+            AvOrigin::Guest,
+            "not guest-mapped and not positively host-owned is not a host verdict"
+        );
+        assert_eq!(
+            classify_access_violation(FaultKind::Other(7), false, true, false, false),
+            AvOrigin::Guest,
+            "an unrecognized access type must not be reclassified"
+        );
     }
 
     /// An f32 result's bits arrive zero-extended, with the upper lane of
