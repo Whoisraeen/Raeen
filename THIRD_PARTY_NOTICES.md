@@ -184,6 +184,18 @@ SOFTWARE.
   element-size guard mirrors its `BitLog2` refusal. Raeen's swizzle-equation
   tables were verified independently equivalent to SharpEmu's for the modes
   both implement (5/9/24/27) and were **not** changed by that comparison.
+  From upstream `6ee445f` (PR #470, "[AGC] Read mip 0 from its GFX10 mip-chain
+  offset"): the GFX10 smallest-first mip-chain arithmetic that locates mip 0 at
+  the END of a mipped allocation — `GnmTiling.TryGetBaseMipPlacement`'s mip-tail
+  capacity/extent thresholds, per-level block-aligned sizes, tail-slot
+  Morton-scattered `mipOffset` de-interleave, and
+  `TryGetBlockElementDimensions`, plus `TextureDescriptor.ResourceMipLevels` /
+  `GetMaximumMipLevels`'s `MAX_MIP + 1` clamp — are re-implemented as
+  `base_mip_placement` / `detile_mip_tail_base` / `block_element_dimensions` in
+  `crates/raeen-gpu/src/texture/tiling.rs` and `resource_mip_levels` in
+  `crates/raeen-gpu/src/draw_translate.rs`. The Rust structure, the diagnostics
+  counters, and every test are original; see
+  `docs/sharpemu-port/texture-mip-present.md`.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;
