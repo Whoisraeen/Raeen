@@ -564,6 +564,33 @@ impl Default for BlendState {
     }
 }
 
+/// One additional colour attachment (MRT slot 1–7) of a multi-render-target
+/// draw. The primary attachment is `DrawState`'s own width/height/format/
+/// blend/write-mask; extras share the primary extent — the hardware requires
+/// matching CB extents — and carry their own format, blend, write mask, and
+/// guest identity.
+///
+/// Extra targets are per-draw resources (no persistent-image cache): an MRT
+/// draw always takes the immediate path, seeds each extra from `initial`
+/// (the framebuffer map's prior readback of that guest base) or CLEARs, and
+/// reads every attachment back so the sink can land each in the map.
+#[derive(Debug, Clone)]
+pub struct MrtAttachment {
+    /// Guest CB slot (1..=7), diagnostic only.
+    pub slot: u8,
+    pub format: vk::Format,
+    /// This slot's nibble of `CB_TARGET_MASK`.
+    pub write_mask: vk::ColorComponentFlags,
+    /// This slot's `CB_BLEND{n}_CONTROL` (blend constants stay shared —
+    /// `CB_BLEND_RED..ALPHA` are per-context, not per-target).
+    pub blend: BlendState,
+    /// `CB_COLOR{n}_BASE` — where the sink files the readback.
+    pub target_base: u64,
+    /// Prior contents (readback-format bytes, primary extent) for a LOAD
+    /// seed; `None` clears to transparent black.
+    pub initial: Option<Vec<u8>>,
+}
+
 /// Everything one offscreen draw needs, with nothing hardcoded.
 ///
 /// This is the parameter object [`render_draw`] takes so a caller can drive a
@@ -636,6 +663,10 @@ pub struct DrawState<'a> {
     pub color_output: bool,
     /// Depth/stencil state; `None` = no depth attachment (colour-only draw).
     pub depth: Option<DepthState<'a>>,
+    /// Additional colour attachments (MRT slots 1–7). Non-empty only when
+    /// `color_output` — the primary attachment is always slot 0. Forces the
+    /// immediate (non-deferred) path.
+    pub mrt: Vec<MrtAttachment>,
 }
 
 /// A guest index buffer fetched into host memory, ready to upload.
@@ -758,6 +789,9 @@ impl DepthImage {
 pub struct DrawOutput {
     pub color: Option<RenderedImage>,
     pub depth: Option<DepthImage>,
+    /// Readbacks of the extra MRT attachments, `(guest base, image)` in
+    /// `DrawState::mrt` order. Empty for a single-target draw.
+    pub mrt_colors: Vec<(u64, RenderedImage)>,
 }
 
 /// Copy `size` bytes from a just-mapped host-visible allocation into an owned
@@ -927,6 +961,7 @@ impl<'a> DrawState<'a> {
             index: None,
             color_output: true,
             depth: None,
+            mrt: Vec::new(),
         }
     }
 
@@ -1103,6 +1138,7 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
     let t2 = std::time::Instant::now();
     let color = res.read_back_color(state, bpp)?;
     let depth = res.read_back_depth(state)?;
+    let mrt_colors = res.read_back_mrt(state)?;
     // The colour readback landed, so the persistent GPU image and the pixels
     // handed back to the caller are byte-identical again: the next draw into
     // this target may LOAD straight from the GPU copy.
@@ -1122,7 +1158,11 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
             seed_uploads_skipped = stats.seed_uploads_skipped,
             "TIME_DRAW: per-draw phase timing (cache counters are cumulative)"
         );
-        return Ok(DrawOutput { color, depth });
+        return Ok(DrawOutput {
+            color,
+            depth,
+            mrt_colors,
+        });
     }
 
     debug!(
@@ -1132,7 +1172,11 @@ pub fn render_draw(dev: &VulkanDevice, state: &DrawState) -> Result<DrawOutput, 
         "offscreen draw rendered on {}",
         dev.device_name()
     );
-    Ok(DrawOutput { color, depth })
+    Ok(DrawOutput {
+        color,
+        depth,
+        mrt_colors,
+    })
 }
 
 /// Dump one selected draw's fully translated host resources for offline
@@ -1243,6 +1287,12 @@ pub fn render_draw_deferred(
         .and_then(|depth| depth.target_base)
         .is_some();
     if force_immediate
+        // MRT draws are immediate-only: the extra attachments are per-draw
+        // resources whose readbacks the caller files by guest base, which the
+        // deferred batch cannot express. The caller that populates `mrt`
+        // (draw_common) calls `render_draw` directly so those readbacks are
+        // not lost; this route is the safety net for any other caller.
+        || !state.mrt.is_empty()
         || !has_only_named_persistent_outputs(
             state.color_output,
             named_color,
@@ -1894,6 +1944,23 @@ struct Resources<'a> {
     pipeline: vk::Pipeline,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Extra MRT colour attachments (slots 1–7), in `DrawState::mrt` order.
+    /// Always per-draw owned (no persistent cache) and immediate-only.
+    mrt_targets: Vec<MrtTargetRes>,
+}
+
+/// Per-draw Vulkan resources of one extra MRT attachment. Owned by
+/// [`Resources`] and destroyed in its `Drop` (the seed staging buffer returns
+/// to the upload ring like every other host upload).
+struct MrtTargetRes {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    readback_buffer: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+    upload_buffer: vk::Buffer,
+    upload_memory: vk::DeviceMemory,
+    bpp: u32,
 }
 
 // RAEEN_TIME_DRAW: per-draw `build()` stage timers (nanoseconds, process-
@@ -2108,6 +2175,7 @@ impl<'a> Resources<'a> {
             pipeline: vk::Pipeline::null(),
             command_buffer: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            mrt_targets: Vec::new(),
         }
     }
 
@@ -2153,6 +2221,7 @@ impl<'a> Resources<'a> {
                 self.upload_memory = memory;
                 draw_stage_add(&DRAW_STAGE_SEED_NS, s);
             }
+            self.create_mrt_targets(state)?;
         }
         if let Some(depth) = &state.depth {
             let s = t.then(std::time::Instant::now);
@@ -2183,6 +2252,62 @@ impl<'a> Resources<'a> {
         draw_stage_add(&DRAW_STAGE_CMD_NS, s);
         if t {
             draw_stage_tick();
+        }
+        Ok(())
+    }
+
+    /// Per-draw images + readback buffers (+ seed staging) for the extra MRT
+    /// attachments. Extras share the primary extent; each has its own format
+    /// and bpp. MRT draws are immediate-only — the deferred batch cannot file
+    /// their readbacks — so a batched build with extras is refused loudly.
+    fn create_mrt_targets(&mut self, state: &DrawState) -> Result<(), GpuError> {
+        if state.mrt.is_empty() {
+            return Ok(());
+        }
+        if self.batched {
+            return Err(GpuError::VulkanInitFailed(
+                "MRT draw reached the deferred batch — extras are immediate-only".to_owned(),
+            ));
+        }
+        for extra in &state.mrt {
+            let bpp = readback_bpp(extra.format)?;
+            if let Some(initial) = &extra.initial {
+                let expected = state.width as usize * state.height as usize * bpp as usize;
+                if initial.len() != expected {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "initial MRT{} contents are {} bytes; {}x{} needs {expected}",
+                        extra.slot,
+                        initial.len(),
+                        state.width,
+                        state.height
+                    )));
+                }
+            }
+            let (image, memory, view) =
+                self.create_color_image_raw(state.width, state.height, extra.format)?;
+            // Push a partially-filled record FIRST so Drop cleans the image up
+            // if a later allocation in this loop fails.
+            self.mrt_targets.push(MrtTargetRes {
+                image,
+                memory,
+                view,
+                readback_buffer: vk::Buffer::null(),
+                readback_memory: vk::DeviceMemory::null(),
+                upload_buffer: vk::Buffer::null(),
+                upload_memory: vk::DeviceMemory::null(),
+                bpp,
+            });
+            let (buffer, memory) =
+                self.create_readback_buffer_raw(state.width, state.height, bpp)?;
+            let record = self.mrt_targets.last_mut().expect("pushed above");
+            record.readback_buffer = buffer;
+            record.readback_memory = memory;
+            if let Some(initial) = &extra.initial {
+                let (buffer, memory) = self.create_buffer_with_bytes(initial)?;
+                let record = self.mrt_targets.last_mut().expect("pushed above");
+                record.upload_buffer = buffer;
+                record.upload_memory = memory;
+            }
         }
         Ok(())
     }
@@ -2493,6 +2618,23 @@ impl<'a> Resources<'a> {
         height: u32,
         format: vk::Format,
     ) -> Result<(), GpuError> {
+        let (image, memory, view) = self.create_color_image_raw(width, height, format)?;
+        self.image = image;
+        self.image_memory = memory;
+        self.image_view = view;
+        Ok(())
+    }
+
+    /// Create a colour-attachment image + memory + view without storing it on
+    /// `self` — shared by the primary target and the per-draw MRT extras. On
+    /// error every partially-created handle is destroyed here, so the caller
+    /// only ever owns a complete triple.
+    fn create_color_image_raw(
+        &self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), GpuError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -2519,33 +2661,54 @@ impl<'a> Resources<'a> {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         // SAFETY: `info` is fully initialized and borrows nothing beyond this
-        // call; the device is live. The handle is stored and destroyed in Drop.
-        self.image = unsafe { self.device().create_image(&info, None) }
+        // call; the device is live. On every error path below the handles
+        // created so far are destroyed before returning.
+        let image = unsafe { self.device().create_image(&info, None) }
             .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateImage failed: {e}")))?;
 
-        // SAFETY: `self.image` was just created from this device.
-        let reqs = unsafe { self.device().get_image_memory_requirements(self.image) };
-        let type_index = self
+        // SAFETY: `image` was just created from this device.
+        let reqs = unsafe { self.device().get_image_memory_requirements(image) };
+        // SAFETY (cleanup closures): each destroys only handles created above
+        // in this call, exactly once, with nothing referencing them yet.
+        let type_index = match self
             .dev
-            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        {
+            Ok(index) => index,
+            Err(e) => {
+                unsafe { self.device().destroy_image(image, None) };
+                return Err(e);
+            }
+        };
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(reqs.size)
             .memory_type_index(type_index);
 
         // SAFETY: allocation size/type come from this image's own requirements.
-        self.image_memory = unsafe { self.device().allocate_memory(&alloc, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("image allocation failed: {e}")))?;
+        let memory = match unsafe { self.device().allocate_memory(&alloc, None) } {
+            Ok(memory) => memory,
+            Err(e) => {
+                unsafe { self.device().destroy_image(image, None) };
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "image allocation failed: {e}"
+                )));
+            }
+        };
 
         // SAFETY: memory was allocated for exactly this image, offset 0 is
         // within it and satisfies the alignment requirement by construction.
-        unsafe {
-            self.device()
-                .bind_image_memory(self.image, self.image_memory, 0)
+        if let Err(e) = unsafe { self.device().bind_image_memory(image, memory, 0) } {
+            unsafe {
+                self.device().free_memory(memory, None);
+                self.device().destroy_image(image, None);
+            }
+            return Err(GpuError::VulkanInitFailed(format!(
+                "vkBindImageMemory failed: {e}"
+            )));
         }
-        .map_err(|e| GpuError::VulkanInitFailed(format!("vkBindImageMemory failed: {e}")))?;
 
         let view_info = vk::ImageViewCreateInfo::default()
-            .image(self.image)
+            .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
@@ -2558,9 +2721,19 @@ impl<'a> Resources<'a> {
 
         // SAFETY: the view's image is live and its format/range match the
         // image's creation parameters.
-        self.image_view = unsafe { self.device().create_image_view(&view_info, None) }
-            .map_err(|e| GpuError::VulkanInitFailed(format!("vkCreateImageView failed: {e}")))?;
-        Ok(())
+        let view = match unsafe { self.device().create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(e) => {
+                unsafe {
+                    self.device().free_memory(memory, None);
+                    self.device().destroy_image(image, None);
+                }
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "vkCreateImageView failed: {e}"
+                )));
+            }
+        };
+        Ok((image, memory, view))
     }
 
     /// Create a buffer plus memory satisfying `properties`.
@@ -3281,6 +3454,21 @@ impl<'a> Resources<'a> {
         height: u32,
         bpp: u32,
     ) -> Result<(), GpuError> {
+        let (buffer, memory) = self.create_readback_buffer_raw(width, height, bpp)?;
+        self.readback_buffer = buffer;
+        self.readback_memory = memory;
+        Ok(())
+    }
+
+    /// A host-readable readback buffer for a `width`x`height`x`bpp` colour
+    /// target, without storing it on `self` — shared by the primary target
+    /// and the per-draw MRT extras.
+    fn create_readback_buffer_raw(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), GpuError> {
         let size =
             vk::DeviceSize::from(width) * vk::DeviceSize::from(height) * vk::DeviceSize::from(bpp);
         // The whole frame is copied out of this buffer on the CPU. Without
@@ -3290,16 +3478,12 @@ impl<'a> Resources<'a> {
         // invalidate); fall back to coherent-only where the device has no such
         // type.
         let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let (buffer, memory) = self
-            .create_buffer(
-                size,
-                vk::BufferUsageFlags::TRANSFER_DST,
-                host | vk::MemoryPropertyFlags::HOST_CACHED,
-            )
-            .or_else(|_| self.create_buffer(size, vk::BufferUsageFlags::TRANSFER_DST, host))?;
-        self.readback_buffer = buffer;
-        self.readback_memory = memory;
-        Ok(())
+        self.create_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            host | vk::MemoryPropertyFlags::HOST_CACHED,
+        )
+        .or_else(|_| self.create_buffer(size, vk::BufferUsageFlags::TRANSFER_DST, host))
     }
 
     fn create_pipeline(&mut self, state: &DrawState) -> Result<(), GpuError> {
@@ -3447,6 +3631,25 @@ impl<'a> Resources<'a> {
                 .iter()
                 .map(|a| (a.location, a.binding, a.format.as_raw(), a.offset))
                 .collect(),
+            mrt: state
+                .mrt
+                .iter()
+                .map(|extra| {
+                    (
+                        extra.format.as_raw(),
+                        extra.write_mask.as_raw(),
+                        BlendKey {
+                            enable: extra.blend.enable,
+                            src_color: extra.blend.src_color.as_raw(),
+                            dst_color: extra.blend.dst_color.as_raw(),
+                            color_op: extra.blend.color_op.as_raw(),
+                            src_alpha: extra.blend.src_alpha.as_raw(),
+                            dst_alpha: extra.blend.dst_alpha.as_raw(),
+                            alpha_op: extra.blend.alpha_op.as_raw(),
+                        },
+                    )
+                })
+                .collect(),
         };
         if let Some(pipeline) = self.caches.lookup_graphics_pipeline(&key) {
             self.pipeline = pipeline;
@@ -3501,25 +3704,54 @@ impl<'a> Resources<'a> {
                 .max_depth_bounds(1.0)
         });
 
-        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(state.color_write_mask)
-            .blend_enable(state.blend.enable)
-            .src_color_blend_factor(state.blend.src_color)
-            .dst_color_blend_factor(state.blend.dst_color)
-            .color_blend_op(state.blend.color_op)
-            .src_alpha_blend_factor(state.blend.src_alpha)
-            .dst_alpha_blend_factor(state.blend.dst_alpha)
-            .alpha_blend_op(state.blend.alpha_op)];
-        // A depth-only draw declares zero colour attachments; the blend
-        // attachment count must match the pipeline's colour attachment count.
-        let color_blend_attachments: &[vk::PipelineColorBlendAttachmentState] =
-            if state.color_output {
-                &blend_attachments
+        // One blend-attachment state per colour attachment: the primary from
+        // DrawState's own blend/write-mask fields, then one per MRT extra
+        // (per-slot CB_BLEND{n}_CONTROL + CB_TARGET_MASK nibble). A depth-only
+        // draw declares zero colour attachments; the blend attachment count
+        // must match the pipeline's colour attachment count.
+        let blend_attachment = |blend: &BlendState, write_mask: vk::ColorComponentFlags| {
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(write_mask)
+                .blend_enable(blend.enable)
+                .src_color_blend_factor(blend.src_color)
+                .dst_color_blend_factor(blend.dst_color)
+                .color_blend_op(blend.color_op)
+                .src_alpha_blend_factor(blend.src_alpha)
+                .dst_alpha_blend_factor(blend.dst_alpha)
+                .alpha_blend_op(blend.alpha_op)
+        };
+        let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = if state
+            .color_output
+        {
+            if state.mrt.is_empty() || self.dev.supports_independent_blend() {
+                std::iter::once(blend_attachment(&state.blend, state.color_write_mask))
+                    .chain(
+                        state
+                            .mrt
+                            .iter()
+                            .map(|extra| blend_attachment(&extra.blend, extra.write_mask)),
+                    )
+                    .collect()
             } else {
-                &[]
-            };
+                // Without `independentBlend` every element of pAttachments
+                // must be IDENTICAL (VUID-VkPipelineColorBlendStateCreateInfo-
+                // pAttachments-00605): degrade to the primary's state for
+                // all targets — a named per-slot-blend loss, not a failed
+                // draw.
+                static NOTED: std::sync::Once = std::sync::Once::new();
+                NOTED.call_once(|| {
+                    tracing::warn!(
+                        "device lacks independentBlend — MRT slots 1-7 use the \
+                             primary attachment's blend/write-mask state"
+                    );
+                });
+                vec![blend_attachment(&state.blend, state.color_write_mask); 1 + state.mrt.len()]
+            }
+        } else {
+            Vec::new()
+        };
         let color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(color_blend_attachments);
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
 
         // Blend constants join viewport/scissor as dynamic state so that a
         // register write to CB_BLEND_* cannot force a new pipeline.
@@ -3534,7 +3766,9 @@ impl<'a> Resources<'a> {
         // Vulkan 1.3 dynamic rendering: the pipeline declares the attachment
         // formats directly instead of referencing a VkRenderPass.
         let color_formats = if state.color_output {
-            vec![state.format]
+            std::iter::once(state.format)
+                .chain(state.mrt.iter().map(|extra| extra.format))
+                .collect()
         } else {
             Vec::new()
         };
@@ -3859,6 +4093,76 @@ impl<'a> Resources<'a> {
                 };
                 self.image_barrier_layers(vk::ImageAspectFlags::COLOR, self.image, 1, transition);
             }
+
+            // Extra MRT attachments: fresh per-draw images, so each either
+            // seeds from its upload staging (prior framebuffer-map contents)
+            // exactly like the primary, or starts UNDEFINED and CLEARs.
+            for extra in &self.mrt_targets {
+                if extra.upload_buffer != vk::Buffer::null() {
+                    self.image_barrier_layers(
+                        vk::ImageAspectFlags::COLOR,
+                        extra.image,
+                        1,
+                        ImageTransition {
+                            old_layout: vk::ImageLayout::UNDEFINED,
+                            new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            src_access: vk::AccessFlags::empty(),
+                            dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                            src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                            dst_stage: vk::PipelineStageFlags::TRANSFER,
+                        },
+                    );
+                    let region = vk::BufferImageCopy::default()
+                        .buffer_offset(0)
+                        .buffer_row_length(0)
+                        .buffer_image_height(0)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        });
+                    // SAFETY: the staging buffer holds exactly
+                    // width*height*bpp bytes (validated in `create_mrt_targets`)
+                    // and the image was created TRANSFER_DST; both belong to
+                    // this device and the command buffer is recording.
+                    unsafe {
+                        self.device().cmd_copy_buffer_to_image(
+                            self.command_buffer,
+                            extra.upload_buffer,
+                            extra.image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[region],
+                        );
+                    }
+                    self.image_barrier_layers(
+                        vk::ImageAspectFlags::COLOR,
+                        extra.image,
+                        1,
+                        ImageTransition {
+                            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                            src_access: vk::AccessFlags::TRANSFER_WRITE,
+                            dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                            src_stage: vk::PipelineStageFlags::TRANSFER,
+                            dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        },
+                    );
+                } else {
+                    self.image_barrier_layers(
+                        vk::ImageAspectFlags::COLOR,
+                        extra.image,
+                        1,
+                        colour_target_attachment_transition(TargetLayout::Undefined),
+                    );
+                }
+            }
         }
 
         // Depth/stencil attachment: transition it to the attachment layout,
@@ -4007,13 +4311,29 @@ impl<'a> Resources<'a> {
             })
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear);
-        let color_attachment_slice = [color_attachment];
         // A depth-only draw declares zero colour attachments, matching the
-        // pipeline built with no colour formats (`create_pipeline`).
-        let color_attachments: &[vk::RenderingAttachmentInfo] = if state.color_output {
-            &color_attachment_slice
+        // pipeline built with no colour formats (`create_pipeline`). MRT
+        // extras follow the primary in `DrawState::mrt` order: LOAD when
+        // seeded from prior contents, CLEAR (transparent black) otherwise.
+        let color_attachments: Vec<vk::RenderingAttachmentInfo> = if state.color_output {
+            std::iter::once(color_attachment)
+                .chain(self.mrt_targets.iter().map(|extra| {
+                    vk::RenderingAttachmentInfo::default()
+                        .image_view(extra.view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(if extra.upload_buffer != vk::Buffer::null() {
+                            vk::AttachmentLoadOp::LOAD
+                        } else {
+                            vk::AttachmentLoadOp::CLEAR
+                        })
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue { float32: [0.0; 4] },
+                        })
+                }))
+                .collect()
         } else {
-            &[]
+            Vec::new()
         };
 
         // Vulkan 1.3 dynamic-rendering depth/stencil attachments. `depth_view`
@@ -4039,7 +4359,7 @@ impl<'a> Resources<'a> {
         let mut rendering_info = vk::RenderingInfo::default()
             .render_area(render_area)
             .layer_count(1)
-            .color_attachments(color_attachments);
+            .color_attachments(&color_attachments);
         if let Some(depth_attachment) = &depth_attachment {
             rendering_info = rendering_info.depth_attachment(depth_attachment);
         }
@@ -4213,6 +4533,36 @@ impl<'a> Resources<'a> {
                     self.readback_buffer,
                     &[region],
                 );
+            }
+            // Extra MRT attachments: same transition + copy-out, one per
+            // attachment (MRT draws are immediate-only, so `!self.batched`
+            // always holds when extras exist).
+            for extra in &self.mrt_targets {
+                self.image_barrier_layers(
+                    vk::ImageAspectFlags::COLOR,
+                    extra.image,
+                    1,
+                    ImageTransition {
+                        old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        dst_access: vk::AccessFlags::TRANSFER_READ,
+                        src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        dst_stage: vk::PipelineStageFlags::TRANSFER,
+                    },
+                );
+                // SAFETY: the extra image is in TRANSFER_SRC per the barrier
+                // above and its readback buffer was sized width*height*bpp —
+                // exactly the region copied.
+                unsafe {
+                    self.device().cmd_copy_image_to_buffer(
+                        self.command_buffer,
+                        extra.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        extra.readback_buffer,
+                        &[region],
+                    );
+                }
             }
         }
 
@@ -4510,6 +4860,42 @@ impl<'a> Resources<'a> {
         }))
     }
 
+    /// Read back every extra MRT attachment, `(guest base, image)` in
+    /// `DrawState::mrt` order. Empty when the draw had no extras.
+    fn read_back_mrt(&self, state: &DrawState) -> Result<Vec<(u64, RenderedImage)>, GpuError> {
+        let mut out = Vec::with_capacity(self.mrt_targets.len());
+        for (res, extra) in self.mrt_targets.iter().zip(&state.mrt) {
+            let size = (state.width as usize) * (state.height as usize) * (res.bpp as usize);
+            // SAFETY: the memory is HOST_VISIBLE and not currently mapped; the
+            // copy that fills it completed (the fence was waited) and the host
+            // barrier made those writes visible.
+            let ptr = unsafe {
+                self.device().map_memory(
+                    res.readback_memory,
+                    0,
+                    size as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+            }
+            .map_err(|e| GpuError::VulkanInitFailed(format!("MRT readback map failed: {e}")))?;
+            // SAFETY: `ptr` maps exactly `size` initialized bytes; the helper
+            // copies them into an owned Vec fallibly and unmaps in every case.
+            let pixels = unsafe {
+                readback_to_vec_fallible(self.device(), res.readback_memory, ptr, size, "MRT")?
+            };
+            out.push((
+                extra.target_base,
+                RenderedImage {
+                    width: state.width,
+                    height: state.height,
+                    pixels,
+                    bytes_per_pixel: res.bpp,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
     /// The depth/stencil readback as a [`DepthImage`], or `None` when the draw
     /// bound no depth attachment. The depth plane occupies the first
     /// `depth_plane_bytes` of `depth_readback_buffer`; the stencil plane (one
@@ -4720,6 +5106,38 @@ impl Drop for Resources<'_> {
         // handle at the batch boundary.
         if self.batched && self.command_buffer != vk::CommandBuffer::null() {
             self.command_buffer = vk::CommandBuffer::null();
+        }
+        // Extra MRT attachments are always per-draw owned: destroy their
+        // images/views/readbacks here and return their seed staging buffers
+        // to the upload ring. The same fence/error argument as the primary
+        // target applies (immediate-only, fence waited before any success).
+        {
+            let mrt_targets = mem::take(&mut self.mrt_targets);
+            for extra in mrt_targets {
+                self.caches
+                    .release_host_buffer(self.dev, extra.upload_buffer, extra.upload_memory);
+                // SAFETY: per-draw handles created from this device for this
+                // draw alone, destroyed exactly once, children before parents;
+                // null handles are skipped (partial build cleanup).
+                unsafe {
+                    let d = self.dev.device();
+                    if extra.readback_buffer != vk::Buffer::null() {
+                        d.destroy_buffer(extra.readback_buffer, None);
+                    }
+                    if extra.readback_memory != vk::DeviceMemory::null() {
+                        d.free_memory(extra.readback_memory, None);
+                    }
+                    if extra.view != vk::ImageView::null() {
+                        d.destroy_image_view(extra.view, None);
+                    }
+                    if extra.image != vk::Image::null() {
+                        d.destroy_image(extra.image, None);
+                    }
+                    if extra.memory != vk::DeviceMemory::null() {
+                        d.free_memory(extra.memory, None);
+                    }
+                }
+            }
         }
         // Guest-data buffers came from the upload ring: return them (no
         // submitted GPU work references them — see the safety argument below;

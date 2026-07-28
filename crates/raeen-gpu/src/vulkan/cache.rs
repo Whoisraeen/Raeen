@@ -226,6 +226,9 @@ pub(crate) struct GraphicsPipelineKey {
     pub vertex_bindings: Vec<(u32, u32, i32)>,
     /// (location, binding, format, offset).
     pub vertex_attributes: Vec<(u32, u32, i32, u32)>,
+    /// Extra MRT attachments: (format, write mask, blend), in attachment
+    /// order after the primary. Empty for a single-target pipeline.
+    pub mrt: Vec<(i32, u32, BlendKey)>,
 }
 
 /// A guest render target kept alive on the device across draws.
@@ -2494,6 +2497,7 @@ mod tests {
             },
             vertex_bindings: vec![(0, 16, vk::VertexInputRate::VERTEX.as_raw())],
             vertex_attributes: vec![(0, 0, vk::Format::R32G32B32A32_SFLOAT.as_raw(), 0)],
+            mrt: Vec::new(),
         };
         assert_eq!(base, base.clone());
 

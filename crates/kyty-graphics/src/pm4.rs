@@ -266,6 +266,47 @@ pub const CB_COLOR0_VIEW: u32 = 0x31B;
 pub const CB_COLOR0_INFO: u32 = 0x31C;
 pub const CB_COLOR7_INFO: u32 = 0x385;
 pub const CB_COLOR0_ATTRIB: u32 = 0x31D;
+pub const CB_COLOR7_VIEW: u32 = 0x384;
+pub const CB_COLOR7_ATTRIB: u32 = 0x386;
+/// DCC control (Pm4.h L653) — compression metadata, decoded but ignored.
+pub const CB_COLOR0_DCC_CONTROL: u32 = 0x31E;
+pub const CB_COLOR7_DCC_CONTROL: u32 = 0x387;
+/// CMASK metadata address low bits (Pm4.h L673).
+pub const CB_COLOR0_CMASK: u32 = 0x31F;
+pub const CB_COLOR7_CMASK: u32 = 0x388;
+/// CMASK slice size (GCN `CB_COLOR0_CMASK_SLICE`; Kyty decodes it from the
+/// fused Gen4 packet's dword 8 — GraphicsRun.cpp L1969). Not named in Kyty's
+/// Pm4.h, but it is the register between CMASK (0x31F) and FMASK (0x321).
+pub const CB_COLOR0_CMASK_SLICE: u32 = 0x320;
+pub const CB_COLOR7_CMASK_SLICE: u32 = 0x389;
+/// FMASK metadata address low bits (Pm4.h L674).
+pub const CB_COLOR0_FMASK: u32 = 0x321;
+pub const CB_COLOR7_FMASK: u32 = 0x38A;
+/// FMASK slice size (GCN `CB_COLOR0_FMASK_SLICE`; Kyty Gen4 fused packet
+/// dword 10 — GraphicsRun.cpp L1973).
+pub const CB_COLOR0_FMASK_SLICE: u32 = 0x322;
+pub const CB_COLOR7_FMASK_SLICE: u32 = 0x38B;
+/// Packed fast-clear colour, low dword (Pm4.h L675).
+pub const CB_COLOR0_CLEAR_WORD0: u32 = 0x323;
+pub const CB_COLOR7_CLEAR_WORD0: u32 = 0x38C;
+/// Packed fast-clear colour, high dword (Pm4.h L676).
+pub const CB_COLOR0_CLEAR_WORD1: u32 = 0x324;
+pub const CB_COLOR7_CLEAR_WORD1: u32 = 0x38D;
+/// DCC metadata address low bits (Pm4.h L677).
+pub const CB_COLOR0_DCC_BASE: u32 = 0x325;
+pub const CB_COLOR7_DCC_BASE: u32 = 0x38E;
+
+/// Gen5 high-address-byte blocks (Pm4.h L688-695). Stride **1**: eight
+/// consecutive dwords per family, one per colour slot, carrying bits 40..48
+/// of the matching 40-bit-shifted address.
+pub const CB_COLOR0_BASE_EXT: u32 = 0x390;
+pub const CB_COLOR7_BASE_EXT: u32 = 0x397;
+pub const CB_COLOR0_CMASK_BASE_EXT: u32 = 0x398;
+pub const CB_COLOR7_CMASK_BASE_EXT: u32 = 0x39F;
+pub const CB_COLOR0_FMASK_BASE_EXT: u32 = 0x3A0;
+pub const CB_COLOR7_FMASK_BASE_EXT: u32 = 0x3A7;
+pub const CB_COLOR0_DCC_BASE_EXT: u32 = 0x3A8;
+pub const CB_COLOR7_DCC_BASE_EXT: u32 = 0x3AF;
 
 /// PS5 extent registers. Stride **1**, not 15 — and note these are nowhere near
 /// `CB_COLOR0_BASE`. Kyty registers them only in its *indirect* table.
@@ -362,8 +403,40 @@ pub mod cb_color_info {
     field!(BLEND_BYPASS, 16, 0x1);
     field!(ROUND_MODE, 18, 0x1);
     field!(CMASK_IS_LINEAR, 19, 0x1);
+    field!(FMASK_COMPRESSION_DISABLE, 26, 0x1);
+    field!(FMASK_COMPRESS_1FRAG_ONLY, 27, 0x1);
     field!(DCC_ENABLE, 28, 0x1);
+    field!(CMASK_ADDR_TYPE, 29, 0x3);
     field!(ALT_TILE_MODE, 31, 0x1);
+}
+
+/// `CB_COLOR0_VIEW` fields (Pm4.h L603-609).
+pub mod cb_color_view {
+    field!(SLICE_START, 0, 0x1FFF);
+    field!(SLICE_MAX, 13, 0x1FFF);
+    field!(MIP_LEVEL, 26, 0xF);
+}
+
+/// `CB_COLOR0_ATTRIB` fields (Pm4.h L641-651).
+pub mod cb_color_attrib {
+    field!(TILE_MODE_INDEX, 0, 0x1F);
+    field!(FMASK_TILE_MODE_INDEX, 5, 0x1F);
+    field!(NUM_SAMPLES, 12, 0x7);
+    field!(NUM_FRAGMENTS, 15, 0x3);
+    field!(FORCE_DST_ALPHA_1, 17, 0x1);
+}
+
+/// `CB_COLOR0_DCC_CONTROL` fields (Pm4.h L654-671).
+pub mod cb_color_dcc_control {
+    field!(OVERWRITE_COMBINER_DISABLE, 0, 0x1);
+    field!(KEY_CLEAR_ENABLE, 1, 0x1);
+    field!(MAX_UNCOMPRESSED_BLOCK_SIZE, 2, 0x3);
+    field!(MIN_COMPRESSED_BLOCK_SIZE, 4, 0x1);
+    field!(MAX_COMPRESSED_BLOCK_SIZE, 5, 0x3);
+    field!(COLOR_TRANSFORM, 7, 0x3);
+    field!(INDEPENDENT_64B_BLOCKS, 9, 0x1);
+    field!(ENABLE_CONSTANT_ENCODE_REG_WRITE, 19, 0x1);
+    field!(INDEPENDENT_128B_BLOCKS, 20, 0x1);
 }
 
 /// `CB_COLOR0_ATTRIB2` fields (Pm4.h L698-703). The PS5 render-target extent.
@@ -591,6 +664,32 @@ mod tests {
         assert_eq!(CB_COLOR0_INFO + 7 * CB_COLOR_SLOT_STRIDE, CB_COLOR7_INFO);
         assert_eq!(CB_COLOR0_ATTRIB2 + 7, CB_COLOR7_ATTRIB2);
         assert_eq!(CB_COLOR0_ATTRIB3 + 7, CB_COLOR7_ATTRIB3);
+    }
+
+    /// Every per-slot CB sub-register family steps by the 15-dword slot
+    /// stride; the Gen5 `_EXT` address-byte blocks step by 1 (Kyty Pm4.h
+    /// L678-695).
+    #[test]
+    fn color_sub_register_strides_match_kyty_bounds() {
+        const S: u32 = 7 * CB_COLOR_SLOT_STRIDE;
+        assert_eq!(CB_COLOR0_VIEW + S, CB_COLOR7_VIEW);
+        assert_eq!(CB_COLOR0_ATTRIB + S, CB_COLOR7_ATTRIB);
+        assert_eq!(CB_COLOR0_DCC_CONTROL + S, CB_COLOR7_DCC_CONTROL);
+        assert_eq!(CB_COLOR0_CMASK + S, CB_COLOR7_CMASK);
+        assert_eq!(CB_COLOR0_CMASK_SLICE + S, CB_COLOR7_CMASK_SLICE);
+        assert_eq!(CB_COLOR0_FMASK + S, CB_COLOR7_FMASK);
+        assert_eq!(CB_COLOR0_FMASK_SLICE + S, CB_COLOR7_FMASK_SLICE);
+        assert_eq!(CB_COLOR0_CLEAR_WORD0 + S, CB_COLOR7_CLEAR_WORD0);
+        assert_eq!(CB_COLOR0_CLEAR_WORD1 + S, CB_COLOR7_CLEAR_WORD1);
+        assert_eq!(CB_COLOR0_DCC_BASE + S, CB_COLOR7_DCC_BASE);
+        assert_eq!(CB_COLOR0_BASE_EXT + 7, CB_COLOR7_BASE_EXT);
+        assert_eq!(CB_COLOR0_CMASK_BASE_EXT + 7, CB_COLOR7_CMASK_BASE_EXT);
+        assert_eq!(CB_COLOR0_FMASK_BASE_EXT + 7, CB_COLOR7_FMASK_BASE_EXT);
+        assert_eq!(CB_COLOR0_DCC_BASE_EXT + 7, CB_COLOR7_DCC_BASE_EXT);
+        // The whole 0x318..=0x3BF neighbourhood is CB-owned; the per-slot
+        // families tile the stride-15 blocks without overlap.
+        assert_eq!(CB_COLOR0_CMASK, CB_COLOR0_BASE + 7);
+        assert_eq!(CB_COLOR0_DCC_BASE, CB_COLOR0_BASE + 13);
     }
 
     #[test]

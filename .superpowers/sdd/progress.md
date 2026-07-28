@@ -5242,3 +5242,55 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * LIVE VERIFY pending (needs the user's controller): DualSense USB, then
   BT, then an Xbox pad in a rumbling title; toggle OFF mid-rumble (stops);
   PS-hold quit mid-rumble (stops). See checklist item 19.
+## 2026-07-28 (worktree agent) — checklist item 16: MRT1-7 + fast-clear register support
+* CB REGISTER DECODE COMPLETE (kyty-graphics): every CB_COLOR{0-7}
+  sub-register now decodes into a named RenderTarget field — VIEW, ATTRIB,
+  DCC_CONTROL, CMASK(+SLICE), FMASK(+SLICE), CLEAR_WORD0/1, DCC_BASE (all
+  stride-15 per-slot families), the Gen5 BASE/CMASK/FMASK/DCC_BASE_EXT
+  high-byte blocks (0x390-0x3AF, stride 1), and the full CB_COLOR0_INFO
+  field set (FMASK_COMPRESSION_DISABLE / COMPRESS_1FRAG_ONLY /
+  CMASK_ADDR_TYPE). Offsets/fields verified against Kyty Pm4.h L601-719 +
+  GraphicsRun.cpp L3522-3700; new hw_regs structs mirror Kyty
+  HardwareContext.h L13-152. Compression metadata (DCC/CMASK/FMASK) is
+  decoded but deliberately NOT emulated — one process-wide INFO note
+  (note_compression_metadata_ignored) replaces the per-register "unknown
+  context register" warnings for the whole CB block. CLEAR_WORD/VIEW are
+  live feature state, not metadata.
+* MRT1-7 ATTACH FOR REAL (raeen-gpu): DrawState.mrt carries slots 1-7 with
+  per-slot format (CB_COLOR{n}_INFO), write mask (CB_TARGET_MASK nibble),
+  and blend (CB_BLEND{n}_CONTROL via blend_state_for_slot). The offscreen
+  pipeline declares N colour attachments + N blend states (pipeline key
+  extended), begin_rendering attaches every extra, each extra seeds from
+  the framebuffer map (LOAD) or CLEARs, and every attachment reads back to
+  its own guest base. independentBlend is now enabled at device creation
+  when supported; without it the pipeline degrades to identical attachment
+  states (warn-once) per VUID-...-pAttachments-00605 — measured live: the
+  very first 2-MRT iron run tripped that VUID. MRT draws are immediate-only
+  (the deferred batch cannot file multi-target readbacks); a slot with an
+  extent mismatch / unmapped format / untranslatable blend is dropped with
+  a named warn; the old "attaches only slot 0 — dropped" warn is retired.
+* FAST CLEAR (shadPS4 FilterDraw port, attributed in THIRD_PARTY_NOTICES):
+  CB_COLOR_CONTROL.MODE 2 (EliminateFastClear) is consumed and applied as a
+  real direct clear — the packed CLEAR_WORD0/1 splatted over the target's
+  framebuffer entry (raw target-format bytes; no per-format unpack needed)
+  + eviction of stale persistent images + PM4-ordered pre-flush; modes
+  3/5/6 (resolve / FMASK / DCC decompress) are once-logged named skips.
+  FCE with fast clear unarmed is a quiet no-op (shadPS4 parity).
+* HONEST LIMIT (named in checklist): guest pixel shaders exporting mrt1+
+  still fail translation — the recompiler handles MRT0 exports only
+  (parse.rs exp target 0x00; recompile stores %outColor only). Real-title
+  MRT output needs the exp mrt1-7 shader extension (declare %outColor1..7 +
+  target-parameterized export handlers); the pipeline/attachment side is
+  ready for it. That is the follow-up work item.
+* Tests: kyty-graphics 484 (479 lib + 5 integration; was 480 — +4: pm4
+  stride/offset pins, per-slot decode sweep over slots 0/3/7, BASE_EXT
+  high-byte assembly, INFO compression flags). raeen-gpu lib 275 (was 269
+  — +6: MRT draw-state translation, masked/mismatched slot refusal,
+  fast-clear splat + refusal, session-level FCE end-to-end, CP fixture DCB
+  with two bound targets -> one extra attachment). NEW
+  tests/mrt_targets.rs: 2 iron Vulkan tests green on the real device —
+  dual-output FS writes both attachments (readback pixel-exact, filed per
+  guest base), per-attachment write mask R|A + LOAD seed verified.
+  raeen-hle 496+1 green (one timing-flaky vblank test passed on isolated
+  rerun; untouched by this diff). clippy -p kyty-graphics -p raeen-gpu
+  --all-targets -D warnings green; cargo fmt --all --check green.

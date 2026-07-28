@@ -4648,6 +4648,119 @@ mod tests {
         assert_eq!((left, right), (48, 96), "one register value flips the half");
     }
 
+    /// An eliminate-fast-clear pass (CB_COLOR_CONTROL mode 2 with FAST_CLEAR
+    /// armed) must become a real direct clear: the draw is consumed and the
+    /// target's framebuffer entry holds the packed CLEAR_WORD colour.
+    #[test]
+    fn eliminate_fast_clear_pass_clears_the_target_framebuffer() {
+        const BASE: u64 = 0x1_0000;
+        let complete = build_cp_draw_dcb(96, 48, ScissorHalf::Left);
+        let split = complete.len() - 7;
+        let mut dcb: Vec<u32> = complete[..split].to_vec();
+        let mut set_cx = |reg: u32, value: u32| {
+            dcb.extend([
+                pm4::header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+                reg,
+                value,
+            ]);
+        };
+        // Arm fast clear on slot 0 (format 0xa RGBA8, FAST_CLEAR bit 13) and
+        // program the packed clear colour.
+        set_cx(pm4::CB_COLOR0_INFO, (0xa << 2) | (1 << 13));
+        set_cx(pm4::CB_COLOR0_CLEAR_WORD0, 0x8040_20FF);
+        // CB_COLOR_CONTROL.MODE = 2 (EliminateFastClear), OP untouched.
+        set_cx(pm4::CB_COLOR_CONTROL, 2 << 4);
+        dcb.extend_from_slice(&complete[split..]);
+
+        let session = AgcGpuSession::new(deny_memory());
+        match session.execute_dcb_cp(&dcb, false) {
+            Ok(_) => {}
+            Err(AgcExecError::Gpu(_)) => return, // Vulkan-less CI host.
+            Err(other) => panic!("FCE DCB must walk: {other:?}"),
+        }
+        let framebuffers = session.framebuffers.lock();
+        let image = framebuffers
+            .get(&BASE)
+            .expect("the direct clear must land in the framebuffer map");
+        assert_eq!((image.width, image.height), (96, 48));
+        assert!(
+            image
+                .pixels
+                .chunks_exact(4)
+                .all(|px| px == 0x8040_20FFu32.to_le_bytes()),
+            "every pixel must be the packed CLEAR_WORD colour"
+        );
+    }
+
+    /// A fixture DCB that binds TWO colour targets must surface the second as
+    /// a real extra attachment in the translated draw state — the full chain
+    /// from `SET_CONTEXT_REG` decode through `draw_state_from_regs`. No
+    /// Vulkan needed; the Vulkan half is pinned by `tests/mrt_targets.rs`.
+    #[test]
+    fn cp_dcb_with_two_bound_targets_translates_to_an_mrt_draw_state() {
+        struct Probe {
+            mrt: Option<Vec<(u8, u64, ash::vk::Format)>>,
+        }
+        impl kyty_graphics::run::DrawSink for Probe {
+            fn draw_index_auto(
+                &mut self,
+                ctx: &kyty_graphics::hw_regs::Context,
+                ucfg: &kyty_graphics::hw_regs::UserConfig,
+                _sh: &kyty_graphics::hw_regs::Shader,
+                index_count: u32,
+                _flags: u32,
+            ) -> Result<(), kyty_graphics::run::DrawError> {
+                const SPIRV: &[u32] = &[0x0723_0203];
+                let state = crate::draw_translate::draw_state_from_regs(
+                    ctx,
+                    ucfg,
+                    index_count,
+                    SPIRV,
+                    SPIRV,
+                )?;
+                self.mrt = Some(
+                    state
+                        .mrt
+                        .iter()
+                        .map(|extra| (extra.slot, extra.target_base, extra.format))
+                        .collect(),
+                );
+                Ok(())
+            }
+        }
+
+        // Splice slot-1 register writes between the fixture's state section
+        // and its trailing 7-dword draw packet, AFTER the fixture's
+        // CB_TARGET_MASK write (which would otherwise zero slot 1's nibble).
+        let complete = build_cp_draw_dcb(96, 48, ScissorHalf::Left);
+        let split = complete.len() - 7;
+        let mut dcb: Vec<u32> = complete[..split].to_vec();
+        let mut set_cx = |reg: u32, value: u32| {
+            dcb.extend([
+                pm4::header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+                reg,
+                value,
+            ]);
+        };
+        set_cx(
+            pm4::CB_COLOR0_BASE + pm4::CB_COLOR_SLOT_STRIDE,
+            0x2_0000 >> 8,
+        );
+        set_cx(pm4::CB_COLOR0_INFO + pm4::CB_COLOR_SLOT_STRIDE, 0xa << 2);
+        set_cx(pm4::CB_COLOR0_ATTRIB2 + 1, (95 << 14) | 47);
+        set_cx(pm4::CB_TARGET_MASK, 0xF | (0xF << 4));
+        dcb.extend_from_slice(&complete[split..]);
+
+        let mut probe = Probe { mrt: None };
+        let mut cp = CommandProcessor::new();
+        cp.run(&dcb, &mut probe).expect("MRT fixture DCB must walk");
+        assert_eq!(
+            probe.mrt.expect("the draw reached the sink"),
+            vec![(1u8, 0x2_0000u64, ash::vk::Format::R8G8B8A8_UNORM)],
+            "slot 1 must translate into one extra attachment"
+        );
+    }
+
     /// Register state belongs to the GPU queue, not to one submitted DCB.
     /// Retail AGC emits state-only setup buffers followed by draw-only buffers;
     /// constructing a fresh command processor per submit loses every shader and

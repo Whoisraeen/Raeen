@@ -91,6 +91,10 @@ pub struct VulkanDevice {
     /// device. When false, viewport min/max depth must stay ordered within
     /// [0, 1] — a guest reverse-Z range cannot be honoured.
     depth_range_unrestricted: bool,
+    /// Whether `independentBlend` was enabled on the logical device (enabled
+    /// exactly when the physical device supports it). Without it every MRT
+    /// attachment must share the primary's blend/write-mask state.
+    independent_blend: bool,
     /// Whether the validation layer was actually enabled.
     validation_enabled: bool,
     /// `VK_EXT_external_memory_host` support: the required host-pointer
@@ -182,6 +186,17 @@ impl VulkanDevice {
         let physical_properties =
             unsafe { instance.get_physical_device_properties(physical_device) };
         let max_push_constants_size = physical_properties.limits.max_push_constants_size;
+
+        // `independentBlend` is enabled at device creation exactly when the
+        // physical device supports it, so supported == enabled here.
+        // SAFETY: same handle validity as above; the call only fills the
+        // returned struct.
+        let independent_blend = unsafe {
+            instance
+                .get_physical_device_features(physical_device)
+                .independent_blend
+                == vk::TRUE
+        };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -291,10 +306,18 @@ impl VulkanDevice {
             debug,
             device_name,
             depth_range_unrestricted,
+            independent_blend,
             imported_host_pointer_alignment,
             max_push_constants_size,
             validation_enabled,
         })
+    }
+
+    /// Whether per-attachment blend/write-mask state is available
+    /// (`independentBlend`, enabled at device creation when supported).
+    #[must_use]
+    pub fn supports_independent_blend(&self) -> bool {
+        self.independent_blend
     }
 
     /// `VkPhysicalDeviceLimits::maxPushConstantsSize` for the selected
@@ -715,9 +738,14 @@ impl VulkanDevice {
         // Gen5 shaders write storage buffers from the vertex stage (UAV
         // writes/stream-out); without `vertexPipelineStoresAndAtomics` the
         // driver rejects those pipelines (VUID-RuntimeSpirv-NonWritable-06341).
+        // `independentBlend` (universal on desktop) lets each MRT attachment
+        // carry its own blend/write-mask state, matching the per-slot
+        // CB_BLEND{n}_CONTROL registers; when absent the pipeline falls back
+        // to the primary attachment's state for every target.
         let features = vk::PhysicalDeviceFeatures::default()
             .fragment_stores_and_atomics(true)
             .vertex_pipeline_stores_and_atomics(true)
+            .independent_blend(supported.independent_blend == vk::TRUE)
             .robust_buffer_access(supported.robust_buffer_access == vk::TRUE);
         // Enable whichever robustness2 features the device actually reports (all
         // three on the measured Radeon 760M). Only chained when the extension is
