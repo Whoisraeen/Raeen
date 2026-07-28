@@ -2923,7 +2923,19 @@ fn shader_parse_smem(
             inst.src[0].size = 2;
             inst.dst.size = 8;
         }
-        0x04 => return Err(ni(dst, S, "s_load_dwordx16", opcode, pc, b0)),
+        // Beyond Kyty (`KYTY_NI` upstream): 16-dword scalar load — 64 bytes
+        // into 16 consecutive SGPRs. Opcode identity from KytyPS5's SMEM table
+        // (`src/graphics/shader/recompiler/MemoryOps.cpp`:
+        // `{0x04u, Opcode::SLoadDwordx16, 16, 32}`) and SharpEmu's Gen5
+        // translator (`Gen5ShaderTranslator.cs`: `0x04 => "SLoadDwordx16"`,
+        // width 16). Measured as the first blocker of Avatar: Frontiers of
+        // Pandora. Operand shape is identical to the x2/x4/x8 rows.
+        0x04 => {
+            inst.type_ = T::SLoadDwordx16;
+            inst.format = F::Sdst16SbaseSoffset;
+            inst.src[0].size = 2;
+            inst.dst.size = 16;
+        }
         0x08 => {
             inst.type_ = T::SBufferLoadDword;
             inst.format = F::SdstSvSoffset;
@@ -3002,8 +3014,24 @@ fn shader_parse_smrd(
     }
 
     match opcode {
-        0x00 => return Err(ni(dst, S, "s_load_dword", opcode, pc, b0)),
-        0x01 => return Err(ni(dst, S, "s_load_dwordx2", opcode, pc, b0)),
+        // Beyond Kyty (`KYTY_NI` upstream for 0x00/0x01/0x04): the legacy SMRD
+        // encoding carries the SAME opcode table as next-gen SMEM (KytyPS5
+        // `MemoryOps.cpp` `SMEM_OPS`), and this parser already produces the
+        // identical operand shape for both — a constant byte offset in
+        // `src[1]` plus an SGPR base pair in `src[0]`. So the x1/x2/x16 rows
+        // reuse the formats their SMEM twins already recompile through.
+        0x00 => {
+            inst.type_ = T::SLoadDword;
+            inst.format = F::SdstSbaseSoffset;
+            inst.src[0].size = 2;
+            inst.dst.size = 1;
+        }
+        0x01 => {
+            inst.type_ = T::SLoadDwordx2;
+            inst.format = F::Sdst2Ssrc02Ssrc1;
+            inst.src[0].size = 2;
+            inst.dst.size = 2;
+        }
         0x02 => {
             inst.type_ = T::SLoadDwordx4;
             inst.format = F::Sdst4SbaseSoffset;
@@ -3016,11 +3044,17 @@ fn shader_parse_smrd(
             inst.src[0].size = 2;
             inst.dst.size = 8;
         }
-        0x04 => return Err(ni(dst, S, "s_load_dwordx16", opcode, pc, b0)),
+        0x04 => {
+            inst.type_ = T::SLoadDwordx16;
+            inst.format = F::Sdst16SbaseSoffset;
+            inst.src[0].size = 2;
+            inst.dst.size = 16;
+        }
         0x08 => {
             inst.type_ = T::SBufferLoadDword;
             inst.format = F::SdstSvSoffset;
             inst.src[0].size = 4;
+            inst.dst.size = 1;
         }
         0x09 => {
             inst.type_ = T::SBufferLoadDwordx2;
@@ -4281,11 +4315,15 @@ fn shader_parse_mimg(
         0x46 => return Err(ni(dst, S, "image_gather4_b_cl", opcode, pc, b0)),
         // Beyond Kyty (KYTY_NI upstream): four-texel single-channel gather at
         // an implicit zero LOD — measured on ASTRO.BOT scene compute
-        // (raw 0xf11c0108/0xf11c0208, dmask 0x1/0x2). The gather dmask names
-        // the ONE channel gathered (must be a single bit); vdata is always 4
-        // dwords, one per texel. Only measured dmask forms are wired; others
-        // stay named with the dmask evidence via the unset-format failure
-        // below.
+        // (raw 0xf11c0108, dmask 0x1; dmask 0x2 measured on the later run that
+        // reached stage `rendering`). The gather dmask names the ONE channel
+        // gathered and MUST be a single bit (KytyPS5 `ImageOps.cpp`
+        // `IsSingleDmaskBit` refuses every other value); vdata is always 4
+        // dwords, one per texel, independent of the dmask (same file,
+        // `data_dwords = gather != nullptr ? 4u : CountDmaskComponents(...)`).
+        // All four single-bit masks are therefore decided by the encoding — the
+        // bit index becomes the SPIR-V gather `Component` operand — so the full
+        // set is wired. Multi-bit dmasks keep the named refusal below.
         0x47 => {
             inst.type_ = T::ImageGather4Lz;
             inst.src[0].size = 3;
@@ -4298,6 +4336,14 @@ fn shader_parse_mimg(
                 }
                 0x2 => {
                     inst.format = F::Vdata4Vaddr3StSsDmask2;
+                    inst.dst.size = 4;
+                }
+                0x4 => {
+                    inst.format = F::Vdata4Vaddr3StSsDmask4;
+                    inst.dst.size = 4;
+                }
+                0x8 => {
+                    inst.format = F::Vdata4Vaddr3StSsDmask8;
                     inst.dst.size = 4;
                 }
                 _ => {}
@@ -4322,6 +4368,10 @@ fn shader_parse_mimg(
         0x5e => return Err(ni(dst, S, "image_gather4_c_b_cl_o", opcode, pc, b0)),
         0x5f => return Err(ni(dst, S, "image_gather4_c_lz_o", opcode, pc, b0)),
         0x60 => return Err(ni(dst, S, "image_get_lod", opcode, pc, b0)),
+        // Name only (identity from KytyPS5 `ImageOps.cpp` `MIMG_GATHER_OPS`):
+        // the horizontal gather has no Vulkan/SPIR-V equivalent, so it stays
+        // refused — but refused BY NAME instead of as an unknown opcode.
+        0x61 => return Err(ni(dst, S, "image_gather4h", opcode, pc, b0)),
         0x68 => return Err(ni(dst, S, "image_sample_cd", opcode, pc, b0)),
         0x69 => return Err(ni(dst, S, "image_sample_cd_cl", opcode, pc, b0)),
         0x6a => return Err(ni(dst, S, "image_sample_c_cd", opcode, pc, b0)),
@@ -5258,6 +5308,65 @@ mod tests {
         assert_eq!((inst.src[0].register_id, inst.src[0].size), (0, 2));
         assert_eq!(inst.src[1].type_, O::IntegerInlineConstant);
         assert_eq!(inst.src[1].constant.i(), 0x10);
+    }
+
+    /// `s_load_dwordx16` — SMEM opcode 0x04, 64 bytes into 16 consecutive
+    /// SGPRs. Identity: KytyPS5 `MemoryOps.cpp` `{0x04u,
+    /// Opcode::SLoadDwordx16, 16, 32}` and SharpEmu `Gen5ShaderTranslator.cs`
+    /// (`0x04 => "SLoadDwordx16"`, width 16). Measured on Avatar: Frontiers of
+    /// Pandora.
+    #[test]
+    fn smem_s_load_dwordx16_writes_sixteen_sgprs() {
+        // opcode 0x04 (bits 25:18), sdst = s16 (bits 12:6), sbase = 0
+        // (s[0:1]); word1 soffset = NULL so the 21-bit imm 0x20 is the offset.
+        let (code, result) = parse(
+            &[0xF410_0400, 0xFA00_0020, S_ENDPGM],
+            ShaderType::Vertex,
+            true,
+        );
+        result.expect("s_load_dwordx16");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLoadDwordx16);
+        assert_eq!(inst.format, F::Sdst16SbaseSoffset);
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Sgpr, 16, 16)
+        );
+        assert_eq!(
+            (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+            (O::Sgpr, 0, 2)
+        );
+        assert_eq!(inst.src[1].type_, O::IntegerInlineConstant);
+        assert_eq!(inst.src[1].constant.i(), 0x20);
+    }
+
+    /// The legacy SMRD encoding carries the same opcode table, so its x1/x2/x16
+    /// rows (all `KYTY_NI` upstream) decode to the same types/formats as their
+    /// SMEM twins.
+    #[test]
+    fn smrd_s_load_dword_x1_x2_x16_decode() {
+        // b0 = 0xC0000000 | opcode<<22 | sdst<<15 | sbase<<9 | imm<<8 | offset
+        // sdst = s8, sbase = s[2:3], imm = 1, offset = 8 dwords (32 bytes).
+        for (word, type_, format, size) in [
+            (0xC004_0308u32, T::SLoadDword, F::SdstSbaseSoffset, 1),
+            (0xC044_0308, T::SLoadDwordx2, F::Sdst2Ssrc02Ssrc1, 2),
+            (0xC104_0308, T::SLoadDwordx16, F::Sdst16SbaseSoffset, 16),
+        ] {
+            let (code, _) = parse_vs(&[word, S_ENDPGM]);
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, type_, "word {word:#010x}");
+            assert_eq!(inst.format, format, "word {word:#010x}");
+            assert_eq!(
+                (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+                (O::Sgpr, 8, size)
+            );
+            assert_eq!(
+                (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+                (O::Sgpr, 2, 2)
+            );
+            assert_eq!(inst.src[1].type_, O::LiteralConstant);
+            assert_eq!(inst.src[1].constant.u, 32); // offset << 2
+        }
     }
 
     #[test]
@@ -6252,6 +6361,87 @@ mod tests {
                 pc: 0
             })
         );
+    }
+
+    /// `image_gather4_lz` (MIMG 0x47) with each of the four single-bit dmasks.
+    /// The dmask names the ONE channel gathered, so vdata is always 4 dwords
+    /// (one per texel) — never `popcount(dmask)`.
+    #[test]
+    fn mimg_image_gather4_lz_all_single_bit_dmasks_decode() {
+        // Base encoding is the measured ASTRO.BOT site (raw 0xf11c0108 /
+        // 0x00400206 — v[2:5], v[6:8], s[0:7], s[8:11], DIM_2D); only the
+        // dmask nibble (bits 11:8) varies.
+        for (word0, dmask_format) in [
+            (0xF11C_0108u32, F::Vdata4Vaddr3StSsDmask1),
+            (0xF11C_0208, F::Vdata4Vaddr3StSsDmask2),
+            (0xF11C_0408, F::Vdata4Vaddr3StSsDmask4),
+            (0xF11C_0808, F::Vdata4Vaddr3StSsDmask8),
+        ] {
+            let (code, result) = parse(&[word0, 0x0040_0206, S_ENDPGM], ShaderType::Compute, true);
+            result.unwrap_or_else(|e| panic!("gather4_lz {word0:#010x}: {e:?}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, T::ImageGather4Lz);
+            assert_eq!(inst.format, dmask_format, "word0 {word0:#010x}");
+            // Four texels regardless of which channel the dmask selects.
+            assert_eq!(
+                (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+                (O::Vgpr, 2, 4)
+            );
+            assert_eq!(
+                (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+                (O::Vgpr, 6, 3)
+            );
+            assert_eq!(
+                (inst.src[1].type_, inst.src[1].register_id, inst.src[1].size),
+                (O::Sgpr, 0, 8)
+            );
+            assert_eq!(
+                (inst.src[2].type_, inst.src[2].register_id, inst.src[2].size),
+                (O::Sgpr, 8, 4)
+            );
+        }
+    }
+
+    /// A gather with more than one dmask bit is illegal on the hardware
+    /// (KytyPS5 `ImageOps.cpp` `IsSingleDmaskBit`); keep it refused by name
+    /// rather than guessing a multi-channel meaning.
+    #[test]
+    fn mimg_image_gather4_lz_multi_bit_dmask_refuses() {
+        let (_, result) = parse(
+            &[0xF11C_0308, 0x0040_0206, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        assert_eq!(
+            result,
+            Err(ShaderParseError::UnknownMimgFormat {
+                opcode: 0x47,
+                dmask: 3,
+                pc: 0
+            })
+        );
+    }
+
+    /// `image_gather4h` (MIMG 0x61) has no SPIR-V equivalent, but it must be
+    /// refused BY NAME (identity from KytyPS5 `MIMG_GATHER_OPS`) rather than
+    /// as an unknown opcode.
+    #[test]
+    fn mimg_image_gather4h_refuses_by_name() {
+        // opcode 0x61 = (0x61 << 18) with the next-gen high bit clear.
+        let (_, result) = parse(
+            &[0xF184_0108, 0x0040_0206, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        match result {
+            Err(ShaderParseError::NotImplemented { instruction, .. }) => {
+                assert!(
+                    instruction.contains("image_gather4h"),
+                    "expected named refusal, got {instruction}"
+                );
+            }
+            other => panic!("expected named image_gather4h refusal, got {other:?}"),
+        }
     }
 
     #[test]

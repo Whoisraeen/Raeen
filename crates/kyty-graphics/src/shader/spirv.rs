@@ -1943,6 +1943,7 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
             T::SLoadDwordx2 => 2u32,
             T::SLoadDwordx4 => 4,
             T::SLoadDwordx8 => 8,
+            T::SLoadDwordx16 => 16,
             _ => continue,
         };
         if inst.src[0].type_ != ShaderOperandType::Sgpr
@@ -5384,6 +5385,7 @@ impl<'a> Spirv<'a> {
                         ShaderInstructionType::SLoadDwordx2 => 2u32,
                         ShaderInstructionType::SLoadDwordx4 => 4,
                         ShaderInstructionType::SLoadDwordx8 => 8,
+                        ShaderInstructionType::SLoadDwordx16 => 16,
                         _ => return None,
                     };
                     (inst.src[0].type_ == ShaderOperandType::Sgpr

@@ -1889,17 +1889,18 @@ fn sload_dword_extended(
     Ok(true)
 }
 
-/// Kyty: `Recompile_SLoadDwordx4_Sdst4SbaseSoffset` (ShaderSpirv.cpp L4311).
-fn recompile_sload_dwordx4(
+/// Shared body of the wide `s_load_dword{x4,x8,x16}` rows: skip the loads that
+/// only exist to bring the embedded vertex-fetch descriptors into SGPRs, then
+/// hand `n` dwords to [`sload_dword_extended`].
+fn sload_dword_wide(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
+    n: i32,
+    func: &'static str,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SLoadDwordx4_Sdst4SbaseSoffset";
-    let inst = inst_at(code, index, FUNC)?;
+    let inst = inst_at(code, index, func)?;
     let vs_info = spirv.get_vs_input_info();
 
     let shift_regs = if vs_info.is_some_and(|v| v.gs_prolog) {
@@ -1919,10 +1920,29 @@ fn recompile_sload_dwordx4(
     }
 
     if spirv.get_bind_info().is_some_and(|b| b.extended.used) && shift_regs != 0 {
-        return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
+        return Err(not_supported(func, "extended path with gs_prolog shift"));
     }
 
-    sload_dword_extended(index, code, &inst, dst_source, spirv, 4, FUNC)
+    sload_dword_extended(index, code, &inst, dst_source, spirv, n, func)
+}
+
+/// Kyty: `Recompile_SLoadDwordx4_Sdst4SbaseSoffset` (ShaderSpirv.cpp L4311).
+fn recompile_sload_dwordx4(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        4,
+        "Recompile_SLoadDwordx4_Sdst4SbaseSoffset",
+    )
 }
 
 /// Kyty: `Recompile_SLoadDwordx8_Sdst8SbaseSoffset` (ShaderSpirv.cpp L4374).
@@ -1934,31 +1954,36 @@ fn recompile_sload_dwordx8(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SLoadDwordx8_Sdst8SbaseSoffset";
-    let inst = inst_at(code, index, FUNC)?;
-    let vs_info = spirv.get_vs_input_info();
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        8,
+        "Recompile_SLoadDwordx8_Sdst8SbaseSoffset",
+    )
+}
 
-    let shift_regs = if vs_info.is_some_and(|v| v.gs_prolog) {
-        8
-    } else {
-        0
-    };
-
-    if vs_info.is_some_and(|v| {
-        v.fetch_embedded
-            && !v.fetch_external
-            && !v.fetch_inline
-            && (inst.src[0].register_id == v.fetch_attrib_reg + shift_regs
-                || inst.src[0].register_id == v.fetch_buffer_reg + shift_regs)
-    }) {
-        return Ok(true);
-    }
-
-    if spirv.get_bind_info().is_some_and(|b| b.extended.used) && shift_regs != 0 {
-        return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
-    }
-
-    sload_dword_extended(index, code, &inst, dst_source, spirv, 8, FUNC)
+/// Beyond Kyty (upstream `KYTY_NI`s SMEM/SMRD opcode 0x04):
+/// `s_load_dwordx16` — the 16-dword row of the same family, reached through
+/// the identical `sload_dword_extended` materialization as x4/x8. Measured as
+/// the first shader blocker of Avatar: Frontiers of Pandora.
+fn recompile_sload_dwordx16(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        16,
+        "Recompile_SLoadDwordx16_Sdst16SbaseSoffset",
+    )
 }
 
 /// Kyty: `Recompile_SMovB32_SVdstSVsrc0` (ShaderSpirv.cpp L4480). Also
@@ -4849,13 +4874,13 @@ fn sgpr_dst_span(inst: &ShaderInstruction) -> Option<(i32, i32)> {
     Some((inst.dst.register_id, opcode_width.max(inst.dst.size.max(1))))
 }
 
-/// The EUD dword offset a covered `s_load{,x2,x4,x8} s[reg..], s[eud_base..],
-/// <const>` loads `reg`'s dword 0 from, or `None` when `inst` is not exactly
-/// that shape (the same acceptance as [`sload_dword_extended`]).
+/// The EUD dword offset a covered `s_load{,x2,x4,x8,x16} s[reg..],
+/// s[eud_base..], <const>` loads `reg`'s dword 0 from, or `None` when `inst` is
+/// not exactly that shape (the same acceptance as [`sload_dword_extended`]).
 fn eud_load_into_reg_offset(inst: &ShaderInstruction, eud_base: i32, reg: i32) -> Option<i32> {
     use ShaderInstructionType as T;
     match inst.type_ {
-        T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
+        T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 | T::SLoadDwordx16 => {}
         _ => return None,
     }
     if inst.src[0].type_ == ShaderOperandType::Sgpr
@@ -5358,6 +5383,7 @@ fn mimg_descriptor_guard(
                 T::SLoadDwordx2 => 2i32,
                 T::SLoadDwordx4 => 4,
                 T::SLoadDwordx8 => 8,
+                T::SLoadDwordx16 => 16,
                 _ => continue,
             };
             if load.src[0].type_ != ShaderOperandType::Sgpr
@@ -6323,38 +6349,18 @@ fn recompile_image_sample_lz_dmask2(
 }
 
 /// Beyond-Kyty (`image_gather4_lz` is `KYTY_NI` upstream): four-texel gather
-/// of channel 0 (dmask 0x1) — measured on ASTRO.BOT scene compute
-/// (raw 0xf11c0108). `OpImageGather` samples the base level, and every
-/// uploaded image carries exactly one mip, so the plain gather IS the LZ
-/// semantic. The four gathered texels land in `vdata..vdata+3` in the
-/// hardware's (i0j1, i1j1, i1j0, i0j0) order, which `OpImageGather` shares.
-fn recompile_image_gather4_lz_dmask1(
-    index: u32,
-    code: &ShaderCode,
-    dst_source: &mut String,
-    spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
-) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask1";
-    image_gather4_lz_single_channel(index, code, dst_source, spirv, FUNC, 0)
-}
-
-/// Beyond-Kyty: measured green-channel (`dmask == 0x2`) companion to
-/// `recompile_image_gather4_lz_dmask1`.
-fn recompile_image_gather4_lz_dmask2(
-    index: u32,
-    code: &ShaderCode,
-    dst_source: &mut String,
-    spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
-) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask2";
-    image_gather4_lz_single_channel(index, code, dst_source, spirv, FUNC, 1)
-}
-
-fn image_gather4_lz_single_channel(
+/// of one channel — measured on ASTRO.BOT scene compute (raw 0xf11c0108,
+/// dmask 0x1; dmask 0x2 on the later `rendering`-stage run).
+/// `OpImageGather` samples the base level, and every uploaded image carries
+/// exactly one mip, so the plain gather IS the LZ semantic. The four gathered
+/// texels land in `vdata..vdata+3` in the hardware's (i0j1, i1j1, i1j0, i0j0)
+/// order, which `OpImageGather` shares.
+///
+/// `component` is the dmask's single set bit's index, which is exactly
+/// `OpImageGather`'s `Component` operand — the gather dmask selects the
+/// channel sampled, not a subset of the destination registers (the
+/// destination is always 4 dwords; see KytyPS5 `ImageOps.cpp`).
+fn image_gather4_lz_component(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
@@ -6362,9 +6368,6 @@ fn image_gather4_lz_single_channel(
     func: &'static str,
     component: u32,
 ) -> Result<bool, ShaderRecompileError> {
-    if component > 3 {
-        return Err(not_supported(func, "gather component must be 0..=3"));
-    }
     let inst = inst_at(code, index, func)?;
 
     let Some(bind_info) = spirv.get_bind_info() else {
@@ -6419,7 +6422,7 @@ fn image_gather4_lz_single_channel(
                OpStore %<dst_value> %g4_v_<index>_<k>
 "#;
 
-    let mut text = HEAD.to_string();
+    let mut text = HEAD.replace("<component>", &format!("{component}"));
     for k in 0..4i32 {
         let dst_value = operand_variable_to_str_shift(inst.dst, k);
         if dst_value.type_ != SpirvType::Float {
@@ -6442,6 +6445,83 @@ fn image_gather4_lz_single_channel(
     *dst_source += &body;
 
     Ok(true)
+}
+
+/// `image_gather4_lz` gathering channel X (dmask 0x1).
+fn recompile_image_gather4_lz_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask1",
+        0,
+    )
+}
+
+/// `image_gather4_lz` gathering channel Y (dmask 0x2) — the measured
+/// ASTRO.BOT blocker.
+fn recompile_image_gather4_lz_dmask2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask2",
+        1,
+    )
+}
+
+/// `image_gather4_lz` gathering channel Z (dmask 0x4).
+fn recompile_image_gather4_lz_dmask4(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask4",
+        2,
+    )
+}
+
+/// `image_gather4_lz` gathering channel W (dmask 0x8).
+fn recompile_image_gather4_lz_dmask8(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask8",
+        3,
+    )
 }
 
 /// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
@@ -10619,6 +10699,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // scene compute, MIMG 0x47 dmask 0x1).
     f(recompile_image_gather4_lz_dmask1, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask1, p1("")),
     f(recompile_image_gather4_lz_dmask2, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask2, p1("")),
+    f(recompile_image_gather4_lz_dmask4, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask4, p1("")),
+    f(recompile_image_gather4_lz_dmask8, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask8, p1("")),
     f(recompile_image_store_dmask1,        T::ImageStore,     F::Vdata1Vaddr3StDmask1,   p1("")),
     f(recompile_image_store_dmask3,        T::ImageStore,     F::Vdata2Vaddr3StDmask3,   p1("")),
     f(recompile_image_store_dmask_f,       T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
@@ -10645,6 +10727,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_sload_dwordx2, T::SLoadDwordx2, F::Sdst2Ssrc02Ssrc1,  p1("")),
     f(recompile_sload_dwordx4, T::SLoadDwordx4, F::Sdst4SbaseSoffset, p1("")),
     f(recompile_sload_dwordx8, T::SLoadDwordx8, F::Sdst8SbaseSoffset, p1("")),
+    f(recompile_sload_dwordx16, T::SLoadDwordx16, F::Sdst16SbaseSoffset, p1("")),
 
     fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SAndn2B64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
         "%tb_<index> = OpBitwiseAnd %uint %t0_<index> %ta_<index>",
@@ -11323,7 +11406,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            350,
+            353,
             "the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
              VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
              the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),            the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
@@ -11355,13 +11438,14 @@ mod tests {
              min/max quartet (VMinU32/VMaxU32/VMinI32/VMaxI32), the four \
              BufferStoreDwordX2 rows, VBfeU32 wired from staged, and the \
              ASTRO.BOT pixel ImageSample dmask2 + ImageSampleLzO dmask1/2 rows, \
-             and the measured VCmpxLeU32 + DsAddRtnU32 rows, plus the \
-             ASTRO.BOT convergence rows VFmacF32, VSubbU32, VSubbrevU32, \
-              ImageSampleL dmask7, and ImageGather4Lz dmask2"
+             and the measured VCmpxLeU32 + DsAddRtnU32 rows, and the \
+             instruction-coverage batch: ImageGather4Lz dmask2/4/8 (the dmask \
+             bit index is the SPIR-V gather Component operand) and \
+             SLoadDwordx16 (SMEM/SMRD opcode 0x04)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 342,
+            implemented, 345,
             "the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
@@ -11387,8 +11471,9 @@ mod tests {
               SAndn1SaveexecB64, VMadU64U32, and the composite-frontier batch: \
               the integer min/max quartet, four BufferStoreDwordX2 rows, \
               VBfeU32, ImageSample dmask2, ImageSampleLzO dmask1/2, VCmpxLeU32, \
-              DsAddRtnU32, VFmacF32, VSubbU32, VSubbrevU32, \
-               ImageGather4Lz dmask2, ImageSampleL dmask7, \
+              DsAddRtnU32, \
+              and the instruction-coverage batch: ImageGather4Lz dmask2/4/8 \
+              and SLoadDwordx16, \
               and the exp-null row: EXP target 9 accepted and dropped)"
         );
         assert_eq!(
@@ -17805,6 +17890,123 @@ mod tests {
         // NOTE: assemble-only — naga's SPIR-V front end does not support
         // OpImageGather (UnsupportedInstruction), which real Vulkan accepts.
         let _ = spirv_run(&source).expect("assemble image_gather4_lz");
+    }
+
+    /// `image_gather4_lz` with each single-bit dmask must translate all the
+    /// way to spirv-val-clean SPIR-V, and the dmask bit index MUST land in
+    /// `OpImageGather`'s `Component` operand — dmask 0x2 is the measured
+    /// ASTRO.BOT blocker ("unknown mimg format for opcode: 0x47 ... dmask:
+    /// 0x2").
+    #[test]
+    fn image_gather4_lz_dmask_selects_the_gather_component() {
+        for (word0, dmask, component) in [
+            (0xF11C_0108u32, 0x1, 0u32),
+            (0xF11C_0208, 0x2, 1),
+            (0xF11C_0408, 0x4, 2),
+            (0xF11C_0808, 0x8, 3),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[word0, 0x0040_0206, V_MOV_V0_0, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("parse gather4_lz dmask {dmask:#x}: {e:?}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, T::ImageGather4Lz);
+            // Always four destination dwords: one per gathered texel.
+            assert_eq!(inst.dst.size, 4, "dmask {dmask:#x}");
+
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            input_info.bind.push_constant_size = 64;
+            input_info.bind.textures2d.textures_num = 1;
+            input_info.bind.textures2d.textures2d_sampled_num = 1;
+            input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+            input_info.bind.samplers.samplers_num = 1;
+            input_info.bind.samplers.start_register[0] = 8;
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .unwrap_or_else(|e| panic!("recompile gather4_lz dmask {dmask:#x}: {e:?}"));
+            assert!(
+                source.contains(&format!("%g4_c_0 %uint_{component}")),
+                "dmask {dmask:#x} must gather component {component}:\n{source}"
+            );
+            // Four texel stores into v[2:5], independent of the dmask.
+            for k in 0..4 {
+                assert!(
+                    source.contains(&format!("OpStore %v{} %g4_v_0_{k}", 2 + k)),
+                    "dmask {dmask:#x} texel {k} store:\n{source}"
+                );
+            }
+            let words = spirv_run(&source)
+                .unwrap_or_else(|e| panic!("assemble gather4_lz dmask {dmask:#x}: {e:?}"));
+            // naga cannot gate this module (its SPIR-V front end rejects
+            // OpImageGather outright); spirv-val is the real bar.
+            spirv_val_ok(&words, &format!("image_gather4_lz_dmask{dmask:#x}"));
+        }
+    }
+
+    /// `s_load_dwordx16` (SMEM opcode 0x04) — Avatar: Frontiers of Pandora's
+    /// first shader blocker. All SIXTEEN destination SGPRs must materialize;
+    /// a width bug would silently drop dwords 8..16.
+    #[test]
+    fn s_load_dwordx16_materializes_all_sixteen_dwords() {
+        // s_load_dwordx16 s[16:31], s[12:13], 0x100 — the EUD base pair with a
+        // constant byte offset (the shape `sload_dword_extended` accepts).
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF410_0406, 0xFA00_0100, V_MOV_V0_0, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse s_load_dwordx16");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLoadDwordx16);
+        assert_eq!(inst.format, F::Sdst16SbaseSoffset);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (16, 16));
+        assert_eq!((inst.src[0].register_id, inst.src[0].size), (12, 2));
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        // No captured descriptor covers EUD dword 0x40..0x50, so the raw
+        // window must be sized to the load's LAST dword — evidence the x16
+        // width reached the detection pass, not just the parser.
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        let raw = input_info.bind.eud_raw;
+        assert!(raw.used);
+        assert_eq!(
+            raw.required_dwords,
+            0x100 / 4 + 16,
+            "raw window must cover all 16 loaded dwords"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile s_load_dwordx16");
+        assert_eq!(
+            source.matches("OpArrayLength %uint %eud_raw 0").count(),
+            16,
+            "one clamped read per loaded dword:\n{source}"
+        );
+        // Destinations are s16..s31 — the last one proves the width.
+        for i in 0..16 {
+            assert!(
+                source.contains(&format!("OpStore %s{} %eudraw_res_0_{i}", 16 + i)),
+                "dword {i} store:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble s_load_dwordx16");
+        spirv_val_ok(&words, "s_load_dwordx16");
     }
 
     #[test]

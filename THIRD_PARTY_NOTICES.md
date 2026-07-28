@@ -127,7 +127,16 @@ SOFTWARE.
   `(object, key, value)`) re-implemented in
   `crates/raeen-hle/src/libsce_np_trophy2.rs` and
   `libsce_np_universal_data.rs`; KytyPS5's fabricated one-bronze-trophy
-  "Kyty" game info is deliberately not ported. No C++ is
+  "Kyty" game info is deliberately not ported. The instruction-coverage batch
+  (`crates/kyty-graphics/src/shader/`, 2026-07-28) uses
+  `src/graphics/shader/recompiler/MemoryOps.cpp`'s `SMEM_OPS` table and
+  `ImageOps.cpp`'s `MIMG_GATHER_OPS` table purely as **opcode-identity
+  evidence** — that SMEM/SMRD opcode `0x04` is `s_load_dwordx16` (16 dwords),
+  that MIMG `0x47`/`0x61` are `image_gather4_lz`/`image_gather4h`, and that a
+  gather's destination is always 4 dwords with a single-bit dmask
+  (`data_dwords = gather ? 4 : CountDmaskComponents(dmask)` plus
+  `IsSingleDmaskBit`). The Rust decode arms, the SPIR-V `OpImageGather`
+  component mapping, and all tests are Raeen's own. No C++ is
   vendored or compiled into Raeen.
 
 ---
