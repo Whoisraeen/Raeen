@@ -184,6 +184,24 @@ SOFTWARE.
   element-size guard mirrors its `BitLog2` refusal. Raeen's swizzle-equation
   tables were verified independently equivalent to SharpEmu's for the modes
   both implement (5/9/24/27) and were **not** changed by that comparison.
+  From upstream PR #422 (`09bd4f0`, "sceKernelSyncOnAddress wait/wake") and
+  PR #439 (`73e8821`, "Hand off mutex ownership directly to the head waiter on
+  unlock"), both verified present at the live tip: the **guest synchronization
+  primitives** in `crates/raeen-kernel/src/lib.rs`
+  (`GuestWaiter`/`GuestWaitQueue`/`SyncAddressTable`, `PthreadMutex`'s handoff
+  FIFO), `crates/raeen-hle/src/libkernel.rs` (`sync_on_address_wait`) and
+  `crates/raeen-hle/src/pthread_sync.rs` (`lock_core`/`hle_mutex_unlock`).
+  Re-implemented after studying `Kernel/KernelSyncOnAddressCompatExports.cs`
+  (address-keyed park/wake, the wake-count argument reading, the bounded
+  self-heal deadline) and `Kernel/KernelPthreadCompatExports.cs`
+  (`PthreadMutexUnlockCore`'s handoff-under-lock, `TryGrantMutexWaiterLocked`'s
+  FIFO-head grant, `EnqueueMutexWaiterLocked`'s one-entry-per-thread pruning,
+  and the fast-acquire refusal of a free-but-queued mutex). Raeen's version
+  diverges deliberately in two places: it performs the **futex value compare**
+  SharpEmu records as unrecovered (enqueue-then-read ordering, `EAGAIN` on
+  mismatch) for the `*Wait32`/`*Wait64` widths, and it replaces the per-address
+  wake **generation counter** with a per-waiter FIFO wake bit. The Rust code and
+  all its deterministic queue-level tests are original.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;

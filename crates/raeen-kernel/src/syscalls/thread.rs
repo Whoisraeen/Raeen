@@ -54,28 +54,43 @@ pub fn sys_thr_exit(_kernel: &OrbisKernel, status: u64) -> Result<u64, KernelErr
 
 /// sys_futex — Fast userspace locking.
 ///
-/// Implements a subset of the futex operations used by PS5 games.
-pub fn sys_futex(_kernel: &OrbisKernel, args: &[u64]) -> Result<u64, KernelError> {
+/// Shares [`OrbisKernel::sync_addresses`] with libkernel's
+/// `sceKernelSyncOnAddress{Wait,Wake}` HLE entry points, so a guest that reaches
+/// the same watched word through the syscall and through the library still parks
+/// in one queue. The syscall path is not the launch hot path today (launches use
+/// HLE trampolines, not `syscall` intercept), but a split parking lot would be a
+/// silent lost-wake bug the day it is.
+///
+/// The **value compare** is deliberately absent here: it needs guest-memory
+/// access this crate does not own, and the HLE path (which does) performs it.
+/// Skipping the compare only costs an unnecessary park, which the bounded slice
+/// below then releases — it never loses a wake.
+pub fn sys_futex(kernel: &OrbisKernel, args: &[u64]) -> Result<u64, KernelError> {
     let uaddr = args[0];
     let op = args[1] as i32;
     let val = args[2] as u32;
 
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
+    /// Bounded park, matching the HLE self-heal: a missed wake resolves into the
+    /// caller re-checking its own condition rather than a hang.
+    const SELF_HEAL: std::time::Duration = std::time::Duration::from_millis(100);
 
     match op & 0x7F {
         FUTEX_WAIT => {
-            debug!("futex_wait(uaddr={:#x}, val={})", uaddr, val);
-            // In a full implementation:
-            // 1. Read the value at uaddr from emulated memory
-            // 2. If it matches val, block the thread
-            // 3. If it doesn't match, return EAGAIN
+            let queue = kernel.sync_addresses.queue(uaddr);
+            let waiter = queue.enqueue_waiter(0);
+            let woken = waiter.wait_for_signal(SELF_HEAL);
+            if !woken {
+                queue.cancel_waiter(&waiter);
+            }
+            debug!("futex_wait(uaddr={uaddr:#x}, val={val}) -> woken={woken}");
             Ok(0)
         }
         FUTEX_WAKE => {
-            debug!("futex_wake(uaddr={:#x}, val={})", uaddr, val);
-            // In a full implementation:
-            // Wake up to val threads blocked on uaddr.
+            let count = if val == 0 { usize::MAX } else { val as usize };
+            let woken = kernel.sync_addresses.wake(uaddr, count);
+            debug!("futex_wake(uaddr={uaddr:#x}, val={val}) -> woke {woken}");
             Ok(0)
         }
         _ => {
