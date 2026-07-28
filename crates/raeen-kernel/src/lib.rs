@@ -374,6 +374,13 @@ pub struct OrbisKernel {
     /// call. The guest walks pointers inside this block, so it is allocated
     /// once in guest memory and cached here for every later call.
     pub agc_register_defaults_addr: std::sync::atomic::AtomicU64,
+    /// Graphics PM4 the title has BUILT after its last DCB submit but not yet
+    /// submitted (KytyPS5 `g_pending_graphics_segment`, agc.cpp L214-264):
+    /// the segment starts where the last submitted DCB ended and grows with
+    /// each contiguous command-buffer allocation in that range. An ACB whose
+    /// waits depend on a `RELEASE_MEM` in this unsubmitted tail would park
+    /// forever; the HLE flushes the segment as a DCB before every ACB submit.
+    pub agc_pending_graphics_segment: std::sync::Mutex<AgcPendingGraphicsSegment>,
     /// Display buffers registered by VideoOut, keyed by `(port, slot)`.
     pub video_out_buffers: DashMap<(i32, i32), VideoOutBuffer>,
     /// Completed VideoOut flips for this process.
@@ -547,6 +554,18 @@ impl Default for EqueueUserEvent {
             data: 0,
         }
     }
+}
+
+/// The unsubmitted graphics tail of the title's command ring, in guest byte
+/// addresses (KytyPS5 `PendingGraphicsSegment`, agc.cpp L214-218). `start` is
+/// where the last submitted DCB ended; `end` grows with contiguous
+/// command-buffer allocations; `range_end` bounds how far the segment may
+/// grow (start + 0xfffff dwords). All zero when nothing is tracked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgcPendingGraphicsSegment {
+    pub start: u64,
+    pub end: u64,
+    pub range_end: u64,
 }
 
 /// Metadata supplied through `sceAgcDriverRegisterResource`.
@@ -1229,6 +1248,9 @@ impl OrbisKernel {
             agc_last_dcb_address: std::sync::atomic::AtomicU64::new(0),
             agc_last_dcb_dwords: std::sync::atomic::AtomicU32::new(0),
             agc_register_defaults_addr: std::sync::atomic::AtomicU64::new(0),
+            agc_pending_graphics_segment: std::sync::Mutex::new(
+                AgcPendingGraphicsSegment::default(),
+            ),
             video_out_buffers: DashMap::new(),
             direct_memory_allocated: std::sync::atomic::AtomicU64::new(0),
             video_out_flip_count: std::sync::atomic::AtomicU64::new(0),

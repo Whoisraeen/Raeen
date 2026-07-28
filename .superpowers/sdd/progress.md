@@ -1,3 +1,47 @@
+- GTA V ACB PHASE B — COMPUTE-QUEUE EXECUTION (2026-07-27; gpu-pipeline agent
+  worktree branch; kyty-graphics 480/480 (475 lib + 5 integration, +3 new),
+  raeen-hle 486/486 (+5 new; one wall-clock vblank flake passed on isolated
+  rerun), raeen-gpu 269 lib green (+1 new), raeen-kernel 45/45, fmt clean,
+  clippy on touched crates: only the pre-existing analysis.rs MSRV lint +
+  raeen-gpu phase-1 dead-code warnings — none from this batch):
+  * REALITY CHECK vs the Phase A handoff plan: submitted ACBs were ALREADY
+    executing — `hle_driver_submit_acb` → `submit_command_buffer` →
+    `GpuQueue::AsyncCompute` → a dedicated compute `CommandProcessor` with
+    WAIT_MEM32/64 suspend/resume, parked in-order backlogs, and the
+    bidirectional produced-label latch (all tested). What was actually
+    missing, now ported from KytyPS5 (MIT lineage, attribution updated):
+  * (1) ACB DESCRIPTOR INDIRECTION (`submit_acb`, agc.cpp L3928-3946): the
+    submitted buffer may be 5 DWORDs `[addr_lo, addr_hi, size, flags=0,
+    magic 0x5533ccaa]` pointing at the real stream. Previously that
+    descriptor failed PM4 decode → the whole compute submission dropped as
+    SCE_ERROR_INVALID_ARGUMENT. Unwrapped for SubmitAcb AND SubmitMultiAcbs.
+  * (2) GRAPHICS→COMPUTE ORDERING (`flush_pending_graphics_segment_before_acb`
+    + segment tracker, agc.cpp L214-264/L3691-3839): graphics PM4 the title
+    builds AFTER its last DCB submit (tracked via `alloc_command_dwords`,
+    the `AllocateDW` mirror; state on `OrbisKernel::agc_pending_graphics_
+    segment`) is flushed as a DCB before every ACB submit — truncated to the
+    last RELEASE_MEM whose label the ACB awaits, trimmed to whole packets.
+    Without this an ACB waiting on a not-yet-submitted producer parks until
+    the dead-wait net fires (glitch path).
+  * (3) COMPUTE PACKET ARMS (kyty-graphics run.rs): IT_DISPATCH_INDIRECT now
+    EXECUTES (both KytyPS5 forms: base+offset via the new indirect-dispatch
+    base, and absolute-address; missing base/memory = once-warned skip);
+    IT_SET_BASE routes select-1 by the header shader-type bit (draw vs
+    dispatch args) per CpOpSetBase. DISPATCH_DIRECT/ACQUIRE_MEM/RELEASE_MEM/
+    WAIT/COND_EXEC verified already queue-indexed — not re-ported.
+  * TESTS: descriptor unwrap → real stream on AsyncCompute (+ raw-stream
+    negative), builder-built RELEASE_MEM flushed as DCB *before* the waiting
+    ACB (order asserted on a recording GPU), wait-match truncation (unawaited
+    producer NOT flushed), non-contiguous allocation ignored, ACB RELEASE_MEM
+    resumes a suspended graphics wait (reverse of the existing cross-queue
+    test), dispatch-indirect base/absolute/degrade trio.
+  * NEXT: checklist 2D — live GTA V re-measure. Look for: the UD2 assert at
+    module+0xae36 moving or clearing; "ACB submission carries dispatches" +
+    "flushing pending graphics segment before ACB" in the log; whether
+    descriptor-form ACBs appear (debug line "ACB submission descriptor
+    unwrapped"); remaining unresolved NIDs should be the ~46 libSceAmpr
+    (agent C) + _Ctype.
+
 - TIER-B OFFLINE-SEMANTICS SERVICE-LIB BATCH (2026-07-27; agent worktree
   branch, raeen-hle 463/463, raeen-firmware 125/125, fmt clean, clippy clean
   on raeen-hle itself — the only `-D warnings` failure is the pre-existing

@@ -105,9 +105,41 @@ Claude `/goal` (≤200 chars):
     `DcbSetIndexIndirectArgs`, `GetDefaultCxStateFlat`, `SetNop`,
     `GetGsOversubscription`, `SetAmmSemaphoreMemory`, `GetSemaphoreLabel` —
     packet shapes/signatures absent from every license-compatible reference.
-- Phase B (not started here): PM4 **compute-queue execution** — the ACB
-  stream currently reaches `hle_driver_submit_acb` but the command processor
-  executes only the graphics-queue path.
+- Phase B (**DONE 2026-07-27**, see the batch below): PM4 compute-queue
+  execution.
+
+### GTA V AGC Phase B batch 2026-07-27 (KytyPS5 `src/libs/agc.cpp` + `guest_gpu`)
+
+- **ACB submission-descriptor indirection — DONE** (`submit_acb`, agc.cpp
+  L3928-3946): `sceAgcDriverSubmitAcb`/`SubmitMultiAcbs` now unwrap the
+  5-DWORD `[addr_lo, addr_hi, size, flags=0, 0x5533ccaa]` descriptor to the
+  real command stream before decoding. Without this a descriptor-form ACB
+  failed PM4 decode and the whole compute submission was dropped.
+- **Pending post-submit graphics segment — DONE** (`PendingGraphicsSegment` +
+  `track_pending_graphics_segment_after_submit` +
+  `track_pending_graphics_allocation` + `flush_pending_graphics_segment_
+  before_acb`, agc.cpp L214-264/L3691-3839): every DCB submit re-tracks the
+  ring region behind it; builder allocations (`alloc_command_dwords`, the
+  `AllocateDW` mirror) grow it contiguously; every ACB submit first flushes
+  the segment as a DCB — truncated to the last `RELEASE_MEM` whose label the
+  ACB awaits, trimmed to whole packets. State lives on `OrbisKernel
+  ::agc_pending_graphics_segment`. Deliberate deviation: a lone `0x8000_0000`
+  padding dword scans as 1 DWORD (Raeen decode convention), not 2.
+- **`CpOpDispatchIndirect` + `CpOpSetBase` shader-type split — DONE**
+  (`pm4Handlers.cpp` L2009-2036/L2546-2567, `graphicsRun.cpp` L1100-1113) in
+  `crates/kyty-graphics/src/run.rs`: both the base+offset (3-DWORD) and
+  absolute-address (4-DWORD) indirect dispatch forms read `[x,y,z]` groups
+  from guest memory and feed the same sink as `DISPATCH_DIRECT`; `IT_SET_BASE`
+  routes select-1 bases by the header's shader-type bit (0 = draw args,
+  1 = dispatch args). Missing base/memory degrades to a once-warned skip,
+  never an aborted walk.
+- **Already present, verified rather than ported:** per-queue command
+  processors (graphics vs compute register/shader state), WAIT_MEM32/64
+  suspend/resume with parked in-order backlogs, the cross-queue produced-label
+  latch, and compute RELEASE_MEM/WRITE_DATA/DMA_DATA in-order execution —
+  raeen-gpu `agc_exec.rs` + kyty-graphics `run.rs`. Added the missing
+  reverse-direction acceptance test (ACB `RELEASE_MEM` resuming a suspended
+  graphics wait).
 
 ### Phase 1 live-import batch 2026-07-25
 

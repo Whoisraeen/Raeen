@@ -4484,6 +4484,71 @@ mod tests {
         session.shutdown();
     }
 
+    /// ACB-form `R_RELEASE_MEM` completion-label write: 8 dwords, body
+    /// `[action, control (data_sel at bits 23:16), addr_lo, addr_hi,
+    /// data_lo, data_hi, ctx]`.
+    fn release_mem_dcb(addr: u64, value: u32) -> Vec<u32> {
+        vec![
+            pm4::header(8, pm4::IT_NOP, pm4::R_RELEASE_MEM),
+            0,
+            1 << 16,
+            addr as u32,
+            (addr >> 32) as u32,
+            value,
+            0,
+            0,
+        ]
+    }
+
+    /// The REVERSE direction of the test above: a suspended GRAPHICS wait is
+    /// resumed by a compute-queue `RELEASE_MEM` producer. GTA V drives both
+    /// directions — graphics fences feeding ACB waits and ACB completion
+    /// labels feeding graphics waits.
+    #[test]
+    fn dcb_wait_resumes_when_an_acb_release_mem_writes_the_label() {
+        let arena: &'static mut [u32] = Box::leak(vec![0u32; 16].into_boxed_slice());
+        let base = arena.as_ptr() as u64;
+        // dword layout: 0 label, 2 consumer src (0xCC), 3 consumer dst.
+        arena[2] = 0xCC;
+        let memory: Arc<dyn crate::guest_mem::GpuGuestMemory> = Arc::new(HostRangeMemory {
+            start: base,
+            len: std::mem::size_of_val(arena) as u64,
+        });
+        let session = AgcGpuSession::new_process(memory);
+
+        // Graphics DCB: wait for label == 1, then copy 0xCC into dword 3.
+        let mut dcb = wait32_dcb(base, 3, 1);
+        dcb.extend(dma_copy_dcb(base + 12, base + 8, 4));
+        session.submit_dcb_async(dcb, false);
+        session.wait_idle();
+        assert_eq!(
+            session.wait_suspend_stats().currently_suspended,
+            1,
+            "unmet graphics wait must suspend its buffer"
+        );
+        assert_eq!(arena[3], 0, "work behind the wait must not run");
+        assert_eq!(arena[0], 0, "the label must never be force-satisfied");
+
+        // Producer: an ACB RELEASE_MEM writes the completion label.
+        session.submit_dcb_async(release_mem_dcb(base, 1), true);
+        session.wait_idle();
+        assert_eq!(arena[0], 1, "the compute RELEASE_MEM landed");
+        assert_eq!(
+            arena[3], 0xCC,
+            "the resumed graphics buffer ran its post-wait work"
+        );
+        assert_eq!(
+            session.wait_suspend_stats(),
+            GpuWaitStats {
+                suspended: 1,
+                resumed: 1,
+                currently_suspended: 0,
+                parked: 0,
+            }
+        );
+        session.shutdown();
+    }
+
     /// The state-only fixture must really be state-only, or the test above
     /// silently starts standing up Vulkan again.
     #[test]
