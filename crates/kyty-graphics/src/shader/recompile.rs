@@ -20069,6 +20069,176 @@ mod tests {
         spirv_val_ok(&module, "full_chain_vsharp_sbuffer_load_x8");
     }
 
+    /// The V# the shader **loads for itself** out of an SRT descriptor table,
+    /// which is the only shape Grand Theft Auto V's vertex shaders use and which
+    /// the live-in-only guard refused outright:
+    ///
+    /// ```text
+    /// s_load_dwordx4        s[20:23], s[12:13], 64   ; fetch the V#
+    /// s_buffer_load_dwordx8 s[24:31], s[20:23], 0    ; then use it
+    /// ```
+    ///
+    /// Measured 2026-07-28
+    /// (`artifacts/compat/raw/baseline-1785273714952/PPSA04264-*.stdout.log`):
+    /// `Recompile_SBufferLoadDwordx8_Sdst8SvSoffset: not supported: no storage
+    /// buffer bound for the V# and no resolved capture: ... V#=s[20:23],
+    /// soffset=none, imm=0x0, pc=0xd4` — 998 of that run's 999 shader errors,
+    /// across three vertex shaders, every one of them this shape. The V# quad is
+    /// not live-in user data (the `s_load_dwordx4` writes it), so
+    /// `shader_capture_vsharp_buffer_loads` skipped the load and the whole
+    /// shader died.
+    ///
+    /// The descriptor is knowable without guessing: the producing `s_load` was
+    /// itself already captured from guest memory by the pointer-load pass that
+    /// runs first, so its four dwords ARE the V#. This drives the real
+    /// production entry point (`shader_capture_runtime_scalar_loads_shifted`,
+    /// which calls the V# pass at its tail) so the ordering the fix depends on
+    /// is under test too.
+    #[test]
+    fn full_chain_vsharp_loaded_from_an_srt_table_to_validated_spirv() {
+        // s_load_dwordx4 s[20:23], s[12:13], 0x40
+        //   b0 = 0x3d << 26 | opcode 0x02 << 18 | sdst 20 << 6 | sbase 6
+        //        (sbase is in SGPR *pairs*: 6 * 2 = s12)
+        //   b1 = soffset NULL (0x7d) << 25 | offset 0x40
+        const SLOAD: [u32; 2] = [0xF408_0506, 0xFA00_0040];
+        // s_buffer_load_dwordx8 s[24:31], s[20:23], 0 — as in the test above.
+        const SBUFFER: [u32; 2] = [0xF42C_060A, 0xFA00_0000];
+        let mut words = Vec::new();
+        words.extend_from_slice(&SLOAD);
+        words.extend_from_slice(&SBUFFER);
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true)
+            .expect("the SRT load and the V# buffer load must parse");
+        let instructions = code.get_instructions();
+        assert_eq!(instructions[0].type_, T::SLoadDwordx4);
+        assert_eq!(
+            (instructions[0].dst.register_id, instructions[0].dst.size),
+            (20, 4),
+            "the SRT load defines the whole V# quad s[20:23]"
+        );
+        assert_eq!(instructions[1].type_, T::SBufferLoadDwordx8);
+        assert_eq!(
+            (
+                instructions[1].src[0].register_id,
+                instructions[1].src[0].size
+            ),
+            (20, 4),
+            "and the buffer load reads its V# from that quad"
+        );
+        let (sload_pc, sbuffer_pc) = (instructions[0].pc, instructions[1].pc);
+
+        // One guest region holding both indirections: the SRT table at `TABLE`
+        // with the V# at byte offset 64, and the payload the V# points at.
+        const TABLE: u64 = 0x0090_0000;
+        const PAYLOAD_AT: u64 = TABLE + 128;
+        let payload: Vec<u32> = (0..8).map(|i| 0xc0de_0000 + i).collect();
+        let mut region = vec![0u32; 40];
+        region[16..20].copy_from_slice(&vsharp(PAYLOAD_AT, 0, 1024));
+        region[32..40].copy_from_slice(&payload);
+        let mem = VsharpMem(TABLE, region);
+
+        // The only live-in user data is the SRT POINTER — never the V# itself.
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        for (i, half) in [TABLE as u32, (TABLE >> 32) as u32].into_iter().enumerate() {
+            user_sgpr.set(
+                12 + i as u32,
+                half,
+                crate::shader::hw_regs::UserSgprType::Region,
+            );
+        }
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        assert_eq!(
+            input_info.bind.storage_buffers.buffers_num, 0,
+            "no storage buffer is bound — the measured failure"
+        );
+
+        crate::shader::analysis::shader_capture_runtime_scalar_loads_shifted(
+            &code,
+            &mem,
+            &user_sgpr,
+            0,
+            &mut input_info.bind,
+        );
+
+        // The SRT load is captured (it is what makes the V# knowable) ...
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(sload_pc)
+                .expect("the SRT descriptor load resolves through the live-in pointer")
+                .values[..4],
+            vsharp(PAYLOAD_AT, 0, 1024)
+        );
+        // ... and the buffer load that consumes it now resolves too.
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(sbuffer_pc)
+                .expect("the V# from the SRT table must resolve the buffer load")
+                .values[..8],
+            payload[..]
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("full chain recompiles with the V# taken from the SRT table");
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "full_chain_vsharp_loaded_from_an_srt_table");
+    }
+
+    /// The refusal must SURVIVE where the producer is not proved. A V# quad
+    /// assembled by moves has no captured producer, so nothing names its fields
+    /// and the named refusal is the honest answer — never a guessed address.
+    #[test]
+    fn vsharp_written_by_moves_is_still_refused() {
+        // s_mov_b32 s20, 0x1234 — SOP1 (`0xBE` prefix), opcode 0x03 in bits
+        // 8..16, sdst 20 in bits 16..23, ssrc0 = literal (255), then the literal.
+        const S_MOV_S20: [u32; 2] = [0xBE94_03FF, 0x0000_1234];
+        const SBUFFER: [u32; 2] = [0xF42C_060A, 0xFA00_0000]; // x8 s[24:31], s[20:23], 0
+        let mut words = Vec::new();
+        words.extend_from_slice(&S_MOV_S20);
+        words.extend_from_slice(&SBUFFER);
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true).expect("parse");
+        let instructions = code.get_instructions();
+        assert_eq!(
+            instructions[0].dst.register_id, 20,
+            "the move writes into the V# quad"
+        );
+        let sbuffer_pc = instructions[1].pc;
+
+        const BASE: u64 = 0x0090_0000;
+        let mem = VsharpMem(BASE, (0..8).map(|i| 0xc0de_0000 + i).collect());
+        // A live-in quad IS present in user data — and must be ignored, because
+        // the shader overwrote part of it.
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        for (i, field) in vsharp(BASE, 0, 1024).into_iter().enumerate() {
+            user_sgpr.set(
+                20 + i as u32,
+                field,
+                crate::shader::hw_regs::UserSgprType::Vsharp,
+            );
+        }
+
+        let mut bind = ShaderBindResources::default();
+        crate::shader::analysis::shader_capture_vsharp_buffer_loads(
+            &code, &mem, &user_sgpr, 0, &mut bind,
+        );
+        assert!(
+            bind.embedded_constant_loads.find(sbuffer_pc).is_none(),
+            "an unproved V# producer must leave the load to the named refusal"
+        );
+    }
+
     /// The combined V# addressing mode end to end: **register soffset AND a
     /// non-zero immediate offset**, which build 36a9b18 refused in the PARSER
     /// (`not implemented smem feature: offset != 0 with register soffset on an

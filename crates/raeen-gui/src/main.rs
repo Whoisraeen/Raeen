@@ -275,11 +275,17 @@ fn main() -> anyhow::Result<()> {
     // squatter here means something allocated before `main` (a static
     // initializer, the loader) — each one is address space a guest fixed map
     // can no longer be served at, so it is worth a warning per region.
+    let windows = title_va
+        .windows
+        .iter()
+        .map(|(start, end)| format!("{start:#x}..{end:#x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     info!(
-        window = format_args!("{:#x}..{:#x}", title_va.window_start, title_va.window_end),
+        windows = %windows,
         blocks = title_va.reserved_blocks,
         reserved_bytes = format_args!("{:#x}", title_va.reserved_bytes),
-        "guest title-VA window claimed at startup"
+        "guest title-VA windows claimed at startup"
     );
     for squatter in &title_va.squatters {
         tracing::warn!(

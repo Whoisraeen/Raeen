@@ -31,11 +31,11 @@ use tracing::{debug, info, warn};
 /// `SCE_OK` — the PS5 convention for "this call succeeded".
 const SCE_OK: u64 = 0;
 
-/// Generic failure sentinel used by the functions below that now attempt a
-/// real operation (`ctx.kernel.memory.mmap`/`ctx.mem` access) and can
-/// genuinely fail. Not a real `SCE_KERNEL_ERROR_*` code — just a nonzero
-/// value distinguishable from `SCE_OK`.
-const HLE_ERROR: u64 = 0xFFFF_FFFF;
+/// `MAP_FIXED` — the guest demands the address it passed in, and the kernel
+/// must refuse rather than relocate. Without it a requested address is only a
+/// hint (shadPS4 `MemoryManager::MapMemory` takes its `SearchFree` path when
+/// `Fixed` is clear).
+const MAP_FIXED: u32 = 0x10;
 
 /// Cap on how many bytes one `write` call will copy out of guest memory —
 /// keeps a wild `count` from ballooning a host buffer. Generous for
@@ -2414,10 +2414,11 @@ fn trace_guest_vmm(message: std::fmt::Arguments<'_>) {
 /// records the mapping's metadata in `ctx.kernel.memory` (so
 /// `is_mapped`/`region_containing` see it), and writes the address through
 /// the `physAddrOut` out-parameter (`args[5]`) via `ctx.mem`. Returns
-/// `SCE_OK` on success; `HLE_ERROR` if the arena is exhausted or
-/// `physAddrOut` is out of bounds (bounds-checked, never a panic/OOB) — in
-/// the latter case the just-recorded metadata is rolled back via
-/// `remove_mapping` so no dangling record is left behind.
+/// `SCE_OK` on success; `SCE_KERNEL_ERROR_EAGAIN` if the budget or the arena
+/// cannot satisfy the request, and `SCE_KERNEL_ERROR_EFAULT` if `physAddrOut`
+/// is out of bounds (bounds-checked, never a panic/OOB) — in the latter case
+/// the just-recorded metadata is rolled back via `remove_mapping` so no
+/// dangling record is left behind.
 /// The direct-memory budget reported to and enforced on titles: ~13.375 GiB,
 /// the commonly-measured game-usable direct memory of a retail PS5. Titles
 /// size their pools by allocating until the kernel refuses, so both the
@@ -2487,11 +2488,15 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         }
     }
     let Some(addr) = ctx.alloc.mmap(len, alignment) else {
-        warn!("sceKernelAllocateDirectMemory: arena mmap failed (len={len:#x})");
+        // Same code as the budget refusal above, and for the same reason: the
+        // real allocator answers "I could not give you this memory" with
+        // `EAGAIN` (shadPS4 `sceKernelAllocateDirectMemory`). A title sizing its
+        // pools by allocating until refusal must see a status it recognises.
+        warn!("sceKernelAllocateDirectMemory: arena mmap failed (len={len:#x}) — EAGAIN");
         ctx.kernel
             .direct_memory_allocated
             .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
-        return HLE_ERROR;
+        return SCE_KERNEL_ERROR_EAGAIN_ALLOC;
     };
     // Remember the allocation's `type` against its physical range, so the
     // mapping made from it can echo that type back through
@@ -2520,7 +2525,9 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         ctx.kernel
             .direct_memory_allocated
             .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
-        return HLE_ERROR;
+        // An unwritable out-parameter is a bad address, which is `EFAULT` —
+        // the same code every other out-param guard in this file returns.
+        return SCE_KERNEL_ERROR_EFAULT;
     }
     if std::env::var_os("RAEEN_TRACE_DIRECT_MEMORY").is_some() {
         warn!(
@@ -2634,10 +2641,11 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr_out = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
     let prot = args.get(2).copied().unwrap_or(0) as u32;
+    let flags = args.get(3).copied().unwrap_or(0) as u32;
     let direct_memory_start = args.get(4).copied().unwrap_or(0);
     let alignment = args.get(5).copied().unwrap_or(0);
     debug!(
-        "sceKernelMapDirectMemory(addrOut={addr_out:#x}, len={len:#x}, prot={prot}, phys={direct_memory_start:#x}, alignment={alignment:#x})"
+        "sceKernelMapDirectMemory(addrOut={addr_out:#x}, len={len:#x}, prot={prot}, flags={flags:#x}, phys={direct_memory_start:#x}, alignment={alignment:#x})"
     );
     if addr_out == 0 || len == 0 || direct_memory_start == 0 {
         return SCE_KERNEL_ERROR_EINVAL;
@@ -2659,6 +2667,7 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     let requested = u64::from_le_bytes(requested_bytes);
+    let fixed = flags & MAP_FIXED != 0;
     let page_size = raeen_core::PS5_PAGE_SIZE as u64;
     if alignment != 0 && !alignment.is_power_of_two() {
         return SCE_KERNEL_ERROR_EINVAL;
@@ -2699,11 +2708,34 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         Some(direct_memory_start)
     } else {
-        ctx.alloc.map_at(requested, len, alignment)
+        // A requested address is mandatory only under `MAP_FIXED`. Without that
+        // flag Orbis treats it as a hint and is free to place the mapping
+        // elsewhere, reporting where through `addrOut` — so a hint we cannot
+        // serve must not sink the call. Falling back to `direct_memory_start`
+        // is exactly the answer the no-hint branch above gives, which keeps the
+        // mapping and the direct memory one storage rather than detaching them.
+        ctx.alloc.map_at(requested, len, alignment).or_else(|| {
+            if fixed || !direct_memory_start.is_multiple_of(alignment) {
+                return None;
+            }
+            warn!(
+                "sceKernelMapDirectMemory: hint {requested:#x} unavailable for len={len:#x}; \
+                 MAP_FIXED is clear, so publishing {direct_memory_start:#x} instead"
+            );
+            Some(direct_memory_start)
+        })
     };
     let Some(mapped) = mapped else {
-        warn!("sceKernelMapDirectMemory: cannot map len={len:#x} at requested={requested:#x}");
-        return HLE_ERROR;
+        // `ENOMEM` is what the real kernel reports for a fixed mapping it
+        // cannot place (shadPS4 `MemoryManager::MapMemory`). It must be a real
+        // `SCE_KERNEL_ERROR_*`: the guest branches on this value, and ASTRO.BOT
+        // asserts on it — a sentinel it cannot classify leaves it dereferencing
+        // whatever it computed from an unmapped base.
+        warn!(
+            "sceKernelMapDirectMemory: cannot map len={len:#x} at requested={requested:#x} \
+             (fixed={fixed}) — ENOMEM"
+        );
+        return SCE_KERNEL_ERROR_ENOMEM;
     };
     // Record it as DIRECT, carrying the physical offset and the type the guest
     // allocated it with — a title reads its own mappings back, and
@@ -2850,9 +2882,10 @@ fn hle_batch_map(ctx: &HleContext, args: &[u64]) -> u64 {
 /// records the mapping's metadata in `ctx.kernel.memory` (so
 /// `is_mapped`/`region_containing` reflect it), and writes the resulting
 /// guest address through `addrOut` (`args[0]`) via `ctx.mem`. Returns
-/// `SCE_OK` on success; `HLE_ERROR` if the arena is exhausted or `addrOut`
-/// is out of bounds — in the latter case `remove_mapping` rolls back the
-/// just-recorded metadata so no dangling record is left behind.
+/// `SCE_OK` on success; `SCE_KERNEL_ERROR_ENOMEM` if the arena is exhausted
+/// and `SCE_KERNEL_ERROR_EFAULT` if `addrOut` is out of bounds — in the
+/// latter case `remove_mapping` rolls back the just-recorded metadata so no
+/// dangling record is left behind.
 fn hle_map_flexible_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr_out = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
@@ -2860,8 +2893,8 @@ fn hle_map_flexible_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     debug!("sceKernelMapFlexibleMemory(addrOut={addr_out:#x}, len={len:#x}, prot={prot})");
 
     let Some(addr) = ctx.alloc.mmap(len, raeen_core::PS5_PAGE_SIZE as u64) else {
-        warn!("sceKernelMapFlexibleMemory: arena mmap failed (len={len:#x})");
-        return HLE_ERROR;
+        warn!("sceKernelMapFlexibleMemory: arena mmap failed (len={len:#x}) — ENOMEM");
+        return SCE_KERNEL_ERROR_ENOMEM;
     };
     ctx.kernel.memory.record_mapping(addr, len, prot);
     trace_guest_vmm(format_args!(
@@ -2869,9 +2902,9 @@ fn hle_map_flexible_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     ));
 
     if addr_out != 0 && !ctx.mem.write(addr_out, &addr.to_le_bytes()) {
-        warn!("sceKernelMapFlexibleMemory: addrOut {addr_out:#x} out of bounds");
+        warn!("sceKernelMapFlexibleMemory: addrOut {addr_out:#x} out of bounds — EFAULT");
         ctx.kernel.memory.remove_mapping(addr);
-        return HLE_ERROR;
+        return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK
 }
@@ -2907,9 +2940,11 @@ fn hle_munmap(ctx: &HleContext, args: &[u64]) -> u64 {
 /// than through an out-parameter (the real ABI's `void **res` is not
 /// modeled here — no `args` slot maps cleanly to it, and every existing
 /// caller of this HLE function already expects the address in the return
-/// value); on failure returns `0` rather than `HLE_ERROR`, since `0` is
-/// `sceKernelMmap`'s real `NULL`-ish failure convention for an
-/// address-returning call.
+/// value); on failure returns `0`, since `0` is `sceKernelMmap`'s real
+/// `NULL`-ish failure convention for an address-returning call. This is the
+/// convention every address-returning export in this file follows — an
+/// `SCE_KERNEL_ERROR_*` code, or the `0xffffffff` sentinel this file used to
+/// carry, is a pointer the caller will happily dereference.
 fn hle_mmap(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
@@ -3572,9 +3607,13 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
 
     if offset >= DYNAMIC_TLS_BLOCK_SIZE {
         warn!(
-            "__tls_get_addr(module={module_id:#x}, offset={offset:#x}): offset exceeds bounded block"
+            "__tls_get_addr(module={module_id:#x}, offset={offset:#x}): offset exceeds bounded \
+             block — NULL"
         );
-        return SCE_KERNEL_ERROR_EINVAL;
+        // `NULL`, not a status: see the allocation failure below. An
+        // `SCE_KERNEL_ERROR_*` handed back from an address-returning call is a
+        // pointer into low memory that the caller will happily dereference.
+        return 0;
     }
 
     let thread = ctx.guest_threads.current_thread();
@@ -3583,8 +3622,14 @@ fn hle_tls_get_addr(ctx: &HleContext, args: &[u64]) -> u64 {
         *existing
     } else {
         let Some(base) = ctx.alloc.alloc(DYNAMIC_TLS_BLOCK_SIZE, 16) else {
-            warn!("__tls_get_addr(module={module_id:#x}): guest TLS allocation failed");
-            return HLE_ERROR;
+            // `__tls_get_addr` returns an ADDRESS, not a status, so no
+            // `SCE_KERNEL_ERROR_*` belongs here — `NULL` is the only value a
+            // caller could conceivably test, and it is the same convention
+            // `hle_mmap` already uses for an address-returning failure. The
+            // sentinel `0xffffffff` was strictly worse: a caller that ignores
+            // the result dereferences it as a real pointer.
+            warn!("__tls_get_addr(module={module_id:#x}): guest TLS allocation failed — NULL");
+            return 0;
         };
         let zeroes = vec![0u8; DYNAMIC_TLS_BLOCK_SIZE as usize];
         if !ctx.mem.write(base, &zeroes) {
@@ -4139,14 +4184,16 @@ fn hle_reserve_virtual_range(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     let requested = u64::from_le_bytes(requested_bytes);
-    const MAP_FIXED: u32 = 0x10;
     let fixed = flags & MAP_FIXED != 0;
     let Some(addr) = ctx.alloc.reserve_with_hint(requested, len, align, fixed) else {
         warn!(
             "sceKernelReserveVirtualRange: address-space reservation failed \
-             (hint={requested:#x}, len={len:#x}, flags={flags:#x}, align={align:#x}, fixed={fixed})"
+             (hint={requested:#x}, len={len:#x}, flags={flags:#x}, align={align:#x}, \
+              fixed={fixed}) — ENOMEM"
         );
-        return HLE_ERROR;
+        // Out of address space is `ENOMEM`, the same code shadPS4 returns when
+        // its VMA search finds nothing that fits.
+        return SCE_KERNEL_ERROR_ENOMEM;
     };
     ctx.kernel.memory.record_mapping(addr, len, 0);
     trace_guest_vmm(format_args!(
@@ -6718,10 +6765,12 @@ mod tests {
         let before = kernel
             .direct_memory_allocated
             .load(std::sync::atomic::Ordering::Relaxed);
-        // physAddrOut = 0x2000 is outside the 0x1000-byte test memory.
+        // physAddrOut = 0x2000 is outside the 0x1000-byte test memory. The code
+        // must be a real Orbis status (`EFAULT`), never the old `0xffffffff`
+        // sentinel — a guest cannot classify that as failure.
         assert_eq!(
             hle_allocate_direct_memory(&ctx, &[0, u64::MAX, page, 0, 0, 0x2000]),
-            HLE_ERROR
+            SCE_KERNEL_ERROR_EFAULT
         );
         let after = kernel
             .direct_memory_allocated
@@ -6739,6 +6788,126 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             before + page,
             "only the successful allocate stays charged"
+        );
+    }
+
+    /// Direct memory allocated 2 MiB-aligned, plus an `addrOut` in-value the
+    /// test allocator cannot serve at that alignment. Shared by the two
+    /// hint-failure tests below so both exercise the same refusal.
+    fn direct_memory_with_unservable_hint(
+        ctx: &HleContext,
+        mem: &crate::TestMemory,
+    ) -> (u64, u64, u64, u64) {
+        let align = 0x20_0000u64; // 2 MiB
+        let len = 0x8000u64;
+        assert_eq!(
+            hle_allocate_direct_memory(ctx, &[0, u64::MAX, len, align, 0, 0x600]),
+            SCE_OK
+        );
+        let mut phys_bytes = [0u8; 8];
+        assert!(mem.read(0x600, &mut phys_bytes));
+        let phys = u64::from_le_bytes(phys_bytes);
+        assert!(
+            phys.is_multiple_of(align),
+            "the allocation must satisfy the 2 MiB alignment it asked for"
+        );
+        // Page-aligned but NOT 2 MiB-aligned, so `map_at` declines it — the
+        // deterministic stand-in for "a host allocation already owns this VA".
+        let hint = raeen_core::PS5_PAGE_SIZE as u64;
+        assert!(!hint.is_multiple_of(align));
+        assert!(mem.write(0x700, &hint.to_le_bytes()));
+        (0x700, len, align, phys)
+    }
+
+    /// The ASTRO.BOT regression, pinned at the ABI. Measured 2026-07-28
+    /// (`artifacts/compat/raw/baseline-1785273714952/PPSA21564-*.stdout.log`):
+    /// the title's `DirectMemoryAllocator` mapped 0xc8000000 bytes at the
+    /// literal 0x1000000000, host thread stacks had landed inside that range,
+    /// and this call answered `0xffffffff` — not an Orbis status at all. The
+    /// guest logged `sceKernelMapDirectMemory error 0xffffffff`, asserted at
+    /// `DirectMemoryAllocator.cpp:122`, and executed `int 0x41`; 128 presented
+    /// frames became 0.
+    ///
+    /// Under `MAP_FIXED` the guest demanded that exact address, so refusing is
+    /// correct — but it must refuse with `ENOMEM`, the code the real kernel
+    /// uses for a fixed mapping it cannot place.
+    #[test]
+    fn map_direct_memory_refuses_an_unplaceable_fixed_address_with_enomem() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x20_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let (addr_out, len, align, phys) = direct_memory_with_unservable_hint(&ctx, &mem);
+        assert_eq!(
+            hle_map_direct_memory(&ctx, &[addr_out, len, 0x3, MAP_FIXED as u64, phys, align]),
+            SCE_KERNEL_ERROR_ENOMEM,
+            "a fixed map that cannot be placed is ENOMEM, never 0xffffffff"
+        );
+    }
+
+    /// Without `MAP_FIXED` the requested address is a HINT: Orbis places the
+    /// mapping wherever it can and reports where through `addrOut` (shadPS4
+    /// `MemoryManager::MapMemory` takes its `SearchFree` path whenever `Fixed`
+    /// is clear). So an unservable hint must not sink the call — it falls back
+    /// to the physical address, which is what the no-hint branch already
+    /// publishes and keeps the mapping and the direct memory one storage.
+    #[test]
+    fn map_direct_memory_falls_back_to_the_physical_address_for_a_plain_hint() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x20_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let (addr_out, len, align, phys) = direct_memory_with_unservable_hint(&ctx, &mem);
+        assert_eq!(
+            hle_map_direct_memory(&ctx, &[addr_out, len, 0x3, 0, phys, align]),
+            SCE_OK,
+            "a hint we cannot serve must not fail the call"
+        );
+        let mut published = [0u8; 8];
+        assert!(mem.read(addr_out, &mut published));
+        assert_eq!(
+            u64::from_le_bytes(published),
+            phys,
+            "the guest must be told where the mapping actually landed"
+        );
+        assert!(
+            kernel.memory.is_mapped(phys),
+            "the fallback mapping must be recorded like any other"
+        );
+    }
+
+    /// `sceKernelMapFlexibleMemory` and `sceKernelReserveVirtualRange` shared
+    /// the same `0xffffffff` sentinel. Both must report Orbis statuses: no
+    /// address space is `ENOMEM`, an unwritable out-parameter is `EFAULT`.
+    #[test]
+    fn flexible_map_and_virtual_reserve_report_orbis_statuses_on_failure() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        // A bump allocator started just below `u64::MAX` cannot satisfy any
+        // real length, so `mmap`/`reserve` return `None` deterministically.
+        let alloc = crate::TestAllocator::new(u64::MAX - 0x10);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let page = raeen_core::PS5_PAGE_SIZE as u64;
+        assert_eq!(
+            hle_map_flexible_memory(&ctx, &[0x600, page, 0x3, 0]),
+            SCE_KERNEL_ERROR_ENOMEM
+        );
+        assert!(mem.write(0x700, &0u64.to_le_bytes()));
+        assert_eq!(
+            hle_reserve_virtual_range(&ctx, &[0x700, page, 0, 0]),
+            SCE_KERNEL_ERROR_ENOMEM
+        );
+
+        // With a working allocator the out-parameter guards take over, and an
+        // out-of-bounds `addrOut` is EFAULT rather than the old sentinel.
+        let alloc = crate::TestAllocator::new(page);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_map_flexible_memory(&ctx, &[0x2000, page, 0x3, 0]),
+            SCE_KERNEL_ERROR_EFAULT
         );
     }
 

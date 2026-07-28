@@ -163,10 +163,10 @@ pub const GUEST_ARENA_BASE: u64 = 0x0000_1000_0000_0000;
 /// the whole point).
 #[derive(Debug, Clone, Default)]
 pub struct TitleVaWindowReport {
-    /// Inclusive start of the defended window.
-    pub window_start: u64,
-    /// Exclusive end of the defended window.
-    pub window_end: u64,
+    /// The defended windows as `(inclusive start, exclusive end)`. A title maps
+    /// direct memory at more than one literal base, so more than one range has
+    /// to be held for it.
+    pub windows: Vec<(u64, u64)>,
     /// How many disjoint free holes were claimed as `MEM_RESERVE` blocks.
     pub reserved_blocks: usize,
     /// Total bytes of address space now reserved for guest fixed-address maps.
@@ -190,8 +190,7 @@ pub use arena::reserve_title_va_window;
 #[cfg(not(target_os = "windows"))]
 pub fn reserve_title_va_window() -> &'static TitleVaWindowReport {
     static EMPTY: TitleVaWindowReport = TitleVaWindowReport {
-        window_start: 0,
-        window_end: 0,
+        windows: Vec::new(),
         reserved_blocks: 0,
         reserved_bytes: 0,
         squatters: Vec::new(),
