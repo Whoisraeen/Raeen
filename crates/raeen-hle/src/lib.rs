@@ -459,6 +459,24 @@ pub trait GuestAllocator {
     fn commit_on_demand(&self, _addr: u64) -> bool {
         false
     }
+    /// Whether `addr` lies in address space this allocator's map attributes to
+    /// the **host process** — its own modules, heap, and thread stacks — rather
+    /// than to the guest.
+    ///
+    /// Used by the runtime's fault handler to tell "the guest dereferenced a
+    /// wild pointer" from "our own Rust code faulted while servicing an HLE
+    /// call". The two used to be reported identically, so an emulator bug
+    /// surfaced as `guest fault at 0x7ff…` and looked like a title problem.
+    ///
+    /// Deliberately a *positive* claim: the default `false` means "unknown",
+    /// not "guest", so an allocator without a whole-address-space map (every
+    /// test double) leaves the existing guest-fault classification exactly as
+    /// it was. Only a backend that really does model host space — the native
+    /// arena, whose VMA map spans the user address space and marks what it does
+    /// not own — answers `true`.
+    fn address_is_host_owned(&self, _addr: u64) -> bool {
+        false
+    }
     /// Release a `length`-byte region previously returned by `mmap` starting
     /// at `addr`. An unrecognized `addr` is simply ignored.
     fn munmap(&self, addr: u64, length: u64);

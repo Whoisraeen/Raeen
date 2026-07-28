@@ -805,12 +805,24 @@ pub struct LockReleaseSummary {
     pub rwlock_writers: usize,
     /// Rwlock read holds the dead thread still had.
     pub rwlock_read_holds: usize,
+    /// Condition-variable wait-queue entries the dead thread left parked.
+    ///
+    /// Not a lock, but the same class of leak and the same consequence. A
+    /// waiter is removed from the FIFO *by the signaler*, so a dead thread's
+    /// entry stays queued: the next `scePthreadCondSignal` pops it, wakes a
+    /// thread that will never look, and returns having "signalled one" — the
+    /// live waiter behind it misses its wakeup. That is a lost wakeup per dead
+    /// waiter, which is a deadlock with extra steps.
+    pub cond_waiters: usize,
 }
 
 impl LockReleaseSummary {
     /// Whether any lock at all was released (worth logging).
     pub fn any(&self) -> bool {
-        self.mutexes != 0 || self.rwlock_writers != 0 || self.rwlock_read_holds != 0
+        self.mutexes != 0
+            || self.rwlock_writers != 0
+            || self.rwlock_read_holds != 0
+            || self.cond_waiters != 0
     }
 }
 
@@ -1008,6 +1020,21 @@ impl PthreadCond {
     pub fn waiter_count(&self) -> usize {
         self.waiters.lock().len()
     }
+
+    /// Drop every entry belonging to a thread that no longer exists, returning
+    /// how many were removed.
+    ///
+    /// Thread-death cleanup, not a wake: the entries are discarded, never
+    /// signalled. Signalling a dead waiter is precisely the bug this prevents —
+    /// [`Self::signal_one`] pops the oldest entry and considers the signal
+    /// delivered, so one abandoned entry silently swallows one wakeup that a
+    /// live waiter needed.
+    pub fn remove_waiters_of(&self, thread: u64) -> usize {
+        let mut waiters = self.waiters.lock();
+        let before = waiters.len();
+        waiters.retain(|waiter| waiter.thread != thread);
+        before - waiters.len()
+    }
 }
 
 #[cfg(test)]
@@ -1151,6 +1178,28 @@ impl OrbisKernel {
     /// Owner-death recovery, not a normal unlock: ownership and recursion are
     /// cleared outright regardless of level, and a read hold gives back its full
     /// share of the shared reader count.
+    ///
+    /// **Runs on every thread exit path**, not only the faulting one, and is
+    /// idempotent: a thread that unlocked everything it held (the normal case)
+    /// scans the maps, finds nothing owned, and reports an all-zero summary. It
+    /// has to be unconditional — a guest thread that leaves a critical section
+    /// via `scePthreadExit`, or one abandoned mid-call by cooperative process
+    /// termination, ends in `Ok(Returned)`/`Ok(Exited)` having skipped its C++
+    /// unlock just as thoroughly as a faulting one does.
+    ///
+    /// # What is *not* released, and why
+    ///
+    /// Kernel counting semaphores ([`Semaphore`]), POSIX semaphores
+    /// ([`PosixSem`]) and event flags ([`EventFlag`]) carry **no owner** — a
+    /// count and a bitmask, with no record of which thread took a unit or set a
+    /// bit. There is nothing here to attribute to the dying thread, and
+    /// inventing an owner would be wrong for the common producer/consumer use,
+    /// where the waiter is never the one expected to post back. Recovering a
+    /// dead thread's semaphore units would require the wait paths to keep a
+    /// per-thread ledger of successful acquisitions (and event flags a per-thread
+    /// record of bits set), which only has a defensible meaning for the
+    /// mutex-shaped `initial == max == 1` usage. Left unimplemented deliberately;
+    /// see `docs/sharpemu-port/veh-hardening.md`.
     pub fn release_locks_owned_by(&self, thread: u64) -> LockReleaseSummary {
         let mut summary = LockReleaseSummary::default();
 
@@ -1218,6 +1267,18 @@ impl OrbisKernel {
                 // Writer died holding it — wake every parked reader/writer.
                 shared.released.notify_all();
             }
+        }
+
+        // Condition-variable queues last: a dead thread's entry is a stolen
+        // wakeup, not a held lock, but it wedges the same waiters. Discarded,
+        // never signalled (see `PthreadCond::remove_waiters_of`).
+        let mut visited = HashSet::new();
+        for entry in &self.pthread_conds {
+            let cond = entry.value();
+            if !visited.insert(Arc::as_ptr(cond) as usize) {
+                continue;
+            }
+            summary.cond_waiters += cond.remove_waiters_of(thread);
         }
 
         summary
@@ -2188,5 +2249,51 @@ mod subsystem_resource_tests {
 
         // Idempotent: a second call on the same (now clean) thread frees nothing.
         assert!(!kernel.release_locks_owned_by(dead).any());
+    }
+
+    /// A dead thread's condition-variable wait entry is a stolen wakeup: the
+    /// next `signal_one` pops it, wakes nobody, and reports success — so the
+    /// live waiter queued behind it never runs. Thread-death cleanup must drop
+    /// the entry (never signal it) and leave the live waiter first in line.
+    #[test]
+    fn release_locks_owned_by_drops_the_dead_threads_cond_waiters_without_signalling_them() {
+        use super::PthreadCond;
+        let kernel = OrbisKernel::new();
+        let dead = 7u64;
+        let live = 9u64;
+
+        let cond = Arc::new(PthreadCond::default());
+        let dead_waiter = cond.enqueue_waiter(dead);
+        let live_waiter = cond.enqueue_waiter(live);
+        kernel.pthread_conds.insert(0x3000, Arc::clone(&cond));
+        // Object address and handle alias one queue; it must be visited once.
+        kernel.pthread_conds.insert(0x3100, Arc::clone(&cond));
+
+        // A second condition the dead thread never touched stays untouched.
+        let other = Arc::new(PthreadCond::default());
+        let other_waiter = other.enqueue_waiter(live);
+        kernel.pthread_conds.insert(0x3200, other);
+
+        let summary = kernel.release_locks_owned_by(dead);
+        assert_eq!(
+            summary.cond_waiters, 1,
+            "exactly one abandoned entry, counted once across both aliases"
+        );
+        assert!(summary.any());
+        assert_eq!(cond.waiter_count(), 1, "the live waiter stays queued");
+        assert!(
+            !dead_waiter.is_signaled(),
+            "a dead waiter is discarded, never woken — waking it is the bug"
+        );
+        assert!(!live_waiter.is_signaled());
+        assert!(!other_waiter.is_signaled());
+
+        // The live waiter is now the one a signal reaches — the lost wakeup is
+        // what this cleanup restores.
+        assert!(cond.signal_one());
+        assert!(live_waiter.is_signaled());
+
+        // Idempotent on a queue with nothing of the dead thread's left.
+        assert_eq!(kernel.release_locks_owned_by(dead).cond_waiters, 0);
     }
 }

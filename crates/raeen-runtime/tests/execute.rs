@@ -4690,3 +4690,227 @@ fn qsort_sorts_a_guest_array_with_a_guest_comparator() {
          (n-1 ≤ calls ≤ 64 for n=6), got {result}"
     );
 }
+
+/// Where [`hle_host_fault_probe`] dereferences. A runtime-loaded value, not a
+/// literal `0`: the point is to make the *hardware* fault, and a literal null
+/// dereference is UB the optimizer is free to turn into `ud2` (or delete)
+/// instead of emitting the load this test needs.
+static HOST_FAULT_ADDRESS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0x40);
+
+/// An HLE handler with an emulator bug in it — the exact shape the VEH used to
+/// misreport: a bad dereference in *host* Rust code while a guest call is in
+/// flight.
+fn hle_host_fault_probe(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    let address = HOST_FAULT_ADDRESS.load(std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: none — deliberately. This models the defect under test (an HLE
+    // handler dereferencing a pointer that is not valid host memory) so the
+    // runtime's classification of the resulting access violation can be
+    // observed. The read faults; control never returns from it, because the VEH
+    // recognizes the faulting Rip as host-owned and long-jumps to the run's
+    // recovery point, which is precisely the behaviour being pinned.
+    unsafe { (address as *const u64).read_volatile() }
+}
+
+/// An access violation raised inside a Rust HLE handler is **our** bug, and must
+/// be reported as one.
+///
+/// It used to be recorded as `RuntimeError::Faulted { addr: <host rip> }` —
+/// indistinguishable from a title dereferencing a wild pointer, so a crash
+/// report read "guest fault at 0x7ff…" and sent the investigation to the guest.
+/// The host verdict must name the host Rip and the HLE call that was executing.
+#[test]
+fn an_access_violation_inside_an_hle_handler_is_reported_as_a_host_fault() {
+    const SLOT: usize = 0x40;
+
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceTestHostFault", hle_host_fault_probe);
+
+    let mut image = vec![0u8; 0x80];
+    let mut off = 0usize;
+    emit_indirect_call(&mut image, &mut off, SLOT);
+    image[off] = 0xC3; // ret
+    image[SLOT..SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = callback_fixture_module(image, &[("libtest", "sceTestHostFault")]);
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect_err("a host fault must end the run, not return a value");
+
+    match err {
+        RuntimeError::HostFaulted {
+            rip,
+            access,
+            kind,
+            hle,
+        } => {
+            assert_eq!(
+                access, 0x40,
+                "the reported access address is what host code touched"
+            );
+            assert_eq!(kind, raeen_runtime::FaultKind::Read);
+            // Outside the arena's whole 2 TiB reservation — the host image
+            // happens to sit *above* the 16 TiB arena base, so "not a guest
+            // address" is a range test, not a comparison.
+            assert!(
+                !(GUEST_ARENA_BASE..GUEST_ARENA_BASE + 0x200_0000_0000).contains(&rip),
+                "the faulting Rip must be the host code's, not a guest address: {rip:#x}"
+            );
+            assert_eq!(
+                hle.as_deref(),
+                Some("libtest::sceTestHostFault"),
+                "a host fault must name the HLE call that was in flight"
+            );
+        }
+        RuntimeError::Faulted { addr, access, kind } => panic!(
+            "an emulator-side access violation was laundered as a guest fault \
+             (addr {addr:#x}, {kind} of {access:#x}) — this is the defect"
+        ),
+        other => panic!("expected Err(HostFaulted {{ .. }}), got {other:?}"),
+    }
+}
+
+/// A guest worker that ends via `scePthreadExit` while still holding a mutex
+/// must have that mutex released.
+///
+/// Lock release used to run only when `dispatch::run` returned `Err` — but
+/// `scePthreadExit` ends a worker with `Ok(Returned)`, so a thread that exited
+/// from inside a critical section (a C++ worker that throws, catches, and exits)
+/// left the mutex owned forever and every later waiter blocked on it
+/// permanently. The worker here never unlocks, so an owner of 0 afterwards can
+/// only come from thread-death recovery.
+///
+/// Deterministic by construction: `scePthreadJoin` joins the host worker, whose
+/// closure performs the release before it finishes, and the main guest thread
+/// only then calls `exit`. No sleeps, no polling.
+#[test]
+fn a_worker_exiting_via_pthread_exit_releases_the_mutex_it_still_held() {
+    const WORKER: usize = 0x100;
+    const MUTEX: usize = 0x170;
+    const THREAD_OUT: usize = 0x180;
+    const RETVAL_OUT: usize = 0x188;
+    const CREATE_SLOT: usize = 0x1C0;
+    const JOIN_SLOT: usize = 0x1C8;
+    const EXIT_SLOT: usize = 0x1D0;
+    const LOCK_SLOT: usize = 0x1D8;
+    const PTHREAD_EXIT_SLOT: usize = 0x1E0;
+
+    let hle = std::sync::Arc::new(HleRegistry::new());
+    let kernel = std::sync::Arc::new(OrbisKernel::new());
+    let mut image = vec![0u8; 0x300];
+
+    let thread_out = GUEST_ARENA_BASE + THREAD_OUT as u64;
+    let retval_out = GUEST_ARENA_BASE + RETVAL_OUT as u64;
+    let worker = GUEST_ARENA_BASE + WORKER as u64;
+    let mutex = GUEST_ARENA_BASE + MUTEX as u64;
+
+    // main: create(worker) -> join(thread, &retval) -> exit(0)
+    let mut off = 0;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]); // mov rdi, thread_out
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 2].copy_from_slice(&[0x31, 0xF6]); // xor esi, esi (attr = 0)
+    off += 2;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBA]); // mov rdx, worker
+    image[off + 2..off + 10].copy_from_slice(&worker.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x31, 0xC9]); // xor rcx, rcx (arg = 0)
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, CREATE_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [thread_out]
+    image[off + 2..off + 10].copy_from_slice(&thread_out.to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBE]); // mov rsi, retval_out
+    image[off + 2..off + 10].copy_from_slice(&retval_out.to_le_bytes());
+    off += 10;
+    emit_indirect_call(&mut image, &mut off, JOIN_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    off += 2;
+    emit_indirect_call(&mut image, &mut off, EXIT_SLOT);
+
+    // worker: scePthreadMutexLock(&mutex) then scePthreadExit(0) — never unlocks.
+    off = WORKER;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]); // mov rdi, mutex
+    image[off + 2..off + 10].copy_from_slice(&mutex.to_le_bytes());
+    off += 10;
+    emit_indirect_call(&mut image, &mut off, LOCK_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    off += 2;
+    emit_indirect_call(&mut image, &mut off, PTHREAD_EXIT_SLOT);
+    image[off] = 0xC3; // ret (unreachable)
+
+    for (slot, index) in [
+        (CREATE_SLOT, 0u64),
+        (JOIN_SLOT, 1),
+        (EXIT_SLOT, 2),
+        (LOCK_SLOT, 3),
+        (PTHREAD_EXIT_SLOT, 4),
+    ] {
+        image[slot..slot + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + index * 8).to_le_bytes());
+    }
+
+    let linked = std::sync::Arc::new(LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadCreate".into(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadJoin".into(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+            HleTrampoline {
+                library: "libc".into(),
+                function: "exit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 16,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadMutexLock".into(),
+                addr: HLE_TRAMPOLINE_BASE + 24,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "scePthreadExit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 32,
+            },
+        ],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    });
+
+    let outcome = execute_process_shared(
+        linked,
+        hle,
+        std::sync::Arc::clone(&kernel),
+        &["/app0/eboot.bin"],
+        &[],
+    )
+    .expect("the process must end cleanly through exit(0)");
+    assert_eq!(outcome, RunOutcome::Exited(0));
+
+    let state = kernel
+        .pthread_mutexes
+        .get(&mutex)
+        .expect("the worker's implicit mutex creation must be visible");
+    let held = state.state.lock();
+    assert_eq!(
+        held.owner, 0,
+        "a worker that exited via scePthreadExit inside a critical section must \
+         not leave the mutex owned — every later waiter would block forever"
+    );
+    assert_eq!(held.recursion, 0);
+}
