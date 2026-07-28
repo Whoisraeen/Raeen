@@ -311,6 +311,18 @@ top-down, update statuses in place, and keep it committed.**
 
 ## Session log (append per session)
 
+- **2026-07-27 (Fable 5, wave 2):** All five wave-2 items landed and merged:
+  ACB Phase B (`8c1dc34` — descriptor-form ACBs were being silently dropped,
+  now execute; pre-ACB graphics flush; DISPATCH_INDIRECT), Ampr 46→0 +
+  abort/exit noreturn (`69ef513`), xtask baseline (`c065b11`), crash report
+  view (`b37d041`), clippy debt (`aebb8f3` + main-session `d030259`/`ba870f7`
+  — workspace --all-targets -D warnings GREEN). Full workspace: 2257 tests,
+  0 failures. Engine-side GTA V NID surface now fully accounted for.
+  REMAINING (need the user's machine or careful sequential A/B): items 2D
+  (GTA V re-measure), 5 (side effects 3-5), 6 (swapchain phase 2), 7 (guest
+  callbacks), 8 (AIO), 9 (soak), 11 (badges — baseline format now exists),
+  14 (async pipelines), 16 (MRT/fast-clear), 17 (trophies), 19 (DualSense),
+  21 (clips); live-verify passes for HUD/screenshots/crash view/Until Dawn.
 - **2026-07-27 (Fable 5):** Checklist created. Delegated in parallel
   (worktree-isolated agents): item 1 → milestone-driver, item 2A →
   gpu-pipeline, item 3 → hle-stubber, item 4 → hle-stubber, items 15+18 →
