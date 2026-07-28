@@ -23,7 +23,7 @@
 use crate::{HleContext, HleFunction, HleRegistry};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Register libc HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -1525,20 +1525,90 @@ fn hle_puts(ctx: &HleContext, args: &[u64]) -> u64 {
     len
 }
 
-fn hle_abort(_ctx: &HleContext, _args: &[u64]) -> u64 {
-    // Real `abort` never returns (raises SIGABRT). The stub cannot terminate
-    // the guest process from here, so it just logs and returns.
-    debug!("abort() [stub: does not actually terminate the process]");
-    0
+/// Shared actionable-report body for the guest-fatal noreturn handlers
+/// (`abort`, `__stack_chk_fail`): the dying thread's recent HLE calls (the
+/// most reliable "what was it doing" signal — host threads are pooled), a
+/// stack code-address chain naming the call path INTO the fatal site, and an
+/// EOWNERDEAD-style release of any spin-loop mutexes the thread holds so the
+/// rest of the process keeps making observable progress (same recovery as
+/// the DebugRaiseException path).
+fn report_fatal_thread_diagnostics(ctx: &HleContext, thread: u64, name: &str) {
+    if let Some(ring) = ctx.kernel.recent_hle_calls.get(&thread) {
+        let recent = ring.lock().iter().cloned().collect::<Vec<_>>().join(" ");
+        if !recent.is_empty() {
+            tracing::error!("  recent HLE calls: {recent}");
+        }
+    }
+    let chain = crate::guest_stack_code_addrs(ctx);
+    if !chain.is_empty() {
+        tracing::error!("  fatal-thread stack code-addrs: {}", chain.join(" "));
+    }
+    let released = ctx.kernel.release_mutexes_owned_by(thread);
+    if released > 0 {
+        warn!("  released {released} mutex(es) held by dying thread {thread} ('{name}')");
+    }
 }
 
-fn hle_exit(_ctx: &HleContext, args: &[u64]) -> u64 {
-    // Real `exit` never returns. Same limitation as `abort` above.
-    debug!(
-        "exit(code={}) [stub: does not actually terminate the process]",
-        args.first().copied().unwrap_or(0)
+/// Real `abort()` never returns: it raises SIGABRT and the compiler treats
+/// the call as `noreturn`, so an HLE handler that returns 0 makes the guest
+/// execute whatever bytes follow the call site — the same walk-into-garbage
+/// hazard `hle_stack_chk_fail` had (measured on Until Dawn: the walk-off
+/// landed in a UD2 and masked the real fatal cause). Report everything
+/// actionable, then unwind the calling guest thread exactly like the other
+/// guest-fatal handlers: `request_exit` makes the dispatcher restore the
+/// recovery context, so control never returns to the aborting frame.
+fn hle_abort(ctx: &HleContext, _args: &[u64]) -> u64 {
+    let thread = ctx.guest_threads.current_thread();
+    let name = ctx
+        .kernel
+        .thread_names
+        .get(&thread)
+        .map_or_else(|| "<unnamed>".to_owned(), |entry| entry.clone());
+    tracing::error!(
+        "abort(): guest called abort on thread {thread} ('{name}'), guest ra={:#x} — \
+         terminating the calling guest thread (exit code {:#x}); the caller's fatal \
+         path (assert/panic/terminate) decided the process state was invalid",
+        ctx.caller_return_addr,
+        crate::ABORT_EXIT_CODE,
     );
-    0
+    report_fatal_thread_diagnostics(ctx, thread, &name);
+    if !ctx.guest_threads.request_exit(crate::ABORT_EXIT_CODE) {
+        // No per-thread unwind available (should not happen on the runtime
+        // dispatch path): escalate to process termination rather than hand
+        // control back to a frame that believes abort() cannot return.
+        ctx.guest_threads
+            .request_process_exit(crate::ABORT_EXIT_CODE);
+    }
+    // Unreachable by the guest: the dispatcher observes the exit request at
+    // the HLE boundary and restores the recovery context instead of
+    // delivering this value.
+    crate::ABORT_EXIT_CODE
+}
+
+/// Real `exit(status)` never returns: it terminates the whole process with
+/// the guest's own `status`. The old stub logged and returned 0, walking the
+/// guest into whatever bytes follow the (noreturn) call site. On the
+/// trampoline path `libc`/`libSceLibcInternal` `exit` is intercepted by the
+/// runtime's terminating-function table before this handler runs; this
+/// implementation is the defense-in-depth for every other route (direct
+/// dispatch, in-tree callers, future provider aliases): record the status
+/// process-wide so all workers stop at their next safe point, then unwind
+/// the calling thread immediately. Unlike `abort`, this is an orderly
+/// termination — the status carried is the guest's, not a fatal-family code.
+fn hle_exit(ctx: &HleContext, args: &[u64]) -> u64 {
+    let status = args.first().copied().unwrap_or(0);
+    info!(
+        "exit(status={status}) on thread {} — terminating the guest process",
+        ctx.guest_threads.current_thread()
+    );
+    // Real exit() ends the whole process: every guest worker observes the
+    // termination flag at its next HLE/fault safe point, and the process
+    // outcome carries the guest's own status.
+    ctx.guest_threads.request_process_exit(status);
+    // Unwind THIS thread now so control never returns to the exiting frame.
+    ctx.guest_threads.request_exit(status);
+    // Unreachable by the guest (dispatcher restores the recovery context).
+    status
 }
 
 /// Real `__stack_chk_fail` never returns: the compiler emits the call as the
@@ -1564,26 +1634,7 @@ fn hle_stack_chk_fail(ctx: &HleContext, _args: &[u64]) -> u64 {
         ctx.caller_return_addr,
         crate::STACK_CHK_FAIL_EXIT_CODE,
     );
-    // The exact HLE calls this guest thread made before the smash — the most
-    // reliable "what was it doing" signal (host threads are pooled).
-    if let Some(ring) = ctx.kernel.recent_hle_calls.get(&thread) {
-        let recent = ring.lock().iter().cloned().collect::<Vec<_>>().join(" ");
-        if !recent.is_empty() {
-            tracing::error!("  recent HLE calls: {recent}");
-        }
-    }
-    let chain = crate::guest_stack_code_addrs(ctx);
-    if !chain.is_empty() {
-        tracing::error!("  fatal-thread stack code-addrs: {}", chain.join(" "));
-    }
-    // A thread killed mid-execution never runs its cleanup; release any
-    // spin-loop mutexes it holds so the rest of the process can keep making
-    // observable progress (same EOWNERDEAD-style recovery as the
-    // DebugRaiseException path).
-    let released = ctx.kernel.release_mutexes_owned_by(thread);
-    if released > 0 {
-        warn!("  released {released} mutex(es) held by dying thread {thread} ('{name}')");
-    }
+    report_fatal_thread_diagnostics(ctx, thread, &name);
     if !ctx
         .guest_threads
         .request_exit(crate::STACK_CHK_FAIL_EXIT_CODE)
@@ -4147,9 +4198,11 @@ fn hle_catch_return_from_main(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `_Assert(expr, file, line)`: Dinkumware's `assert()` core — prints
 /// "Assertion failed: ..." and aborts. The message goes to the kernel
 /// console (stderr's home in this process) and the host log with the caller
-/// address; the abort itself follows `hle_abort`'s noreturn-stub pattern:
-/// log loudly and return 0 so diagnostics keep flowing
-/// (`hle_stack_chk_fail` no longer returns — it unwinds the guest thread).
+/// address. Deliberately still returns 0 so diagnostics keep flowing: the
+/// real `_Assert` calls `abort()`, but its call sites (the `assert()` macro
+/// expansion) have well-formed code after the call, so returning is safe
+/// here — unlike `abort`/`exit`/`__stack_chk_fail`, which are emitted as
+/// `noreturn` tail calls and now unwind the guest thread instead.
 fn hle_dinkum_assert(ctx: &HleContext, args: &[u64]) -> u64 {
     let expr = args.first().copied().unwrap_or(0);
     let file = args.get(1).copied().unwrap_or(0);
@@ -4472,6 +4525,159 @@ mod tests {
             ret, 0,
             "the (never-delivered) return value must not look like success"
         );
+    }
+
+    /// Test doubles for the noreturn-handler tests (`abort`, `exit`): a GPU
+    /// subsystem and guest-call scheduler that do nothing, plus a thread
+    /// scheduler that records the exit requests the handlers must make.
+    struct FatalNoGpu;
+    impl crate::GpuSubmissionSubsystem for FatalNoGpu {
+        fn submit(&self, _words: Vec<u32>, _queue: raeen_core::subsystems::GpuQueue) {}
+        fn map_shader_metadata(
+            &self,
+            _code_address: u64,
+            _data: raeen_core::subsystems::ShaderMappedData,
+        ) {
+        }
+        fn present_scanout(
+            &self,
+            _address: u64,
+            _descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
+        ) {
+        }
+        fn wait_idle(&self) {}
+        fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
+            raeen_core::subsystems::GpuSubmissionStats::default()
+        }
+    }
+    struct FatalNoGuestCalls;
+    impl crate::GuestCallScheduler for FatalNoGuestCalls {
+        fn request(&self, _request: crate::GuestCallRequest) -> bool {
+            false
+        }
+    }
+    /// Records both the per-thread unwind and any process-exit request.
+    struct FatalRecordingThreads {
+        exit_requested: std::cell::Cell<Option<u64>>,
+        process_exit_requested: std::cell::Cell<Option<u64>>,
+    }
+    impl FatalRecordingThreads {
+        fn new() -> Self {
+            Self {
+                exit_requested: std::cell::Cell::new(None),
+                process_exit_requested: std::cell::Cell::new(None),
+            }
+        }
+    }
+    impl crate::GuestThreadScheduler for FatalRecordingThreads {
+        fn create(&self, _thread_out: u64, _attr: u64, _entry: u64, _arg: u64) -> u64 {
+            0x8002_000B
+        }
+        fn join(&self, _thread: u64, _retval_out: u64) -> u64 {
+            0x8002_0003
+        }
+        fn detach(&self, _thread: u64) -> u64 {
+            0x8002_0003
+        }
+        fn request_exit(&self, retval: u64) -> bool {
+            self.exit_requested.set(Some(retval));
+            true
+        }
+        fn current_thread(&self) -> u64 {
+            1
+        }
+        fn request_process_exit(&self, code: u64) {
+            self.process_exit_requested.set(Some(code));
+        }
+        fn process_is_terminating(&self) -> bool {
+            false
+        }
+    }
+    fn fatal_test_ctx<'a>(
+        kernel: &'a raeen_kernel::OrbisKernel,
+        mem: &'a crate::TestMemory,
+        alloc: &'a crate::TestAllocator,
+        gpu: &'a FatalNoGpu,
+        guest_calls: &'a FatalNoGuestCalls,
+        threads: &'a FatalRecordingThreads,
+    ) -> crate::HleContext<'a> {
+        crate::HleContext {
+            kernel,
+            services: kernel,
+            gpu,
+            mem,
+            alloc,
+            guest_calls,
+            guest_threads: threads,
+            caller_return_addr: 0,
+            caller_rsp: 0,
+            float_args: [0; 8],
+        }
+    }
+
+    /// `abort()` is `noreturn` on hardware. Like `__stack_chk_fail`, the
+    /// handler must unwind the calling guest thread with its own fatal code
+    /// (distinct from the canary-smash code) rather than return 0 into a
+    /// frame the compiler compiled as never resuming.
+    #[test]
+    fn abort_requests_guest_thread_exit_instead_of_returning() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let gpu = FatalNoGpu;
+        let guest_calls = FatalNoGuestCalls;
+        let threads = FatalRecordingThreads::new();
+        let ctx = fatal_test_ctx(&kernel, &mem, &alloc, &gpu, &guest_calls, &threads);
+
+        let ret = hle_abort(&ctx, &[]);
+        assert_eq!(
+            threads.exit_requested.get(),
+            Some(crate::ABORT_EXIT_CODE),
+            "abort must unwind the guest thread with the abort fatal code"
+        );
+        assert_eq!(
+            threads.process_exit_requested.get(),
+            None,
+            "with a working per-thread unwind, abort must not escalate to process exit"
+        );
+        assert_ne!(
+            crate::ABORT_EXIT_CODE,
+            crate::STACK_CHK_FAIL_EXIT_CODE,
+            "a deliberate abort must be distinguishable from a canary smash"
+        );
+        assert_ne!(
+            ret, 0,
+            "the (never-delivered) return value must not look like success"
+        );
+    }
+
+    /// `exit(status)` is `noreturn` on hardware and terminates the whole
+    /// process with the guest's own status: the handler must record the
+    /// status process-wide (so every worker stops at its next safe point)
+    /// AND unwind the calling thread immediately — carrying `status`, not a
+    /// fatal-family code.
+    #[test]
+    fn exit_requests_process_and_thread_exit_with_the_guest_status() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let gpu = FatalNoGpu;
+        let guest_calls = FatalNoGuestCalls;
+        let threads = FatalRecordingThreads::new();
+        let ctx = fatal_test_ctx(&kernel, &mem, &alloc, &gpu, &guest_calls, &threads);
+
+        let ret = hle_exit(&ctx, &[42]);
+        assert_eq!(
+            threads.process_exit_requested.get(),
+            Some(42),
+            "exit must request process termination with the guest's own status"
+        );
+        assert_eq!(
+            threads.exit_requested.get(),
+            Some(42),
+            "exit must unwind the calling guest thread with the guest's own status"
+        );
+        assert_eq!(ret, 42, "the (never-delivered) value carries the status");
     }
 
     #[test]

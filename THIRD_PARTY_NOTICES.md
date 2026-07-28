@@ -88,7 +88,15 @@ SOFTWARE.
   `DcbDrawIndexMultiInstanced`, `UpdatePrimState` (with
   `GraphicsPrimitiveTypeToGsOut`), `GetDataPacketPayloadRange`, the
   CondExec/QueueEndOfPipeAction/WaitRegMem/DmaData packet-patch family, and
-  the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. No C++ is
+  the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. The GTA V
+  `libSceAmpr` Tier-C batch (`crates/raeen-hle/src/libsce_ampr.rs`,
+  2026-07-27) behaviorally re-implements `src/libs/libAmpr.cpp`: the
+  nop/marker/wait command family as inert records, the KytyPS5 argument
+  bounds (`APR_MAX_*`, 16 KiB map granularity, 1..=16 nop dwords), the
+  gather/scatter read-stream continuation (file id sticks, destination and
+  file offset continue past each read), the `WriteAddressFrom*` value-0
+  completion, and the APR map-window `EPERM` state machine; record byte
+  layouts, the eager-read model, and all tests are Raeen's own. No C++ is
   vendored or compiled into Raeen.
 
 ---

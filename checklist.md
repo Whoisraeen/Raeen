@@ -74,9 +74,16 @@ top-down, update statuses in place, and keep it committed.**
     the cross-queue label latch in `raeen-gpu/src/agc_exec.rs`; (3)
     queue-indexed execution context for DISPATCH/ACQUIRE_MEM/RELEASE_MEM/
     WAIT/COND_EXEC arms already encoded in `kyty-graphics/src/run.rs`.
-  - [~] **C. `libSceAmpr` (46 NIDs)** — WAVE 2 IN PROGRESS (hle-stubber
-    agent, bundled with the abort/exit noreturn fix, 2026-07-27). Honest
-    semantics (likely synchronous completion).
+  - [x] **C. DONE 2026-07-27** (hle-stubber agent, worktree branch; raeen-hle
+    492 green). All 46 measured-missing `libSceAmpr` NIDs registered from
+    KytyPS5 `src/libs/libAmpr.cpp` behavior: 37 real (nop/marker inert
+    records, gather/scatter file reads with REAL eager data movement +
+    host-tracked stream continuation, WriteAddress_04_00 completion write,
+    GetType/GetBufferBaseAddress, every MeasureCommandSize* pinned to its
+    writer's exact advance) + 9 `register_incomplete` honest-parity (waits
+    dropped/counters unmodeled/map window unmapped — KytyPS5 does the same,
+    but ours are tagged so coverage keeps naming them). MEASURED via local
+    `xtask nids coverage` re-run: libSceAmpr unresolved **46 → 0**.
   - [ ] **D. Re-measure GTA V** stop point; update
     `docs/gta5-blocker-analysis-2026-07-27.md`.
 - **Why:** One structural capability (async compute) unblocks the whole AAA
@@ -123,10 +130,15 @@ top-down, update statuses in place, and keep it committed.**
   with shadPS4 values. Empty dir: 0x200 once, then 0. Verified-not-assumed
   list in the ledger. Post-merge: raeen-hle 445, kernel 43+2, runtime
   77+47+1 green.
-- [~] NEW (residual risk from the audit): `hle_abort` and `hle_exit` still
-  log-and-return-0 — same noreturn hazard when a title's fatal path uses
-  `abort()`. Route both through the same `request_exit` unwind. WAVE 2 IN
-  PROGRESS (hle-stubber agent, bundled with item 2C Ampr, 2026-07-27).
+- [x] DONE 2026-07-27 (hle-stubber agent, worktree branch): `hle_abort` and
+  `hle_exit` no longer return into their (noreturn) call sites. `abort` →
+  full actionable report (thread, guest RA, recent-HLE ring, stack code
+  chain, EOWNERDEAD mutex release — shared helper factored from the
+  stack-chk fix) + `request_exit(ABORT_EXIT_CODE 0xa002_0106)`, distinct
+  from the canary-smash code. `exit(status)` → `request_process_exit(status)`
+  + `request_exit(status)` carrying the guest's own status (defense-in-depth
+  behind the VEH terminating-function intercept). Runtime poison-tail
+  acceptance tests for both (execute.rs, 49 green) + 2 hle unit tests.
 - [ ] Re-test Until Dawn live: expect it past /app0/deepfiles now; capture the
   next stop point if any.
 - [ ] Dragon Ball: worker threads deref a count (rax=2 → 0x20) as a list

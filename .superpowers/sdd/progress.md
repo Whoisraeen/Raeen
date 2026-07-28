@@ -4808,3 +4808,54 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * Phase B (NOT started, next wall): PM4 compute-queue execution — ACBs reach
   hle_driver_submit_acb but only the graphics-queue CP path executes; then
   re-run GTA V to move the UD2 assert.
+## 2026-07-27 (worktree agent) — abort/exit noreturn fix + GTA V Ampr Tier-C batch (46 NIDs)
+* abort/exit no longer return into (noreturn) call sites — the residual walk-
+  into-garbage hazard d818df9 left open. hle_abort: actionable report
+  (thread+name, guest RA, recent-HLE ring, stack code-addr chain, EOWNERDEAD
+  mutex release — shared report_fatal_thread_diagnostics factored out of the
+  stack-chk handler) then request_exit(ABORT_EXIT_CODE=0xa002_0106; SIGABRT
+  low byte, bit 8 distinguishes deliberate abort from a canary smash), with
+  request_process_exit escalation fallback. hle_exit(status):
+  request_process_exit(status) + request_exit(status) — the guest's OWN
+  status, orderly not fatal; defense-in-depth behind the VEH
+  TERMINATING_FUNCTIONS intercept (which still handles libc/
+  libSceLibcInternal exit before dispatch). _Assert comment corrected (its
+  call sites have well-formed code after the call; still returns).
+* Runtime acceptance: abort_unwinds_the_guest_instead_of_returning +
+  exit_unwinds_the_guest_with_its_status_instead_of_returning (poison tail
+  mov eax,0xBAD after the call must NOT execute; results ABORT_EXIT_CODE /
+  0x2A). Unit tests pin request_exit/request_process_exit recording.
+* libSceAmpr batch: all 46 measured-missing NIDs registered in
+  libsce_ampr.rs from KytyPS5 src/libs/libAmpr.cpp semantics (behavioral
+  port; THIRD_PARTY_NOTICES + reference-port-ledger updated).
+  - 37 REAL: nop/marker family as inert SELF-SIZING records (type 4,
+    [type][total_size], walker skips; KytyPS5 appends zeroed no-ops the
+    same way) with KytyPS5 arg bounds (Nop 1..=16 dwords, NopWithData <=15,
+    marker size = align4(hdr+strlen+1)); GetType (host-tracked flag word:
+    0x10000 GS-valid / 0x20000 map-active) + GetBufferBaseAddress;
+    WriteAddress_04_00 -> existing type-3 completion record;
+    ReadFileGather/Scatter/GatherScatter + ResetGatherScatterState with
+    host-tracked stream continuation (OrbisKernel::ampr_gather_scatter —
+    file id sticks, dest/offset continue past each read) and the eager-read
+    model — REAL data movement through guest memory, never faked; every
+    MeasureCommandSize* returns exactly its paired writer's advance (the
+    invariant a title sizing buffers by measure calls observes; sizes are
+    Raeen's records, deliberately not console packet sizes).
+  - 9 register_incomplete honest-parity: WaitOnAddress/WaitOnCounter (waits
+    dropped — synchronous completion), WriteCounter (counters unmodeled),
+    WriteAddressFromCounter/Pair/TimeCounter (complete by writing 0 —
+    KytyPS5 does exactly this), MapBegin/MapDirectBegin/MapEnd (16KiB-
+    granular validation + EPERM window state machine, no actual mapping).
+* apr_complete_command_buffer walks the new type-4 skip records; corrupt
+  total_size fails loudly (EINVAL). Ctor/reset/dtor/ResetGatherScatterState
+  clear the new host state (reset keeps flags — KytyPS5 parity).
+* MEASURED: local xtask nids coverage re-run — libSceAmpr unresolved
+  46 -> 0; the 9 degraded entries appear in registered_but_not_implemented.
+* Tests: raeen-hle 492 green (481 baseline + 2 abort/exit + 9 Ampr),
+  raeen-runtime 77+49(+2 new)+1 green, raeen-kernel 43+2 green; fmt green;
+  clippy clean on raeen-hle/raeen-kernel (mod-4/page-align checks written as
+  masks to dodge the manual_is_multiple_of vs MSRV-1.85 trap); workspace
+  clippy still blocked only by the pre-existing kyty-graphics
+  is_multiple_of MSRV lint (checklist item 13, another agent's wave).
+* NEXT: item 2D re-measure GTA V once 2B (compute-queue execution) merges;
+  watch for titles depending on real AMPR counter/time values (currently 0).

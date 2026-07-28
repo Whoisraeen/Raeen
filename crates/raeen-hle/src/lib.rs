@@ -531,6 +531,15 @@ pub trait GuestThreadScheduler {
 /// executing the bytes after the (noreturn) call site.
 pub const STACK_CHK_FAIL_EXIT_CODE: u64 = 0xa002_0006;
 
+/// The thread-exit code a guest thread terminated by the HLE `abort()`
+/// reports: same `0xa002_xxxx` fatal family and SIGABRT (6) low byte as
+/// [`STACK_CHK_FAIL_EXIT_CODE`], with bit 8 set so a deliberate guest
+/// `abort()` is distinguishable from a canary smash in logs and in the
+/// runtime's acceptance tests. Public for the same reason as the stack-chk
+/// code: the runtime asserts the guest unwound with exactly this value
+/// instead of executing the bytes after the (noreturn) call site.
+pub const ABORT_EXIT_CODE: u64 = 0xa002_0106;
+
 /// Bounded, read-only walk of the calling guest thread's stack collecting
 /// values that look like return addresses into the composed guest image
 /// (`0x1000_0000_0000 .. +~128 GiB` window used by the linker), so a fatal

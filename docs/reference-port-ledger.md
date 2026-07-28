@@ -109,6 +109,33 @@ Claude `/goal` (≤200 chars):
   stream currently reaches `hle_driver_submit_acb` but the command processor
   executes only the graphics-queue path.
 
+### GTA V Ampr Tier-C batch 2026-07-27 (KytyPS5 `src/libs/libAmpr.cpp`)
+
+- **The full measured 46-NID `libSceAmpr` gap
+  (docs/gta5-blocker-analysis-2026-07-27.md) is now registered** in
+  `crates/raeen-hle/src/libsce_ampr.rs`; a coverage re-run reports **zero
+  unresolved `libSceAmpr` imports** for PPSA04264. Two tiers, honestly
+  labeled:
+  - **KytyPS5 behavioral ports (37 real):** the nop/marker family
+    (`Nop`/`NopWithData`/`ConstructNop`/`ConstructMarker`/`Set`/`Push`/
+    `PopMarker` ± color) as inert self-sizing records with real
+    cursor/count effects and KytyPS5's argument bounds; `GetType` (flag
+    word) + `GetBufferBaseAddress`; `WriteAddress_04_00` on the existing
+    type-3 completion record; `ReadFileGather`/`Scatter`/`GatherScatter` +
+    `ResetGatherScatterState` continuing a host-tracked stream state
+    (`OrbisKernel::ampr_gather_scatter`) with the eager-read model —
+    **real data movement, never faked**; and every `MeasureCommandSize*`
+    pinned to exactly the bytes its paired writer advances (the
+    buffer-sizing invariant a title can observe).
+  - **Honest-error surface (registered-incomplete, callable with KytyPS5
+    parity, logged in coverage):** `WaitOnAddress`/`WaitOnCounter` (waits
+    dropped — synchronous completion), `WriteCounter` (counters
+    unmodeled), `WriteAddressFromCounter`/`Pair`/`TimeCounter` (complete by
+    writing 0, KytyPS5 parity), `MapBegin`/`MapDirectBegin`/`MapEnd`
+    (validated + `EPERM` window state machine, no actual mapping).
+- The completion walker (`apr_complete_command_buffer`) now skips the
+  self-sizing type-4 records; corrupt sizes fail loudly with `EINVAL`.
+
 ### Phase 1 live-import batch 2026-07-25
 
 - **SharpEmu `74a5198`, `2272b9b`, `d3600c9` re-audit — DONE.** The required

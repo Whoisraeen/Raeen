@@ -132,6 +132,23 @@ pub struct NpStateCallbackRegistration {
     pub notified: bool,
 }
 
+/// AMPR gather/scatter continuation state for one command buffer: after a
+/// `ReadFile*` append, the file id sticks while the destination and file
+/// offset continue immediately past the bytes just read, so the follow-up
+/// `ReadFileGather` (new file offset, continued destination) /
+/// `ReadFileScatter` (new destination, continued file offset) /
+/// `ReadFileGatherScatter` (both given) know where "next" is (KytyPS5
+/// `libAmpr.cpp` `CommandBufferState` gather_scatter_* fields).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AmprGatherScatterState {
+    /// APR file id of the read stream being gathered/scattered.
+    pub file_id: u32,
+    /// Guest address one byte past the previous read's destination.
+    pub next_destination: u64,
+    /// File offset one byte past the previous read's range.
+    pub next_file_offset: u64,
+}
+
 /// The emulated PS5 kernel state.
 ///
 /// Holds all kernel-level state: memory map, file descriptors,
@@ -414,6 +431,21 @@ pub struct OrbisKernel {
     /// SharpEmu's `AmprCommandBufferState.CommandCount` — zeroed on
     /// construct/reset, incremented per appended record).
     pub ampr_command_counts: DashMap<u64, u64>,
+    /// AMPR per-command-buffer gather/scatter continuation state, keyed by
+    /// the command-buffer address. Seeded/advanced by every successful
+    /// `sceAmprAprCommandBufferReadFile*` append (KytyPS5 `libAmpr.cpp`
+    /// `AppendReadFileRecord`: file id sticks, destination and file offset
+    /// continue past the previous read); presence in the map = "valid".
+    /// Cleared by construct/reset/destruct and
+    /// `sceAmprAprCommandBufferResetGatherScatterState`.
+    pub ampr_gather_scatter: DashMap<u64, AmprGatherScatterState>,
+    /// AMPR per-command-buffer "type" flag word (`sceAmprCommandBufferGetType`
+    /// reads it), host-tracked because Raeen's guest-visible command-buffer
+    /// struct layout has no type field at +0x00 (KytyPS5 keeps these bits in
+    /// the guest header; the observable flag semantics are the same):
+    /// `0x0001_0000` = gather/scatter state valid, `0x0002_0000` = an APR
+    /// map window is active (MapBegin seen, MapEnd pending).
+    pub ampr_type_flags: DashMap<u64, u32>,
     /// The libSceFiber context-size-check profiling toggle (0 = off, 1 = on).
     pub fiber_context_size_check: std::sync::atomic::AtomicU32,
     /// Suspended-fiber snapshots keyed by the guest `SceFiber` address: the
@@ -1241,6 +1273,8 @@ impl OrbisKernel {
             semaphore_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             ampr_write_offsets: DashMap::new(),
             ampr_command_counts: DashMap::new(),
+            ampr_gather_scatter: DashMap::new(),
+            ampr_type_flags: DashMap::new(),
             fiber_context_size_check: std::sync::atomic::AtomicU32::new(0),
             fibers: DashMap::new(),
             fiber_threads: DashMap::new(),

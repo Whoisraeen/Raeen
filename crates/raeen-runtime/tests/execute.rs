@@ -544,6 +544,119 @@ fn stack_chk_fail_unwinds_the_guest_instead_of_returning() {
     );
 }
 
+/// `abort()` is `noreturn` on hardware: a title's fatal path (assert,
+/// terminate, panic handler) ends in `call abort` with garbage — often UD2 —
+/// after it. The old stub returned 0, walking the guest into that garbage
+/// and misreporting the deliberate abort as a wild fault. The fixed handler
+/// must unwind the guest thread with the abort fatal code, exactly like the
+/// `__stack_chk_fail` test above (same walk-into-poison layout).
+#[test]
+fn abort_unwinds_the_guest_instead_of_returning() {
+    const SLOT: usize = 0x40;
+    const POISON: u32 = 0xBAD;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x80];
+    let mut off = 0usize;
+    emit_indirect_call(&mut image, &mut off, SLOT); // call abort
+    image[off] = 0xB8; // mov eax, POISON  (must never execute)
+    image[off + 1..off + 5].copy_from_slice(&POISON.to_le_bytes());
+    off += 5;
+    image[off] = 0xC3; // ret
+    image[SLOT..SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "abort".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("a guest abort is a reported guest-fatal unwind, not a host fault");
+    assert_ne!(
+        result,
+        u64::from(POISON),
+        "abort returned control to the guest frame that called it"
+    );
+    assert_eq!(
+        result,
+        raeen_hle::ABORT_EXIT_CODE,
+        "the guest thread must unwind with the abort exit code"
+    );
+}
+
+/// `exit(status)` is `noreturn` on hardware: nothing after the call site may
+/// execute, and the status must be the run's outcome. Same poison-tail
+/// layout as the abort/stack-chk tests — an exit that merely returned to its
+/// caller would surface as `POISON` instead of the status.
+#[test]
+fn exit_unwinds_the_guest_with_its_status_instead_of_returning() {
+    const SLOT: usize = 0x40;
+    const POISON: u32 = 0xBAD;
+    const STATUS: u8 = 0x2A;
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x80];
+    let mut off = 0usize;
+    // mov edi, STATUS  (SysV arg0 = exit status)
+    image[off] = 0xBF;
+    image[off + 1..off + 5].copy_from_slice(&u32::from(STATUS).to_le_bytes());
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, SLOT); // call exit
+    image[off] = 0xB8; // mov eax, POISON  (must never execute)
+    image[off + 1..off + 5].copy_from_slice(&POISON.to_le_bytes());
+    off += 5;
+    image[off] = 0xC3; // ret
+    image[SLOT..SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libc".to_string(),
+            function: "exit".to_string(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("exit() must terminate the run cleanly, not fault");
+    assert_ne!(
+        result,
+        u64::from(POISON),
+        "exit returned control to the guest frame that called it"
+    );
+    assert_eq!(
+        result,
+        u64::from(STATUS),
+        "the run must end with the guest's own exit status"
+    );
+}
+
 /// M1-E: a worker that ends via `scePthreadExit(v)` — rather than returning —
 /// unwinds its guest context and hands `v` to the joiner. The poison tail
 /// (`mov eax, POISON; ret`) sits immediately after the exit call, so an exit
