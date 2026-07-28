@@ -1408,12 +1408,15 @@ pub fn flush_deferred_draws(dev: &VulkanDevice) -> Result<Vec<(u64, RenderedImag
     flush_deferred_draws_filtered(dev, None)
 }
 
+/// Render-target readbacks keyed by their guest base address.
+pub type RenderedTargets = Vec<(u64, RenderedImage)>;
+
 /// Flush native targets plus any successfully produced ABI-v3 presentation
 /// images. Native pixels remain the guest framebuffer authority; plugin images
 /// are display-only.
 pub fn flush_deferred_draws_with_gpu_plugins(
     dev: &VulkanDevice,
-) -> Result<(Vec<(u64, RenderedImage)>, Vec<(u64, RenderedImage)>), GpuError> {
+) -> Result<(RenderedTargets, RenderedTargets), GpuError> {
     flush_deferred_draws_filtered_timed(dev, None).map(|flush| (flush.images, flush.plugin_images))
 }
 
@@ -1451,10 +1454,10 @@ pub(crate) struct DeferredFlushTiming {
 /// Timed form used by the presentation HUD. Public callers keep the legacy
 /// image-only wrapper above so diagnostics do not leak into the rendering API.
 pub(crate) struct DeferredFlush {
-    pub images: Vec<(u64, RenderedImage)>,
+    pub images: RenderedTargets,
     /// GPU-plugin results keyed by the native target base. These are for
     /// presentation only and must never replace the native framebuffer seed.
-    pub plugin_images: Vec<(u64, RenderedImage)>,
+    pub plugin_images: RenderedTargets,
     pub timing: DeferredFlushTiming,
 }
 
@@ -1588,14 +1591,7 @@ fn record_and_read_flush(
     pending: &[PendingDrawResources],
     already_submitted: usize,
     touched: &[TargetKey],
-) -> Result<
-    (
-        Vec<(u64, RenderedImage)>,
-        Vec<(u64, RenderedImage)>,
-        DeferredFlushTiming,
-    ),
-    GpuError,
-> {
+) -> Result<(RenderedTargets, RenderedTargets, DeferredFlushTiming), GpuError> {
     let device = dev.device();
     let live: Vec<(TargetKey, PersistentTarget, u32)> = touched
         .iter()
