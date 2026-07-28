@@ -2988,13 +2988,22 @@ fn shader_parse_smem(
             F::Sdst8SbaseSoffset => F::Sdst8SbaseSoffsetOffset,
             F::Sdst16SbaseSoffset => F::Sdst16SbaseSoffsetOffset,
             // The `s_buffer_load` family addresses through a four-SGPR V#, so
-            // the base is a descriptor rather than a pointer and the combined
-            // soffset+immediate rule above does NOT transfer. Nothing measured
-            // needs it; refuse by name instead of guessing the semantics.
+            // the base is a descriptor rather than a pointer — but the two
+            // offset terms compose IDENTICALLY (both in bytes, simply summed,
+            // low two bits dropped). See [`Format::SdstSvSoffsetOffset`] for
+            // the rule and its three reference sources.
+            F::SdstSvSoffset => F::SdstSvSoffsetOffset,
+            F::Sdst2SvSoffset => F::Sdst2SvSoffsetOffset,
+            F::Sdst4SvSoffset => F::Sdst4SvSoffsetOffset,
+            F::Sdst8SvSoffset => F::Sdst8SvSoffsetOffset,
+            F::Sdst16SvSoffset => F::Sdst16SvSoffsetOffset,
+            // Unreachable today: every SMEM opcode row above sets one of the
+            // ten formats handled here. Kept as a named refusal so a future
+            // opcode cannot silently inherit the wrong addressing mode.
             _ => {
                 return Err(feature(
                     S,
-                    "offset != 0 with register soffset on an s_buffer_load (V# base)",
+                    "offset != 0 with register soffset on an unmodeled SMEM format",
                     pc,
                 ));
             }
@@ -5523,20 +5532,77 @@ mod tests {
         assert_eq!(code.get_instructions()[0].src[2].constant.i(), -1);
     }
 
-    /// `s_buffer_load` addresses through a four-SGPR V#, so the pointer rule
-    /// above does not transfer. Nothing measured needs it: it stays a refusal
-    /// that NAMES the form rather than a guess.
+    /// `s_buffer_load` addresses through a four-SGPR V#, so the *base* is a
+    /// descriptor rather than a pointer — but the two offset terms compose
+    /// identically (both bytes, simply summed). Sources for the rule:
+    /// SharpEmu `Gen5ShaderScalarEvaluator.cs::TryExecuteScalarLoad`
+    /// (L1875-1902) runs `s_load*` and `s_buffer_load*` through ONE body where
+    /// only `baseAddress` differs, and KytyPS5 `MemoryOps.cpp::DecodeSmem`
+    /// (L218-256) gives both families the identical operand shape.
+    ///
+    /// Build 36a9b18 refused this in the PARSER
+    /// (`not implemented smem feature: offset != 0 with register soffset on an
+    /// s_buffer_load (V# base)`) — ASTRO.BOT's measured first blocker.
     #[test]
-    fn smem_buffer_load_register_soffset_with_offset_refuses_by_name() {
-        // opcode 0x0a (s_buffer_load_dwordx4), soffset = s4, offset = 64.
+    fn smem_buffer_load_register_soffset_with_offset_decodes_three_operands() {
+        // opcode 0x0a (s_buffer_load_dwordx4), sdst = s20, sbase field 4 =>
+        // s[8:11] (a V# quad), soffset = s4, immediate offset = 64 bytes.
         let b0 = 0xF400_0000 | (0x0a << 18) | (20 << 6) | 4;
-        let (_, result) = parse(&[b0, 0x0800_0040, S_ENDPGM], ShaderType::Compute, true);
-        let err = result.expect_err("V#-based combined addressing is not modeled");
-        let text = err.to_string();
-        assert!(
-            text.contains("register soffset") && text.contains("s_buffer_load"),
-            "refusal must name the form, got: {text}"
+        let (code, result) = parse(&[b0, 0x0800_0040, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("V#-based combined addressing must parse");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SBufferLoadDwordx4);
+        assert_eq!(inst.format, F::Sdst4SvSoffsetOffset);
+        assert_eq!(inst.src_num, 3);
+        assert_eq!(
+            (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+            (O::Sgpr, 8, 4),
+            "src[0] is the four-SGPR V# quad, not a pointer pair"
         );
+        assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Sgpr, 4));
+        assert_eq!(inst.src[2].constant.i(), 64);
+        assert!(crate::shader::types::smem_has_combined_offset(inst));
+        assert_eq!(
+            crate::shader::types::smem_offset_operand(inst).constant.i(),
+            64
+        );
+    }
+
+    /// Every `s_buffer_load` width carries the combined V# addressing mode.
+    #[test]
+    fn smem_buffer_load_register_soffset_covers_every_width() {
+        for (opcode, type_, format, size) in [
+            (0x08u32, T::SBufferLoadDword, F::SdstSvSoffsetOffset, 1),
+            (0x09, T::SBufferLoadDwordx2, F::Sdst2SvSoffsetOffset, 2),
+            (0x0a, T::SBufferLoadDwordx4, F::Sdst4SvSoffsetOffset, 4),
+            (0x0b, T::SBufferLoadDwordx8, F::Sdst8SvSoffsetOffset, 8),
+            (0x0c, T::SBufferLoadDwordx16, F::Sdst16SvSoffsetOffset, 16),
+        ] {
+            // sdst = s32, sbase field 6 => s[12:15], soffset = s6, offset 0x30.
+            let b0 = 0xF400_0000 | (opcode << 18) | (32 << 6) | 6;
+            let (code, result) = parse(&[b0, 0x0C00_0030, S_ENDPGM], ShaderType::Compute, true);
+            result.unwrap_or_else(|e| panic!("opcode {opcode:#04x} must parse: {e}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, type_, "opcode {opcode:#04x}");
+            assert_eq!(inst.format, format, "opcode {opcode:#04x}");
+            assert_eq!(inst.dst.size, size, "opcode {opcode:#04x}");
+            assert_eq!((inst.src[0].register_id, inst.src[0].size), (12, 4));
+            assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Sgpr, 6));
+            assert_eq!(inst.src[2].constant.i(), 0x30);
+        }
+    }
+
+    /// A register soffset with a ZERO immediate keeps the two-operand V# shape,
+    /// so nothing that already parsed changes format.
+    #[test]
+    fn smem_buffer_load_register_soffset_without_offset_keeps_two_operands() {
+        let b0 = 0xF400_0000 | (0x0a << 18) | (20 << 6) | 4;
+        let (code, result) = parse(&[b0, 0x0800_0000, S_ENDPGM], ShaderType::Compute, true);
+        result.expect("zero immediate already parsed");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.format, F::Sdst4SvSoffset);
+        assert_eq!(inst.src_num, 2);
+        assert!(!crate::shader::types::smem_has_combined_offset(inst));
     }
 
     #[test]

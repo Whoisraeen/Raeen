@@ -903,6 +903,213 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
     if texture_changed {
         shader_calc_binding_indices(bind);
     }
+
+    shader_capture_vsharp_buffer_loads(code, mem, user_sgpr, shift, bind);
+}
+
+/// Beyond Kyty: resolve `s_buffer_load*` whose base is a **buffer resource
+/// descriptor (V#)** living in live-in user SGPRs, and snapshot the loaded
+/// dwords for SPIR-V translation.
+///
+/// The recompiler's storage-buffer path only serves an `s_buffer_load` when the
+/// static usage-table walk already bound a storage buffer for that scalar quad
+/// (`bind.storage_buffers.buffers_num > 0`). A title that delivers the V# as
+/// plain user data — or loads it out of a descriptor table and never declares a
+/// slot — has `buffers_num == 0`, so every width returned `false` and the whole
+/// shader died with `can't recompile: SBufferLoadDwordx8 [Sdst8SvSoffset]`
+/// (measured first blocker of Grand Theft Auto V).
+///
+/// # The addressing rule (established, not guessed)
+///
+/// ```text
+/// addr = V#.base48 + zext(SGPR[soffset]) + sext21(imm) ; addr &= !3
+/// size = stride == 0 ? num_records : stride * num_records   (the BOUND only)
+/// ```
+///
+/// * SharpEmu `Gen5ShaderScalarEvaluator.cs::TryExecuteScalarLoad` (L1875-1902)
+///   runs `s_load*` and `s_buffer_load*` through ONE body. Only the base
+///   differs — `hasBufferDescriptor ? bufferDescriptor.BaseAddress : (sgpr pair
+///   as u64)` — while `byteOffset = immediateOffset + dynamicOffset` and
+///   `address = (baseAddress + byteOffset) & ~3UL` are shared verbatim. So the
+///   V# contributes ONLY its base address to the offset arithmetic.
+/// * SharpEmu `TryDecodeBufferDescriptor` (L2163-2216) shows what the other
+///   fields are for: `baseAddress = word0 | ((word1 & 0xFFFF) << 32)`,
+///   `stride = (word1 >> 16) & 0x3FFF`, and
+///   `sizeBytes = stride == 0 ? word2 : stride * word2` — a *size*, never an
+///   address term. It also rejects `word3 >> 30 != 0` (not a buffer sharp).
+/// * KytyPS5 `spirvEmitterMemory.cpp::EmitBufferAddressFromParts` (L212-253)
+///   confirms `stride` only multiplies an **index**, and the index term is
+///   gated on `idxen` (`EmitBufferByteAddress` L255-278) — a flag SMEM does not
+///   have. The scalar form therefore reduces to `offset + soffset`.
+///
+/// Captured loads reuse the per-PC [`ShaderEmbeddedConstantLoads`]
+/// representation, so `recompile_sbuffer_load_*` materializes the exact dwords
+/// into the destination SGPRs — the same mechanism `sload_dword_extended`
+/// already uses for pointer-based loads.
+///
+/// Only fully-proved loads are captured: the V# quad must be inside the
+/// captured user-data window, never written earlier in the shader, buffer-typed
+/// and non-null; the soffset must resolve through
+/// [`resolve_scalar_soffset_bytes`]; the read must stay inside the descriptor's
+/// own `size` bound and be readable from guest memory. Anything else is left to
+/// the recompiler's named refusal.
+pub fn shader_capture_vsharp_buffer_loads(
+    code: &ShaderCode,
+    mem: &impl ShaderMemory,
+    user_sgpr: &UserSgprInfo,
+    shift: i32,
+    bind: &mut ShaderBindResources,
+) {
+    use ShaderInstructionType as T;
+
+    const fn width(type_: ShaderInstructionType) -> Option<usize> {
+        match type_ {
+            T::SBufferLoadDword => Some(1),
+            T::SBufferLoadDwordx2 => Some(2),
+            T::SBufferLoadDwordx4 => Some(4),
+            T::SBufferLoadDwordx8 => Some(8),
+            T::SBufferLoadDwordx16 => Some(16),
+            _ => None,
+        }
+    }
+
+    let instructions = code.get_instructions();
+
+    for (at, load) in instructions.iter().enumerate() {
+        let Some(dwords) = width(load.type_) else {
+            continue;
+        };
+        // src[0] is the V# quad; the offset operand is src[1] (two-operand
+        // form) or src[2] (combined soffset+immediate form).
+        let offset_operand = crate::shader::types::smem_offset_operand(load);
+        if load.src[0].type_ != ShaderOperandType::Sgpr
+            || load.src[0].size != 4
+            || load.dst.type_ != ShaderOperandType::Sgpr
+            || !matches!(
+                offset_operand.type_,
+                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+            )
+            || offset_operand.constant.i() < 0
+        {
+            continue;
+        }
+        if bind.embedded_constant_loads.find(load.pc).is_some() {
+            continue;
+        }
+        let base_reg = load.src[0].register_id;
+        // A V# that already has a BOUND storage buffer keeps the descriptor
+        // path: that reads guest memory live at draw time, while this pass
+        // bakes a translate-time snapshot into the module. Baking would make
+        // every subsequent frame reuse the first frame's constants for a buffer
+        // the title updates per draw (the whole point of a constant buffer), so
+        // the live descriptor always wins where one exists. This capture is for
+        // the case Kyty had NO lowering for at all: `buffers_num == 0`.
+        let bound_count = usize::try_from(bind.storage_buffers.buffers_num.max(0))
+            .unwrap_or(0)
+            .min(bind.storage_buffers.start_register.len());
+        if bind.storage_buffers.start_register[..bound_count]
+            .iter()
+            .any(|start| start.saturating_add(shift) == base_reg)
+        {
+            continue;
+        }
+        // The descriptor must be a live-in: any in-shader write to the quad
+        // means the user-data snapshot is not what the load will read.
+        if instructions[..at]
+            .iter()
+            .any(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)))
+        {
+            continue;
+        }
+        // A register soffset adds a second runtime term. Prove it or skip —
+        // folding the immediate alone would snapshot the wrong dwords.
+        let Some(soffset_bytes) =
+            resolve_scalar_soffset_bytes(&instructions[..at], load, Some(user_sgpr), shift)
+        else {
+            continue;
+        };
+        let Ok(base) = usize::try_from(base_reg - shift) else {
+            continue;
+        };
+        if base + 3 >= UserSgprInfo::SGPRS_MAX || base + 3 >= user_sgpr.count as usize {
+            continue;
+        }
+        let mut fields = [0u32; 4];
+        fields.copy_from_slice(&user_sgpr.value[base..base + 4]);
+        if fields.iter().all(|field| *field == 0) {
+            continue;
+        }
+        // SharpEmu `TryDecodeBufferDescriptor`: `word3 >> 30 != 0` is not a
+        // buffer sharp (it is a T#/S#), and a zero-size descriptor is unbound.
+        if !sharp_dword3_is_buffer(fields[3]) {
+            continue;
+        }
+        let resource = super::resources::ShaderBufferResource { fields };
+        let stride = u64::from(resource.stride());
+        let records = u64::from(resource.num_records());
+        let size_bytes = if stride == 0 {
+            records
+        } else {
+            stride.saturating_mul(records)
+        };
+        if size_bytes == 0 {
+            continue;
+        }
+        let base_address = resource.base48();
+        if base_address == 0 {
+            continue;
+        }
+        let byte_offset =
+            u64::from(offset_operand.constant.u).wrapping_add(u64::from(soffset_bytes));
+        // Refuse a read the descriptor itself says is out of range rather than
+        // snapshotting whatever happens to follow the buffer in guest memory.
+        let read_bytes = (dwords as u64) * 4;
+        if byte_offset.saturating_add(read_bytes) > size_bytes {
+            tracing::debug!(
+                pc = load.pc,
+                base_register = base_reg,
+                base_address = format_args!("{base_address:#x}"),
+                byte_offset,
+                read_bytes,
+                size_bytes,
+                "s_buffer_load reads past the V# bound; left to the named refusal"
+            );
+            continue;
+        }
+        // RDNA2 drops the low two address bits rather than faulting (SharpEmu
+        // `Gen5ShaderScalarEvaluator.cs:1898` `& ~3UL`).
+        let address = base_address.wrapping_add(byte_offset) & !3u64;
+        let Some(source) = mem.dwords_at(address) else {
+            continue;
+        };
+        if source.len() < dwords {
+            continue;
+        }
+
+        let Ok(slot) = usize::try_from(bind.embedded_constant_loads.loads_num.max(0)) else {
+            continue;
+        };
+        if slot >= ShaderEmbeddedConstantLoads::LOADS_MAX {
+            tracing::warn!(
+                pc = load.pc,
+                "more V# scalar-buffer loads than LOADS_MAX; dropping the rest"
+            );
+            break;
+        }
+        let capture = &mut bind.embedded_constant_loads.loads[slot];
+        *capture = ShaderEmbeddedConstantLoad::default();
+        capture.pc = load.pc;
+        capture.dwords_num = dwords as u32;
+        capture.values[..dwords].copy_from_slice(&source[..dwords]);
+        bind.embedded_constant_loads.loads_num += 1;
+        tracing::debug!(
+            pc = load.pc,
+            base_register = base_reg,
+            address = format_args!("{address:#x}"),
+            dwords,
+            "captured V#-based s_buffer_load from user-data descriptor"
+        );
+    }
 }
 
 /// For an `s_add_u32`, return `(constant_addend, other_sgpr)` when exactly one
