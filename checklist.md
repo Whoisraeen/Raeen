@@ -170,13 +170,40 @@ top-down, update statuses in place, and keep it committed.**
   (the phased plan), `crates/raeen-gpu/` present path + `present_plugin`.
 
 ### 7. Synchronous guest callbacks (call back INTO guest from HLE)
-- [ ] Design + implement re-entrant guest dispatch from inside a VEH/gateway
-  HLE handler (nested execute on the current guest thread; RSP discipline;
-  re-entrancy tests).
-- [ ] Retire the blocked class: `qsort` (comparator), `atexit` chain, module
-  init/fini callbacks; later VideoOut/GPU event callbacks.
-- **Where:** `crates/raeen-runtime/` (dispatch/VEH), then
-  `crates/raeen-hle/src/libc.rs` consumers.
+- [x] MECHANISM DONE 2026-07-27 (worktree agent, commit `ba3c123` on branch
+  `worktree-agent-a8a0f93f4ac611946`; raeen-runtime 77 lib + 56 execute
+  (+6 new) + 1 m3 green, raeen-hle 500 (+3 new), raeen-firmware 125, fmt
+  clean, clippy `-D warnings` green on both touched crates).
+  `GuestCallScheduler::call_guest(entry, [u64;6]) -> Result<u64, GuestCallError>`
+  — an HLE handler calls INTO guest code mid-call and gets its RAX, on the
+  current guest thread. Design (full rationale on `ActiveContext::call_guest`
+  in dispatch.rs): on the **VEH path** the handler already executes on the
+  guest stack (vectored exceptions dispatch on the faulting thread's stack),
+  so a plain native `sysv64` call runs the callback below the trapped frame
+  with compiler-kept alignment — and the armed recovery context, TLS/FS
+  re-arm, on-demand commit, and terminating arms all stay live, so nested
+  HLE imports trap normally. Nesting bounded only by guest stack; depth 2
+  (HLE→cb→HLE→cb) pinned by test. Unwind composition: callback faults →
+  `Err(Faulted)`; `request_exit` under the callback (stack_chk/abort) →
+  clean unwind, interrupted handler provably never resumes (poison-tail +
+  resumed-flag tests). **Direct leaf gateway refuses loudly** (`Unsupported`
+  + error log): its bridge re-bases RSP to a fixed host-stack top on every
+  entry, so re-entry there would clobber live gateway frames —
+  `direct_dispatchable` lists only never-re-enter imports; refusal pinned by
+  test overriding `libc::strlen`. Interrupted handler's `active_hle` +
+  `pending_guest_call` saved/restored around the callback.
+- [~] Retire the blocked class: `qsort` DONE (real in-place heapsort over
+  guest memory, comparator gets REAL element pointers, verified end-to-end:
+  guest fixture sorts + guest-side order check + comparator call counter;
+  ledger 2026-07-25's "qsort (needs sync guest callback)" skip retired).
+  Remaining, now unblocked by the same mechanism: `atexit` chain (needs a
+  hook in the terminating-function arm before the exit longjmp), module
+  init/fini callbacks, VideoOut/GPU event callbacks.
+- **Where:** `crates/raeen-runtime/src/dispatch.rs`
+  (`ActiveContext::call_guest`, `direct_gateway_active`),
+  `crates/raeen-hle/src/lib.rs` (trait + `GuestCallError`),
+  `crates/raeen-hle/src/libc.rs` (`hle_qsort`),
+  `crates/raeen-runtime/tests/execute.rs` (6 acceptance tests).
 
 ### 8. AIO infrastructure
 - [ ] The 5 skipped kernel AIO NIDs ("no infra — do not fake", ledger

@@ -4264,3 +4264,429 @@ fn execute_process_records_initializer_transitions_in_diagnostic_mode() {
         "diagnostic sequence numbers are stable and monotonic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Checklist item 7: SYNCHRONOUS guest callbacks — an HLE handler calls back
+// INTO guest code mid-call via `GuestCallScheduler::call_guest` and receives
+// its RAX, on the current guest thread. Acceptance tests below pin: the
+// returned value reaching the handler (and the handler's own eventual return
+// value reaching the guest), depth-2 nesting (HLE → callback → HLE →
+// callback), fault propagation, `request_exit` unwind composition, the
+// direct-gateway refusal, and the first real consumer (`qsort`).
+// ---------------------------------------------------------------------------
+
+/// `lea <reg>, [rip+disp32]` targeting `target` (an offset in the same flat
+/// image). ModRM reg codes: rax=0 rcx=1 rdx=2 rbx=3 rsi=6 rdi=7.
+fn emit_lea_rip(image: &mut [u8], off: &mut usize, modrm_reg: u8, target: usize) {
+    let after = *off as i64 + 7;
+    let disp = (target as i64 - after) as i32;
+    image[*off..*off + 3].copy_from_slice(&[0x48, 0x8D, 0x05 | (modrm_reg << 3)]);
+    image[*off + 3..*off + 7].copy_from_slice(&disp.to_le_bytes());
+    *off += 7;
+}
+
+/// A [`LinkedModule`] over a hand-assembled image whose import slots were
+/// already patched with `HLE_TRAMPOLINE_BASE + i*8`; trampoline `i` is the
+/// `i`-th `(library, function)` pair.
+fn callback_fixture_module(image: Vec<u8>, imports: &[(&str, &str)]) -> LinkedModule {
+    LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: imports
+            .iter()
+            .enumerate()
+            .map(|(i, (library, function))| HleTrampoline {
+                library: (*library).to_string(),
+                function: (*function).to_string(),
+                addr: HLE_TRAMPOLINE_BASE + i as u64 * 8,
+            })
+            .collect(),
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    }
+}
+
+/// HLE handler: synchronously call the guest function in arg0 with arg1,
+/// then return `callback_rax + 0x1000` — proving BOTH directions of the
+/// value flow (callback result into the handler; the handler's eventual
+/// result back to the interrupted guest call site).
+fn hle_call_guest_and_add(ctx: &HleContext, args: &[u64]) -> u64 {
+    match ctx
+        .guest_calls
+        .call_guest(args[0], [args[1], 0, 0, 0, 0, 0])
+    {
+        Ok(value) => value.wrapping_add(0x1000),
+        Err(_) => 0xDEAD,
+    }
+}
+
+/// A synchronous guest callback's RAX reaches the HLE handler mid-call, and
+/// the handler's own return value still reaches the interrupted guest call.
+#[test]
+fn call_guest_returns_callback_rax_to_the_hle_handler() {
+    const CB: usize = 0x20;
+    const SLOT: usize = 0x40;
+
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceTestCallGuestAdd", hle_call_guest_and_add);
+
+    let mut image = vec![0u8; 0x60];
+    let mut off = 0usize;
+    emit_lea_rip(&mut image, &mut off, 7, CB); // rdi = &callback
+    image[off..off + 5].copy_from_slice(&[0xBE, 0x2A, 0x00, 0x00, 0x00]); // mov esi, 0x2A
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, SLOT);
+    image[off] = 0xC3; // ret
+    // callback: lea rax, [rdi+1]; ret  — returns its argument + 1.
+    image[CB..CB + 5].copy_from_slice(&[0x48, 0x8D, 0x47, 0x01, 0xC3]);
+    image[SLOT..SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = callback_fixture_module(image, &[("libtest", "sceTestCallGuestAdd")]);
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("synchronous callback round-trip must succeed");
+    assert_eq!(
+        result,
+        0x2A + 1 + 0x1000,
+        "callback rax (arg+1) must reach the handler, and the handler's result the guest"
+    );
+}
+
+/// Depth-2 nesting handlers: outer calls guest cb1 (which calls the inner
+/// import, which calls guest cb2). Each level adds a distinct constant so the
+/// final value proves every hop ran exactly once, in order.
+fn hle_nest_outer(ctx: &HleContext, args: &[u64]) -> u64 {
+    match ctx
+        .guest_calls
+        .call_guest(args[0], [args[1], args[2], 0, 0, 0, 0])
+    {
+        Ok(value) => value + 0x100,
+        Err(_) => 0xDEAD,
+    }
+}
+
+fn hle_nest_inner(ctx: &HleContext, args: &[u64]) -> u64 {
+    match ctx
+        .guest_calls
+        .call_guest(args[0], [args[1], 0, 0, 0, 0, 0])
+    {
+        Ok(value) => value + 0x10,
+        Err(_) => 0xDEAD,
+    }
+}
+
+/// Documented supported nesting depth: 2 (HLE → guest callback → HLE → guest
+/// callback). Chain: entry → OUTER(cb1, cb2, 5) → cb1 → INNER(cb2, 5) → cb2.
+/// cb2(5)=8; INNER=0x18; cb1=0x19; OUTER=0x119.
+#[test]
+fn nested_call_guest_composes_to_depth_two() {
+    const CB1: usize = 0x30;
+    const CB2: usize = 0x50;
+    const OUTER_SLOT: usize = 0x60;
+    const INNER_SLOT: usize = 0x68;
+
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceTestNestOuter", hle_nest_outer);
+    hle.register("libtest", "sceTestNestInner", hle_nest_inner);
+
+    let mut image = vec![0u8; 0x80];
+    let mut off = 0usize;
+    emit_lea_rip(&mut image, &mut off, 7, CB1); // rdi = &cb1
+    emit_lea_rip(&mut image, &mut off, 6, CB2); // rsi = &cb2
+    image[off..off + 5].copy_from_slice(&[0xBA, 0x05, 0x00, 0x00, 0x00]); // mov edx, 5
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, OUTER_SLOT);
+    image[off] = 0xC3; // ret
+    // cb1 (rdi = &cb2, rsi = 5): keep SysV 16-byte call alignment, forward
+    // its own arguments to the INNER import, add 1 to its result.
+    let mut cb1 = CB1;
+    image[cb1..cb1 + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+    cb1 += 4;
+    emit_indirect_call(&mut image, &mut cb1, INNER_SLOT);
+    image[cb1..cb1 + 4].copy_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    cb1 += 4;
+    image[cb1..cb1 + 4].copy_from_slice(&[0x48, 0x83, 0xC0, 0x01]); // add rax, 1
+    cb1 += 4;
+    image[cb1] = 0xC3; // ret
+    assert!(cb1 < CB2, "cb1 must not overlap cb2");
+    // cb2 (rdi = 5): lea rax, [rdi+3]; ret.
+    image[CB2..CB2 + 5].copy_from_slice(&[0x48, 0x8D, 0x47, 0x03, 0xC3]);
+    image[OUTER_SLOT..OUTER_SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    image[INNER_SLOT..INNER_SLOT + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + 8).to_le_bytes());
+
+    let linked = callback_fixture_module(
+        image,
+        &[
+            ("libtest", "sceTestNestOuter"),
+            ("libtest", "sceTestNestInner"),
+        ],
+    );
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("depth-2 nested callbacks must succeed");
+    assert_eq!(
+        result, 0x119,
+        "every nesting level must run exactly once, in order"
+    );
+}
+
+static FAULTING_CB_HANDLER_RESUMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn hle_call_guest_fault_probe(ctx: &HleContext, args: &[u64]) -> u64 {
+    let result = ctx.guest_calls.call_guest(args[0], [0; 6]);
+    // A faulting callback longjmps to the run's recovery point: this store
+    // (and the handler's return) must never execute.
+    FAULTING_CB_HANDLER_RESUMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    result.unwrap_or(0xDEAD)
+}
+
+/// A guest callback that faults must surface as `Err(Faulted)` from the run
+/// — never as corruption, and never as a successful return to the HLE
+/// handler that invoked it.
+#[test]
+fn faulting_guest_callback_propagates_as_a_fault_not_a_return() {
+    const CB: usize = 0x20;
+    const SLOT: usize = 0x40;
+    const POISON: u32 = 0xBAD;
+
+    let hle = HleRegistry::new();
+    hle.register(
+        "libtest",
+        "sceTestCallGuestFault",
+        hle_call_guest_fault_probe,
+    );
+
+    let mut image = vec![0u8; 0x60];
+    let mut off = 0usize;
+    emit_lea_rip(&mut image, &mut off, 7, CB); // rdi = &callback
+    emit_indirect_call(&mut image, &mut off, SLOT);
+    image[off] = 0xB8; // mov eax, POISON (must never execute)
+    image[off + 1..off + 5].copy_from_slice(&POISON.to_le_bytes());
+    image[off + 5] = 0xC3;
+    // callback: mov rax, [0]; ret — a null read.
+    image[CB..CB + 8].copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
+    image[CB + 8] = 0xC3;
+    image[SLOT..SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = callback_fixture_module(image, &[("libtest", "sceTestCallGuestFault")]);
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[]);
+    match result {
+        Err(RuntimeError::Faulted { access, .. }) => {
+            assert_eq!(access, 0, "the callback's null read is the reported access");
+        }
+        other => panic!("a faulting callback must recover as Err(Faulted), got {other:?}"),
+    }
+    assert!(
+        !FAULTING_CB_HANDLER_RESUMED.load(std::sync::atomic::Ordering::SeqCst),
+        "the HLE handler must never resume after its callback faulted"
+    );
+}
+
+static EXITING_CB_HANDLER_RESUMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn hle_call_guest_exit_probe(ctx: &HleContext, args: &[u64]) -> u64 {
+    let result = ctx.guest_calls.call_guest(args[0], [0; 6]);
+    // The callback triggers __stack_chk_fail's request_exit unwind: this
+    // store (and the handler's return) must never execute.
+    EXITING_CB_HANDLER_RESUMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    result.unwrap_or(0xDEAD)
+}
+
+/// A callback that triggers the `request_exit` unwind (`__stack_chk_fail`)
+/// must unwind the whole guest call cleanly — the interrupted HLE handler
+/// never resumes, and the run ends with the fatal exit code, exactly like a
+/// canary smash outside a callback.
+#[test]
+fn callback_that_requests_exit_unwinds_past_the_interrupted_hle_handler() {
+    const CB: usize = 0x20;
+    const PROBE_SLOT: usize = 0x40;
+    const CHK_SLOT: usize = 0x48;
+    const POISON: u32 = 0xBAD;
+
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceTestCallGuestExit", hle_call_guest_exit_probe);
+
+    let mut image = vec![0u8; 0x60];
+    let mut off = 0usize;
+    emit_lea_rip(&mut image, &mut off, 7, CB); // rdi = &callback
+    emit_indirect_call(&mut image, &mut off, PROBE_SLOT);
+    image[off] = 0xB8; // mov eax, POISON (must never execute)
+    image[off + 1..off + 5].copy_from_slice(&POISON.to_le_bytes());
+    image[off + 5] = 0xC3;
+    // callback: call __stack_chk_fail, then a poison tail that must never run.
+    let mut cb = CB;
+    image[cb..cb + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+    cb += 4;
+    emit_indirect_call(&mut image, &mut cb, CHK_SLOT);
+    image[cb] = 0xB8;
+    image[cb + 1..cb + 5].copy_from_slice(&POISON.to_le_bytes());
+    image[cb + 5] = 0xC3;
+    image[PROBE_SLOT..PROBE_SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    image[CHK_SLOT..CHK_SLOT + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + 8).to_le_bytes());
+
+    let linked = callback_fixture_module(
+        image,
+        &[
+            ("libtest", "sceTestCallGuestExit"),
+            ("libc", "__stack_chk_fail"),
+        ],
+    );
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("a fatal unwind under a callback is a reported exit, not a host fault");
+    assert_eq!(
+        result,
+        raeen_hle::STACK_CHK_FAIL_EXIT_CODE,
+        "the run must end with the canary-smash exit code from under the callback"
+    );
+    assert!(
+        !EXITING_CB_HANDLER_RESUMED.load(std::sync::atomic::Ordering::SeqCst),
+        "the interrupted HLE handler must never resume after the unwind"
+    );
+}
+
+fn hle_direct_gateway_call_guest_probe(ctx: &HleContext, _args: &[u64]) -> u64 {
+    // A nonzero, genuinely-executable entry: the refusal must fire BEFORE any
+    // attempt to run it (were it dispatched, the probe would return 0xE3).
+    match ctx.guest_calls.call_guest(GUEST_ARENA_BASE, [0; 6]) {
+        Err(raeen_hle::GuestCallError::Unsupported) => 0xE1,
+        Err(_) => 0xE2,
+        Ok(_) => 0xE3,
+    }
+}
+
+/// The direct leaf gateway cannot host synchronous guest re-entry (its
+/// generated bridge re-bases RSP to a fixed host stack top on every entry):
+/// `call_guest` must refuse loudly with `Unsupported` on that path rather
+/// than corrupt the gateway frames.
+#[test]
+fn call_guest_is_refused_on_the_direct_gateway_path() {
+    if !fsgsbase_available() || std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
+        return;
+    }
+    let hle = HleRegistry::new();
+    // Override a direct-dispatchable leaf with a probe that attempts a
+    // synchronous callback from inside the gateway.
+    hle.register("libc", "strlen", hle_direct_gateway_call_guest_probe);
+
+    let result = execute_linked(
+        &direct_import_module("libc", "strlen"),
+        &hle,
+        &OrbisKernel::new(),
+        0,
+        &[],
+    )
+    .expect("the refused callback must not disturb the direct dispatch itself");
+    assert_eq!(
+        result, 0xE1,
+        "call_guest inside the direct gateway must report GuestCallError::Unsupported"
+    );
+}
+
+/// End-to-end consumer: guest `qsort` with a REAL guest comparator. The
+/// entry sorts a 6-element u64 array through the libc HLE, then verifies the
+/// order IN GUEST CODE and returns the comparator's own call counter — so a
+/// pass proves the comparator executed (counter ≥ n-1), received real
+/// element pointers (order is right), and the array memory was really moved.
+#[test]
+fn qsort_sorts_a_guest_array_with_a_guest_comparator() {
+    const CMP: usize = 0x60;
+    const SLOT: usize = 0xA0;
+    const COUNTER: usize = 0xA8;
+    const ARRAY: usize = 0xB0;
+    const VALUES: [u64; 6] = [5, 1, 4, 2, 6, 3];
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    let mut off = 0usize;
+    // qsort(&array, 6, 8, &comparator)
+    emit_lea_rip(&mut image, &mut off, 7, ARRAY); // rdi
+    image[off..off + 5].copy_from_slice(&[0xBE, 0x06, 0x00, 0x00, 0x00]); // mov esi, 6
+    off += 5;
+    image[off..off + 5].copy_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+    off += 5;
+    emit_lea_rip(&mut image, &mut off, 1, CMP); // rcx
+    emit_indirect_call(&mut image, &mut off, SLOT);
+    // Verify ascending order in guest code: rsi walks, ecx counts pairs.
+    emit_lea_rip(&mut image, &mut off, 6, ARRAY); // rsi
+    image[off..off + 5].copy_from_slice(&[0xB9, 0x05, 0x00, 0x00, 0x00]); // mov ecx, 5
+    off += 5;
+    let check = off;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x06]); // mov rax, [rsi]
+    off += 3;
+    image[off..off + 4].copy_from_slice(&[0x48, 0x39, 0x46, 0x08]); // cmp [rsi+8], rax
+    off += 4;
+    let jb_fail = off; // jb fail (patched below)
+    image[off] = 0x72;
+    off += 2;
+    image[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xC6, 0x08]); // add rsi, 8
+    off += 4;
+    image[off..off + 2].copy_from_slice(&[0xFF, 0xC9]); // dec ecx
+    off += 2;
+    image[off] = 0x75; // jnz check
+    image[off + 1] = (check as i64 - (off as i64 + 2)) as i8 as u8;
+    off += 2;
+    // mov eax, [rip+COUNTER]; ret
+    image[off..off + 2].copy_from_slice(&[0x8B, 0x05]);
+    let counter_disp = (COUNTER as i64 - (off as i64 + 6)) as i32;
+    image[off + 2..off + 6].copy_from_slice(&counter_disp.to_le_bytes());
+    off += 6;
+    image[off] = 0xC3;
+    off += 1;
+    let fail = off;
+    image[jb_fail + 1] = (fail as i64 - (jb_fail as i64 + 2)) as i8 as u8;
+    image[off] = 0xB8; // mov eax, 0xBAD (order violated)
+    image[off + 1..off + 5].copy_from_slice(&0xBADu32.to_le_bytes());
+    image[off + 5] = 0xC3;
+    assert!(off + 6 <= CMP, "entry code must not overlap the comparator");
+
+    // Comparator(a=rdi, b=rsi): count the call, then C-style <0/0/>0 on the
+    // pointed-at u64s.
+    let mut cmp = CMP;
+    image[cmp..cmp + 2].copy_from_slice(&[0xFF, 0x05]); // inc dword [rip+COUNTER]
+    let inc_disp = (COUNTER as i64 - (cmp as i64 + 6)) as i32;
+    image[cmp + 2..cmp + 6].copy_from_slice(&inc_disp.to_le_bytes());
+    cmp += 6;
+    image[cmp..cmp + 3].copy_from_slice(&[0x48, 0x8B, 0x07]); // mov rax, [rdi]
+    cmp += 3;
+    image[cmp..cmp + 3].copy_from_slice(&[0x48, 0x3B, 0x06]); // cmp rax, [rsi]
+    cmp += 3;
+    image[cmp..cmp + 5].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+    cmp += 5;
+    image[cmp..cmp + 2].copy_from_slice(&[0x77, 0x09]); // ja done
+    cmp += 2;
+    image[cmp..cmp + 5].copy_from_slice(&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov eax, -1
+    cmp += 5;
+    image[cmp..cmp + 2].copy_from_slice(&[0x72, 0x02]); // jb done
+    cmp += 2;
+    image[cmp..cmp + 2].copy_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    cmp += 2;
+    image[cmp] = 0xC3; // done: ret
+    assert!(cmp < SLOT, "comparator must not overlap the import slot");
+
+    image[SLOT..SLOT + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    for (i, v) in VALUES.iter().enumerate() {
+        image[ARRAY + i * 8..ARRAY + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let linked = callback_fixture_module(image, &[("libc", "qsort")]);
+    let kernel = OrbisKernel::new();
+    let result = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect("qsort with a guest comparator must complete");
+    assert_ne!(result, 0xBAD, "the array must be ascending after qsort");
+    assert!(
+        (5..=64).contains(&result),
+        "the guest comparator must have run a plausible number of times \
+         (n-1 ≤ calls ≤ 64 for n=6), got {result}"
+    );
+}

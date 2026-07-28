@@ -90,12 +90,14 @@ pub fn register(registry: &HleRegistry) {
     // titles (artifacts/compat/nid-coverage.json; list in
     // scratch/nid-fill/missing-libc.txt). Implemented below with real,
     // host-backed behavior — grouped here by family. The skipped remainder
-    // is listed with reasons in the big comment above `kernel_key`:
-    // qsort (needs a synchronous guest comparator callback), the C++
+    // is listed with reasons in the big comment above `kernel_key`: the C++
     // unwinder family, data objects (vtables/typeinfo/locale ids), and the
     // Dinkumware locale/iostream internals whose object layouts this build
-    // cannot verify.
+    // cannot verify. (qsort left this list 2026-07-27 when
+    // GuestCallScheduler::call_guest gained synchronous guest callbacks.)
     // ------------------------------------------------------------------
+    // Sorting with a REAL synchronous guest comparator (checklist item 7).
+    register_abi(registry, "qsort", hle_qsort);
     // Dinkumware CRT internals (Sony's libc is Dinkumware-derived).
     register_abi(registry, "_Assert", hle_dinkum_assert);
     register_abi(registry, "_Atomic_fetch_add_4", hle_atomic_fetch_add_4);
@@ -1696,8 +1698,6 @@ fn hle_posix_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
 // lie (the unresolved-trampoline path already logs the NID loudly and the
 // report back lists every one):
 //
-// * qsort: needs a SYNCHRONOUS guest comparator callback mid-sort;
-//   GuestCallScheduler only defers a single post-return callback.
 // * the C++ unwinder (_Unwind_Resume, __cxa_begin_catch, __cxa_end_catch,
 //   __cxa_rethrow, __gxx_personality_v0) and __dynamic_cast: real stack
 //   unwinding and an RTTI graph walk are runtime machinery HLE cannot
@@ -1711,6 +1711,172 @@ fn hle_posix_memalign(ctx: &HleContext, args: &[u64]) -> u64 {
 //   operate on C++ object layouts this build cannot verify, so any
 //   implementation would be a guess that corrupts or double-frees.
 // ---------------------------------------------------------------------------
+
+/// Upper bound on `nmemb * size` for [`hle_qsort`]. A garbage length from a
+/// confused guest must fail loudly here, not spin the sort across terabytes
+/// of unmapped address space (every element access is still bounds-checked
+/// individually; this cap just keeps the failure immediate and attributable).
+const QSORT_MAX_TOTAL_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Upper bound on a single element's `size` for [`hle_qsort`] — bounds the
+/// two host-side swap buffers.
+const QSORT_MAX_ELEM_BYTES: u64 = 1 << 24; // 16 MiB
+
+/// Why an in-flight qsort had to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QsortAbort {
+    /// The synchronous comparator dispatch was refused (test double, direct
+    /// gateway). A comparator that *starts* and then faults or unwinds never
+    /// produces this — the runtime's recovery machinery abandons the whole
+    /// handler instead (see `GuestCallScheduler::call_guest`).
+    Call(crate::GuestCallError),
+    /// A guest element read/write at this address failed the bounds check.
+    Memory(u64),
+}
+
+/// `void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const
+/// void *, const void *))` — a REAL sort with a REAL guest comparator,
+/// dispatched synchronously mid-sort through
+/// [`crate::GuestCallScheduler::call_guest`] (checklist item 7's first
+/// consumer).
+///
+/// In-place heapsort over guest memory: every comparator invocation receives
+/// genuine pointers **into the live array** (maximum ABI fidelity — a
+/// comparator that inspects addresses sees exactly what hardware would show
+/// it), swaps move `size`-byte elements through bounds-checked guest
+/// reads/writes, and no scratch guest allocation is needed. Heapsort keeps
+/// the O(n log n) bound without qsort's recursion (comparator calls are
+/// exception round-trips through the runtime, so the comparison count
+/// matters) and is trivially abortable mid-flight.
+///
+/// Failure honesty: a null/refused comparator logs loudly and leaves the
+/// array untouched (the refusal is deterministic, so it always precedes the
+/// first swap); a mid-sort memory failure logs the address and leaves the
+/// array partially heapified — never silently "sorted". A comparator that
+/// faults or triggers a fatal unwind never returns control here at all.
+fn hle_qsort(ctx: &HleContext, args: &[u64]) -> u64 {
+    let base = args[0];
+    let nmemb = args[1];
+    let size = args[2];
+    let compar = args[3];
+    if nmemb < 2 || size == 0 {
+        return 0; // Nothing to reorder; C says this is a no-op.
+    }
+    if compar == 0 {
+        warn!("qsort(base={base:#x}, nmemb={nmemb}, size={size}): null comparator — untouched");
+        return 0;
+    }
+    let total = nmemb.checked_mul(size);
+    if size > QSORT_MAX_ELEM_BYTES
+        || total.is_none_or(|t| t > QSORT_MAX_TOTAL_BYTES)
+        || base.checked_add(total.unwrap_or(u64::MAX)).is_none()
+    {
+        warn!("qsort(base={base:#x}, nmemb={nmemb}, size={size}): implausible extent — untouched");
+        return 0;
+    }
+    match qsort_heapsort(ctx, base, nmemb, size, compar) {
+        Ok(comparator_calls) => {
+            debug!(
+                "qsort(base={base:#x}, nmemb={nmemb}, size={size}, compar={compar:#x}): sorted \
+                 with {comparator_calls} guest comparator calls"
+            );
+        }
+        Err(QsortAbort::Call(err)) => {
+            tracing::error!(
+                "qsort(base={base:#x}, nmemb={nmemb}, size={size}): synchronous guest \
+                 comparator dispatch refused ({err:?}) — this dispatch path cannot re-enter \
+                 guest code; array left unsorted"
+            );
+        }
+        Err(QsortAbort::Memory(addr)) => {
+            warn!(
+                "qsort(base={base:#x}, nmemb={nmemb}, size={size}): guest element access at \
+                 {addr:#x} failed mid-sort — array left partially reordered"
+            );
+        }
+    }
+    0
+}
+
+/// The heapsort behind [`hle_qsort`]. Returns the number of guest comparator
+/// calls made. Ordering follows C `qsort`: the comparator's `int` return
+/// (RAX's low 32 bits, sign-interpreted) — negative means `a < b`.
+fn qsort_heapsort(
+    ctx: &HleContext,
+    base: u64,
+    nmemb: u64,
+    size: u64,
+    compar: u64,
+) -> Result<u64, QsortAbort> {
+    let elem = |i: u64| base + i * size;
+
+    // compare(elements at indices i, j) via the guest comparator.
+    let mut comparator_calls = 0u64;
+    let mut cmp = |i: u64, j: u64| -> Result<i32, QsortAbort> {
+        comparator_calls += 1;
+        let raw = ctx
+            .guest_calls
+            .call_guest(compar, [elem(i), elem(j), 0, 0, 0, 0])
+            .map_err(QsortAbort::Call)?;
+        // SysV int return: the callee's meaningful result is EAX.
+        Ok(raw as u32 as i32)
+    };
+    let swap = |i: u64, j: u64| -> Result<(), QsortAbort> {
+        let mut a = vec![0u8; size as usize];
+        let mut b = vec![0u8; size as usize];
+        if !ctx.mem.read(elem(i), &mut a) {
+            return Err(QsortAbort::Memory(elem(i)));
+        }
+        if !ctx.mem.read(elem(j), &mut b) {
+            return Err(QsortAbort::Memory(elem(j)));
+        }
+        if !ctx.mem.write(elem(i), &b) {
+            return Err(QsortAbort::Memory(elem(i)));
+        }
+        if !ctx.mem.write(elem(j), &a) {
+            return Err(QsortAbort::Memory(elem(j)));
+        }
+        Ok(())
+    };
+    // Sift the max-heap property down from `root` over the heap `0..=end`.
+    let mut sift_down = |mut root: u64, end: u64| -> Result<(), QsortAbort> {
+        loop {
+            let child = 2 * root + 1;
+            if child > end {
+                return Ok(());
+            }
+            let mut largest = root;
+            if cmp(largest, child)? < 0 {
+                largest = child;
+            }
+            if child < end && cmp(largest, child + 1)? < 0 {
+                largest = child + 1;
+            }
+            if largest == root {
+                return Ok(());
+            }
+            swap(root, largest)?;
+            root = largest;
+        }
+    };
+
+    // Build the max-heap, then repeatedly move the maximum to the tail.
+    let mut start = (nmemb - 2) / 2;
+    loop {
+        sift_down(start, nmemb - 1)?;
+        if start == 0 {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = nmemb - 1;
+    while end > 0 {
+        swap(0, end)?;
+        end -= 1;
+        sift_down(0, end)?;
+    }
+    Ok(comparator_calls)
+}
 
 /// Process-scoped key for the per-process tables below: the live kernel's
 /// host address. One guest process per host process (the RT0 invariant the
@@ -4379,6 +4545,141 @@ fn hle_std_uncaught_exception(_ctx: &HleContext, _args: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::{GuestMemory, test_ctx};
+
+    /// A host-side stand-in for the runtime's synchronous guest-callback
+    /// dispatch: "calls" the comparator by reading the two pointed-at `u64`s
+    /// straight from the shared test memory and comparing them — exactly the
+    /// observable behavior of the guest comparator fixture the runtime
+    /// acceptance test uses.
+    struct HostComparator<'a> {
+        mem: &'a crate::TestMemory,
+        expected_entry: u64,
+        calls: std::cell::Cell<u64>,
+    }
+
+    impl crate::GuestCallScheduler for HostComparator<'_> {
+        fn request(&self, _request: crate::GuestCallRequest) -> bool {
+            false
+        }
+
+        fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, crate::GuestCallError> {
+            assert_eq!(
+                entry, self.expected_entry,
+                "qsort must dispatch the comparator the guest supplied"
+            );
+            self.calls.set(self.calls.get() + 1);
+            let read = |addr: u64| {
+                let mut bytes = [0u8; 8];
+                assert!(
+                    self.mem.read(addr, &mut bytes),
+                    "comparator argument {addr:#x} must point into the live array"
+                );
+                u64::from_le_bytes(bytes)
+            };
+            let (a, b) = (read(args[0]), read(args[1]));
+            Ok(match a.cmp(&b) {
+                std::cmp::Ordering::Less => (-1i32) as u32 as u64,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            })
+        }
+    }
+
+    /// `qsort` end-to-end at the HLE level: an in-memory `u64` array is
+    /// sorted ascending through synchronous comparator dispatches that
+    /// receive REAL element addresses inside the array, and the comparator
+    /// runs at least `nmemb - 1` times (no sort can verify order with
+    /// fewer comparisons).
+    #[test]
+    fn qsort_sorts_a_guest_array_through_a_synchronous_comparator() {
+        const BASE: u64 = 0x100;
+        const CMP_ENTRY: u64 = 0x9000;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let values: [u64; 7] = [5, 1, 4, 2, 6, 3, 3];
+        for (i, v) in values.iter().enumerate() {
+            assert!(mem.write(BASE + i as u64 * 8, &v.to_le_bytes()));
+        }
+        let comparator = HostComparator {
+            mem: &mem,
+            expected_entry: CMP_ENTRY,
+            calls: std::cell::Cell::new(0),
+        };
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &comparator);
+
+        let ret = hle_qsort(&ctx, &[BASE, values.len() as u64, 8, CMP_ENTRY, 0, 0]);
+        assert_eq!(ret, 0, "qsort returns void");
+
+        let mut sorted = [0u64; 7];
+        for (i, slot) in sorted.iter_mut().enumerate() {
+            let mut bytes = [0u8; 8];
+            assert!(mem.read(BASE + i as u64 * 8, &mut bytes));
+            *slot = u64::from_le_bytes(bytes);
+        }
+        assert_eq!(
+            sorted,
+            [1, 2, 3, 3, 4, 5, 6],
+            "ascending per the comparator"
+        );
+        assert!(
+            comparator.calls.get() >= values.len() as u64 - 1,
+            "a real sort cannot order {} elements with only {} comparator calls",
+            values.len(),
+            comparator.calls.get()
+        );
+    }
+
+    /// A dispatch context that cannot re-enter guest code (the default
+    /// `call_guest` — test doubles, the direct gateway) must leave the array
+    /// byte-for-byte untouched and still return: refusal happens before the
+    /// first swap, never mid-sort.
+    #[test]
+    fn qsort_without_call_guest_support_leaves_the_array_untouched() {
+        const BASE: u64 = 0x100;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let values: [u64; 4] = [4, 3, 2, 1];
+        for (i, v) in values.iter().enumerate() {
+            assert!(mem.write(BASE + i as u64 * 8, &v.to_le_bytes()));
+        }
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_qsort(&ctx, &[BASE, 4, 8, 0x9000, 0, 0]), 0);
+
+        for (i, v) in values.iter().enumerate() {
+            let mut bytes = [0u8; 8];
+            assert!(mem.read(BASE + i as u64 * 8, &mut bytes));
+            assert_eq!(
+                u64::from_le_bytes(bytes),
+                *v,
+                "refused dispatch must not have moved element {i}"
+            );
+        }
+    }
+
+    /// Degenerate inputs are C-standard no-ops, and a null comparator is
+    /// refused without touching memory.
+    #[test]
+    fn qsort_degenerate_inputs_are_no_ops() {
+        const BASE: u64 = 0x100;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        assert!(mem.write(BASE, &7u64.to_le_bytes()));
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        assert_eq!(hle_qsort(&ctx, &[BASE, 0, 8, 0x9000, 0, 0]), 0); // nmemb 0
+        assert_eq!(hle_qsort(&ctx, &[BASE, 1, 8, 0x9000, 0, 0]), 0); // nmemb 1
+        assert_eq!(hle_qsort(&ctx, &[BASE, 4, 0, 0x9000, 0, 0]), 0); // size 0
+        assert_eq!(hle_qsort(&ctx, &[BASE, 4, 8, 0, 0, 0]), 0); // null comparator
+        assert_eq!(hle_qsort(&ctx, &[BASE, u64::MAX, 8, 0x9000, 0, 0]), 0); // overflow
+
+        let mut bytes = [0u8; 8];
+        assert!(mem.read(BASE, &mut bytes));
+        assert_eq!(u64::from_le_bytes(bytes), 7, "no degenerate call may write");
+    }
 
     /// M1-C: `printf` reads the guest format string and `%s` pointee, formats
     /// against the captured registers, and lands the output in the kernel
