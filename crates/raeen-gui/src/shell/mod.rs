@@ -2441,6 +2441,9 @@ fn trophy_summary_for(item: &LibraryItem) -> Option<per_game::TrophySummary> {
     })
 }
 
+// One positional arg per independent overlay input; a params struct would
+// just move the same eight names one level down at this single call site.
+#[allow(clippy::too_many_arguments)]
 fn draw_session_overlay(
     ui: &mut egui::Ui,
     theme: &Theme,
