@@ -34,6 +34,7 @@
 
 pub mod builtin;
 pub mod cabi;
+pub mod cabi_v3;
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -167,6 +168,31 @@ pub trait PresentPlugin: Send + Sync {
         None
     }
 
+    /// Pre-device Vulkan requirements advertised through ABI v3. CPU plugins
+    /// and older binaries return `None`.
+    fn vulkan_requirements_v3(&self) -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
+        None
+    }
+
+    /// Initialize the ABI-v3 GPU instance after Raeen created a device with
+    /// the plugin's declared requirements.
+    fn initialize_gpu_v3(&mut self, _host: &cabi_v3::RaeenVulkanHostV3) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Release plugin-owned GPU state while the Vulkan device is still alive.
+    fn shutdown_gpu_v3(&mut self) {}
+
+    /// Record one GPU-resident temporal pass. The host owns every resource and
+    /// submits the command buffer after this call returns.
+    fn process_gpu_v3(
+        &mut self,
+        _frame: &cabi_v3::RaeenPresentFrameV3,
+        _output: &mut cabi_v3::RaeenPluginOutputV3,
+    ) -> i32 {
+        cabi_v3::RAEEN_V3_DECLINED
+    }
+
     /// Transform one complete source frame into the frame(s) to present.
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput;
 }
@@ -238,6 +264,47 @@ impl Registry {
             .collect()
     }
 
+    fn active_vulkan_requirements_v3(&self) -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
+        let name = self.active.as_ref()?;
+        self.plugins.get(name)?.vulkan_requirements_v3()
+    }
+
+    fn initialize_active_gpu_v3(
+        &mut self,
+        host: &cabi_v3::RaeenVulkanHostV3,
+    ) -> Result<(), String> {
+        let Some(name) = self.active.clone() else {
+            return Ok(());
+        };
+        let Some(plugin) = self.plugins.get_mut(&name) else {
+            return Ok(());
+        };
+        plugin.initialize_gpu_v3(host)
+    }
+
+    fn process_active_gpu_v3(
+        &mut self,
+        frame: &cabi_v3::RaeenPresentFrameV3,
+        output: &mut cabi_v3::RaeenPluginOutputV3,
+    ) -> i32 {
+        let Some(name) = self.active.clone() else {
+            return cabi_v3::RAEEN_V3_DECLINED;
+        };
+        let Some(plugin) = self.plugins.get_mut(&name) else {
+            return cabi_v3::RAEEN_V3_DECLINED;
+        };
+        plugin.process_gpu_v3(frame, output)
+    }
+
+    fn shutdown_active_gpu_v3(&mut self) {
+        let Some(name) = self.active.clone() else {
+            return;
+        };
+        if let Some(plugin) = self.plugins.get_mut(&name) {
+            plugin.shutdown_gpu_v3();
+        }
+    }
+
     /// Run the active plugin, or `None` for the identity fast path.
     fn apply_frame(
         &mut self,
@@ -280,6 +347,35 @@ pub fn select_none() {
 #[must_use]
 pub fn active() -> Option<String> {
     registry().lock().active.clone()
+}
+
+/// Vulkan requirements for the active ABI-v3 plugin. The runner selects its
+/// persisted plugin before the lazy Vulkan backend is created.
+#[must_use]
+pub fn active_vulkan_requirements_v3() -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
+    registry().lock().active_vulkan_requirements_v3()
+}
+
+/// Initialize the selected ABI-v3 plugin against the newly-created Vulkan
+/// device. No-op for built-ins and v1/v2-only plugins.
+pub(crate) fn initialize_active_gpu_v3(host: &cabi_v3::RaeenVulkanHostV3) -> Result<(), String> {
+    registry().lock().initialize_active_gpu_v3(host)
+}
+
+/// Record the selected ABI-v3 plugin into a host-owned command buffer.
+///
+/// The caller must have transitioned and synchronized all resources according
+/// to the validated frame contract. No-op/declined for non-v3 plugins.
+pub fn process_active_gpu_v3(
+    frame: &cabi_v3::RaeenPresentFrameV3,
+    output: &mut cabi_v3::RaeenPluginOutputV3,
+) -> i32 {
+    registry().lock().process_active_gpu_v3(frame, output)
+}
+
+/// Destroy selected-plugin GPU state before its Vulkan device is destroyed.
+pub(crate) fn shutdown_active_gpu_v3() {
+    registry().lock().shutdown_active_gpu_v3();
 }
 
 /// `(name, capabilities)` for every registered plugin — for a Settings dropdown.

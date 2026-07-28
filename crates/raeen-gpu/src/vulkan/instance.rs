@@ -11,10 +11,10 @@
 //! is wired later, when `libSceVideoOut` flips reach the backend.
 
 use super::cache::{DrawCacheStats, DrawCaches};
-use ash::{Device, Entry, Instance, ext::debug_utils, vk};
+use ash::{Device, Entry, Instance, ext::debug_utils, vk, vk::Handle};
 use parking_lot::{Mutex, MutexGuard};
 use raeen_core::error::GpuError;
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
@@ -150,8 +150,9 @@ impl VulkanDevice {
         let entry = unsafe { Entry::load() }
             .map_err(|e| GpuError::VulkanInitFailed(format!("Vulkan loader unavailable: {e}")))?;
 
+        let plugin_requirements = crate::present_plugin::active_vulkan_requirements_v3();
         let (instance, validation_enabled, debug_utils_enabled) =
-            Self::create_instance(&entry, validation)?;
+            Self::create_instance(&entry, validation, plugin_requirements.as_ref())?;
 
         // Attach the debug messenger before device selection so that
         // validation errors during the remaining setup are still reported.
@@ -163,7 +164,7 @@ impl VulkanDevice {
 
         // From here on, any early return must not leak the instance, so each
         // fallible step cleans up explicitly via `destroy_partial`.
-        let result = Self::pick_and_create_device(&entry, &instance);
+        let result = Self::pick_and_create_device(&entry, &instance, plugin_requirements.as_ref());
         let (
             physical_device,
             device,
@@ -298,7 +299,7 @@ impl VulkanDevice {
             }
         };
 
-        Ok(Self {
+        let result = Self {
             entry,
             instance,
             physical_device,
@@ -321,7 +322,31 @@ impl VulkanDevice {
             imported_host_pointer_alignment,
             max_push_constants_size,
             validation_enabled,
-        })
+        };
+
+        let plugin_host = crate::present_plugin::cabi_v3::RaeenVulkanHostV3 {
+            instance: result.instance.handle().as_raw(),
+            physical_device: result.physical_device.as_raw(),
+            device: result.device.handle().as_raw(),
+            graphics_queue: result.queue.as_raw(),
+            // Raeen currently records graphics and compute on the same
+            // graphics-capable queue. Optical flow is rejected during
+            // requirements negotiation until a dedicated queue is owned.
+            compute_queue: result.queue.as_raw(),
+            optical_flow_queue: 0,
+            graphics_queue_family: result.queue_family_index,
+            compute_queue_family: result.queue_family_index,
+            optical_flow_queue_family: u32::MAX,
+            _reserved: 0,
+            get_instance_proc_addr: result.entry.static_fn().get_instance_proc_addr
+                as *const c_void,
+            get_device_proc_addr: result.instance.fp_v1_0().get_device_proc_addr as *const c_void,
+        };
+        crate::present_plugin::initialize_active_gpu_v3(&plugin_host).map_err(|error| {
+            GpuError::VulkanInitFailed(format!("active GPU plugin initialization failed: {error}"))
+        })?;
+
+        Ok(result)
     }
 
     /// Whether per-attachment blend/write-mask state is available
@@ -537,6 +562,7 @@ impl VulkanDevice {
     fn create_instance(
         entry: &Entry,
         validation: bool,
+        plugin_requirements: Option<&crate::present_plugin::cabi_v3::RaeenVulkanRequirementsV3>,
     ) -> Result<(Instance, bool, bool), GpuError> {
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"Raeen")
@@ -564,6 +590,42 @@ impl VulkanDevice {
         let mut extensions: Vec<*const i8> = Vec::new();
         if debug_utils_available {
             extensions.push(debug_utils::NAME.as_ptr());
+        }
+        let mut plugin_extension_names = Vec::new();
+        if let Some(requirements) = plugin_requirements {
+            if requirements.minimum_api_version > vk::API_VERSION_1_3 {
+                return Err(GpuError::VulkanInitFailed(format!(
+                    "active plugin requires Vulkan API {:#x}, Raeen creates {:#x}",
+                    requirements.minimum_api_version,
+                    vk::API_VERSION_1_3
+                )));
+            }
+            for name in
+                &requirements.instance_extensions[..requirements.instance_extension_count as usize]
+            {
+                let name = CString::new(name.as_str().map_err(|error| {
+                    GpuError::VulkanInitFailed(format!(
+                        "active plugin returned an invalid instance extension: {error:?}"
+                    ))
+                })?)
+                .map_err(|_| {
+                    GpuError::VulkanInitFailed(
+                        "active plugin instance extension contains NUL".to_string(),
+                    )
+                })?;
+                if !Self::has_instance_extension(entry, &name) {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "active plugin requires unavailable instance extension {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                plugin_extension_names.push(name);
+            }
+            for name in &plugin_extension_names {
+                if name.as_c_str() != debug_utils::NAME {
+                    extensions.push(name.as_ptr());
+                }
+            }
         }
 
         let create_info = vk::InstanceCreateInfo::default()
@@ -641,6 +703,7 @@ impl VulkanDevice {
     fn pick_and_create_device(
         _entry: &Entry,
         instance: &Instance,
+        plugin_requirements: Option<&crate::present_plugin::cabi_v3::RaeenVulkanRequirementsV3>,
     ) -> Result<PickedDevice, GpuError> {
         // SAFETY: `instance` is live; enumeration only fills a Vec of handles.
         let devices = unsafe { instance.enumerate_physical_devices() }
@@ -718,6 +781,68 @@ impl VulkanDevice {
         // copy. See docs/superpowers/plans/2026-07-27-gpu-resident-present.md
         // (phase 1). Absent it, the existing copy path is used unchanged.
         let external_memory_host = has_device_ext(c"VK_EXT_external_memory_host");
+        let mut plugin_device_extension_names = Vec::new();
+        if let Some(requirements) = plugin_requirements {
+            if requirements.extra_graphics_queues != 0
+                || requirements.extra_compute_queues != 0
+                || requirements.extra_optical_flow_queues != 0
+            {
+                return Err(GpuError::VulkanInitFailed(
+                    "active plugin requests extra Vulkan queues; this host does not yet expose \
+                     safe multi-queue ownership"
+                        .to_string(),
+                ));
+            }
+            let queue_properties =
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+            let selected_queue = queue_properties
+                .get(queue_family_index as usize)
+                .ok_or_else(|| {
+                    GpuError::VulkanInitFailed(
+                        "selected Vulkan queue family disappeared".to_string(),
+                    )
+                })?;
+            if requirements.required_queue_flags
+                & crate::present_plugin::cabi_v3::RAEEN_V3_QUEUE_COMPUTE
+                != 0
+                && !selected_queue.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            {
+                return Err(GpuError::VulkanInitFailed(
+                    "active plugin requires compute on the selected Vulkan queue".to_string(),
+                ));
+            }
+            if requirements.required_queue_flags
+                & crate::present_plugin::cabi_v3::RAEEN_V3_QUEUE_OPTICAL_FLOW
+                != 0
+            {
+                return Err(GpuError::VulkanInitFailed(
+                    "active plugin requires a dedicated optical-flow queue; unsupported by the \
+                     current host"
+                        .to_string(),
+                ));
+            }
+            for name in
+                &requirements.device_extensions[..requirements.device_extension_count as usize]
+            {
+                let name = CString::new(name.as_str().map_err(|error| {
+                    GpuError::VulkanInitFailed(format!(
+                        "active plugin returned an invalid device extension: {error:?}"
+                    ))
+                })?)
+                .map_err(|_| {
+                    GpuError::VulkanInitFailed(
+                        "active plugin device extension contains NUL".to_string(),
+                    )
+                })?;
+                if !has_device_ext(&name) {
+                    return Err(GpuError::VulkanInitFailed(format!(
+                        "active plugin requires unavailable device extension {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                plugin_device_extension_names.push(name);
+            }
+        }
         let mut extension_names: Vec<*const i8> = Vec::new();
         if depth_range_unrestricted {
             extension_names.push(c"VK_EXT_depth_range_unrestricted".as_ptr());
@@ -727,6 +852,17 @@ impl VulkanDevice {
         }
         if external_memory_host {
             extension_names.push(c"VK_EXT_external_memory_host".as_ptr());
+        }
+        for name in &plugin_device_extension_names {
+            if ![
+                c"VK_EXT_depth_range_unrestricted",
+                c"VK_EXT_robustness2",
+                c"VK_EXT_external_memory_host",
+            ]
+            .contains(&name.as_c_str())
+            {
+                extension_names.push(name.as_ptr());
+            }
         }
 
         let priorities = [1.0f32];
@@ -935,6 +1071,9 @@ impl Drop for VulkanDevice {
         // device cannot be recovered here and drop must not panic.
         unsafe {
             let _ = self.device.device_wait_idle();
+            // The plugin may own pipelines/descriptors created from this
+            // device. Destroy them after idle but before any Vulkan parent.
+            crate::present_plugin::shutdown_active_gpu_v3();
             self.caches.get_mut().destroy(
                 &self.device,
                 self.command_pool,

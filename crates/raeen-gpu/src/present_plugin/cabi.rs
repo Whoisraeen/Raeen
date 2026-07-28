@@ -48,7 +48,11 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use super::{Capabilities, PluginFrame, PluginOutput, PresentContext, PresentFrame, PresentPlugin};
+use serde::Deserialize;
+
+use super::{
+    Capabilities, PluginFrame, PluginOutput, PresentContext, PresentFrame, PresentPlugin, cabi_v3,
+};
 
 /// ABI generation understood by this build. A plugin reporting anything else is
 /// refused — the vtable layout is only meaningful for a matching version.
@@ -419,6 +423,10 @@ pub enum LoadError {
     CreateFailed { path: PathBuf },
     #[error("plugin {path} reported an unusable name ({reason})")]
     BadName { path: PathBuf, reason: &'static str },
+    #[error("plugin {path} has an invalid ABI-v3 requirements entry: {reason}")]
+    BadV3Requirements { path: PathBuf, reason: String },
+    #[error("plugin package manifest {path} is invalid: {reason}")]
+    BadManifest { path: PathBuf, reason: String },
 }
 
 // ─── The adapter ────────────────────────────────────────────────────────────
@@ -434,6 +442,11 @@ pub struct DynamicPlugin {
     capabilities: Capabilities,
     /// Points into the loaded image; valid only while `_library` is alive.
     vtable: PluginVtable,
+    /// Optional ABI-v3 entry in the same image. The v1/v2 vtable remains the
+    /// CPU compatibility path until GPU-frame execution is wired.
+    vtable_v3: Option<*const cabi_v3::RaeenPluginV3>,
+    requirements_v3: Option<cabi_v3::RaeenVulkanRequirementsV3>,
+    instance_v3: *mut c_void,
     instance: *mut c_void,
     source: PathBuf,
     /// `None` for a vtable supplied directly (tests, or a statically-known
@@ -552,6 +565,9 @@ impl DynamicPlugin {
             name,
             capabilities: capabilities_from_bits(bits),
             vtable: PluginVtable::V1(vtable),
+            vtable_v3: None,
+            requirements_v3: None,
+            instance_v3: std::ptr::null_mut(),
             instance,
             source,
             _library: library,
@@ -626,15 +642,78 @@ impl DynamicPlugin {
             name,
             capabilities: capabilities_from_bits(bits),
             vtable: PluginVtable::V2(vtable),
+            vtable_v3: None,
+            requirements_v3: None,
+            instance_v3: std::ptr::null_mut(),
             instance,
             source,
             _library: library,
         })
     }
+
+    /// Validate and attach the optional ABI-v3 pre-device requirements entry.
+    ///
+    /// A v3-capable binary also exports v1 or v2 for older/CPU-only hosts. The
+    /// v3 entry is authoritative when present: malformed requirements refuse
+    /// the plugin instead of creating a Vulkan device that cannot run it.
+    unsafe fn attach_v3(
+        mut self,
+        vtable: *const cabi_v3::RaeenPluginV3,
+    ) -> Result<Self, LoadError> {
+        let bad = |reason: String| LoadError::BadV3Requirements {
+            path: self.source.clone(),
+            reason,
+        };
+        if vtable.is_null() {
+            return Err(bad("entry returned a null vtable".to_string()));
+        }
+        // SAFETY: the entry point promised a statically-lived v3 vtable in the
+        // library retained by `self`.
+        let vt = unsafe { *vtable };
+        if vt.abi_version != cabi_v3::RAEEN_PLUGIN_ABI_VERSION_V3 {
+            return Err(bad(format!(
+                "reported ABI {}, expected {}",
+                vt.abi_version,
+                cabi_v3::RAEEN_PLUGIN_ABI_VERSION_V3
+            )));
+        }
+        if vt.struct_size as usize != std::mem::size_of::<cabi_v3::RaeenPluginV3>() {
+            return Err(bad(format!("unexpected vtable size {}", vt.struct_size)));
+        }
+        let mut requirements = cabi_v3::RaeenVulkanRequirementsV3::empty();
+        // SAFETY: output is host-owned, correctly sized, and live for the call.
+        let result = unsafe { (vt.query_requirements)(&mut requirements) };
+        if result != cabi_v3::RAEEN_V3_OK {
+            return Err(bad(format!("query_requirements returned {result}")));
+        }
+        requirements
+            .validate()
+            .map_err(|error| bad(format!("{error:?}")))?;
+        self.vtable_v3 = Some(vtable);
+        self.requirements_v3 = Some(requirements);
+        Ok(self)
+    }
+
+    fn destroy_gpu_v3(&mut self) {
+        if self.instance_v3.is_null() {
+            return;
+        }
+        // SAFETY: the v3 instance came from this retained vtable's create
+        // callback and has not yet been destroyed.
+        unsafe {
+            if let Some(vtable) = self.vtable_v3
+                && !vtable.is_null()
+            {
+                ((*vtable).destroy)(self.instance_v3);
+            }
+        }
+        self.instance_v3 = std::ptr::null_mut();
+    }
 }
 
 impl Drop for DynamicPlugin {
     fn drop(&mut self) {
+        self.destroy_gpu_v3();
         if self.instance.is_null() {
             return;
         }
@@ -764,6 +843,55 @@ impl PresentPlugin for DynamicPlugin {
 
     fn source_path(&self) -> Option<&Path> {
         Some(&self.source)
+    }
+
+    fn vulkan_requirements_v3(&self) -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
+        self.requirements_v3
+    }
+
+    fn initialize_gpu_v3(&mut self, host: &cabi_v3::RaeenVulkanHostV3) -> Result<(), String> {
+        let Some(vtable) = self.vtable_v3 else {
+            return Ok(());
+        };
+        if !self.instance_v3.is_null() {
+            return Ok(());
+        }
+        // SAFETY: vtable is validated and retained by `_library`; host is live
+        // for the call and contains handles owned by the new Vulkan device.
+        let instance = unsafe { ((*vtable).create)(host) };
+        if instance.is_null() {
+            return Err(format!(
+                "plugin {} failed ABI-v3 GPU initialization",
+                self.name
+            ));
+        }
+        self.instance_v3 = instance;
+        Ok(())
+    }
+
+    fn shutdown_gpu_v3(&mut self) {
+        self.destroy_gpu_v3();
+    }
+
+    fn process_gpu_v3(
+        &mut self,
+        frame: &cabi_v3::RaeenPresentFrameV3,
+        output: &mut cabi_v3::RaeenPluginOutputV3,
+    ) -> i32 {
+        let (Some(vtable), false) = (self.vtable_v3, self.instance_v3.is_null()) else {
+            return cabi_v3::RAEEN_V3_DECLINED;
+        };
+        if let Err(error) = frame.validate() {
+            tracing::warn!(
+                plugin = %self.name,
+                ?error,
+                "refused invalid ABI-v3 GPU frame before calling plugin"
+            );
+            return cabi_v3::RAEEN_V3_BAD_INPUT;
+        }
+        // SAFETY: validated frame/output are live for the call; vtable and
+        // instance remain owned by `self`.
+        unsafe { ((*vtable).process)(self.instance_v3, frame, output) }
     }
 
     fn process(&mut self, frame: &PresentFrame<'_>, ctx: &PresentContext) -> PluginOutput {
@@ -953,6 +1081,99 @@ pub const fn plugin_extension() -> &'static str {
     }
 }
 
+const PLUGIN_MANIFEST: &str = "raeen-plugin.json";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginManifest {
+    schema_version: u32,
+    id: String,
+    entrypoints: std::collections::BTreeMap<String, String>,
+}
+
+#[must_use]
+fn plugin_platform_key() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "windows-x86_64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("macos", "aarch64") => "macos-aarch64",
+        ("macos", "x86_64") => "macos-x86_64",
+        _ => "unsupported",
+    }
+}
+
+fn manifest_entry(manifest_path: &Path) -> Result<PathBuf, LoadError> {
+    let bad = |reason: String| LoadError::BadManifest {
+        path: manifest_path.to_path_buf(),
+        reason,
+    };
+    let bytes = std::fs::read(manifest_path).map_err(|error| bad(error.to_string()))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(bad("larger than 64 KiB".to_string()));
+    }
+    let manifest: PluginManifest =
+        serde_json::from_slice(&bytes).map_err(|error| bad(error.to_string()))?;
+    if manifest.schema_version != 1 {
+        return Err(bad(format!(
+            "unsupported schema_version {}",
+            manifest.schema_version
+        )));
+    }
+    if manifest.id.is_empty()
+        || manifest.id.len() > 128
+        || !manifest
+            .id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    {
+        return Err(bad(
+            "id must be 1-128 ASCII letters, digits, '.', '_' or '-'".to_string(),
+        ));
+    }
+    let relative = manifest
+        .entrypoints
+        .get(plugin_platform_key())
+        .ok_or_else(|| {
+            bad(format!(
+                "no entrypoint for platform {}",
+                plugin_platform_key()
+            ))
+        })?;
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(bad(
+            "entrypoint must be a normalized relative path without '..'".to_string(),
+        ));
+    }
+    let entry = manifest_path
+        .parent()
+        .expect("manifest path always has a parent")
+        .join(relative);
+    if entry
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case(plugin_extension()))
+    {
+        return Err(bad(format!(
+            "entrypoint must have the .{} platform extension",
+            plugin_extension()
+        )));
+    }
+    let metadata = std::fs::symlink_metadata(&entry)
+        .map_err(|error| bad(format!("entrypoint {}: {error}", entry.display())))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(bad(
+            "entrypoint must be a regular non-symlink file".to_string()
+        ));
+    }
+    Ok(entry)
+}
+
 /// Load one plugin binary.
 ///
 /// # Safety
@@ -966,6 +1187,21 @@ pub unsafe fn load_from_path(path: &Path) -> Result<DynamicPlugin, LoadError> {
         path: path.to_path_buf(),
         source,
     })?;
+
+    // ABI v3 is an optional companion entry: a binary still exports v1/v2 for
+    // the CPU compatibility path, while v3 supplies pre-device requirements
+    // and (later) the GPU temporal pass.
+    let vtable_v3 = {
+        // SAFETY: resolved by the documented symbol name and called while the
+        // library is alive.
+        let entry: Result<libloading::Symbol<'_, cabi_v3::RaeenPluginEntryV3Fn>, _> =
+            unsafe { library.get(cabi_v3::RAEEN_PLUGIN_ENTRY_V3) };
+        match entry {
+            // SAFETY: the symbol has the documented no-argument entry shape.
+            Ok(entry) => Some(unsafe { entry() }),
+            Err(_) => None,
+        }
+    };
 
     // Version negotiation: a `raeen_plugin_v2` export is authoritative when
     // present (a binary may export both for older Raeens); v1 remains fully
@@ -988,7 +1224,13 @@ pub unsafe fn load_from_path(path: &Path) -> Result<DynamicPlugin, LoadError> {
     if let Some(vtable) = vtable_v2 {
         // SAFETY: `vtable` is whatever the plugin returned (null-checked
         // inside); `library` moves in so the image outlives every use.
-        return unsafe { DynamicPlugin::from_vtable_v2(vtable, Some(library), path.to_path_buf()) };
+        let plugin =
+            unsafe { DynamicPlugin::from_vtable_v2(vtable, Some(library), path.to_path_buf()) }?;
+        return match vtable_v3 {
+            // SAFETY: the pointer came from the same retained library.
+            Some(v3) => unsafe { plugin.attach_v3(v3) },
+            None => Ok(plugin),
+        };
     }
 
     let vtable = {
@@ -1008,43 +1250,97 @@ pub unsafe fn load_from_path(path: &Path) -> Result<DynamicPlugin, LoadError> {
 
     // SAFETY: `vtable` is whatever the plugin returned (null-checked inside),
     // and `library` is moved in so the image outlives every use of it.
-    unsafe { DynamicPlugin::from_vtable(vtable, Some(library), path.to_path_buf()) }
+    let plugin = unsafe { DynamicPlugin::from_vtable(vtable, Some(library), path.to_path_buf()) }?;
+    match vtable_v3 {
+        // SAFETY: the pointer came from the same retained library.
+        Some(v3) => unsafe { plugin.attach_v3(v3) },
+        None => Ok(plugin),
+    }
 }
 
 /// Scan a directory for plugin binaries and attempt to load each.
 ///
-/// Non-recursive and extension-filtered. Returns one entry per candidate — a
+/// Bounded-recursive and extension-filtered. Returns one entry per candidate — a
 /// refusal is reported, never silently skipped, so a user who drops in a wrong
 /// or stale plugin learns why. A missing directory yields an empty list (having
 /// no `plugins/` directory is the normal case, not an error).
+///
+/// Symlinked directories are never followed, traversal stops after four nested
+/// directories, and at most 256 binaries are considered per scan.
 ///
 /// # Safety
 ///
 /// Loads and executes every matching binary in `dir` — see [`load_from_path`].
 pub unsafe fn scan_dir(dir: &Path) -> Vec<Result<DynamicPlugin, LoadError>> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let want = plugin_extension();
+    // This walks a user-controlled native-code directory. Keep recursion
+    // deliberately bounded, never follow directory symlinks, and cap the
+    // number of binaries one rescan can attempt to load.
+    const MAX_PLUGIN_SCAN_DEPTH: usize = 4;
+    const MAX_PLUGIN_CANDIDATES: usize = 256;
 
-    let mut candidates: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case(want))
-        })
-        .collect();
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let want = plugin_extension();
+    let mut candidates = Vec::new();
+    let mut manifest_errors = Vec::new();
+    let mut pending = vec![(dir.to_path_buf(), 0usize)];
+
+    while let Some((current, depth)) = pending.pop() {
+        let manifest_path = current.join(PLUGIN_MANIFEST);
+        if manifest_path.is_file() {
+            match manifest_entry(&manifest_path) {
+                Ok(entry) => candidates.push(entry),
+                Err(error) => manifest_errors.push(error),
+            }
+            // A manifest owns this package directory. Never descend into its
+            // runtime/vendor folders or treat dependency DLLs as entrypoints.
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if depth < MAX_PLUGIN_SCAN_DEPTH {
+                    pending.push((path, depth + 1));
+                }
+                continue;
+            }
+            if kind.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(want))
+            {
+                candidates.push(path);
+                if candidates.len() == MAX_PLUGIN_CANDIDATES {
+                    pending.clear();
+                    break;
+                }
+            }
+        }
+    }
     // Deterministic order: the load sequence must not depend on filesystem
     // enumeration order, or two machines register plugins differently.
     candidates.sort();
 
-    candidates
-        .iter()
-        // SAFETY: delegated to this function's caller.
-        .map(|p| unsafe { load_from_path(p) })
+    manifest_errors
+        .into_iter()
+        .map(Err)
+        .chain(
+            candidates
+                .iter()
+                // SAFETY: delegated to this function's caller.
+                .map(|p| unsafe { load_from_path(p) }),
+        )
         .collect()
 }
 
@@ -1415,6 +1711,44 @@ mod tests {
         unsafe { DynamicPlugin::from_vtable_v2(vt, None, PathBuf::from("test://vtable-v2")) }
     }
 
+    unsafe extern "C" fn fake_requirements_v3(out: *mut cabi_v3::RaeenVulkanRequirementsV3) -> i32 {
+        if out.is_null() {
+            return cabi_v3::RAEEN_V3_BAD_INPUT;
+        }
+        // SAFETY: the host supplies a live, correctly sized output.
+        let out = unsafe { &mut *out };
+        *out = cabi_v3::RaeenVulkanRequirementsV3::empty();
+        out.minimum_api_version = ash::vk::API_VERSION_1_3;
+        out.required_queue_flags = cabi_v3::RAEEN_V3_QUEUE_GRAPHICS;
+        cabi_v3::RAEEN_V3_OK
+    }
+
+    unsafe extern "C" fn fake_create_v3(_host: *const cabi_v3::RaeenVulkanHostV3) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn fake_process_v3(
+        _instance: *mut c_void,
+        _frame: *const cabi_v3::RaeenPresentFrameV3,
+        _out: *mut cabi_v3::RaeenPluginOutputV3,
+    ) -> i32 {
+        cabi_v3::RAEEN_V3_DECLINED
+    }
+
+    fn vtable_v3() -> cabi_v3::RaeenPluginV3 {
+        cabi_v3::RaeenPluginV3 {
+            abi_version: cabi_v3::RAEEN_PLUGIN_ABI_VERSION_V3,
+            struct_size: std::mem::size_of::<cabi_v3::RaeenPluginV3>() as u32,
+            query_requirements: fake_requirements_v3,
+            create: fake_create_v3,
+            destroy: fake_destroy_v2,
+            name: fake_name_v2,
+            capabilities: fake_capabilities_v2,
+            process: fake_process_v3,
+            _reserved: [0; 8],
+        }
+    }
+
     #[test]
     fn a_conforming_v2_plugin_round_trips_with_cpu_kind_frames() {
         let vt = vtable_v2();
@@ -1443,6 +1777,25 @@ mod tests {
             V2_UNFREED.load(Ordering::SeqCst),
             before,
             "v2 output must be released back to the plugin"
+        );
+    }
+
+    #[test]
+    fn a_v3_companion_supplies_validated_pre_device_requirements() {
+        let vt2 = vtable_v2();
+        let vt3 = vtable_v3();
+        let plugin = load_v2(&vt2).expect("v2 compatibility entry must load");
+        // SAFETY: both local vtables outlive `plugin`; v3 functions honour the
+        // requirements-query contract.
+        let plugin =
+            unsafe { plugin.attach_v3(&vt3) }.expect("conforming v3 requirements must attach");
+        let requirements = plugin
+            .vulkan_requirements_v3()
+            .expect("v3 requirements must be exposed to device creation");
+        assert_eq!(requirements.minimum_api_version, ash::vk::API_VERSION_1_3);
+        assert_eq!(
+            requirements.required_queue_flags,
+            cabi_v3::RAEEN_V3_QUEUE_GRAPHICS
         );
     }
 
@@ -1719,6 +2072,126 @@ mod tests {
             found.is_empty(),
             "only files with the platform plugin extension are candidates"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scanning_finds_a_nested_plugin_candidate() {
+        let dir = std::env::temp_dir().join("raeen-plugin-nested-scan-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("vendor").join("plugin");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bogus = nested.join(format!("nested.{}", plugin_extension()));
+        std::fs::write(&bogus, b"not a shared library").unwrap();
+
+        // SAFETY: the candidate is deliberately not a loadable image, so no
+        // foreign entry point can execute.
+        let found = unsafe { scan_dir(&dir) };
+        assert_eq!(found.len(), 1, "nested plugin binary must be discovered");
+        let err = found.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("nested"),
+            "refusal must name the nested candidate: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_manifest_selects_only_its_declared_entrypoint() {
+        let dir = std::env::temp_dir().join("raeen-plugin-manifest-scan-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let package = dir.join("vendor-plugin");
+        let runtime = package.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let entry = package.join(format!("adapter.{}", plugin_extension()));
+        let dependency = runtime.join(format!("vendor-runtime.{}", plugin_extension()));
+        std::fs::write(&entry, b"adapter is intentionally not loadable").unwrap();
+        std::fs::write(&dependency, b"dependency must never be loaded").unwrap();
+        let manifest = format!(
+            r#"{{
+                "schema_version": 1,
+                "id": "test.vendor-plugin",
+                "entrypoints": {{
+                    "{}": "{}"
+                }}
+            }}"#,
+            plugin_platform_key(),
+            entry.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(package.join(PLUGIN_MANIFEST), manifest).unwrap();
+
+        // SAFETY: selected entry is malformed and cannot execute. The runtime
+        // dependency must not even be offered to the native loader.
+        let found = unsafe { scan_dir(&dir) };
+        assert_eq!(found.len(), 1, "manifest selects exactly one binary");
+        let error = found.into_iter().next().unwrap().unwrap_err();
+        assert!(error.to_string().contains("adapter"));
+        assert!(
+            !error.to_string().contains("vendor-runtime"),
+            "dependency DLL must remain package data"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_manifest_rejects_parent_directory_entrypoint() {
+        let dir = std::env::temp_dir().join("raeen-plugin-manifest-traversal-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let package = dir.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        let manifest = format!(
+            r#"{{
+                "schema_version": 1,
+                "id": "test.bad",
+                "entrypoints": {{
+                    "{}": "../escape.{}"
+                }}
+            }}"#,
+            plugin_platform_key(),
+            plugin_extension()
+        );
+        std::fs::write(package.join(PLUGIN_MANIFEST), manifest).unwrap();
+
+        // SAFETY: manifest validation fails before any library load.
+        let found = unsafe { scan_dir(&dir) };
+        assert_eq!(found.len(), 1);
+        let error = found.into_iter().next().unwrap().unwrap_err();
+        assert!(matches!(error, LoadError::BadManifest { .. }));
+        assert!(error.to_string().contains("without '..'"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scanning_stops_beyond_the_bounded_depth() {
+        let dir = std::env::temp_dir().join("raeen-plugin-depth-scan-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let accepted = dir.join("one").join("two").join("three").join("four");
+        let rejected = accepted.join("five");
+        std::fs::create_dir_all(&rejected).unwrap();
+        std::fs::write(
+            accepted.join(format!("accepted.{}", plugin_extension())),
+            b"not a shared library",
+        )
+        .unwrap();
+        std::fs::write(
+            rejected.join(format!("rejected.{}", plugin_extension())),
+            b"not a shared library",
+        )
+        .unwrap();
+
+        // SAFETY: both files are malformed images and cannot execute.
+        let found = unsafe { scan_dir(&dir) };
+        assert_eq!(
+            found.len(),
+            1,
+            "only candidates within four nested directories are considered"
+        );
+        let err = found.into_iter().next().unwrap().unwrap_err();
+        assert!(err.to_string().contains("accepted"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
