@@ -2281,7 +2281,13 @@ fn decode_texture(
             );
         }
     }
-    Ok(TextureUpload {
+    // This path has already read and detiled the guest bytes above, so it is
+    // the CPU-staging upload — not the Stage-B direct-bind of a live
+    // persistent target (that would early-return before the detile with
+    // `render_target: Some(base)`). With a non-zero hash the backend donates
+    // the uploaded image to the persistent-texture cache on draw success.
+    Ok(texture_upload_from(
+        t,
         width,
         height,
         format,
@@ -2291,17 +2297,8 @@ fn decode_texture(
         array,
         volume,
         depth,
-        // This path has already read and detiled the guest bytes above, so it is
-        // the CPU-staging upload — not the Stage-B direct-bind of a live
-        // persistent target (that would early-return before the detile with
-        // `render_target: Some(base)`).
-        render_target: None,
-        // Cache identity (stage D): with a non-zero hash the backend donates
-        // the uploaded image to the persistent-texture cache on draw success.
-        guest_base: t.base40(),
         sample_hash,
-        cached: false,
-    })
+    ))
 }
 
 /// Build a CPU-staged [`TextureUpload`] from already-decoded linear pixels.
@@ -2325,6 +2322,39 @@ fn texture_upload_from(
     depth: u32,
     sample_hash: u64,
 ) -> TextureUpload {
+    // Diagnostic: `RAEEN_DUMP_TEXTURES=<dir>` writes each distinct decoded
+    // RGBA8-class upload as a P6 PPM (`tex_<base>_<w>x<h>_l<layers>.ppm`) so
+    // sampled CONTENT can be eyeballed offline — the probe that located the
+    // Minecraft flat-terrain defect (the composed atlas never reaching the
+    // sampled image). First decode per path wins; layered uploads dump layer 0.
+    if let Ok(dir) = std::env::var("RAEEN_DUMP_TEXTURES")
+        && !dir.is_empty()
+        && matches!(
+            format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+        )
+    {
+        let path = std::path::Path::new(&dir).join(format!(
+            "tex_{:012x}_{width}x{height}_l{layers}.ppm",
+            t.base40()
+        ));
+        if !path.exists() {
+            let w = width as usize;
+            let h = height as usize;
+            if pixels.len() >= w * h * 4 {
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                let bgra = format == vk::Format::B8G8R8A8_UNORM;
+                for px in pixels[..w * h * 4].chunks_exact(4) {
+                    if bgra {
+                        out.extend_from_slice(&[px[2], px[1], px[0]]);
+                    } else {
+                        out.extend_from_slice(&[px[0], px[1], px[2]]);
+                    }
+                }
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
     TextureUpload {
         width,
         height,
@@ -2704,14 +2734,31 @@ fn matching_live_target(
         .map(|(_, width, height, _)| (*width, *height))
 }
 
+/// Whether a sampled T# may be served by a live persistent colour target's
+/// GPU image (stage B) instead of a guest-memory decode.
+///
+/// Only a plain 2D T# can alias a colour attachment — and only a
+/// SINGLE-LEVEL one. A scene attachment never carries a mip chain, while a
+/// mip-chained T# whose base also names a live target is a CPU-composed
+/// texture atlas: measured on Minecraft Bedrock, the 2048x1024 fmt-56
+/// tile-27 `MAX_MIP=3` terrain atlas is filled by the game writing block
+/// tiles into the atlas's guest memory (plus a handful of GPU draws for
+/// animated tiles). The direct-bound GPU image never receives those guest
+/// writes, so every terrain face sampled the attachment clear colour and the
+/// whole world rendered as flat per-face tints. Guest memory is the
+/// authority for such a T#; the known cost is that GPU-drawn animated tiles
+/// go stale in the sampled copy until the guest memory is rewritten.
+fn texture_aliases_live_target(t: &kyty_graphics::shader::ShaderTextureResource) -> bool {
+    matches!(t.type_(), 8 | 9) && t.max_mip() == 0
+}
+
 /// A [`TextureUpload`] that binds the persistent GPU image of a live render
 /// target directly, when this T# names one (stage B). `None` falls through to
 /// the guest-memory decode / CPU-pixels fallback.
 fn sampled_render_target(
     t: &kyty_graphics::shader::ShaderTextureResource,
 ) -> Option<TextureUpload> {
-    // Only a plain 2D T# can alias a colour attachment.
-    if !matches!(t.type_(), 8 | 9) {
+    if !texture_aliases_live_target(t) {
         return None;
     }
     let width = u32::from(t.width5()) + 1;
@@ -3478,7 +3525,11 @@ fn prepare_stage_binding_inner(
             // CPU fallback for what the direct binding cannot serve (the
             // draw's own target — a feedback loop — or an extent/format
             // mismatch): substitute the framebuffer map's rendered pixels.
-            if can_replace_with_render_target_pixels(&decoded)
+            // Gated by the same aliasing predicate as the direct bind: a T#
+            // whose authority is guest memory (mip-chained CPU-composed atlas)
+            // must never have its decode overwritten by the target snapshot.
+            if texture_aliases_live_target(&desc.texture)
+                && can_replace_with_render_target_pixels(&decoded)
                 && let Some((width, height, px)) =
                     render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
             {
@@ -7354,6 +7405,35 @@ mod tests {
             matching_live_target(&live, 0x31c0_0000, 1920, 1080, format, 1.0),
             None,
             "a mismatched extent is not an alias when scaling is disabled"
+        );
+    }
+
+    /// A T# that carries a mip chain (`MAX_MIP > 0`) must never alias a live
+    /// colour attachment. A scene attachment is single-level; a mip-chained T#
+    /// whose base also names a render target is a CPU-composed texture atlas
+    /// (measured: Minecraft's 2048x1024 terrain atlas, fmt 56 tile 27
+    /// max_mip=3 — the game uploads its block tiles into the atlas's guest
+    /// memory, which the direct-bound GPU image never receives, so every
+    /// terrain face sampled the target's clear colour and rendered FLAT).
+    /// The authority for such a T# is the guest-memory decode.
+    #[test]
+    fn mip_chained_texture_never_aliases_a_live_render_target() {
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.fields[3] |= 9 << 28; // type = Texture2D
+        assert!(
+            texture_aliases_live_target(&t),
+            "a single-level 2D T# may bind a live target directly"
+        );
+        t.fields[5] |= 3 << 4; // MAX_MIP = 3 (the measured Minecraft atlas)
+        assert!(
+            !texture_aliases_live_target(&t),
+            "a mip-chained T# must fall through to the guest-memory decode"
+        );
+        let mut cube = kyty_graphics::shader::ShaderTextureResource::default();
+        cube.fields[3] |= 13 << 28; // type = Cube
+        assert!(
+            !texture_aliases_live_target(&cube),
+            "only plain 2D T#s can alias a colour attachment"
         );
     }
 
