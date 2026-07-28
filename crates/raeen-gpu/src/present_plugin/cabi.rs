@@ -1103,6 +1103,10 @@ mod tests {
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     /// How many buffers the fake plugin allocated but has not yet freed.
     static UNFREED: AtomicUsize = AtomicUsize::new(0);
+    /// V2 uses independent counters so Rust's parallel test runner cannot make
+    /// a v1 allocation look like a leak in the v2 adapter (or vice versa).
+    static V2_LIVE: AtomicUsize = AtomicUsize::new(0);
+    static V2_UNFREED: AtomicUsize = AtomicUsize::new(0);
 
     struct FakeState {
         /// Value written into the first byte of every output pixel.
@@ -1310,8 +1314,17 @@ mod tests {
         {
             return std::ptr::null_mut();
         }
-        LIVE.fetch_add(1, Ordering::SeqCst);
+        V2_LIVE.fetch_add(1, Ordering::SeqCst);
         Box::into_raw(Box::new(FakeState { tint: 0xCD })).cast()
+    }
+
+    unsafe extern "C" fn fake_destroy_v2(instance: *mut c_void) {
+        if instance.is_null() {
+            return;
+        }
+        // SAFETY: `instance` came from `fake_create_v2`'s `Box::into_raw`.
+        drop(unsafe { Box::from_raw(instance.cast::<FakeState>()) });
+        V2_LIVE.fetch_sub(1, Ordering::SeqCst);
     }
 
     unsafe extern "C" fn fake_name_v2(_i: *mut c_void, buf: *mut u8, cap: usize) -> usize {
@@ -1351,7 +1364,7 @@ mod tests {
         }
         let len = pixels.len();
         let ptr = Box::into_raw(pixels.into_boxed_slice()).cast::<u8>();
-        UNFREED.fetch_add(1, Ordering::SeqCst);
+        V2_UNFREED.fetch_add(1, Ordering::SeqCst);
         out.base.primary = RaeenPluginFrame {
             width: frame.width,
             height: frame.height,
@@ -1380,7 +1393,7 @@ mod tests {
             ))
         });
         out.base.primary.pixels = std::ptr::null();
-        UNFREED.fetch_sub(1, Ordering::SeqCst);
+        V2_UNFREED.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn vtable_v2() -> RaeenPluginV2 {
@@ -1388,7 +1401,7 @@ mod tests {
             abi_version: RAEEN_PLUGIN_ABI_V2,
             _reserved: 0,
             create: fake_create_v2,
-            destroy: fake_destroy,
+            destroy: fake_destroy_v2,
             name: fake_name_v2,
             capabilities: fake_capabilities_v2,
             process: fake_process_v2,
@@ -1419,7 +1432,7 @@ mod tests {
         );
 
         let buf = vec![0x22u8; 2 * 2 * 4];
-        let before = UNFREED.load(Ordering::SeqCst);
+        let before = V2_UNFREED.load(Ordering::SeqCst);
         let out = plugin.process(&source_frame(&buf), &CTX);
         assert_eq!(out.primary.pixels.len(), 16);
         for px in out.primary.pixels.chunks(4) {
@@ -1427,7 +1440,7 @@ mod tests {
             assert_eq!(px[1], 0x22, "untouched bytes must survive the copy");
         }
         assert_eq!(
-            UNFREED.load(Ordering::SeqCst),
+            V2_UNFREED.load(Ordering::SeqCst),
             before,
             "v2 output must be released back to the plugin"
         );
@@ -1437,10 +1450,10 @@ mod tests {
     fn a_v2_abi_version_mismatch_is_refused_before_create() {
         let mut vt = vtable_v2();
         vt.abi_version = 7;
-        let live = LIVE.load(Ordering::SeqCst);
+        let live = V2_LIVE.load(Ordering::SeqCst);
         let err = load_v2(&vt).expect_err("wrong v2 version must refuse");
         assert!(matches!(err, LoadError::AbiMismatch { found: 7, .. }));
-        assert_eq!(LIVE.load(Ordering::SeqCst), live, "no instance may leak");
+        assert_eq!(V2_LIVE.load(Ordering::SeqCst), live, "no instance may leak");
     }
 
     #[test]

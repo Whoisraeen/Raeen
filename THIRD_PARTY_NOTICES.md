@@ -189,6 +189,15 @@ SOFTWARE.
   SharpEmu's native import trampoline state/ABI preservation; Raeen's
   implementation is original Rust plus generated x86-64 code and retains the
   existing VEH route for context-changing calls.
+  Raeen's pthread-mutex acquisition queue and direct ownership handoff were
+  behaviorally re-implemented from SharpEmu's
+  `KernelPthreadCompatExports.cs` waiter/grant model: each waiter has a private
+  host wake object, unlock transfers ownership to the FIFO head under the
+  mutex-state lock, and arrivals cannot barge ahead. The Windows host-thread
+  priority bands in `crates/raeen-runtime/src/thread.rs` follow SharpEmu's
+  `DirectExecutionBackend.cs::MapGuestThreadPriority`; KytyPS5
+  `src/kernel/pthread.cpp` independently confirms the same Orbis thresholds.
+  Both implementations are original Rust and no C# or C++ is vendored.
   From upstream `5228335` (PR #587, "Gen5 flat memory and 3D images"):
   `OpImageQuerySizeLod`'s result vector is sized from the descriptor's
   dimensionality (`%v3int` for 3D and 2D-array, `%v2int` for 2D) in

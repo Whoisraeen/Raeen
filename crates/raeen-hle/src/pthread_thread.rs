@@ -130,15 +130,14 @@ fn resolve_thread(ctx: &HleContext, thread: u64) -> u64 {
     }
 }
 
-/// `scePthreadSetprio(thread, prio)`: record the requested Orbis priority for
-/// the thread. Raeen does not map guest priorities onto host scheduling (only
-/// contention order could differ, never correctness), but the value must be
-/// RECORDED so `scePthreadGetprio` reads back what was set — shadPS4's
-/// pthread priority model does the same bookkeeping.
+/// `scePthreadSetprio(thread, prio)`: record the requested Orbis priority and
+/// ask the native runtime to apply it to the live host thread. Host mapping is
+/// runtime-gated for A/B safety; readback remains exact either way.
 fn hle_setprio(ctx: &HleContext, args: &[u64]) -> u64 {
     let thread = resolve_thread(ctx, args.first().copied().unwrap_or(0));
     let prio = args.get(1).copied().unwrap_or(0) as i32;
     ctx.kernel.thread_priorities.insert(thread, prio);
+    ctx.guest_threads.set_priority(thread, prio);
     OK
 }
 
@@ -205,10 +204,9 @@ fn hle_getschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `scePthreadSetschedparam(thread, int policy, const struct sched_param
 /// *param)`: record the requested policy and the priority carried in
-/// `param->sched_priority`. Raeen does not map guest priorities onto host
-/// scheduling (only contention order could differ, never correctness — the
-/// same bookkeeping model as `scePthreadSetprio` above), but both values must
-/// be RECORDED so `scePthreadGetschedparam` reads back what was set.
+/// `param->sched_priority`. The value is recorded for exact readback and
+/// forwarded to the native scheduler under the same gate as
+/// `scePthreadSetprio`.
 fn hle_setschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
     let thread = resolve_thread(ctx, args.first().copied().unwrap_or(0));
     let policy = args.get(1).copied().unwrap_or(0) as i32;
@@ -223,6 +221,7 @@ fn hle_setschedparam(ctx: &HleContext, args: &[u64]) -> u64 {
     let priority = i32::from_le_bytes(priority);
     ctx.kernel.thread_sched_policies.insert(thread, policy);
     ctx.kernel.thread_priorities.insert(thread, priority);
+    ctx.guest_threads.set_priority(thread, priority);
     OK
 }
 

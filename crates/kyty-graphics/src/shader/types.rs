@@ -168,6 +168,10 @@ pub enum ShaderInstructionType {
     ImageGetResinfo,
     ImageLoad,
     ImageSample,
+    /// MIMG 0x24: sampled image read with an explicit LOD supplied after the
+    /// dimensional coordinate tuple in VADDR. Measured on ASTRO.BOT scene
+    /// compute (raw 0xf0900718).
+    ImageSampleL,
     /// MIMG 0x2f: comparison sample with an explicit zero LOD.
     ImageSampleCLz,
     ImageSampleLz,
@@ -730,6 +734,9 @@ pub mod shader_instruction_format {
         /// consecutive VGPRs (one per gathered texel) while the dmask names
         /// the one channel gathered.
         Vdata4Vaddr3StSsDmask1 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_1]),
+        /// Beyond Kyty: the measured green-channel companion to
+        /// `Vdata4Vaddr3StSsDmask1` (ASTRO.BOT MIMG 0x47 dmask 0x2).
+        Vdata4Vaddr3StSsDmask2 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_2]),
         Vdata4Vaddr3StSsDmaskF = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_F]),
         Vdata4Vaddr4StDmaskF = format_define(&[DA4, S0A4, S1A8, DMASK_F]),
         Vdata4VaddrSvSoffsIdxen = format_define(&[DA4, S0, S1A4, S2, IDXEN]),
@@ -975,6 +982,11 @@ pub struct ShaderInstruction {
     /// export is `0xf`, a partial one (e.g. a `vec2` texcoord) `0x3`. Set by
     /// `shader_parse_exp`; the recompiler writes 0 to the disabled channels.
     pub export_enable: u32,
+    /// Raw EXP target. Fragment colour targets 0..=7 map directly to Vulkan
+    /// output locations 0..=7. Kept separately from `format` so the existing
+    /// MRT0 operand-shape rows can lower every MRT without multiplying the
+    /// format enum by eight identical variants.
+    pub export_target: u8,
     /// Beyond Kyty (SharpEmu PR #587 `Gen5GlobalMemoryControl.UsesFlatAddress`):
     /// only meaningful for the FLAT-class ops (`Flat*`). `true` when the guest
     /// address is a complete 64-bit pointer held in the VGPR pair

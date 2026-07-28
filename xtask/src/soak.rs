@@ -11,10 +11,11 @@
 //!   every 32 completed presents under `RAEEN_TIME_WORKER=1`), the AGC
 //!   `total_flips=N` progress lines, and per-call `sceVideoOutSubmitFlip`
 //!   lines. Any high-water increase or new flip line is an epoch advance.
-//! * **Deadlock warnings** — the runtime's own warning
-//!   `scePthreadMutexLock stuck >3s — deadlock; naming the holder`
-//!   (pthread_sync.rs), the line that located the Minecraft streaming-pool
-//!   bug. One observed warning fails the soak immediately.
+//! * **Probable deadlocks** — the runtime observes one mutex owner
+//!   continuously for 30 seconds and emits
+//!   `scePthreadMutexLock waiting >30s with one owner — probable deadlock`.
+//!   Shorter waits with rotating owners are slow convoys, not deadlocks; the
+//!   ordinary frame-stall detector still catches lost presentation progress.
 //! * **Process-tree resources** — CPU% and memory via `sysinfo`, sampled
 //!   periodically over the whole tree rooted at the child.
 //!
@@ -67,9 +68,9 @@ const POLL: Duration = Duration::from_millis(500);
 /// plenty for a 30-minute trend and stays above sysinfo's minimum CPU
 /// update interval.
 const RESOURCE_SAMPLE_EVERY: u32 = 4;
-/// The runtime's contended-mutex forensic line (`pthread_sync.rs`): fires
-/// once per lock call after 3 s of waiting and names mutex/owner/waiter.
-const DEADLOCK_MARKER: &str = "scePthreadMutexLock stuck >3s";
+/// The runtime's stable-owner forensic line (`pthread_sync.rs`): fires once
+/// after one owner has remained continuously observed for 30 seconds.
+const DEADLOCK_MARKER: &str = "scePthreadMutexLock waiting >30s with one owner — probable deadlock";
 /// Raw-log ring kept for the failure report.
 const TAIL_LINES: usize = 80;
 const TAIL_LINE_CAP: usize = 400;
@@ -929,9 +930,15 @@ mod tests {
         )
     }
 
-    const DEADLOCK_LINE: &str = "2026-07-28T00:01:00Z WARN raeen_hle::pthread_sync: \
+    const DEADLOCK_LINE: &str = "2026-07-28T00:01:30Z ERROR raeen_hle::pthread_sync: \
          mutex=0x1019a1d48c0 waiter=42 waiter_name=MAIN owner=7 owner_name=Streaming \
-         ty=1 recursion=1 scePthreadMutexLock stuck >3s — deadlock; naming the holder";
+         ty=1 recursion=1 owner_stable_ms=30000 \
+         scePthreadMutexLock waiting >30s with one owner — probable deadlock";
+
+    const CONTENTION_LINE: &str = "2026-07-28T00:01:00Z WARN raeen_hle::pthread_sync: \
+         mutex=0x1019a1d48c0 waiter=42 waiter_name=MAIN owner=7 owner_name=Streaming \
+         ty=1 recursion=1 owner_changes=4 \
+         scePthreadMutexLock waiting >3s — long contention";
 
     // -- line assembly -------------------------------------------------------
 
@@ -1087,7 +1094,7 @@ mod tests {
     #[test]
     fn deadlock_marker_is_found_through_ansi_and_fields_default_when_absent() {
         let colored = "\u{1b}[33mWARN\u{1b}[0m \u{1b}[3mmutex\u{1b}[0m=0xabc \
-             scePthreadMutexLock stuck >3s — deadlock; naming the holder";
+             scePthreadMutexLock waiting >30s with one owner — probable deadlock";
         let mut t = tracker();
         t.observe_line(secs(1), colored);
         assert_eq!(t.deadlocks.len(), 1);
@@ -1098,11 +1105,12 @@ mod tests {
     #[test]
     fn cond_trace_and_ordinary_warns_are_not_deadlocks() {
         let mut t = tracker();
+        t.observe_line(secs(1), CONTENTION_LINE);
         t.observe_line(
-            secs(1),
+            secs(2),
             "WARN TRACE_COND: waiting >3s — this cond has not been signalled cond=0x1 waiter=2",
         );
-        t.observe_line(secs(2), "WARN shader: opcode not supported");
+        t.observe_line(secs(3), "WARN shader: opcode not supported");
         assert!(t.deadlocks.is_empty());
     }
 

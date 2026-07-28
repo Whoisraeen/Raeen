@@ -672,6 +672,21 @@ pub fn shader_capture_runtime_scalar_loads(
             continue;
         }
         let base_reg = load.src[0].register_id;
+        // A recovered EUD pointer has a stronger lowering contract than this
+        // generic live-user-pointer snapshot. `sload_dword_extended` maps
+        // descriptor dwords through the push-constant table, whose dword 0
+        // has been rewritten from the guest address to the compact Vulkan
+        // descriptor-array index. Snapshotting the same load here would
+        // materialize the raw guest V#/T#/S# dwords first and bypass that
+        // rewrite (measured ASTRO.BOT PS 0x500652400: index 0x026f6a70 into
+        // a one-element storage-buffer array -> AMD VK_ERROR_DEVICE_LOST).
+        //
+        // PC-relative embedded loads are discovered by the dedicated pass
+        // below, after proving their base was built by s_getpc_b64; they do
+        // not need this live-in user-pointer fallback.
+        if bind.extended.used && base_reg == bind.extended.start_register {
+            continue;
+        }
         if instructions[..at]
             .iter()
             .any(|prior| writes_sgpr(prior, base_reg) || writes_sgpr(prior, base_reg + 1))
@@ -6776,6 +6791,51 @@ mod tests {
                 .expect("runtime capture retained")
                 .values[..8],
             fields
+        );
+    }
+
+    #[test]
+    fn runtime_scalar_load_does_not_snapshot_eud_descriptor_as_literal() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        // Measured ASTRO.BOT PS 0x500652400 shape: s28:s29 is the recovered
+        // EUD pointer and an s_load_dwordx4 reads a V# from it. Capturing those
+        // four raw dwords as an "embedded constant" makes the recompiler seed
+        // the destination with the guest base (0x026f6a70) instead of the
+        // rewritten Vulkan descriptor-array index 0. The resulting valid
+        // SPIR-V indexes a one-element descriptor array out of bounds and
+        // resets the AMD device.
+        let mut load = ShaderInstruction {
+            pc: 0x1c,
+            type_: T::SLoadDwordx4,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(28, 2);
+        load.src[1] = imm_op(32);
+        load.src_num = 2;
+        load.dst = sgpr_op(0, 4);
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        let descriptor = [0x026f_6a70, 0x0010_0005, 0x0000_0002, 0x0004_dfac];
+        let mem = TestMem {
+            regions: vec![(0x0500_1000 + 32, descriptor.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(28, 0x0500_1000, UserSgprType::Unknown);
+        user_sgpr.set(29, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        bind.extended.used = true;
+        bind.extended.start_register = 28;
+
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+
+        assert!(
+            bind.embedded_constant_loads.find(0x1c).is_none(),
+            "EUD loads must flow through sload_dword_extended so descriptor \
+             dword 0 is rewritten to the Vulkan array index"
         );
     }
 

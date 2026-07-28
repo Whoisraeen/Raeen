@@ -25,7 +25,7 @@ use raeen_hle::{HleContext, HleRegistry};
 use raeen_kernel::OrbisKernel;
 use raeen_runtime::{
     GUEST_ARENA_BASE, RunOutcome, RuntimeError, execute_linked, execute_process,
-    execute_process_shared, fsbase_rearm_count, hle_dispatch_metrics,
+    execute_process_shared, fsbase_rearm_count, guest_watchpoint_hit_count, hle_dispatch_metrics,
 };
 
 const R_X86_64_JUMP_SLOT: u64 = 7;
@@ -376,6 +376,92 @@ fn sentinel_call_through_real_lm1_linker_dispatches_to_hle() {
     assert_eq!(
         result, 0xC0DE,
         "guest RAX after the trapped HLE call is the sentinel's return value"
+    );
+}
+
+/// Controlled end-to-end proof for the hardware write-watch diagnostic.
+///
+/// Run this test in its own process with:
+///
+/// `RAEEN_WATCH_ADDR=0x100000000080 cargo test -p raeen-runtime
+/// --test execute hardware_write_watch_reports_the_guest_writer -- --exact`
+///
+/// The synthetic guest calls one VEH-dispatched HLE import (the point where
+/// the diagnostic arms DR0/DR7), writes a known value to the watched guest
+/// address, and returns that value. The hit counter proves Windows delivered
+/// the resulting `EXCEPTION_SINGLE_STEP` with DR6.B0 and Raeen consumed it.
+#[test]
+fn hardware_write_watch_reports_the_guest_writer() {
+    const SLOT_OFF: usize = 0x40;
+    const WATCHED_OFF: usize = 0x80;
+    const WRITTEN: u64 = 0x1234_5678_9ABC_DEF0;
+    const WATCHED_ADDR: u64 = GUEST_ARENA_BASE + WATCHED_OFF as u64;
+
+    let Ok(configured) = std::env::var("RAEEN_WATCH_ADDR") else {
+        eprintln!(
+            "RAEEN_WATCH_ADDR is not set; skipping the opt-in hardware-watchpoint acceptance"
+        );
+        return;
+    };
+    assert_eq!(
+        u64::from_str_radix(configured.trim_start_matches("0x"), 16).ok(),
+        Some(WATCHED_ADDR),
+        "RAEEN_WATCH_ADDR must select the synthetic guest's watched word"
+    );
+
+    let mut image = vec![0u8; 0x100];
+    write_entry_stub(&mut image, 0, SLOT_OFF);
+    image[6..16].copy_from_slice(&[
+        0x48,
+        0xB8,
+        WRITTEN as u8,
+        (WRITTEN >> 8) as u8,
+        (WRITTEN >> 16) as u8,
+        (WRITTEN >> 24) as u8,
+        (WRITTEN >> 32) as u8,
+        (WRITTEN >> 40) as u8,
+        (WRITTEN >> 48) as u8,
+        (WRITTEN >> 56) as u8,
+    ]); // mov rax, imm64
+    let store_next = 23_i32;
+    let store_disp = WATCHED_OFF as i32 - store_next;
+    image[16..19].copy_from_slice(&[0x48, 0x89, 0x05]); // mov [rip+disp32], rax
+    image[19..23].copy_from_slice(&store_disp.to_le_bytes());
+    let load_next = 30_i32;
+    let load_disp = WATCHED_OFF as i32 - load_next;
+    image[23..26].copy_from_slice(&[0x48, 0x8B, 0x05]); // mov rax, [rip+disp32]
+    image[26..30].copy_from_slice(&load_disp.to_le_bytes());
+    image[30] = 0xC3;
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libtest".to_owned(),
+            function: "sceTestSentinel".to_owned(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceTestSentinel", sentinel);
+    let before = guest_watchpoint_hit_count();
+    let result = execute_linked(&linked, &hle, &OrbisKernel::new(), 0, &[])
+        .expect("watched synthetic guest must resume after the single-step");
+    assert_eq!(result, WRITTEN);
+    assert_eq!(
+        guest_watchpoint_hit_count(),
+        before + 1,
+        "the controlled guest write must produce one DR6.B0 watchpoint hit"
     );
 }
 

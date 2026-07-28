@@ -102,6 +102,28 @@ const RESERVE_MIN: u64 = 0x0100_0000_0000; // 1 TiB — above USER_MAPPING_LIMIT
 /// Explicit Windows reservations must start on a 64 KiB boundary.
 const WINDOWS_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
 
+/// Historical and production-safe number of pages to back after a guest first
+/// touches a reserved page. A 16-page experiment is available through the
+/// environment control below, but measured slightly worse on Minecraft's world
+/// transition (11.1 s stall / 1,909 MiB versus 10.8 s / 1,873 MiB), so one page
+/// remains the honest default.
+const DEFAULT_DEMAND_COMMIT_BATCH_PAGES: u64 = 1;
+
+/// Production rollback/tuning control for clustered lazy commits.
+///
+/// `RAEEN_DEMAND_COMMIT_BATCH_PAGES=16` selects a 64 KiB experiment. The upper
+/// bound limits speculative backing to 1 MiB per random touch.
+fn demand_commit_batch_pages() -> u64 {
+    static PAGES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        std::env::var("RAEEN_DEMAND_COMMIT_BATCH_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|pages| pages.clamp(1, 256))
+            .unwrap_or(DEFAULT_DEMAND_COMMIT_BATCH_PAGES)
+    })
+}
+
 /// The guest fixed-VA window retail titles map direct memory into by literal
 /// address, defended for the guest by a process-startup reservation.
 ///
@@ -1029,6 +1051,12 @@ impl GuestArena {
     /// otherwise about to be reported as a genuine fault — so a `false` return
     /// costs nothing and preserves the existing diagnostics exactly.
     pub fn commit_on_demand(&self, addr: u64) -> bool {
+        self.commit_on_demand_with_batch(addr, demand_commit_batch_pages())
+    }
+
+    /// Implementation split out so the bounded clustering policy can be
+    /// regression-tested without mutating process-global environment state.
+    fn commit_on_demand_with_batch(&self, addr: u64, batch_pages: u64) -> bool {
         // The map is the authority, and it is the only safe one: since `reserve`
         // takes its span from the OS, a reservation can live anywhere in the
         // address space, not just the arena's sparse tail. A range check against
@@ -1036,35 +1064,37 @@ impl GuestArena {
         let mut state = self.lock_state();
         let page = addr & !(PAGE_SIZE - 1);
 
-        match state.vmm.find(page).map(|vma| vma.kind) {
+        let reserved_end = match state.vmm.find(page) {
             // An untouched reservation page: back it, and the retry lands on
             // memory.
-            Some(VmaType::Reserved) => {}
+            Some(vma) if vma.kind == VmaType::Reserved => vma.end(),
             // Already backed, which here can only mean another thread raced us
             // into this same page. Let its retry proceed rather than
             // double-commit.
-            Some(VmaType::ReservedBacked) => return true,
+            Some(vma) if vma.kind == VmaType::ReservedBacked => return true,
             // Everything else is not a reservation, and declining leaves the
             // access to be reported as the fault it is: the committed core (a
             // fault there is real and unfixable — the pages already exist),
             // unclaimed free space, or the host process's own address space.
             _ => return false,
-        }
+        };
+        let batch_bytes = batch_pages.clamp(1, 256).saturating_mul(PAGE_SIZE);
+        let commit_end = page.saturating_add(batch_bytes).min(reserved_end);
+        let commit_len = commit_end - page;
 
-        // SAFETY: `[page, page + PAGE_SIZE)` is page aligned and lies inside a
-        // `Reserved` VMA. Every producer of one places it over a range that is
-        // really `MEM_RESERVE`d and outlives this arena's guest run: `reserve`
-        // and `map_console_va` over an OS reservation recorded in
+        // SAFETY: `[page, commit_end)` is page aligned, non-empty, and clipped
+        // to one `Reserved` VMA. Every producer of one places it over a range
+        // that is really `MEM_RESERVE`d and outlives this arena's guest run:
+        // `reserve` and `map_console_va` over an OS reservation recorded in
         // `os_reservations`; `map_at`'s demand-commit fallback over either a
-        // newly-reserved Foreign range (also pushed to `os_reservations`) or the
-        // arena master reservation (the free sparse tail, released in `Drop`).
-        // So the reservation is real either way. `MEM_COMMIT` over an
-        // already-committed page is a documented no-op, so losing a race here is
-        // benign too.
+        // newly-reserved Foreign range (also pushed to `os_reservations`) or
+        // the arena master reservation (the free sparse tail, released in
+        // `Drop`). `MEM_COMMIT` over an already-committed page is a documented
+        // no-op, so losing a race here is benign too.
         let raw = unsafe {
             VirtualAlloc(
                 page as *const c_void,
-                PAGE_SIZE as usize,
+                commit_len as usize,
                 MEM_COMMIT,
                 PAGE_READWRITE,
             )
@@ -1073,13 +1103,13 @@ impl GuestArena {
             return false;
         }
 
-        // Only this page becomes backed. Its neighbours stay `Reserved`, which
-        // is what keeps a 512 GiB reservation costing address space instead of
-        // 512 GiB of RAM. Contiguous backed pages coalesce, so a title walking
-        // its reservation linearly does not shred the map into slivers.
+        // Only this small forward cluster becomes backed. The rest stays
+        // `Reserved`, which keeps a 512 GiB reservation costing address space
+        // instead of 512 GiB of RAM. Contiguous backed clusters coalesce, so a
+        // title walking its reservation linearly does not shred the map.
         state.vmm.map_range(
             page,
-            PAGE_SIZE,
+            commit_len,
             VmaType::ReservedBacked,
             prot::CPU_READ_WRITE,
             None,
@@ -1089,11 +1119,12 @@ impl GuestArena {
         if !state.demand_commit_announced {
             tracing::info!(
                 address = page,
+                pages = commit_len / PAGE_SIZE,
                 "guest touched a reserved-but-uncommitted range; backing it on demand"
             );
             state.demand_commit_announced = true;
         }
-        DEMAND_COMMITS.fetch_add(1, Ordering::Relaxed);
+        DEMAND_COMMITS.fetch_add(commit_len / PAGE_SIZE, Ordering::Relaxed);
         true
     }
 
@@ -2949,9 +2980,9 @@ mod tests {
     }
 
     /// Demand paging: a reserved page carries no memory until touched, and
-    /// `commit_on_demand` backs exactly the touched page. This is what lets a
-    /// title reserve 512 GiB and then use a bitmap 33.6 MB into it (Until Dawn,
-    /// Dragon Ball) without the emulator committing 512 GiB of RAM.
+    /// `commit_on_demand` backs only a bounded forward cluster. This amortizes
+    /// linear streaming faults without turning a 512 GiB reservation into a
+    /// 512 GiB commit.
     #[test]
     fn touching_a_reserved_page_commits_it_on_demand() {
         let _lock = crate::dispatch::call_lock();
@@ -2970,7 +3001,10 @@ mod tests {
         );
 
         // The fault handler's question. It must say yes, and only once per page.
-        assert!(arena.commit_on_demand(deep), "a touch inside a reservation");
+        assert!(
+            arena.commit_on_demand_with_batch(deep, 16),
+            "a touch inside a reservation"
+        );
         assert!(
             arena.write(deep, &[0xAB]),
             "page must be usable after commit"
@@ -2981,9 +3015,13 @@ mod tests {
         // Idempotent: a second touch of a now-backed page still says "retry".
         assert!(arena.commit_on_demand(deep));
 
-        // Committing one page must not silently back its neighbours — that
-        // would turn a 512 GiB reservation into a 512 GiB commit.
-        assert!(!arena.read(deep + PAGE_SIZE, &mut byte));
+        // A linear stream gets the remainder of one bounded 64 KiB cluster,
+        // avoiding fifteen more VEH/VirtualAlloc/map-split cycles.
+        let page = deep & !(PAGE_SIZE - 1);
+        assert!(arena.read(page + 15 * PAGE_SIZE, &mut byte));
+        // The cluster remains bounded. A huge reservation is not eagerly
+        // committed past the configured production window.
+        assert!(!arena.read(page + 16 * PAGE_SIZE, &mut byte));
     }
 
     /// The safety boundary: demand commit answers ONLY for reserved ranges. A
@@ -3032,15 +3070,12 @@ mod tests {
         // no data a never-written page could deliver, and this is what keeps
         // "reserved" observably different from "committed".
         assert!(!arena.read(first, &mut byte));
-        // An HLE WRITE demand-commits the touched page exactly as a native
-        // guest store would (the measured getdents-into-lazy-malloc case) —
-        // one page, not the reservation.
+        // An HLE WRITE demand-commits exactly as a native guest store would
+        // (the measured getdents-into-lazy-malloc case).
         assert!(arena.write(first, &[1]));
         assert!(arena.read(first, &mut byte));
         assert_eq!(byte, [1]);
-        // A page nothing wrote is still unreadable: the write above committed
-        // its own page only.
-        assert!(!arena.read(first + 0x1000, &mut byte));
+        assert!(!arena.read(first + PAGE_SIZE, &mut byte));
 
         let mapped = arena
             .map_at(first, 0x2_0000, raeen_core::PS5_PAGE_SIZE as u64)
@@ -3177,8 +3212,8 @@ mod tests {
     /// The demand-commit fallback itself — forced deterministically, since a
     /// unit test cannot exhaust the real Windows commit limit. On a refused
     /// up-front commit `map_at` must still return the requested address, leave
-    /// it reserved-but-unbacked, back a page on first write (the faulting offset
-    /// from logs/raeen.txt), keep neighbours unbacked, and release the
+    /// it reserved-but-unbacked, back one page on first write (the faulting
+    /// offset from logs/raeen.txt), keep later pages unbacked, and release the
     /// reservation exactly once so a later map at the same address succeeds.
     #[test]
     fn map_at_demand_commits_when_the_up_front_commit_is_refused() {
@@ -3207,7 +3242,7 @@ mod tests {
         let mut byte = [0u8; 1];
         assert!(!arena.read(base, &mut byte), "range must start unbacked");
 
-        // A write demand-commits its own page and round-trips.
+        // A write demand-commits its page and round-trips.
         assert!(arena.write(base + 0x20, &[0xAB]));
         assert!(arena.read(base + 0x20, &mut byte));
         assert_eq!(byte, [0xAB]);

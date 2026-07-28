@@ -2746,25 +2746,28 @@ fn shader_parse_exp(
 
     inst.type_ = T::Exp;
     inst.export_enable = en;
+    inst.export_target = target as u8;
 
     match target {
-        0x00 => {
+        0x00..=0x07 => {
             if done != 0 && compr != 0 && vm != 0 && en == 0x0 {
+                // The no-source discard form is only established for MRT0.
+                // Do not turn an empty secondary export into OpKill.
+                if target != 0 {
+                    return Err(ShaderParseError::UnknownExpTarget { target, pc });
+                }
                 inst.format = F::Mrt0OffOffComprVmDone;
                 inst.src_num = 0;
-            } else if done != 0 && compr != 0 && vm != 0 && en != 0 {
+            } else if compr != 0 && vm != 0 && en != 0 {
                 // Compressed exports always carry two packed source operands;
-                // `en` selects individual unpacked channels. GTA V emits
-                // en=0x3 (RG only), leaving BA at the export defaults.
+                // `en` selects individual unpacked channels. `done` marks the
+                // final export, so MRT0 commonly has done=0 when MRT1 follows.
                 inst.format = F::Mrt0Vsrc0Vsrc1ComprVmDone;
                 inst.src_num = 2;
-            } else if done != 0 && compr == 0 && vm != 0 && en != 0 {
-                // Uncompressed MRT0 export. Kyty knows only the full en==0xf
-                // form (ShaderSpirv.cpp L2348); a partial mask selects which
-                // full-float VGPRs are written (measured: ASTRO.BOT PS exports
-                // en=0x3 — rg only, a 32_GR render target). `export_enable`
-                // carries the mask; the recompiler writes the GCN default
-                // (0, 0, 0, 1) to the disabled channels.
+            } else if compr == 0 && vm != 0 && en != 0 {
+                // Uncompressed MRT0..7 export. A partial mask selects which
+                // full-float VGPRs are written; `export_enable` carries it and
+                // the recompiler writes (0,0,0,1) defaults elsewhere.
                 inst.format = F::Mrt0Vsrc0Vsrc1Vsrc2Vsrc3VmDone;
             }
         }
@@ -4143,7 +4146,16 @@ fn shader_parse_mimg(
         0x21 => return Err(ni(dst, S, "image_sample_cl", opcode, pc, b0)),
         0x22 => return Err(ni(dst, S, "image_sample_d", opcode, pc, b0)),
         0x23 => return Err(ni(dst, S, "image_sample_d_cl", opcode, pc, b0)),
-        0x24 => return Err(ni(dst, S, "image_sample_l", opcode, pc, b0)),
+        0x24 => {
+            inst.type_ = T::ImageSampleL;
+            inst.src[0].size = 4;
+            inst.src[1].size = 8;
+            inst.src[2].size = 4;
+            if dmask == 0x7 {
+                inst.format = F::Vdata3Vaddr4StSsDmask7;
+                inst.dst.size = 3;
+            }
+        }
         0x25 => return Err(ni(dst, S, "image_sample_b", opcode, pc, b0)),
         0x26 => return Err(ni(dst, S, "image_sample_b_cl", opcode, pc, b0)),
         0x27 => {
@@ -4269,18 +4281,26 @@ fn shader_parse_mimg(
         0x46 => return Err(ni(dst, S, "image_gather4_b_cl", opcode, pc, b0)),
         // Beyond Kyty (KYTY_NI upstream): four-texel single-channel gather at
         // an implicit zero LOD — measured on ASTRO.BOT scene compute
-        // (raw 0xf11c0108, dmask 0x1). The gather dmask names the ONE channel
-        // gathered (must be a single bit); vdata is always 4 dwords, one per
-        // texel. Only the measured dmask is wired; others stay named with the
-        // dmask evidence via the unset-format failure below.
+        // (raw 0xf11c0108/0xf11c0208, dmask 0x1/0x2). The gather dmask names
+        // the ONE channel gathered (must be a single bit); vdata is always 4
+        // dwords, one per texel. Only measured dmask forms are wired; others
+        // stay named with the dmask evidence via the unset-format failure
+        // below.
         0x47 => {
             inst.type_ = T::ImageGather4Lz;
             inst.src[0].size = 3;
             inst.src[1].size = 8;
             inst.src[2].size = 4;
-            if dmask == 0x1 {
-                inst.format = F::Vdata4Vaddr3StSsDmask1;
-                inst.dst.size = 4;
+            match dmask {
+                0x1 => {
+                    inst.format = F::Vdata4Vaddr3StSsDmask1;
+                    inst.dst.size = 4;
+                }
+                0x2 => {
+                    inst.format = F::Vdata4Vaddr3StSsDmask2;
+                    inst.dst.size = 4;
+                }
+                _ => {}
             }
         }
         0x48 => return Err(ni(dst, S, "image_gather4_c", opcode, pc, b0)),

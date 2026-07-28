@@ -29,7 +29,8 @@
 //! Two kinds are ours: [`VmaType::Foreign`] and [`VmaType::ReservedBacked`].
 //! Both exist because shadPS4 reserves its entire guest address range up front
 //! and commits a range when it is mapped, while we share a process with the host
-//! and back reservations one fault at a time. Each carries its own note.
+//! and back reservations in bounded clusters on demand. Each carries its own
+//! note.
 //!
 //! # Invariant
 //!
@@ -58,16 +59,16 @@ pub enum VmaType {
     /// Not in shadPS4, which commits a range when it is mapped and so never has
     /// a half-backed reservation to describe. We must: titles reserve far more
     /// than they touch (Until Dawn opens with 512 GiB) and then use the range
-    /// directly, so pages are backed one fault at a time. This is the kind that
-    /// says "backed, and reached through a reservation" — the fault handler
+    /// directly, so pages are backed in small clusters on demand. This is the
+    /// kind that says "backed, and reached through a reservation" — the fault handler
     /// needs exactly that distinction, because a fault on a *core* page is
     /// unfixable and must be reported, while a fault on a reservation page
     /// another thread has already backed just needs a retry. Both are
     /// host-backed, so [`VmaType::is_host_backed`] alone cannot tell them apart.
     ///
-    /// Contiguous backed pages coalesce ([`Vma::mergeable_with`]), so a title
+    /// Contiguous backed clusters coalesce ([`Vma::mergeable_with`]), so a title
     /// walking a reservation linearly collapses back to one VMA rather than
-    /// shredding the map into 4 KiB slivers.
+    /// shredding the map into small slivers.
     ReservedBacked,
     /// Backed by direct ("physical") memory at [`Vma::phys_base`].
     Direct,

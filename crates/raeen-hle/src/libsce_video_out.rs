@@ -708,39 +708,92 @@ fn vblank_period() -> Option<std::time::Duration> {
 /// timer (~0.5 ms) instead of `Sleep`, and only the last millisecond spins.
 /// That removes up to a whole tick of yield-spin per wait from the guest core
 /// the title parks here. At 120 Hz the whole 8.3 ms wait is one timer signal.
+trait VblankClock {
+    fn elapsed(&self) -> std::time::Duration;
+    fn wait_until(&self, deadline: std::time::Duration);
+}
+
+struct HostVblankClock {
+    epoch: std::time::Instant,
+}
+
+impl VblankClock for HostVblankClock {
+    fn elapsed(&self) -> std::time::Duration {
+        self.epoch.elapsed()
+    }
+
+    fn wait_until(&self, deadline: std::time::Duration) {
+        /// The final slice of every wait is a spin: an OS signal can arrive
+        /// early, and overshooting an edge is worse than spinning a
+        /// millisecond.
+        const SPIN_REMAINDER: std::time::Duration = std::time::Duration::from_millis(1);
+        /// Coarse-sleep granularity of the no-high-res-timer fallback.
+        const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(17);
+        loop {
+            let now = self.elapsed();
+            if now >= deadline {
+                return;
+            }
+            let remaining = deadline - now;
+            if remaining <= SPIN_REMAINDER {
+                std::thread::yield_now();
+                continue;
+            }
+            #[cfg(windows)]
+            let served = precise_wait::wait(remaining - SPIN_REMAINDER);
+            #[cfg(not(windows))]
+            let served = false;
+            if !served {
+                // Fallback without a high-resolution timer: coarse-sleep,
+                // never past the spin window, and re-derive the remaining time
+                // each lap.
+                std::thread::sleep((remaining - SPIN_REMAINDER).min(TIMER_TICK));
+            }
+        }
+    }
+}
+
+fn wait_next_vblank_edge_with_clock(period: std::time::Duration, clock: &impl VblankClock) {
+    let elapsed = clock.elapsed();
+    let next = elapsed.as_nanos() / period.as_nanos() + 1;
+    let deadline_nanos = next.saturating_mul(period.as_nanos());
+    let deadline = std::time::Duration::from_nanos(deadline_nanos.min(u64::MAX as u128) as u64);
+    clock.wait_until(deadline);
+}
+
 fn wait_next_vblank_edge() {
     let Some(period) = vblank_period() else {
         return;
     };
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let epoch = *EPOCH.get_or_init(std::time::Instant::now);
-    let elapsed = epoch.elapsed();
-    let next = (elapsed.as_nanos() / period.as_nanos() + 1) as u64;
-    let deadline = std::time::Duration::from_nanos(next.saturating_mul(period.as_nanos() as u64));
-    /// The final slice of every wait is a spin: an OS signal can arrive early,
-    /// and overshooting an edge is worse than spinning a millisecond.
-    const SPIN_REMAINDER: std::time::Duration = std::time::Duration::from_millis(1);
-    /// Coarse-sleep granularity of the no-high-res-timer fallback.
-    const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(17);
-    loop {
-        let now = epoch.elapsed();
-        if now >= deadline {
-            return;
-        }
-        let remaining = deadline - now;
-        if remaining <= SPIN_REMAINDER {
-            std::thread::yield_now();
-            continue;
-        }
-        #[cfg(windows)]
-        let served = precise_wait::wait(remaining - SPIN_REMAINDER);
-        #[cfg(not(windows))]
-        let served = false;
-        if !served {
-            // Fallback without a high-resolution timer: coarse-sleep, never
-            // past the spin window, and re-derive the remaining time each lap.
-            std::thread::sleep((remaining - SPIN_REMAINDER).min(TIMER_TICK));
-        }
+    wait_next_vblank_edge_with_clock(period, &HostVblankClock { epoch });
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ManualVblankClock {
+    now: std::cell::Cell<std::time::Duration>,
+    deadlines: std::cell::RefCell<Vec<std::time::Duration>>,
+}
+
+#[cfg(test)]
+impl ManualVblankClock {
+    fn deadlines(&self) -> Vec<std::time::Duration> {
+        self.deadlines.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+impl VblankClock for ManualVblankClock {
+    fn elapsed(&self) -> std::time::Duration {
+        self.now.get()
+    }
+
+    fn wait_until(&self, deadline: std::time::Duration) {
+        assert!(deadline >= self.now.get());
+        self.deadlines.borrow_mut().push(deadline);
+        self.now.set(deadline);
     }
 }
 
@@ -1086,29 +1139,18 @@ mod tests {
         }
     }
 
-    /// Two consecutive vblank waits must land one full period apart: the first
-    /// anchors to the next edge, the second to the edge after. A wait that
-    /// returned early (broken timer) or a full tick late (uncompensated drift)
-    /// fails the window. Skipped in the unpaced benchmark mode, where the wait
-    /// contract is explicitly void.
+    /// Two consecutive vblank waits must choose consecutive absolute edges.
+    /// The clock is deterministic: host scheduling load cannot turn this
+    /// schedule-unit test into a false failure.
     #[test]
     fn consecutive_vblank_waits_land_one_period_apart() {
-        let Some(period) = vblank_period() else {
-            eprintln!("unpaced benchmark mode (RAEEN_VBLANK_HZ=0): skipping");
-            return;
-        };
-        wait_next_vblank_edge();
-        let start = std::time::Instant::now();
-        wait_next_vblank_edge();
-        let interval = start.elapsed();
-        assert!(
-            interval >= period - std::time::Duration::from_millis(3),
-            "wait returned {interval:?} after the previous edge — early vs period {period:?}"
-        );
-        assert!(
-            interval <= period + std::time::Duration::from_millis(10),
-            "wait took {interval:?} for one period {period:?} — late signal or drift"
-        );
+        let period = std::time::Duration::from_nanos(1_000_000_000 / 60);
+        let clock = ManualVblankClock::default();
+        wait_next_vblank_edge_with_clock(period, &clock);
+        assert_eq!(clock.elapsed(), period);
+        wait_next_vblank_edge_with_clock(period, &clock);
+        assert_eq!(clock.elapsed(), period * 2);
+        assert_eq!(clock.deadlines(), vec![period, period * 2]);
     }
 
     #[test]
