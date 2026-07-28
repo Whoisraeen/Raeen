@@ -5017,3 +5017,62 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   is_multiple_of MSRV lint (checklist item 13, another agent's wave).
 * NEXT: item 2D re-measure GTA V once 2B (compute-queue execution) merges;
   watch for titles depending on real AMPR counter/time values (currently 0).
+
+## 2026-07-27 (hle-stubber agent, worktree) — ITEM 8: real kernel AIO infrastructure
+
+* CLOSES the 2026-07-25 "Skips: 5 AIO (no infra — do not fake)" gap. The 5
+  measured NIDs (phase1-nid-coverage.json: Until Dawn + Dragon Ball Sparking
+  Zero, identical set): sceKernelAioSubmitReadCommands (0x1e05fbf80391239f),
+  SubmitWriteCommands (0x5d0f02f32f9d7be1), WaitRequest (0x28e17fa096d056f7),
+  PollRequests (0xa3b3b8cf78f02b3a), DeleteRequest (0xe5380c13a018b72e) —
+  all REAL, plus 7 sibling spellings sharing the machinery
+  (SubmitRead/WriteCommandsMultiple, WaitRequests, PollRequest,
+  CancelRequest[s], DeleteRequests). InitializeParam/Impl were already real
+  (2026-07-18) and stay in libkernel.rs.
+* ENGINE (`crates/raeen-kernel/src/aio.rs`, new; `OrbisKernel.aio` field):
+  host-threadpool AIO with Orbis submit/poll/wait/cancel/delete semantics.
+  - 2 worker threads, spawned lazily on first submit (a kernel that never
+    uses AIO owns no threads); shutdown on engine drop.
+  - I/O runs through the SAME Arc<VirtualFileSystem> descriptor table as the
+    sync read/pread/pwrite path — a synchronously-opened fd works in an
+    async request, and async writes are visible to sync preads.
+  - States SUBMITTED(1)/PROCESSING(2)/COMPLETED(3)/ABORTED(4); ids s32 >= 1
+    (0 reserved as cancel's "no request" sentinel), wrap-safe.
+  - cancel aborts only not-yet-started slots (returnValue ECANCELED,
+    sign-extended); in-flight requests finish normally and the batch
+    completes — matching Orbis "PROCESSING = could not cancel". Cancel
+    after complete is a no-op. delete retires the final state into a
+    1024-entry ring so a late poll of a deleted id still answers; delete
+    notifies waiters (found + fixed a lost-wakeup on delete-while-waiting).
+* GUEST-MEMORY DISCIPLINE: workers never touch guest memory. Write payloads
+  are captured from the guest buffer at submit time on the guest thread;
+  read completions are staged host-side and copied into the guest buffer +
+  SceKernelAioResult through ctx.mem (the same GuestMemory layer the sync
+  path uses) when the guest drains via wait/poll/cancel/delete. Result
+  structs read SUBMITTED until the API first reports the terminal state.
+* LAYOUTS re-derived from the public C declarations, cross-checked against
+  shadPS4 src/core/libraries/kernel/aio.h (GPL-2.0): RWRequest 0x28
+  (offset@0 s64, nbyte@8 s64, buf@0x10, result@0x18, fd@0x20 s32); Result
+  0x10 (returnValue@0 s64, state@8 u32). No code ported (shadPS4's AIO is
+  synchronous-inline; ours is genuinely async) — no THIRD_PARTY_NOTICES
+  change needed.
+* HLE surface: `crates/raeen-hle/src/kernel_aio.rs` (new module, registered
+  in HleRegistry::new after kernel_equeue). EFAULT/EINVAL/ESRCH/ETIMEDOUT
+  per null-pointer/bad-size/unknown-id/timeout; infinite waits sliced at
+  50ms re-checking process_is_terminating so an AIO wait can never outlive
+  its guest process; batch walks capped at 128 (SCE_KERNEL_AIO_MAX_REQUESTS
+  class bound).
+* Tests: raeen-kernel 53 (+10: submit/poll/wait/cancel/delete lifecycles,
+  multi-request batch, cancel-race with deterministic fresh-engine spawn
+  window, retire ring, unique nonzero ids, negative-SCE returnValue) + 2
+  integration; raeen-hle 507 (+10: struct-layout round-trips, write-persists
+  -through-shared-fd-table, poll-array, timeout, delete-before-wait still
+  delivers staged read, cancel(0) sentinel, validation, registry). One
+  UNRELATED pre-existing flake observed once under full parallel load:
+  libsce_video_out consecutive_vblank_waits_land_one_period_apart (13.0ms <
+  16.6ms period; passes solo and on rerun — host timer granularity).
+  raeen-runtime 77+1+49+1 green. cargo fmt --all clean; clippy
+  --all-targets -D warnings clean on raeen-kernel + raeen-hle.
+* NEXT: re-run xtask nids coverage against installed titles to confirm the
+  5 measured AIO imports flip resolved (needs local game installs); Until
+  Dawn live re-test (checklist item 4) now has one fewer missing surface.

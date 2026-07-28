@@ -22,6 +22,7 @@
 //! | libSceSysmodule.sprx | Partial | Module registry |
 
 pub(crate) mod fmt;
+pub mod kernel_aio;
 pub mod kernel_equeue;
 pub mod kernel_eventflag;
 pub mod kernel_semaphore;
@@ -711,6 +712,9 @@ impl HleRegistry {
         posix_sem::register(&registry);
         // Kernel event queues + user events (supersedes libkernel's equeue stubs).
         kernel_equeue::register(&registry);
+        // Kernel async file I/O (submit/wait/poll/cancel/delete), backed by
+        // the raeen-kernel host-threadpool AIO engine.
+        kernel_aio::register(&registry);
         // BSD sockets (offline) + pure net helpers (htons/inet_pton/bzero).
         kernel_socket::register(&registry);
         libc::register(&registry);
