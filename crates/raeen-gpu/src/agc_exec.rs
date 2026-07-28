@@ -4846,10 +4846,16 @@ mod tests {
             Err(AgcExecError::Gpu(_)) => return, // Vulkan-less CI host.
             other => panic!("state-only submit should not draw: {other:?}"),
         }
-        let image = session
-            .execute_dcb_cp(draw_only, false)
-            .expect("draw-only DCB must inherit the setup DCB")
-            .expect("persistent state reaches a real draw");
+        // The state-only submit above never needs a device (it draws nothing),
+        // so it returns `Ok(None)` even on a Vulkan-less host and the guard
+        // there does not fire. This second submit is the one that actually
+        // rasterizes, so it needs its OWN guard — without it the test fails
+        // only on hosts with no Vulkan 1.3 driver, i.e. exactly CI.
+        let image = match session.execute_dcb_cp(draw_only, false) {
+            Ok(image) => image.expect("persistent state reaches a real draw"),
+            Err(AgcExecError::Gpu(_)) => return, // Vulkan-less CI host.
+            Err(other) => panic!("draw-only DCB must inherit the setup DCB: {other:?}"),
+        };
         assert_eq!((image.width, image.height), (96, 48));
     }
 
