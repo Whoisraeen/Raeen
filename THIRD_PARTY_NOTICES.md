@@ -249,6 +249,34 @@ SOFTWARE.
   options 0x40 and the `GetOutputStatus` 0x30 layout, which Raeen already
   matched); the audit, the guard API, the Rust code, and all of its tests are
   original. Findings recorded in `docs/sharpemu-port/outbuffer-audit.md`.
+  From the GTA V / UE5 boot-unblocker family (upstream `a1cbff8` PR #454,
+  `db4339f` PR #650, `daaeb62` PR #406, `2764aaa` PR #542): three semantics were
+  re-implemented after reading SharpEmu's current tree.
+  (1) **One process-wide stack-protector guard.** `HleDataSymbols.cs`'s
+  *"Keep the process data symbol and every per-thread TLS copy byte-for-byte
+  identical"* and `Kernel/KernelRuntimeCompatExports.cs`'s `__stack_chk_guard`
+  export (one `_stackChkGuardValue` written to both the guard object and
+  `fs:0x28`) established that libkernel's `__stack_chk_guard` global and every
+  thread's TCB slot must hold the same word; Raeen now serves both from
+  `raeen_firmware::stack_chk_guard` (`crates/raeen-firmware/src/lib.rs`,
+  `crates/raeen-runtime/src/arena.rs`). Raeen keeps its own randomized
+  terminator canary and its real FSGSBASE TCB — SharpEmu's Rosetta-driven
+  `mov reg, fs:[0x28]` → `xor reg, reg` code patch is deliberately **not**
+  ported.
+  (2) **Unreal project-relative guest paths.** `NormalizeMountRelativePath`'s
+  pop-with-clamp treatment of `..` (documented there as what makes a UE title's
+  `../../../`-prefixed content paths land back inside `/app0` instead of walking
+  out of the game folder) replaced Raeen's stricter outright refusal in
+  `combine_within_mount` (`crates/raeen-kernel/src/filesystem/mod.rs`); Raeen's
+  drive-qualifier, reparse-point, and canonical-containment defenses are
+  retained unchanged.
+  (3) **Dinkumware `_Ctype` as a data object.** The dual data/function
+  registration pattern of `HleDataSymbols` + `SysAbiExport` and the
+  `LibcStdioExports.cs` table convention (384 `u16` entries over `-128..=255`,
+  exported pointer at the `c == 0` slot) informed publishing `_Ctype` in Raeen's
+  HLE data page from the same generator that backs `_Getpctype`
+  (`crates/raeen-hle/src/libc.rs`). SharpEmu has no `_Ctype` export; the flag
+  layout was already independently present in Raeen.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;
