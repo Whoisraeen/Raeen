@@ -334,6 +334,135 @@ fn dpp_instruction_parses_through_full_chain() {
     );
 }
 
+/// GTA V's measured first shader blocker: a vertex attribute of **2 components
+/// of unified format 5** — `(FMT_8, UINT)` per the RDNA2 table, i.e. two RAW
+/// INTEGER channels. The live 9-title baseline had the title at 192 presented
+/// flips, zero unresolved NIDs and no canary smash, failing only on
+///
+/// ```text
+/// Spirv::WriteGlobalVariables: not supported: invalid registers_num/input format: 2/5
+/// ```
+///
+/// The old translator accepted raw-integer attributes at ONE component wide
+/// only (Minecraft's format-11 bone index), and every other width as float —
+/// so `(2, UINT)` fell through to the refusal, which drops the entire vertex
+/// shader and therefore every draw using it.
+///
+/// This drives the pair through the real chain on the public API only:
+/// `shader_parse_attrib` (the analysis stage that derives `registers_num` from
+/// the semantic and pairs it with the guest V#) -> `shader_recompile_vs`
+/// (SPIR-V generation + assembly) -> **spirv-val**, the Khronos validator the
+/// runtime gate uses. Vulkan additionally requires the interface type's
+/// numeric class to match the bound `VkFormat` (`R8_UINT` demands a uint-typed
+/// input), so a float declaration would not have been a correct fallback.
+#[test]
+fn gta_two_channel_uint_vertex_attribute_translates_to_validated_spirv() {
+    use kyty_graphics::shader::{
+        ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType, ShaderOperand,
+        ShaderOperandType, ShaderSemantic, shader_instruction_format, shader_parse_attrib,
+        shader_parse_vs,
+    };
+
+    // --- 1. analysis: the measured (registers_num, format) pair ------------
+    //
+    // `size_in_elements` = 2 (raw bits 16+), `hardware_mapping` = 2 (bits 8+):
+    // the semantic declares a two-VGPR attribute starting at v2. The attrib
+    // table entry selects V# index 0, whose dword 3 carries unified format 5
+    // in bits 12..18.
+    let semantic = ShaderSemantic {
+        raw: (2 << 8) | (2 << 16),
+    };
+    let attrib = [0u32];
+    let mut vsharp = vec![0u32; 4];
+    vsharp[3] = 5 << 12;
+
+    let mut input_info = ShaderVertexInputInfo {
+        export_count: 1,
+        fetch_embedded: true,
+        // Every measured Gen5 (NGG) vertex shader runs with the GS prolog;
+        // `Spirv::DetectFetch` refuses an embedded fetch without it.
+        gs_prolog: true,
+        ..Default::default()
+    };
+    shader_parse_attrib(&mut input_info, &[semantic], &attrib, &vsharp)
+        .expect("shader_parse_attrib");
+    assert_eq!(
+        input_info.resources_dst[0].registers_num, 2,
+        "the semantic's size_in_elements is the component count the SPIR-V input declares"
+    );
+    assert_eq!(
+        input_info.resources[0].format(),
+        5,
+        "the V# carries the RDNA2 unified format verbatim"
+    );
+
+    // --- 2. a real vertex shader that fetches it --------------------------
+    //
+    // `exp pos0 v0..v3 done; s_endpgm`, with the fetch of attrib id 0 into
+    // v2..v3 prepended. `Spirv::DetectFetch` rewrites a guest
+    // `buffer_load_format_xy` into this `FetchXy` form after proving the
+    // index/buffer/attrib register pattern; constructing the post-detection
+    // instruction directly keeps the fixture free of the embedded-fetch
+    // prolog while exercising the same recompile path.
+    let mem = TestMem {
+        regions: vec![(
+            VS_ADDR,
+            build_shader_blob(
+                &[0xBE83_0380, 0xF800_08CF, 0x0302_0100, S_ENDPGM],
+                &[],
+                0xAAAA_0005,
+                0xBBBB_0005,
+            ),
+        )],
+    };
+    let mut code: ShaderCode = shader_parse_vs(&vs_regs(), &sh_regs(), &mem, false)
+        .expect("shader_parse_vs (GTA 2/5 fixture)");
+
+    let mut fetch = ShaderInstruction {
+        type_: ShaderInstructionType::FetchXy,
+        format: shader_instruction_format::Format::Vdata2VaddrSvSoffsIdxen,
+        src_num: 3,
+        ..Default::default()
+    };
+    fetch.dst = ShaderOperand {
+        type_: ShaderOperandType::Vgpr,
+        register_id: 2,
+        size: 2,
+        ..Default::default()
+    };
+    // src2 holds the attrib-table id after `DetectFetch`.
+    fetch.src[2] = ShaderOperand {
+        type_: ShaderOperandType::IntegerInlineConstant,
+        constant: ShaderConstant::from_i(0),
+        size: 1,
+        ..Default::default()
+    };
+    code.get_instructions_mut().insert(0, fetch);
+
+    // --- 3. recompile + the honest gate ----------------------------------
+    let words = shader_recompile_vs(&code, &input_info)
+        .expect("a 2-component raw-integer vertex attribute must translate");
+    assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+
+    let validator = spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_3));
+    let options = spirv_tools::val::ValidatorOptions {
+        relax_block_layout: Some(true),
+        ..Default::default()
+    };
+    {
+        use spirv_tools::val::Validator;
+        if let Err(e) = validator.validate(&words, Some(options)) {
+            panic!("spirv-val of the GTA 2/5 vertex shader failed: {e}");
+        }
+    }
+
+    // naga is NOT the gate here: it cannot parse this module's storage-image
+    // and descriptor-array shapes in general, a documented false negative for
+    // this crate. spirv-val above is the Khronos authority.
+    let module = naga_parse_and_validate(&words, "gta 2/5 vs");
+    assert_entry_point(&module, naga::ShaderStage::Vertex, "gta 2/5 vs");
+}
+
 /// A shader blob with no `0xBEEB03FF` trailer must fail in analysis with a
 /// named error rather than producing a bogus module -- the boundary is
 /// reported, not papered over.

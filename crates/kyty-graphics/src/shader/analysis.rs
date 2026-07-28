@@ -5337,6 +5337,27 @@ mod tests {
         assert_eq!(info.resources_dst[0].registers_num, 3);
     }
 
+    /// GTA V's measured vertex-attribute shape: a `size_in_elements = 2`
+    /// semantic over a V# whose unified format is **5** = `(FMT_8, UINT)` — two
+    /// RAW INTEGER components. This is where the `2/5` pair that the SPIR-V
+    /// input declaration used to refuse actually comes from: `registers_num`
+    /// is the SEMANTIC's element count, the numeric class is the V#'s, and the
+    /// two are independent — a 1-component hardware format feeding a
+    /// 2-component fetch is normal (the absent channel reads back the default).
+    #[test]
+    fn parse_attrib_carries_the_measured_gta_two_component_uint_pair() {
+        let sem = ShaderSemantic {
+            raw: (2 << 8) | (2 << 16),
+        };
+        let attrib = [0u32]; // V# index 0, no format/offset/fetch overrides
+        let mut buffer = vec![0u32; 4];
+        buffer[3] = 5 << 12; // unified FORMAT lives in dword 3 bits 12..18
+        let mut info = ShaderVertexInputInfo::default();
+        shader_parse_attrib(&mut info, &[sem], &attrib, &buffer).unwrap();
+        assert_eq!(info.resources_dst[0].registers_num, 2);
+        assert_eq!(info.resources[0].format(), 5);
+    }
+
     /// A GAPPED semantics table — Minecraft's measured shape: array positions
     /// 0,1,2 carry semantics 0,2,3 (semantic 1 absent). Each slot must record
     /// the semantic it came from, because `recompile_fetch` resolves by
