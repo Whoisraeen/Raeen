@@ -345,11 +345,8 @@ pub fn draw(
     config: &EmulatorConfig,
     draft: &PerGameSettings,
     title: &str,
-<<<<<<< HEAD
     badge: Option<&compat::TitleBadge>,
-=======
     trophies: Option<&TrophySummary>,
->>>>>>> worktree-agent-ab8451f5668e88c3c
 ) -> Option<GameOptionsClick> {
     let screen = ui.max_rect();
     ui.painter().rect_filled(screen, 0.0, theme.palette.ground);

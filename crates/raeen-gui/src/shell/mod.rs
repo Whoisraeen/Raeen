@@ -1864,11 +1864,8 @@ impl Shell {
                     &self.config,
                     &self.game_options_draft,
                     &title,
-<<<<<<< HEAD
                     badge,
-=======
                     self.game_options_trophies.as_ref(),
->>>>>>> worktree-agent-ab8451f5668e88c3c
                 );
                 return;
             }
