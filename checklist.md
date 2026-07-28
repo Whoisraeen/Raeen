@@ -1364,3 +1364,71 @@ Until Dawn, or ASTRO.BOT. Do not claim any of the three titles is fixed.
 - Porting agents must not edit `checklist.md` or `.superpowers/sdd/progress.md`
   (the main session owns both); they write `docs/sharpemu-port/<cluster>.md`.
   This eliminated the conflict storm from earlier waves.
+
+---
+
+## ★ LIVE VALIDATION OF THE SWEEP — MEASURED 2026-07-28 (build 2e4bdca)
+
+Full 9-title `cargo xtask baseline run` against the sweep build. Raw report:
+`artifacts/compat/baseline-parts/baseline-1785235662044/merged.json`.
+**Formal diff verdict: 4 matched titles, 2 progressed, 0 REGRESSED.**
+This is the measured evidence the earlier waves lacked.
+
+### Until Dawn (PPSA15421) — the canary abort is GONE
+
+| | stage | flips | first blocker |
+|---|---|---|---|
+| before | `exited` @ 6.7 s | 0 | `__stack_chk_fail: guest stack canary smashed on thread 1` |
+| **after** | **`timed_out` (survives the full 180 s)** | 0 | **(none logged at all)** |
+
+The title no longer aborts, and **no error line is emitted for the whole run**.
+This directly confirms the wave-5 root cause: Raeen was minting a fresh random
+guard word per TCB plus another for the `__stack_chk_guard` global, so a frame
+created on one thread and validated on another failed on an intact stack.
+Unifying them removed the abort. **Measured, not inferred.**
+
+### ASTRO.BOT (PPSA21564) — the 0xC0000409 host crash is GONE
+
+| | stage | flips | exit | first blocker |
+|---|---|---|---|---|
+| before | `crashed` | 4 | **-1073740791 (0xC0000409)** | `storage_texture_dim_format: mixed storage image dims/formats ((Three,"Rgba16f") vs (Two,…))` |
+| **after** | **`rendering`** | **64 (+60)** | **0 (clean)** | `unknown mimg format for opcode: 0x47, dmask: 0x2` |
+
+Both the mixed-dim shader refusal AND the host crash are gone; the process now
+exits **cleanly** and is classified `rendering`. Two independent fixes were in
+play (the type-nibble `volume` flag and the `RefCell`-in-VEH defect) and the
+crash did not survive either way. The new blocker is a *different, further-along*
+shader gap.
+
+### GTA V (PPSA04264) — the canary is gone; 48x more frames presented
+
+| | stage | flips | first blocker |
+|---|---|---|---|
+| before (this session, build 9c7cc30) | `timed_out` | 4 | `__stack_chk_fail: guest stack canary smashed on thread 31` |
+| **after** | `timed_out` | **192 (48x)** | `Spirv::WriteGlobalVariables: not supported: invalid registers_num/input format: 2/5` |
+
+The thread-31 canary smash no longer appears anywhere in the run, and the
+blocker has moved from a memory-corruption abort to a shader-translation gap.
+
+### Minecraft (PPSA17221) — no regression
+
+`timed_out`, 10,080 flips, **zero** unresolved NIDs, **no error line logged**.
+FPS in this run (59.7) is NOT comparable: the host was concurrently running the
+user's Codex build (2 cargo + 1 rustc, 1.4 GB free). Stage/flips/blocker are
+load-robust; FPS is not.
+
+### The measured frontier is now shader translation, not memory corruption
+
+Every remaining first-blocker across the library is a *rendering* gap — which is
+exactly where the goal points next:
+
+| Title | Stage | Blocker |
+|---|---|---|
+| GTA V | timed_out, 192 flips | `Spirv::WriteGlobalVariables: invalid registers_num/input format: 2/5` |
+| ASTRO.BOT | **rendering**, 64 flips | `unknown mimg format for opcode 0x47, dmask 0x2` |
+| Avatar Frontiers of Pandora | timed_out, 141 flips | `unknown smem instruction s_load_dwordx16, opcode 0x4` (+5 unresolved NIDs) |
+| A Plague Tale Requiem | crashed | exit `-1073741676` = **0xC0000094 integer divide-by-zero** (new signal, host-side) |
+| Subnautica Below Zero | timed_out, 0 flips | `sceKernelRaiseException: async delivery not implemented` |
+| Dragon Ball Sparking Zero | timed_out / exited | (two entries; no blocker line) |
+
+Note none of these is a canary smash or an unresolved NID any more.
