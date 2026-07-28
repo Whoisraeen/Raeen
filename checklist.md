@@ -486,13 +486,24 @@ top-down, update statuses in place, and keep it committed.**
   getdents d_reclen overflow is fixed, so another guest-visible struct/size
   mismatch remains (hunt the same way: audit the syscalls in the pre-canary
   log window against shadPS4 layouts). This is now GTA V's top blocker.
-- [ ] **ASTRO.BOT regression (TimedOut → Crashed 0xC0000409):** ACB Phase B
-  made previously-dropped descriptor-form compute submissions execute; ASTRO
-  now reaches 20 shader errors (`storage_texture_dim_format: mixed storage
-  image dims/formats in one shader (Three vs Two, Rgba16f)`) and then a HOST
-  fail-fast (STATUS_STACK_BUFFER_OVERRUN) after 83 s — that's OUR bug, not
-  the guest's: (a) support or gracefully refuse mixed-dim storage images in
-  one shader; (b) find the host-side buffer overrun in the new dispatch path.
+- [x] **ASTRO.BOT regression fixed 2026-07-28** (`94910987be57+dirty`,
+  release): mixed `(Dim, format)` sampled/storage arrays are split into
+  matching Vulkan descriptor arrays, and exact compute slices/lifetimes are
+  bounded. The remaining `0xC0000409` was traced by validation-clean
+  graphics/compute A/B to PS `0x500652400`. Its valid SPIR-V indexed a
+  one-element storage-buffer descriptor array with guest V# base
+  `0x026f6a70`: `shader_capture_runtime_scalar_loads` had snapshotted an
+  `s_load_dwordx4` through the recovered EUD pointer as raw constants,
+  pre-empting `sload_dword_extended`'s guest-address → Vulkan-index rewrite.
+  EUD-base loads now stay on the mapped push-constant path; a regression pins
+  that exact descriptor value while the non-EUD Minecraft runtime-pointer
+  capture remains green. Live production-default validation:
+  `validation-eud-descriptor-rewrite-fix-production-60.json` — 60.6 s,
+  9 measured flips, 2.84 GB peak RAM, zero device-loss/VUID/fastfail/
+  `STATUS_STACK_BUFFER_OVERRUN`. Controlled reciprocal A/B also proved
+  `0x500652400` alone was necessary and sufficient for the old loss.
+  This closes the host-crash regression, not ASTRO rendering correctness:
+  named shader gaps and the existing exact compute quarantines remain.
 - **Note:** Minecraft FPS in this run (65.6 vs 72.2) was measured while five
   agent worktree builds were running — contaminated, not a regression signal.
 
@@ -933,3 +944,94 @@ address-range heuristic. (In flight.)
   screenshot and the HUD all block for a full fence duration. Not yet assigned.
 - `PthreadCond` holds the tree's only true FIFO per-waiter queue; it is the
   structure to generalize for the futex and mutex handoff work.
+
+### Also on `integration/sharpemu-sweep` (wave 2)
+
+- **`b2541c9` — VEH hardening (three defects, all from auditing Raeen itself).**
+  Verdict recorded on ASTRO's `0xC0000409`: **defect 1 is the only one that can
+  produce that exit code**, and the mechanism is specific — nested callback +
+  guest fault + a completion address the arena refuses → fault taken while the
+  `RefCell` borrow is live → re-entrant VEH → `BorrowMutError` → panic across
+  `extern "system"` → `abort` → `__fastfail` → 409 **with no Raeen fault line**,
+  which matches the observed signature exactly. Not proven under a debugger,
+  but it is the one defect whose failure mode *is* that code. (Defect 3 can only
+  hang; defect 2 always recovers — but it sent every such investigation to the
+  wrong crate.)
+  1. `callback_frames` is now `Cell<Vec<_>>` (matching every other
+     `ActiveContext` field), and three helpers take the vector OUT of the cell
+     before any guest memory is touched, at all four sites. Worst case is now
+     one un-rolled-back completion word instead of a panic inside an exception
+     handler.
+  2. New pure `classify_access_violation`: an AV whose RIP the VMA map
+     *positively* attributes to host code (and which is not a stub/trampoline
+     hit, not an execute fault, not guest-readable RIP) becomes
+     `RuntimeError::HostFaulted { rip, access, kind, hle }` logged as "this is a
+     Raeen bug" instead of being laundered as a guest fault. Host-owned comes
+     from `VmaType::Foreign`, not an address range — a range test provably
+     cannot work here (guest maps at 12 GiB, below the 16 TiB arena; the host
+     image loads at `0x7ff6…`, above it — measured).
+  3. Abandoned-lock recovery now runs on **every** worker exit path
+     (`returned/pthread-exit`, `process-exit`, `faulted`) instead of only
+     `result.is_err()`, and `LockReleaseSummary` gains `cond_waiters`: a dead
+     thread's condvar entry is now **discarded, never signalled** (a
+     `signal_one` popping an abandoned entry silently swallowed a live waiter's
+     wakeup). Semaphore ownership is **not trackable today** — no owner field on
+     `Semaphore`/`PosixSem`/`EventFlag` — and the agent correctly declined to
+     invent one; the doc records that it would need a `(thread, sema)` ledger
+     gated on `max_count == 1`.
+- **`38a2086` — real futex + mutex direct handoff** (SharpEmu #422, #439).
+  - `sceKernelSyncOnAddressWait/Wake` were stubs (an unconditional 10 ms sleep
+    that never read the watched word, and a no-op wake). Now a real
+    address-keyed parking lot. The existing FIFO was **generalized rather than
+    duplicated**: `PthreadCondWaiter`/`PthreadCond` split into `GuestWaiter` +
+    `GuestWaitQueue`, now serving `PthreadCond` (public API byte-identical, so
+    `pthread_cond.rs` needed zero edits), the new `SyncAddressTable`, and the
+    mutex handoff queue. `sys_futex` (previously three `debug!` lines and
+    `Ok(0)`) shares the same table.
+  - **Deliberate divergence from SharpEmu:** they approximate the missing
+    compare value with a per-address wake *generation counter*; this does
+    enqueue-before-read instead, so a waker writing after our read necessarily
+    finds us queued and one writing before is caught by the compare
+    (`EAGAIN`). No wake can be lost, and it avoids the stale-wake failure mode
+    already removed from `PthreadCond` (a generation bump is visible to every
+    waiter, turning wake-one into a broadcast). `Wait32`/`Wait64` do the real
+    compare; the generic unsized `Wait` deliberately does not (its argument
+    layout past the address is unrecovered — guessing risks a permanent
+    spurious `EAGAIN`) and parks with a 100 ms self-heal. Every park is
+    bounded; no path can hang.
+  - Mutex unlock is now a true handoff: `try_grant_head` sets owner+recursion
+    and wakes the head **under the state lock**, and the shared `unlocked`
+    condvar is deleted (notifying it *was* the barging). `lock_core` is two
+    phases with the type matrix preserved verbatim and in order — `owner ==
+    current` is tested before the free check, so self-relock never queues and a
+    grant cannot double-count recursion. Three behavioral consequences recorded:
+    `Trylock` returns `EBUSY` on a free-but-queued mutex (correct anti-barging);
+    a timeout racing a grant returns `OK` rather than leaking ownership; and
+    free-with-waiters is unacquirable, so every path clearing `owner` — both
+    owner-death recovery functions included — must grant the head.
+  - 24 new deterministic tests (no threads, no sleeps).
+- **Reconciliation commit** — the two branches collided semantically (VEH added
+  cond-waiter cleanup while futex moved `PthreadCond` onto `GuestWaitQueue`);
+  `PthreadCond::remove_waiters_of` now delegates. Verified after merge:
+  **raeen-hle 540, raeen-kernel 64, raeen-runtime 82** green.
+
+### Environment hazards discovered (record these)
+
+- **`git stash` is repository-wide, NOT per-worktree.** Two agents each popped
+  the other's stash; one recovered its work from a dangling object via
+  `git fsck --unreachable`. **Porting agents must never use `git stash`** — and
+  never blind-pop: at one point the stack held two live agents' entries.
+- **Memory exhaustion is a real failure mode with parallel worktree agents.**
+  With several `cargo` builds live the host hit **0.6 GB free of 13.8 GB** and
+  `rustc` began dying with `0xC0000409` and `os error 1455` ("paging file is too
+  small"). Two agents saw exactly this and recovered on retry. Cap concurrent
+  building agents (~3) or stagger them; a `rustc` 409 under load is NOT a code
+  defect. This also means **a bare `0xC0000409` is ambiguous on this host** —
+  confirm whether the dying process is `raeen.exe` or `rustc.exe` before
+  concluding anything about ASTRO.
+- Two wall-clock tests flake purely as a function of host load:
+  `libsce_video_out::consecutive_vblank_waits_land_one_period_apart` and
+  `kernel_equeue::finite_timeout_longer_than_internal_slice_waits_for_event`.
+  Round-2 item 29 (inject a mock clock) covers the first; the second needs the
+  same treatment. Suite runs 1.1 s clean vs 4–12 s with failures under
+  contention.
