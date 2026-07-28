@@ -460,6 +460,38 @@ fn format_guest_thread_site(kernel: &raeen_kernel::OrbisKernel, thread: u64) -> 
     )
 }
 
+/// Resolve a bounded set of guest return addresses retained in the owner's
+/// acquisition frame. This runs only after three seconds of contention; doing
+/// the same walk on every hot mutex acquisition would distort the title.
+fn format_guest_acquire_stack(ctx: &HleContext, rsp: u64) -> String {
+    if rsp == 0 {
+        return "<unavailable>".to_owned();
+    }
+    let mut sites = Vec::new();
+    for index in 0..128u64 {
+        let mut bytes = [0u8; 8];
+        if !ctx.mem.read(rsp.wrapping_add(index * 8), &mut bytes) {
+            break;
+        }
+        let address = u64::from_le_bytes(bytes);
+        let Some(module) = ctx.kernel.unwind_module_for_addr(address) else {
+            continue;
+        };
+        let site = format!("{}+{:#x}", module.name, address - module.start);
+        if sites.last() != Some(&site) {
+            sites.push(site);
+        }
+        if sites.len() == 8 {
+            break;
+        }
+    }
+    if sites.is_empty() {
+        "<no guest return addresses>".to_owned()
+    } else {
+        sites.join(" <- ")
+    }
+}
+
 /// The lock state machine. With one active guest thread, a mutex either is
 /// free (acquire it) or is already held by this thread (per-type re-lock
 /// behavior). A missing mutex is created implicitly (guest static
@@ -559,6 +591,7 @@ fn lock_core(
             state.owner = current;
             state.recursion = 1;
             state.owner_acquire_site = ctx.caller_return_addr;
+            state.owner_acquire_rsp = ctx.caller_rsp;
             return OK;
         }
         if try_only || ctx.guest_threads.process_is_terminating() {
@@ -567,7 +600,7 @@ fn lock_core(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        let waiter = state.enqueue_waiter(current, ctx.caller_return_addr);
+        let waiter = state.enqueue_waiter(current, ctx.caller_return_addr, ctx.caller_rsp);
         if state.try_grant_head() == Some(current) {
             return OK;
         }
@@ -602,11 +635,12 @@ fn lock_core(
             return abandon_mutex_wait(&shared, &waiter, ETIMEDOUT);
         }
 
-        let (owner, owner_acquire_site, ty, recursion, queued) = {
+        let (owner, owner_acquire_site, owner_acquire_rsp, ty, recursion, queued) = {
             let state = shared.state.lock();
             (
                 state.owner,
                 state.owner_acquire_site,
+                state.owner_acquire_rsp,
                 state.ty,
                 state.recursion,
                 state.waiter_count(),
@@ -667,6 +701,7 @@ fn lock_core(
                 .in_flight_hle
                 .get(&owner)
                 .map_or_else(|| "<guest code>".to_owned(), |entry| entry.clone());
+            let owner_acquire_stack = format_guest_acquire_stack(ctx, owner_acquire_rsp);
             match diagnostic {
                 MutexWaitDiagnostic::LongContention => {
                     reported_contention = true;
@@ -677,6 +712,7 @@ fn lock_core(
                         owner,
                         owner_name = %owner_name,
                         owner_acquired_at = %owner_acquired_at,
+                        owner_acquire_stack = %owner_acquire_stack,
                         owner_site = %owner_site,
                         owner_wait = %owner_wait,
                         ty,
@@ -695,6 +731,7 @@ fn lock_core(
                         owner,
                         owner_name = %owner_name,
                         owner_acquired_at = %owner_acquired_at,
+                        owner_acquire_stack = %owner_acquire_stack,
                         owner_site = %owner_site,
                         owner_wait = %owner_wait,
                         ty,
@@ -756,6 +793,7 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     if state.recursion == 0 {
         state.owner = 0;
         state.owner_acquire_site = 0;
+        state.owner_acquire_rsp = 0;
         // Transfer ownership under the state lock and wake exactly the FIFO
         // head. Clearing then notifying allowed arrivals to barge ahead of the
         // selected waiter, starving Minecraft's streaming workers.

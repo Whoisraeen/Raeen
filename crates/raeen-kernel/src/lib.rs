@@ -833,6 +833,10 @@ pub struct PthreadMutex {
     /// of the critical section instead of sampling an arbitrary instruction
     /// several seconds later. Zero means unavailable or unlocked.
     pub owner_acquire_site: u64,
+    /// Guest stack pointer at the lock import boundary. Read only after a
+    /// long-contention threshold, while the owning critical-section frame is
+    /// still live, to recover parent guest return addresses.
+    pub owner_acquire_rsp: u64,
     /// Threads blocked on this mutex, oldest first.
     waiters: std::collections::VecDeque<PthreadMutexWaiter>,
 }
@@ -841,6 +845,7 @@ pub struct PthreadMutex {
 struct PthreadMutexWaiter {
     signal: Arc<PthreadCondWaiter>,
     acquire_site: u64,
+    acquire_rsp: u64,
 }
 
 /// One guest mutex's shared state and FIFO of private waiter signals.
@@ -863,6 +868,7 @@ impl PthreadMutex {
                 owner: 0,
                 recursion: 0,
                 owner_acquire_site: 0,
+                owner_acquire_rsp: 0,
                 waiters: std::collections::VecDeque::new(),
             }),
         })
@@ -878,6 +884,7 @@ impl PthreadMutex {
                 owner,
                 recursion,
                 owner_acquire_site: 0,
+                owner_acquire_rsp: 0,
                 waiters: std::collections::VecDeque::new(),
             }),
         })
@@ -890,6 +897,7 @@ impl PthreadMutex {
         &mut self,
         thread: u64,
         acquire_site: u64,
+        acquire_rsp: u64,
     ) -> Arc<PthreadCondWaiter> {
         if thread != 0 {
             self.waiters
@@ -899,6 +907,7 @@ impl PthreadMutex {
         self.waiters.push_back(PthreadMutexWaiter {
             signal: Arc::clone(&waiter),
             acquire_site,
+            acquire_rsp,
         });
         waiter
     }
@@ -930,6 +939,7 @@ impl PthreadMutex {
         self.owner = waiter.signal.thread;
         self.recursion = 1;
         self.owner_acquire_site = waiter.acquire_site;
+        self.owner_acquire_rsp = waiter.acquire_rsp;
         waiter.signal.wake();
         Some(waiter.signal.thread)
     }
@@ -1123,8 +1133,8 @@ mod pthread_mutex_handoff_tests {
         state.owner = 0x100;
         state.recursion = 1;
 
-        let first = state.enqueue_waiter(0x201, 0x1000_0201);
-        let second = state.enqueue_waiter(0x202, 0x1000_0202);
+        let first = state.enqueue_waiter(0x201, 0x1000_0201, 0x2000_0201);
+        let second = state.enqueue_waiter(0x202, 0x1000_0202, 0x2000_0202);
         assert_eq!(state.waiter_count(), 2);
         assert_eq!(state.try_grant_head(), None);
 
@@ -1137,6 +1147,7 @@ mod pthread_mutex_handoff_tests {
             state.owner_acquire_site, 0x1000_0201,
             "direct handoff must retain the selected waiter's guest call site"
         );
+        assert_eq!(state.owner_acquire_rsp, 0x2000_0201);
         assert!(first.is_signaled());
         assert!(!second.is_signaled());
         assert_eq!(state.waiter_count(), 1);
@@ -1149,9 +1160,9 @@ mod pthread_mutex_handoff_tests {
         state.owner = 0x100;
         state.recursion = 1;
 
-        let timed_out = state.enqueue_waiter(0x201, 0x1000_0201);
-        let stale = state.enqueue_waiter(0x202, 0x1000_dead);
-        let live = state.enqueue_waiter(0x202, 0x1000_0202);
+        let timed_out = state.enqueue_waiter(0x201, 0x1000_0201, 0x2000_0201);
+        let stale = state.enqueue_waiter(0x202, 0x1000_dead, 0x2000_dead);
+        let live = state.enqueue_waiter(0x202, 0x1000_0202, 0x2000_0202);
         assert!(state.cancel_waiter(&timed_out));
         assert_eq!(state.waiter_count(), 1);
 
@@ -1162,6 +1173,7 @@ mod pthread_mutex_handoff_tests {
         assert!(!stale.is_signaled());
         assert!(live.is_signaled());
         assert_eq!(state.owner_acquire_site, 0x1000_0202);
+        assert_eq!(state.owner_acquire_rsp, 0x2000_0202);
     }
 }
 
@@ -1256,6 +1268,7 @@ impl OrbisKernel {
                 state.owner = 0;
                 state.recursion = 0;
                 state.owner_acquire_site = 0;
+                state.owner_acquire_rsp = 0;
                 released += 1;
                 // Wake every parked waiter — the lock they were waiting for
                 // just became available via owner death.
@@ -1297,6 +1310,7 @@ impl OrbisKernel {
                 state.owner = 0;
                 state.recursion = 0;
                 state.owner_acquire_site = 0;
+                state.owner_acquire_rsp = 0;
                 summary.mutexes += 1;
                 // Owner died holding this — wake the parked waiters.
                 state.try_grant_head();
