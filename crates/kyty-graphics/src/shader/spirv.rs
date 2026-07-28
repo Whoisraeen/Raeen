@@ -1938,25 +1938,50 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
 
     let base_reg = bind.extended.start_register;
     let mut required: Option<u32> = None;
+    let mut unresolved_dynamic_offset = false;
     for inst in code.get_instructions() {
         let n = match inst.type_ {
-            T::SLoadDwordx2 => 2u32,
+            T::SLoadDword => 1u32,
+            T::SLoadDwordx2 => 2,
             T::SLoadDwordx4 => 4,
             T::SLoadDwordx8 => 8,
             T::SLoadDwordx16 => 16,
             _ => continue,
         };
-        if inst.src[0].type_ != ShaderOperandType::Sgpr
-            || inst.src[0].register_id != base_reg
-            || !matches!(
-                inst.src[1].type_,
-                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
-            )
-            || inst.src[1].constant.i() < 0
+        if inst.src[0].type_ != ShaderOperandType::Sgpr || inst.src[0].register_id != base_reg {
+            continue;
+        }
+        // Beyond Kyty: a register soffset (RDNA2 `base + soffset + imm`) makes
+        // this load's dword index runtime-variable, so it CANNOT contribute a
+        // window size. Silently skipping it would record a window that looks
+        // authoritative but may not cover the access; record the doubt instead
+        // (the recompiler then refuses the raw read by name). A load whose
+        // soffset analysis already proved is served from its per-PC capture and
+        // never touches this window.
+        if crate::shader::types::smem_register_soffset(inst).is_some() {
+            if bind.embedded_constant_loads.find(inst.pc).is_none() {
+                unresolved_dynamic_offset = true;
+                tracing::warn!(
+                    pc = inst.pc,
+                    type_ = ?inst.type_,
+                    format = ?inst.format,
+                    dwords = n,
+                    eud_base_register = base_reg,
+                    "raw EUD-window size is a lower bound: s_load off the EUD base has an \
+                     unresolved register soffset"
+                );
+            }
+            continue;
+        }
+        let offset = crate::shader::types::smem_offset_operand(inst);
+        if !matches!(
+            offset.type_,
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+        ) || offset.constant.i() < 0
         {
             continue;
         }
-        let base_dw = inst.src[1].constant.u >> 2;
+        let base_dw = offset.constant.u >> 2;
         for i in 0..n {
             let idx = base_dw + i;
             let is_covered = usize::try_from(idx)
@@ -1990,6 +2015,7 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
             used: true,
             binding_index,
             required_dwords,
+            unresolved_dynamic_offset,
         };
         tracing::debug!(
             binding_index,

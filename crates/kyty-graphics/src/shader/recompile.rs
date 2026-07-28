@@ -1664,32 +1664,29 @@ fn recompile_sendpgm_empty(
 }
 
 /// Kyty: `Recompile_SLoadDword_SdstSbaseSoffset` (ShaderSpirv.cpp L4287) —
-/// pure gate: skip the load when it belongs to the embedded fetch shader.
+/// upstream is a pure gate: skip the load when it belongs to the embedded fetch
+/// shader, otherwise `return false` ("can't recompile").
+///
+/// Beyond Kyty: a single-dword scalar load is the same addressing family as
+/// x2/x4/x8/x16 and now shares their materialization ([`sload_dword_wide`]), so
+/// an `s_load_dword` off the EUD base or off a captured live-in/PC-relative
+/// pointer lowers instead of failing the whole shader.
 fn recompile_sload_dword(
     index: u32,
     code: &ShaderCode,
-    _dst_source: &mut String,
+    dst_source: &mut String,
     spirv: &Spirv<'_>,
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SLoadDword_SdstSbaseSoffset";
-    let inst = inst_at(code, index, FUNC)?;
-    let vs_info = spirv.get_vs_input_info();
-
-    let shift_regs = if vs_info.is_some_and(|v| v.gs_prolog) {
-        8
-    } else {
-        0
-    };
-
-    Ok(vs_info.is_some_and(|v| {
-        v.fetch_embedded
-            && !v.fetch_external
-            && !v.fetch_inline
-            && (inst.src[0].register_id == v.fetch_attrib_reg + shift_regs
-                || inst.src[0].register_id == v.fetch_buffer_reg + shift_regs)
-    }))
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        1,
+        "Recompile_SLoadDword_SdstSbaseSoffset",
+    )
 }
 
 /// Kyty: `Recompile_SLoadDwordx2_Sdst2Ssrc02Ssrc1` (ShaderSpirv.cpp L4299).
@@ -1766,6 +1763,33 @@ fn sload_dword_extended(
             );
         }
         return Ok(true);
+    }
+
+    // Beyond Kyty: an unresolved **register soffset**. RDNA2 adds
+    // `SGPR[soffset]` to the address, so neither the EUD dword index below nor
+    // the raw-window index is knowable at translate time. Analysis
+    // (`resolve_scalar_soffset_bytes`) folds the shapes it can prove into the
+    // per-PC capture handled above; reaching here means it could not, so refuse
+    // by name — with the width and format, so the log line identifies the exact
+    // form still missing (measured ASTRO.BOT `rendering`, three compute
+    // shaders).
+    if let Some(soffset) = crate::shader::types::smem_register_soffset(inst) {
+        return Err(not_supported(
+            func,
+            format!(
+                "unresolved register soffset: {:?} [{:?}] x{n} dwords, base=s{}, soffset={}, \
+                 imm={:#x}, pc={:#x}",
+                inst.type_,
+                inst.format,
+                inst.src[0].register_id,
+                match soffset.type_ {
+                    ShaderOperandType::Sgpr => format!("s{}", soffset.register_id),
+                    other => format!("{other:?}"),
+                },
+                crate::shader::types::smem_offset_operand(inst).constant.u,
+                inst.pc,
+            ),
+        ));
     }
 
     if !bind_info.extended.used {
@@ -1874,6 +1898,23 @@ fn sload_dword_extended(
                     // shader; keep the named refusal rather than reading a
                     // buffer the dispatch path will not bind.
                     return Err(refusal);
+                }
+                if bind_info.eud_raw.unresolved_dynamic_offset {
+                    // Detection could not size the window: another s_load off
+                    // the same EUD base has a runtime register soffset, so
+                    // `required_dwords` is only a lower bound. Reading it would
+                    // silently clamp to 0 past a window we KNOW may be short —
+                    // refuse by name instead (see `shader_detect_eud_raw_window`).
+                    return Err(not_supported(
+                        func,
+                        format!(
+                            "raw EUD window is a lower bound (an s_load off s{} has an \
+                             unresolved register soffset); refusing dword {} of x{n} at pc={:#x}",
+                            bind_info.extended.start_register,
+                            offset + i,
+                            inst.pc,
+                        ),
+                    ));
                 }
                 let idx = u32::try_from(offset + i)
                     .map_err(|_| not_supported(func, "negative raw EUD dword index"))?;
@@ -10728,6 +10769,17 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_sload_dwordx4, T::SLoadDwordx4, F::Sdst4SbaseSoffset, p1("")),
     f(recompile_sload_dwordx8, T::SLoadDwordx8, F::Sdst8SbaseSoffset, p1("")),
     f(recompile_sload_dwordx16, T::SLoadDwordx16, F::Sdst16SbaseSoffset, p1("")),
+    // Beyond Kyty: the same five widths in the three-operand addressing form
+    // (`src[1]` register soffset + `src[2]` immediate — RDNA2 adds both). They
+    // share the x1..x16 lowering: a load whose soffset analysis proved is served
+    // from its per-PC capture, anything else refuses by name inside
+    // `sload_dword_extended`. Without these rows the dispatch table had NO entry
+    // for the format and the shader died at "no table entry" instead.
+    f(recompile_sload_dword,    T::SLoadDword,    F::SdstSbaseSoffsetOffset,   p1("")),
+    f(recompile_sload_dwordx2,  T::SLoadDwordx2,  F::Sdst2SbaseSoffsetOffset,  p1("")),
+    f(recompile_sload_dwordx4,  T::SLoadDwordx4,  F::Sdst4SbaseSoffsetOffset,  p1("")),
+    f(recompile_sload_dwordx8,  T::SLoadDwordx8,  F::Sdst8SbaseSoffsetOffset,  p1("")),
+    f(recompile_sload_dwordx16, T::SLoadDwordx16, F::Sdst16SbaseSoffsetOffset, p1("")),
 
     fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SAndn2B64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
         "%tb_<index> = OpBitwiseAnd %uint %t0_<index> %ta_<index>",
@@ -11406,7 +11458,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            353,
+            358,
             "the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
              VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
              the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),            the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
@@ -11441,11 +11493,11 @@ mod tests {
              and the measured VCmpxLeU32 + DsAddRtnU32 rows, and the \
              instruction-coverage batch: ImageGather4Lz dmask2/4/8 (the dmask \
              bit index is the SPIR-V gather Component operand) and \
-             SLoadDwordx16 (SMEM/SMRD opcode 0x04)"
+             SLoadDwordx16 (SMEM/SMRD opcode 0x04), and the SMEM              register-soffset batch: the five Sdst/2/4/8/16-SbaseSoffsetOffset              rows (RDNA2 `base + soffset + imm`)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 345,
+            implemented, 350,
             "the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
@@ -11474,6 +11526,8 @@ mod tests {
               DsAddRtnU32, \
               and the instruction-coverage batch: ImageGather4Lz dmask2/4/8 \
               and SLoadDwordx16, \
+              and the SMEM register-soffset batch: five \
+              Sdst/2/4/8/16-SbaseSoffsetOffset rows, \
               and the exp-null row: EXP target 9 accepted and dropped)"
         );
         assert_eq!(
@@ -19340,9 +19394,447 @@ mod tests {
 
         let err = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect_err("register-soffset s_load_dwordx8 must refuse");
+        // The refusal now names the width, the format, the base and the
+        // soffset register (it used to be the generic "src1 is not a constant
+        // offset"), so a live log line identifies the exact unsupported form.
+        let text = err.to_string();
+        for want in [
+            "unresolved register soffset",
+            "SLoadDwordx8",
+            "Sdst8SbaseSoffset",
+            "x8 dwords",
+            "base=s12",
+            "soffset=s20",
+        ] {
+            assert!(text.contains(want), "refusal must name {want}, got: {text}");
+        }
+    }
+
+    // ---- SMEM register soffset (RDNA2 `base + soffset + imm`) -------------
+
+    /// A three-operand register-soffset load (`src[1]` soffset register,
+    /// `src[2]` immediate) whose address analysis already resolved: the per-PC
+    /// capture materializes the dwords, so the shader translates instead of
+    /// dying at "no table entry for .../Sdst4SbaseSoffsetOffset".
+    ///
+    /// This is ASTRO.BOT's blocked shape (`offset != 0 with register soffset`,
+    /// three compute shaders) taken all the way to validated SPIR-V.
+    #[test]
+    fn register_soffset_with_offset_materializes_a_resolved_capture() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // Twice: `Recompile_SEndpgm_Empty` inspects the two preceding
+        // instructions, so a one-instruction body cannot reach s_endpgm.
+        let load = ShaderInstruction {
+            pc: 0x20,
+            type_: T::SLoadDwordx4,
+            format: F::Sdst4SbaseSoffsetOffset,
+            src_num: 3,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 16,
+                size: 4,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 4,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::IntegerInlineConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(16),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(load);
+        code.get_instructions_mut().push(load);
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let values = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        let loads = &mut input_info.bind.embedded_constant_loads;
+        loads.loads_num = 1;
+        loads.loads[0].pc = 0x20;
+        loads.loads[0].dwords_num = 4;
+        loads.loads[0].values[..4].copy_from_slice(&values);
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("a resolved register-soffset load materializes");
+        for v in values {
+            assert!(
+                source.contains(&format!("{v}")) || source.contains(&format!("{v:#x}")),
+                "each captured dword is stored as a constant:\n{source}"
+            );
+        }
         assert!(
-            err.to_string().contains("src1 is not a constant offset"),
-            "named refusal expected, got: {err}"
+            source.matches("OpStore").count() >= 4,
+            "four destination SGPRs are written:\n{source}"
         );
+        let words = spirv_run(&source).expect("assemble register-soffset compute shader");
+        spirv_val_ok(&words, "register_soffset_resolved_x4");
+    }
+
+    /// The same three-operand form with NOTHING resolved: a named refusal that
+    /// carries the width, the format, the base and the soffset register, so the
+    /// live log line identifies the exact addressing form still missing (and it
+    /// is counted like every other shader error, being logged through the same
+    /// recompile-failure path).
+    #[test]
+    fn unresolved_register_soffset_with_offset_refuses_naming_format_and_width() {
+        for (type_, format, width) in [
+            (T::SLoadDword, F::SdstSbaseSoffsetOffset, "x1"),
+            (T::SLoadDwordx2, F::Sdst2SbaseSoffsetOffset, "x2"),
+            (T::SLoadDwordx4, F::Sdst4SbaseSoffsetOffset, "x4"),
+            (T::SLoadDwordx8, F::Sdst8SbaseSoffsetOffset, "x8"),
+            (T::SLoadDwordx16, F::Sdst16SbaseSoffsetOffset, "x16"),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 0x24,
+                type_,
+                format,
+                src_num: 3,
+                dst: ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 40,
+                    size: 1,
+                    ..Default::default()
+                },
+                src: [
+                    ShaderOperand {
+                        type_: ShaderOperandType::Sgpr,
+                        register_id: 12,
+                        size: 2,
+                        ..Default::default()
+                    },
+                    ShaderOperand {
+                        type_: ShaderOperandType::Sgpr,
+                        register_id: 7,
+                        size: 1,
+                        ..Default::default()
+                    },
+                    ShaderOperand {
+                        type_: ShaderOperandType::IntegerInlineConstant,
+                        constant: crate::shader::types::ShaderConstant::from_u(0x50),
+                        ..Default::default()
+                    },
+                    ShaderOperand::default(),
+                ],
+                ..Default::default()
+            });
+            code.get_instructions_mut().push(ShaderInstruction {
+                type_: T::SEndpgm,
+                format: F::Empty,
+                ..Default::default()
+            });
+
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            input_info.bind.push_constant_size = 16;
+            input_info.bind.extended.used = true;
+            input_info.bind.extended.start_register = 12;
+
+            let err = spirv_generate_source(&code, None, None, Some(&input_info))
+                .expect_err("an unresolved register soffset must refuse");
+            let text = err.to_string();
+            for want in [
+                "unresolved register soffset".to_string(),
+                format!("{format:?}"),
+                format!("{width} dwords"),
+                "soffset=s7".to_string(),
+                "imm=0x50".to_string(),
+            ] {
+                assert!(
+                    text.contains(&want),
+                    "refusal must name {want}, got: {text}"
+                );
+            }
+        }
+    }
+
+    /// `s_load_dword` (x1) used to be an embedded-fetch-only gate: every other
+    /// single-dword scalar load returned `false` -> "can't recompile", failing
+    /// the whole shader. It now shares the x2..x16 materialization.
+    #[test]
+    fn sload_dword_x1_materializes_instead_of_failing_the_shader() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        let load = ShaderInstruction {
+            pc: 0x08,
+            type_: T::SLoadDword,
+            format: F::SdstSbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 30,
+                size: 1,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 10,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::IntegerInlineConstant,
+                    constant: crate::shader::types::ShaderConstant::from_u(4),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(load);
+        code.get_instructions_mut().push(load);
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        // Without a capture the load has no resolvable source: `false` ->
+        // "can't recompile" (the pre-change behavior for EVERY x1 load).
+        let mut bare = ShaderComputeInputInfo::default();
+        bare.threads_num = [1, 1, 1];
+        let err = spirv_generate_source(&code, None, None, Some(&bare))
+            .expect_err("an unresolvable x1 load still fails");
+        assert!(err.to_string().contains("can't recompile"), "{err}");
+
+        // With the capture analysis now produces for x1, it lowers.
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let loads = &mut input_info.bind.embedded_constant_loads;
+        loads.loads_num = 1;
+        loads.loads[0].pc = 0x08;
+        loads.loads[0].dwords_num = 1;
+        loads.loads[0].values[0] = 0xfeed_face;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("a captured x1 load materializes");
+        assert!(source.contains("OpStore"), "{source}");
+        let words = spirv_run(&source).expect("assemble x1 scalar-load compute shader");
+        spirv_val_ok(&words, "sload_dword_x1_capture");
+    }
+
+    /// The raw EUD window must never look authoritative when it is not. An
+    /// `s_load` off the EUD base with a runtime register soffset cannot
+    /// contribute a dword index, so detection records
+    /// `unresolved_dynamic_offset` (rather than silently skipping the load) and
+    /// the recompiler refuses the raw read by name instead of clamping to 0
+    /// past a window it knows may be short.
+    #[test]
+    fn eud_raw_window_records_and_refuses_an_unresolved_dynamic_offset() {
+        let sload = |type_, format, src1: ShaderOperand, src2: ShaderOperand, pc, src_num| {
+            ShaderInstruction {
+                pc,
+                type_,
+                format,
+                src_num,
+                dst: ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 16,
+                    size: 4,
+                    ..Default::default()
+                },
+                src: [
+                    ShaderOperand {
+                        type_: ShaderOperandType::Sgpr,
+                        register_id: 12,
+                        size: 2,
+                        ..Default::default()
+                    },
+                    src1,
+                    src2,
+                    ShaderOperand::default(),
+                ],
+                ..Default::default()
+            }
+        };
+        let imm = |v: u32| ShaderOperand {
+            type_: ShaderOperandType::IntegerInlineConstant,
+            constant: crate::shader::types::ShaderConstant::from_u(v),
+            ..Default::default()
+        };
+        let sgpr = |r: i32| ShaderOperand {
+            type_: ShaderOperandType::Sgpr,
+            register_id: r,
+            size: 1,
+            ..Default::default()
+        };
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // A constant-offset load (sizes the window) and a register-soffset one
+        // off the SAME EUD base (cannot).
+        code.get_instructions_mut().push(sload(
+            T::SLoadDwordx4,
+            F::Sdst4SbaseSoffset,
+            imm(0),
+            ShaderOperand::default(),
+            0x10,
+            2,
+        ));
+        code.get_instructions_mut().push(sload(
+            T::SLoadDwordx4,
+            F::Sdst4SbaseSoffsetOffset,
+            sgpr(5),
+            imm(32),
+            0x18,
+            3,
+        ));
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        let raw = input_info.bind.eud_raw;
+        assert!(raw.used, "the constant-offset load still declares a window");
+        assert_eq!(raw.required_dwords, 4, "sized only by what it could size");
+        assert!(
+            raw.unresolved_dynamic_offset,
+            "the register-soffset load must be RECORDED, not silently dropped"
+        );
+
+        // With the doubt recorded, the raw read refuses by name.
+        let err = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect_err("a lower-bound window must not be read");
+        let text = err.to_string();
+        assert!(
+            text.contains("lower bound") || text.contains("unresolved register soffset"),
+            "named refusal expected, got: {text}"
+        );
+
+        // Same shader without the dynamic load: the window is authoritative and
+        // the raw read is emitted as before (no regression).
+        let mut clean = ShaderCode::new();
+        clean.set_type(ShaderType::Compute);
+        for _ in 0..2 {
+            clean.get_instructions_mut().push(sload(
+                T::SLoadDwordx4,
+                F::Sdst4SbaseSoffset,
+                imm(0),
+                ShaderOperand::default(),
+                0x10,
+                2,
+            ));
+        }
+        clean.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+        crate::shader::spirv::shader_detect_eud_raw_window(&clean, &mut input_info.bind);
+        assert!(!input_info.bind.eud_raw.unresolved_dynamic_offset);
+        let source = spirv_generate_source(&clean, None, None, Some(&input_info))
+            .expect("an authoritative window still lowers");
+        assert!(
+            source.contains("OpArrayLength %uint %eud_raw 0"),
+            "{source}"
+        );
+        let words = spirv_run(&source).expect("assemble raw-window compute shader");
+        spirv_val_ok(&words, "eud_raw_window_authoritative");
+    }
+
+    /// The whole chain for the combined addressing mode, starting from real
+    /// encoded SMEM bytes: **ISA words -> parse -> analysis capture -> recompile
+    /// -> assemble -> spirv-val (Vulkan 1.3)**. On build 2741d21 this program
+    /// died in step 2 with `not implemented smem feature: offset != 0 with
+    /// register soffset` and never produced a module at all.
+    #[test]
+    fn full_chain_register_soffset_bytes_to_validated_spirv() {
+        use std::borrow::Cow;
+
+        struct Mem(u64, Vec<u32>);
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+                (addr >= self.0 && (addr - self.0) % 4 == 0)
+                    .then(|| ((addr - self.0) / 4) as usize)
+                    .filter(|start| *start < self.1.len())
+                    .map(|start| Cow::Borrowed(&self.1[start..]))
+            }
+        }
+
+        // s_load_dwordx4 s[16:19], s[12:13], s4 offset:16
+        //   b0 = 0x3d << 26 | opcode 0x02 << 18 | sdst 16 << 6 | sbase 6
+        //   b1 = soffset s4 << 25 | offset 16
+        const SLOAD: [u32; 2] = [0xF408_0406, 0x0800_0010];
+        let mut words = Vec::new();
+        words.extend_from_slice(&SLOAD); // pc 0x00
+        words.extend_from_slice(&SLOAD); // pc 0x08
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        // next_gen = true: the SMEM (0x3d) encoding is next-gen only.
+        crate::shader::parse::shader_parse(0, &words, &mut code, true)
+            .expect("combined-addressing SMEM must parse");
+        assert_eq!(
+            code.get_instructions()[0].format,
+            F::Sdst4SbaseSoffsetOffset
+        );
+
+        // ptr(s12:s13) = 0x0080_0000, soffset s4 = 0x20, imm = 16.
+        let payload = vec![0x0a0a_0a0au32, 0x0b0b_0b0b, 0x0c0c_0c0c, 0x0d0d_0d0d];
+        let mem = Mem(0x0080_0030, payload.clone());
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(4, 0x20, crate::shader::hw_regs::UserSgprType::Unknown);
+        user_sgpr.set(
+            12,
+            0x0080_0000,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user_sgpr.set(13, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            &mut input_info.bind,
+        );
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(0)
+                .expect("the parsed load resolves through base + soffset + imm")
+                .values[..4],
+            payload[..]
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("full chain recompiles");
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "full_chain_register_soffset");
     }
 }

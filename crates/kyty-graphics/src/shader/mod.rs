@@ -33,7 +33,8 @@ pub use crate::hw_regs::{
 pub use analysis::{
     EudView, ShaderAnalysisError, ShaderBinaryInfo, ShaderMap, ShaderMemory, ShaderParsedUsage,
     ShaderUsageInfo, ShaderUsageSlot, get_binary_info, get_usage_slots,
-    shader_calc_binding_indices, shader_capture_runtime_scalar_loads, shader_detect_buffers,
+    shader_calc_binding_indices, shader_capture_runtime_scalar_loads,
+    shader_capture_runtime_scalar_loads_shifted, shader_detect_buffers,
     shader_detect_embedded_buffer_fetch, shader_detect_embedded_constant_loads, shader_get_id_cs,
     shader_get_id_ps, shader_get_id_vs, shader_get_input_info_cs, shader_get_input_info_ps,
     shader_get_input_info_vs, shader_get_input_info_vs_decoded,
@@ -64,5 +65,6 @@ pub use spirv::{
 pub use types::{
     DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf,
     ShaderInstruction, ShaderInstructionType, ShaderInstructionTypeFormat, ShaderLabel,
-    ShaderOperand, ShaderOperandType, ShaderType, shader_instruction_format,
+    ShaderOperand, ShaderOperandType, ShaderType, shader_instruction_format, smem_offset_operand,
+    smem_register_soffset,
 };

@@ -535,10 +535,16 @@ impl EudView<'_> {
 pub struct ScalarLoadRef {
     /// First register of the base-pointer SGPR pair (`sbase`).
     pub base_register: i32,
-    /// Byte offset added to the base before the load (0 when not a constant).
+    /// **Immediate** byte offset added to the base before the load. This is the
+    /// compile-time term only; a register soffset (below) adds to it at runtime.
     pub byte_offset: u32,
     /// Number of 32-bit dwords fetched: 1, 2, 4, 8, or 16.
     pub dwords: u32,
+    /// Beyond Kyty: `Some(reg)` when the address also adds the runtime value of
+    /// SGPR `reg` (RDNA2 `base + soffset + imm`). While this is set,
+    /// `byte_offset` alone is NOT the load's offset — see
+    /// [`scalar_load_target_address`], which refuses rather than under-report.
+    pub soffset_register: Option<i32>,
 }
 
 /// Scan a shader for scalar memory loads and report each one's base pointer,
@@ -557,12 +563,14 @@ pub fn find_scalar_load_bases(code: &ShaderCode) -> Vec<ScalarLoadRef> {
                 ShaderInstructionType::SLoadDwordx16 => 16,
                 _ => return None,
             };
-            // src[0] = base SGPR pair; src[1] = byte offset. The SRT/EUD pattern
-            // uses a constant offset; a register offset is a harder case and is
-            // reported as 0 for now.
-            let byte_offset = match inst.src[1].type_ {
+            // src[0] = base SGPR pair. The immediate byte offset is `src[1]`
+            // (two-operand form) or `src[2]` (three-operand register-soffset
+            // form) — `smem_offset_operand` picks the right one, so a combined
+            // `base + soffset + imm` load no longer reports its immediate as 0.
+            let offset = crate::shader::types::smem_offset_operand(inst);
+            let byte_offset = match offset.type_ {
                 ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
-                    inst.src[1].constant.u
+                    offset.constant.u
                 }
                 _ => 0,
             };
@@ -570,6 +578,8 @@ pub fn find_scalar_load_bases(code: &ShaderCode) -> Vec<ScalarLoadRef> {
                 base_register: inst.src[0].register_id,
                 byte_offset,
                 dwords,
+                soffset_register: crate::shader::types::smem_register_soffset(inst)
+                    .map(|op| op.register_id),
             })
         })
         .collect()
@@ -582,13 +592,83 @@ pub fn find_scalar_load_bases(code: &ShaderCode) -> Vec<ScalarLoadRef> {
 /// range. Combined with [`find_scalar_load_bases`] this yields the exact guest
 /// addresses a shader spills its descriptors to — what increment 3 reads from
 /// guest memory to populate the existing `extended_buffer` path.
+///
+/// Beyond Kyty: returns `None` when the load also adds a **register soffset**.
+/// This helper sees no instruction context, so it cannot prove that register's
+/// value; returning `base + byte_offset` would be a silently wrong address.
+/// The context-aware resolver is `resolve_scalar_soffset_bytes`, used by
+/// [`shader_capture_runtime_scalar_loads_shifted`].
 #[must_use]
 pub fn scalar_load_target_address(load: &ScalarLoadRef, user_sgpr: &UserSgprInfo) -> Option<u64> {
+    if load.soffset_register.is_some() {
+        return None;
+    }
     let base = usize::try_from(load.base_register).ok()?;
     let lo = *user_sgpr.value.get(base)?;
     let hi = *user_sgpr.value.get(base + 1)?;
     let ptr = u64::from(lo) | (u64::from(hi) << 32);
     Some(ptr.wrapping_add(u64::from(load.byte_offset)))
+}
+
+/// Beyond Kyty: the **total byte offset** of a scalar load — the immediate plus
+/// the soffset register's value — or `None` when the soffset is a runtime value
+/// this pass cannot prove.
+///
+/// RDNA2 sums `base + soffset + imm` in bytes (see
+/// [`crate::shader::types::shader_instruction_format::Format::SdstSbaseSoffsetOffset`]
+/// for the rule and its two reference sources), so a load with a register
+/// soffset has a *dispatch-time* constant address exactly when that register's
+/// value is knowable. Two bounded shapes are accepted, both side-effect free:
+///
+/// * the register is **never written** before the load and names a captured
+///   live-in user-data slot (`user_sgpr.value[reg - shift]`) — the SRT/global
+///   table pointer ABI; `shift` is the NGG scalar rebase (8 for a gs-prolog
+///   vertex stage, 0 elsewhere, see `rebase_ngg_constant_sharps`);
+/// * the last writer before the load is `s_mov_b32`/`s_movk_i32` from a
+///   compile-time constant.
+///
+/// Anything else (a computed offset, a lane-dependent value, `m0`, `vcc`)
+/// returns `None` so the caller keeps its named refusal instead of recording a
+/// wrong address.
+fn resolve_scalar_soffset_bytes(
+    prior: &[ShaderInstruction],
+    inst: &ShaderInstruction,
+    user_sgpr: Option<&UserSgprInfo>,
+    shift: i32,
+) -> Option<u32> {
+    use ShaderInstructionType as T;
+
+    let Some(soffset) = crate::shader::types::smem_register_soffset(inst) else {
+        return Some(0);
+    };
+    if soffset.type_ != ShaderOperandType::Sgpr {
+        return None;
+    }
+    let reg = soffset.register_id;
+
+    if let Some(writer) = prior.iter().rposition(|prior| writes_sgpr(prior, reg)) {
+        let writer = &prior[writer];
+        if !matches!(writer.type_, T::SMovB32 | T::SMovkI32)
+            || writer.dst.register_id != reg
+            || writer.dst.size > 1
+        {
+            return None;
+        }
+        return match writer.src[0].type_ {
+            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
+                Some(writer.src[0].constant.u)
+            }
+            _ => None,
+        };
+    }
+
+    // Never written in-shader: a live-in user-data register.
+    let user_sgpr = user_sgpr?;
+    let slot = usize::try_from(reg - shift).ok()?;
+    if slot >= UserSgprInfo::SGPRS_MAX || slot >= user_sgpr.count as usize {
+        return None;
+    }
+    Some(user_sgpr.value[slot])
 }
 
 /// Does `inst` write scalar register `reg` (via either destination)?
@@ -631,10 +711,36 @@ pub fn shader_capture_runtime_scalar_loads(
     user_sgpr: &UserSgprInfo,
     bind: &mut ShaderBindResources,
 ) {
+    shader_capture_runtime_scalar_loads_shifted(code, mem, user_sgpr, 0, bind);
+}
+
+/// [`shader_capture_runtime_scalar_loads`] with the NGG scalar-register rebase.
+///
+/// A gs-prolog (next-gen) vertex stage addresses its user data eight SGPRs up:
+/// shader register `N` is hardware user-data slot `N - 8`
+/// (`rebase_ngg_constant_sharps`'s `NGG_SCALAR_BASE`, and the same shift
+/// `shader_measure_constant_buffer_accesses_shifted` and the recompiler's
+/// `shift_regs` already apply). Passing `shift = 0` is the compute/pixel case.
+///
+/// This shift is why the vertex stage could not simply call the unshifted entry
+/// point: Avatar: Frontiers of Pandora loads `s_load_dwordx16 s[12:27],
+/// s[8:9], 0` and GTA V `s_load_dwordx4 s[20:23], s[12:13], 64` — shader
+/// registers 8 and 12, i.e. hardware slots 0 and 4.
+pub fn shader_capture_runtime_scalar_loads_shifted(
+    code: &ShaderCode,
+    mem: &impl ShaderMemory,
+    user_sgpr: &UserSgprInfo,
+    shift: i32,
+    bind: &mut ShaderBindResources,
+) {
     use ShaderInstructionType as T;
 
     const fn width(type_: ShaderInstructionType) -> Option<usize> {
         match type_ {
+            // x1 joined the list once `recompile_sload_dword` started routing
+            // through `sload_dword_extended`; before that a captured single
+            // dword had no consumer.
+            T::SLoadDword => Some(1),
             T::SLoadDwordx2 => Some(2),
             T::SLoadDwordx4 => Some(4),
             T::SLoadDwordx8 => Some(8),
@@ -662,14 +768,15 @@ pub fn shader_capture_runtime_scalar_loads(
         let Some(dwords) = width(load.type_) else {
             continue;
         };
+        let offset_operand = crate::shader::types::smem_offset_operand(load);
         if load.src[0].type_ != ShaderOperandType::Sgpr
             || load.src[0].size != 2
             || load.dst.type_ != ShaderOperandType::Sgpr
             || !matches!(
-                load.src[1].type_,
+                offset_operand.type_,
                 ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
             )
-            || load.src[1].constant.i() < 0
+            || offset_operand.constant.i() < 0
         {
             continue;
         }
@@ -695,7 +802,16 @@ pub fn shader_capture_runtime_scalar_loads(
         {
             continue;
         }
-        let base = match usize::try_from(base_reg) {
+        // A register soffset adds a second, runtime term to the address. Prove
+        // its value or skip — never fold the immediate alone (that would
+        // snapshot the wrong dwords, which is worse than the named refusal the
+        // recompiler keeps for an unresolved soffset).
+        let Some(soffset_bytes) =
+            resolve_scalar_soffset_bytes(&instructions[..at], load, Some(user_sgpr), shift)
+        else {
+            continue;
+        };
+        let base = match usize::try_from(base_reg - shift) {
             Ok(base)
                 if base + 1 < UserSgprInfo::SGPRS_MAX && base + 1 < user_sgpr.count as usize =>
             {
@@ -705,8 +821,14 @@ pub fn shader_capture_runtime_scalar_loads(
         };
         let pointer =
             u64::from(user_sgpr.value[base]) | (u64::from(user_sgpr.value[base + 1]) << 32);
-        let address = pointer.wrapping_add(u64::from(load.src[1].constant.u));
-        if pointer == 0 || address & 0x3 != 0 {
+        // RDNA2 drops the low two address bits rather than faulting
+        // (KytyPS5 `EmitRelativeAddress` `align_components`; SharpEmu
+        // `Gen5ShaderScalarEvaluator.cs:1898` `& ~3UL`).
+        let address = pointer
+            .wrapping_add(u64::from(offset_operand.constant.u))
+            .wrapping_add(u64::from(soffset_bytes))
+            & !3u64;
+        if pointer == 0 {
             continue;
         }
         let Some(source) = mem.dwords_at(address) else {
@@ -887,11 +1009,12 @@ pub fn shader_detect_embedded_constant_loads(
     // both routes are consumed by the same recompiler materialization path.
     let mut out = bind.embedded_constant_loads;
     for (i, load) in insts.iter().enumerate() {
-        // Only the widths the recompiler routes through `sload_dword_extended`
-        // (where the materialization lives) — x1 has a distinct fetch-only
-        // path, so capturing it would record dwords nothing can consume.
+        // Every width the recompiler routes through `sload_dword_extended`
+        // (where the materialization lives). x1 joined that set once
+        // `recompile_sload_dword` stopped being an embedded-fetch-only gate.
         let dwords = match load.type_ {
-            T::SLoadDwordx2 => 2u32,
+            T::SLoadDword => 1u32,
+            T::SLoadDwordx2 => 2,
             T::SLoadDwordx4 => 4,
             T::SLoadDwordx8 => 8,
             T::SLoadDwordx16 => 16,
@@ -905,22 +1028,29 @@ pub fn shader_detect_embedded_constant_loads(
         if load.src[0].type_ != ShaderOperandType::Sgpr || load.src[0].size != 2 {
             continue;
         }
-        let load_off = match load.src[1].type_ {
+        let offset_operand = crate::shader::types::smem_offset_operand(load);
+        let load_off = match offset_operand.type_ {
             ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
-                if load.src[1].constant.i() < 0 {
+                if offset_operand.constant.i() < 0 {
                     continue;
                 }
-                u64::from(load.src[1].constant.u)
+                u64::from(offset_operand.constant.u)
             }
             _ => continue,
+        };
+        // A register soffset adds a runtime term. There is no user-data file
+        // here (the base is PC-relative), so only an in-shader constant move
+        // can prove it; anything else is skipped and keeps its refusal.
+        let Some(soffset_bytes) = resolve_scalar_soffset_bytes(&insts[..i], load, None, 0) else {
+            continue;
         };
         let Some(base_addr) = pc_relative_base_address(&insts[..i], load.src[0].register_id) else {
             continue;
         };
-        let addr = base_addr.wrapping_add(load_off);
-        if addr % 4 != 0 {
-            continue;
-        }
+        let addr = base_addr
+            .wrapping_add(load_off)
+            .wrapping_add(u64::from(soffset_bytes))
+            & !3u64;
         let Some(src) = mem.dwords_at(addr) else {
             continue;
         };
@@ -6700,16 +6830,19 @@ mod tests {
                     base_register: 14,
                     byte_offset: 8,
                     dwords: 2,
+                    soffset_register: None,
                 },
                 ScalarLoadRef {
                     base_register: 4,
                     byte_offset: 0,
                     dwords: 1,
+                    soffset_register: None,
                 },
                 ScalarLoadRef {
                     base_register: 20,
                     byte_offset: 16,
                     dwords: 4,
+                    soffset_register: None,
                 },
             ]
         );
@@ -6732,6 +6865,7 @@ mod tests {
             base_register: 14,
             byte_offset: 8,
             dwords: 2,
+            soffset_register: None,
         };
         assert_eq!(
             scalar_load_target_address(&load, &user_sgpr),
@@ -6744,6 +6878,7 @@ mod tests {
             base_register: (UserSgprInfo::SGPRS_MAX - 1) as i32,
             byte_offset: 0,
             dwords: 2,
+            soffset_register: None,
         };
         assert_eq!(scalar_load_target_address(&out_of_range, &user_sgpr), None);
     }
@@ -6823,6 +6958,238 @@ mod tests {
                 .expect("runtime capture retained")
                 .values[..8],
             fields
+        );
+    }
+
+    /// The RDNA2 addressing rule for a register soffset, exercised end to end
+    /// through the capture pass: `addr = base_pair + SGPR[soffset] + imm`, both
+    /// offsets in bytes (KytyPS5 `EmitRelativeAddress`; SharpEmu
+    /// `Gen5ShaderScalarEvaluator.cs:1889-1900`). Here the soffset is a live-in
+    /// user-data register that the shader never writes, so its dispatch-time
+    /// value is known and the whole address folds.
+    fn register_soffset_load(pc: u32, base: i32, soffset: i32, imm: u32) -> ShaderInstruction {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+        let mut load = ShaderInstruction {
+            pc,
+            type_: T::SLoadDwordx4,
+            format: F::Sdst4SbaseSoffsetOffset,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(base, 2);
+        load.src[1] = sgpr_op(soffset, 1);
+        load.src[2] = imm_op(imm);
+        load.src_num = 3;
+        load.dst = sgpr_op(16, 4);
+        load
+    }
+
+    #[test]
+    fn register_soffset_adds_to_the_immediate_when_it_is_a_live_in_user_sgpr() {
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut()
+            .push(register_soffset_load(0x20, 12, 4, 16));
+
+        // ptr = 0x0030_0000; soffset s4 = 0x20; imm = 16 -> 0x0030_0030.
+        let payload = [0xdead_0000, 0xdead_0001, 0xdead_0002, 0xdead_0003];
+        let mem = TestMem {
+            regions: vec![(0x0030_0030, payload.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(4, 0x20, UserSgprType::Unknown);
+        user_sgpr.set(12, 0x0030_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+        let captured = bind
+            .embedded_constant_loads
+            .find(0x20)
+            .expect("base + soffset + imm resolves to a readable address");
+        assert_eq!(captured.dwords_num, 4);
+        assert_eq!(captured.values[..4], payload);
+
+        // Proof that the soffset really participates: with s4 = 0 the address
+        // is base + imm, where nothing is mapped, so nothing is captured.
+        let mut no_soffset = UserSgprInfo::default();
+        no_soffset.set(4, 0, UserSgprType::Unknown);
+        no_soffset.set(12, 0x0030_0000, UserSgprType::Unknown);
+        no_soffset.set(13, 0, UserSgprType::Unknown);
+        let mut bind2 = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &no_soffset, &mut bind2);
+        assert!(
+            bind2.embedded_constant_loads.find(0x20).is_none(),
+            "the soffset term must change the address, not be ignored"
+        );
+    }
+
+    #[test]
+    fn register_soffset_resolves_from_a_preceding_constant_move() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut mov = ShaderInstruction {
+            pc: 0x10,
+            type_: T::SMovB32,
+            ..Default::default()
+        };
+        mov.dst = sgpr_op(4, 1);
+        mov.src[0] = imm_op(0x40);
+        mov.src_num = 1;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut()
+            .extend([mov, register_soffset_load(0x20, 12, 4, 8)]);
+
+        // 0x0040_0000 + 0x40 + 8 = 0x0040_0048.
+        let payload = [1u32, 2, 3, 4];
+        let mem = TestMem {
+            regions: vec![(0x0040_0048, payload.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        // s4's live-in value is deliberately WRONG: the in-shader move wins.
+        user_sgpr.set(4, 0xffff_ffff, UserSgprType::Unknown);
+        user_sgpr.set(12, 0x0040_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+        assert_eq!(
+            bind.embedded_constant_loads
+                .find(0x20)
+                .expect("s_mov_b32-defined soffset resolves")
+                .values[..4],
+            payload
+        );
+    }
+
+    #[test]
+    fn computed_register_soffset_is_never_captured() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        // s4 comes out of an ALU op — a genuinely per-dispatch value this pass
+        // cannot prove. Capturing anything here would snapshot wrong dwords.
+        let mut alu = ShaderInstruction {
+            pc: 0x10,
+            type_: T::SLshlB32,
+            ..Default::default()
+        };
+        alu.dst = sgpr_op(4, 1);
+        alu.src[0] = sgpr_op(5, 1);
+        alu.src[1] = imm_op(2);
+        alu.src_num = 2;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut()
+            .extend([alu, register_soffset_load(0x20, 12, 4, 0)]);
+
+        let mem = TestMem {
+            regions: vec![(0x0050_0000, vec![7u32; 8])],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(4, 0, UserSgprType::Unknown);
+        user_sgpr.set(12, 0x0050_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+        assert!(
+            bind.embedded_constant_loads.find(0x20).is_none(),
+            "an unprovable soffset must fall through to the recompiler's named refusal"
+        );
+    }
+
+    /// The vertex-stage rebase. A next-gen (gs-prolog) vertex program addresses
+    /// user data eight SGPRs up — shader register N is hardware slot N - 8, the
+    /// same `NGG_SCALAR_BASE` shift `rebase_ngg_constant_sharps` applies. These
+    /// are the two measured shapes that made Avatar: Frontiers of Pandora and
+    /// GTA V fail on build 2741d21, both plain constant-offset loads that the
+    /// vertex stage simply never ran this pass over.
+    #[test]
+    fn vertex_stage_shift_maps_shader_registers_to_hardware_user_data_slots() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+
+        // Avatar: `s_load_dwordx16 s[12:27], s[8:9], 0` -> hardware slots 0:1.
+        let mut avatar = ShaderInstruction {
+            pc: 0x30,
+            type_: T::SLoadDwordx16,
+            format: F::Sdst16SbaseSoffset,
+            ..Default::default()
+        };
+        avatar.src[0] = sgpr_op(8, 2);
+        avatar.src[1] = imm_op(0);
+        avatar.src_num = 2;
+        avatar.dst = sgpr_op(12, 16);
+
+        // GTA V: `s_load_dwordx4 s[20:23], s[12:13], 64` -> hardware slots 4:5.
+        let mut gta = ShaderInstruction {
+            pc: 0x40,
+            type_: T::SLoadDwordx4,
+            format: F::Sdst4SbaseSoffset,
+            ..Default::default()
+        };
+        gta.src[0] = sgpr_op(12, 2);
+        gta.src[1] = imm_op(64);
+        gta.src_num = 2;
+        gta.dst = sgpr_op(20, 4);
+
+        // Two separate programs: Avatar's x16 destination covers s12:s13, which
+        // is GTA V's base pair — in one shader the second load's base would
+        // (correctly) look shader-written and be skipped.
+        let mut avatar_code = ShaderCode::new();
+        avatar_code.get_instructions_mut().push(avatar);
+        let mut gta_code = ShaderCode::new();
+        gta_code.get_instructions_mut().push(gta);
+
+        let sixteen: Vec<u32> = (0..16).map(|i| 0xa000_0000 + i).collect();
+        let four = vec![0xb000_0000u32, 0xb000_0001, 0xb000_0002, 0xb000_0003];
+        let mem = TestMem {
+            regions: vec![(0x0060_0000, sixteen.clone()), (0x0070_0040, four.clone())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(0, 0x0060_0000, UserSgprType::Unknown); // shader s8
+        user_sgpr.set(1, 0, UserSgprType::Unknown); //           shader s9
+        user_sgpr.set(4, 0x0070_0000, UserSgprType::Unknown); // shader s12
+        user_sgpr.set(5, 0, UserSgprType::Unknown); //           shader s13
+
+        // Unshifted (the compute/pixel entry point) resolves NEITHER — it would
+        // read slots 8:9 and 12:13, which hold nothing. This is exactly what
+        // the vertex stage got before the shifted call was wired in: nothing.
+        for (code, pc) in [(&avatar_code, 0x30u32), (&gta_code, 0x40)] {
+            let mut unshifted = ShaderBindResources::default();
+            shader_capture_runtime_scalar_loads(code, &mem, &user_sgpr, &mut unshifted);
+            assert!(
+                unshifted.embedded_constant_loads.find(pc).is_none(),
+                "unshifted lookup must not resolve a gs-prolog vertex load"
+            );
+        }
+
+        let mut avatar_bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads_shifted(
+            &avatar_code,
+            &mem,
+            &user_sgpr,
+            8,
+            &mut avatar_bind,
+        );
+        assert_eq!(
+            avatar_bind
+                .embedded_constant_loads
+                .find(0x30)
+                .expect("Avatar's x16 load resolves through hardware slot 0:1")
+                .values[..16],
+            sixteen[..]
+        );
+
+        let mut gta_bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads_shifted(&gta_code, &mem, &user_sgpr, 8, &mut gta_bind);
+        assert_eq!(
+            gta_bind
+                .embedded_constant_loads
+                .find(0x40)
+                .expect("GTA V's x4 load resolves through hardware slot 4:5")
+                .values[..4],
+            four[..]
         );
     }
 

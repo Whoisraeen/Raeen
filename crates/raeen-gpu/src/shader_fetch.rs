@@ -773,6 +773,34 @@ impl ShaderTranslateCache {
                     &mut vs_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
+                // The vertex stage was the ONLY stage that never ran this pass
+                // (the pixel-stage call site even claimed it did). Measured
+                // consequence on build 2741d21: every Avatar: Frontiers of
+                // Pandora and GTA V shader error was a VERTEX shader failing at
+                // `can't recompile: SLoadDwordx16 [Sdst16SbaseSoffset] s[12:27],
+                // s[8:9], 0` / `SLoadDwordx4 ... s[12:13], 64` — a plain
+                // constant-offset scalar load through a live-in user-data
+                // pointer that no pass had ever resolved for VS, so
+                // `sload_dword_extended` fell through its EUD-only path and
+                // returned "can't recompile".
+                //
+                // Next-gen vertex programs run as a gs-prolog, where shader
+                // register N is hardware user-data slot N - 8 (the
+                // `NGG_SCALAR_BASE` rebase `rebase_ngg_constant_sharps`,
+                // `shader_measure_constant_buffer_accesses_shifted` and the
+                // recompiler's `shift_regs` all apply), hence the shifted entry
+                // point and the gs/vs user-SGPR file selection below.
+                kyty_graphics::shader::shader_capture_runtime_scalar_loads_shifted(
+                    &code,
+                    mem,
+                    if gs_instead_of_vs {
+                        &vs.gs_user_sgpr
+                    } else {
+                        &vs.vs_user_sgpr
+                    },
+                    if vs_info.gs_prolog { 8 } else { 0 },
+                    &mut vs_info.bind,
+                );
                 // Beyond Kyty: capture PC-relative embedded-constant scalar
                 // loads (the shader reading its own baked constant table) so the
                 // recompiler materializes them as SPIR-V constants instead of
@@ -845,7 +873,8 @@ impl ShaderTranslateCache {
                 // EUD window. Evaluate bounded constant-offset loads through
                 // live user-data pointers before the generic placeholder pass
                 // so the real texture descriptor reaches both codegen and the
-                // Vulkan binding table.
+                // Vulkan binding table. (Pixel user SGPRs are not rebased, so
+                // this is the unshifted entry point — cf. `translate_vs`.)
                 kyty_graphics::shader::shader_capture_runtime_scalar_loads(
                     &code,
                     mem,

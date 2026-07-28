@@ -847,6 +847,13 @@ pub struct ShaderEudRawResources {
     /// 256 KiB minimum) or LESS (unreadable tail) — the recompiled reads
     /// clamp against the bound size and return 0 beyond it.
     pub required_dwords: u32,
+    /// Beyond Kyty: at least one `s_load` off the EUD base carries a **runtime
+    /// register soffset** (RDNA2 `base + soffset + imm`), so its dword index is
+    /// not knowable at translate time and [`Self::required_dwords`] above is a
+    /// LOWER BOUND that may be short. Set by `shader_detect_eud_raw_window`; the
+    /// recompiler refuses the raw-window read by name rather than silently
+    /// reading a window it knows may not cover the access.
+    pub unresolved_dynamic_offset: bool,
 }
 
 /// Beyond Kyty (SharpEmu PR #587): the guest-memory window backing the

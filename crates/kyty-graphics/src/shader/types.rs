@@ -681,6 +681,37 @@ pub mod shader_instruction_format {
         /// into 16 consecutive SGPRs. Same operand shape as the x2/x4/x8 rows,
         /// only wider. Measured on Avatar: Frontiers of Pandora.
         Sdst16SbaseSoffset = format_define(&[DA16, S0A2, S1]),
+        // Beyond Kyty: the SMEM addressing mode where BOTH a register soffset
+        // and a non-zero immediate offset are present. RDNA2 adds all three
+        // terms and then drops the low two address bits:
+        //
+        //   addr = SGPR[base:base+1] + zext(SGPR[soffset]) + sext21(imm)
+        //   addr &= !3 ;  dword index = addr >> 2
+        //
+        // Both offsets are in BYTES; the immediate is 21-bit signed, the
+        // soffset register unsigned. Established from two independent
+        // references, not guessed:
+        //   * KytyPS5 `spirvEmitterMemory.cpp` `EmitRelativeAddress`
+        //     (L286-315, called from `EmitSLoadDword` L1174 with
+        //     `align_components = true`): immediate `& !3`, each added source
+        //     `& !3`, 64-bit add with carry, then `index = address >> 2`.
+        //   * SharpEmu `Gen5ShaderScalarEvaluator.cs` L1889-1900:
+        //     `byteOffset = immediateOffset + dynamicOffset;`
+        //     `address = (baseAddress + byteOffset) & ~3UL;`
+        // Both keep the immediate and the soffset register as INDEPENDENT
+        // simultaneous fields (KytyPS5 `MemoryOps.cpp::DecodeSmem` sets
+        // `inst.offset` AND `src1`; SharpEmu builds
+        // `Gen5ScalarMemoryControl(count, offset, dynamicOffsetRegister)`),
+        // which is why this needs a third operand rather than a choice.
+        //
+        // Operand shape: `src[1]` = the soffset register, `src[2]` = the
+        // immediate byte offset. Measured as the first blocker of ASTRO.BOT's
+        // `rendering` stage (three compute shaders).
+        SdstSbaseSoffsetOffset = format_define(&[D, S0A2, S1, S2]),
+        Sdst2SbaseSoffsetOffset = format_define(&[DA2, S0A2, S1, S2]),
+        Sdst4SbaseSoffsetOffset = format_define(&[DA4, S0A2, S1, S2]),
+        Sdst8SbaseSoffsetOffset = format_define(&[DA8, S0A2, S1, S2]),
+        Sdst16SbaseSoffsetOffset = format_define(&[DA16, S0A2, S1, S2]),
         Sdst8SvSoffset = format_define(&[DA8, S0A4, S1]),
         SdstSvSoffset = format_define(&[D, S0A4, S1]),
         SmaskVsrc0Vsrc1 = format_define(&[DA2, S0, S1]),
@@ -1065,6 +1096,52 @@ impl ShaderLabel {
     #[must_use]
     pub const fn is_disabled(&self) -> bool {
         self.dst == 0 && self.src == 0
+    }
+}
+
+/// Beyond Kyty: the **immediate byte-offset** operand of an SMEM/SMRD scalar
+/// load. Two operand shapes exist (see
+/// [`shader_instruction_format::Format::SdstSbaseSoffsetOffset`]):
+///
+/// * two-operand — `src[1]` is either the folded immediate (NULL soffset) or
+///   the soffset register (immediate 0);
+/// * three-operand — `src[1]` is the soffset register and `src[2]` the
+///   immediate, because RDNA2 adds BOTH.
+///
+/// Every consumer that wants "the constant part of the address" must go through
+/// this so the three-operand form is not silently read as offset 0.
+#[must_use]
+pub fn smem_offset_operand(inst: &ShaderInstruction) -> ShaderOperand {
+    use shader_instruction_format::Format as F;
+    match inst.format {
+        F::SdstSbaseSoffsetOffset
+        | F::Sdst2SbaseSoffsetOffset
+        | F::Sdst4SbaseSoffsetOffset
+        | F::Sdst8SbaseSoffsetOffset
+        | F::Sdst16SbaseSoffsetOffset => inst.src[2],
+        _ => inst.src[1],
+    }
+}
+
+/// Beyond Kyty: the soffset operand when it is a **runtime register** rather
+/// than a compile-time constant — i.e. the address carries a term nothing
+/// downstream can fold without knowing that register's value. `None` for a
+/// constant or absent (NULL) soffset.
+///
+/// Covers both operand shapes: the three-operand form always has a register
+/// soffset in `src[1]`, and the two-operand form has one whenever `src[1]`
+/// survived parsing as a register (immediate offset 0). The returned operand is
+/// usually an `Sgpr`, but `m0`/`vcc_*`/`exec_*` also reach here — callers that
+/// need an SGPR index must check `type_`.
+#[must_use]
+pub fn smem_register_soffset(inst: &ShaderInstruction) -> Option<ShaderOperand> {
+    match inst.src[1].type_ {
+        ShaderOperandType::LiteralConstant
+        | ShaderOperandType::IntegerInlineConstant
+        | ShaderOperandType::FloatInlineConstant
+        | ShaderOperandType::Null
+        | ShaderOperandType::Unknown => None,
+        _ => Some(inst.src[1]),
     }
 }
 
