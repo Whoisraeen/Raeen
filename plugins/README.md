@@ -14,7 +14,7 @@ NVIDIA **DLSS** shim — implements the same `PresentPlugin` trait and registers
 itself via `AgcGpuSession::register_present_plugin(...)`.
 
 Raeen itself ships only **GPL-2.0-clean** code. The default build includes the
-`passthrough` and `nearest` reference plugins. Builds made with
+`passthrough`, `nearest`, and Vulkan `gpu-blit` reference plugins. Builds made with
 `--features upscale-plugins` also include the in-tree `raeen-upscale` backends
 described below. None of them link a proprietary vendor SDK.
 
@@ -26,6 +26,7 @@ The plugin system is vendor-neutral; it is not limited to DLSS.
 |---|---|---|
 | `passthrough` | Working, built in | Identity/reference implementation |
 | `nearest` | Working, built in | Simple reference upscaler |
+| `gpu-blit` | Working, built in | GPU-resident Vulkan reference path; records into Raeen's command buffer |
 | `bilinear` | Working, optional | Spatial 2x2 linear upscale |
 | `bicubic` | Working, optional | Spatial Catmull-Rom upscale |
 | `sharpen` | Working, optional | Native-resolution unsharp pass |
@@ -40,10 +41,12 @@ built with:
 cargo build -p raeen-gui --features upscale-plugins
 ```
 
-FSR2/FSR3, DLSS, and XeSS are temporal techniques. The ABI reserves their
-inputs, but Raeen does not yet populate GPU frames, depth, or motion vectors.
-Until that work lands, selecting the current `dlss` or `xess` probe produces a
-bicubic fallback rather than running the vendor technology.
+FSR2/FSR3, DLSS, and XeSS are temporal techniques. ABI v3 now supplies live
+Vulkan color/output images and the matching persistent depth attachment when
+one exists. Raeen does not yet identify and normalize the title's motion-vector
+surface, so plugins that require motion vectors are declined instead of being
+given fabricated data. The current `dlss` and `xess` probes therefore remain
+fallbacks rather than vendor inference.
 
 ## The license boundary (read before adding a proprietary plugin)
 
