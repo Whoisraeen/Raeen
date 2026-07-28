@@ -58,7 +58,9 @@ pub mod vmm;
 /// Windows discarded at a context switch (see `dispatch::fsbase_rearm_count`).
 /// Windows-only, like the rest of the execution core.
 #[cfg(target_os = "windows")]
-pub use dispatch::{HleDispatchMetrics, fsbase_rearm_count, hle_dispatch_metrics};
+pub use dispatch::{
+    HleDispatchMetrics, fsbase_rearm_count, guest_watchpoint_hit_count, hle_dispatch_metrics,
+};
 
 use raeen_firmware::LinkedModule;
 #[cfg(target_os = "windows")]

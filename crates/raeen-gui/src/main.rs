@@ -1131,7 +1131,7 @@ fn main() -> anyhow::Result<()> {
                             "runner enabled deterministic controller input replay"
                         );
                     }
-                    let mut last_buttons = None;
+                    let mut last_pad_state = None;
                     // Guest → host rumble return path. With the Shell bridge
                     // the child only forwards the encoded word — the Shell
                     // owns hardware delivery, its Settings gate, and the
@@ -1158,10 +1158,16 @@ fn main() -> anyhow::Result<()> {
                         };
                         let buttons =
                             u32::from_le_bytes(encoded[0..4].try_into().expect("pad prefix"));
-                        if last_buttons != Some(buttons) {
+                        if last_pad_state.as_ref() != Some(&encoded) {
                             tracing::info!(
                                 elapsed_ms = started.elapsed().as_millis(),
                                 buttons = format_args!("{buttons:#010x}"),
+                                left_x = encoded[4],
+                                left_y = encoded[5],
+                                right_x = encoded[6],
+                                right_y = encoded[7],
+                                l2 = encoded[8],
+                                r2 = encoded[9],
                                 source = if is_scripted {
                                     "script"
                                 } else if shared_input.is_some() {
@@ -1171,7 +1177,7 @@ fn main() -> anyhow::Result<()> {
                                 },
                                 "runner applied controller state"
                             );
-                            last_buttons = Some(buttons);
+                            last_pad_state = Some(encoded);
                         }
                         input_kernel.set_pad_state(encoded);
                         // Rumble return path (see the declaration above).

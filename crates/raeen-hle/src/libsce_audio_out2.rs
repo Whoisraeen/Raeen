@@ -405,14 +405,46 @@ fn hle_port_set_attributes(ctx: &HleContext, args: &[u64]) -> u64 {
 /// they stack-allocate it. Writing 8 bytes here clobbered the 4 bytes above
 /// the slot — for GTA V's audio thread that was the frame canary, so the
 /// title aborted in `__stack_chk_fail` with no HLE error ever reported.
-/// (SharpEmu hit and fixed the identical defect: PR #532, restored by #650.)
+/// SharpEmu names the same casualty at the same address we measured
+/// independently: "killed Bink Snd @ eboot+0xAE36" (PR #532, reverted by
+/// `6db095e`, restored by #650; constants re-verified against tip `b21dd9f`).
+///
+/// There are **two** outs. `outLevel` (arg 1) is the drained depth. `rdx` is a
+/// second `uint32_t *` "available" slot; SharpEmu reports the context's queue
+/// depth there, defaulting to 4 — which matters because GTA V compares that
+/// dword against 4. Two further rules from their tip:
+/// * if `outLevel` is null the caller used the 2-arg spelling and the level
+///   pointer arrived in `rdx`, so it shifts down into `outLevel`; and
+/// * the secondary out is only written when it is a distinct, writable buffer
+///   — an adjacent caller local must never be stamped (out-buffer rule 6).
 fn hle_context_get_queue_level(ctx: &HleContext, args: &[u64]) -> u64 {
-    let level = args.get(1).copied().unwrap_or(0);
-    if level != 0 && !ctx.mem.write(level, &0u32.to_le_bytes()) {
+    let mut level = args.get(1).copied().unwrap_or(0);
+    let mut available = args.get(2).copied().unwrap_or(0);
+    if level == 0 {
+        level = available;
+        available = 0;
+    }
+    if level != 0 && !ctx.write_out_u32(level, 0) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    // Only a distinct, non-stack buffer: on a frame this slot is usually an
+    // adjacent caller local, and stamping it is how the canary died in the
+    // first place. `allows_bulk_init()` is exactly that predicate.
+    if available != 0
+        && available != level
+        && ctx.classify_out(available, 4).allows_bulk_init()
+        && !ctx.write_out_u32(available, DEFAULT_QUEUE_DEPTH)
+    {
         return SCE_ERROR_MEMORY_FAULT;
     }
     OK
 }
+
+/// Queue depth reported through `GetQueueLevel`'s secondary "available" out
+/// when the context's own depth is unknown. GTA V compares that dword against
+/// 4, and 4 is both SharpEmu's default and the depth this module's
+/// `ContextQueryMemory` advertises (`+0x0C` of the context param).
+const DEFAULT_QUEUE_DEPTH: u32 = 4;
 
 /// Per-context playback cadence, ported from SharpEmu's `ContextState`: one
 /// grain is `grain_samples / frequency` seconds of wall-clock time, and each
@@ -1098,6 +1130,46 @@ mod tests {
             "the dword past the 32-bit out must be untouched (canary guard)"
         );
         assert_eq!(hle_context_get_queue_level(&ctx, &[handle, 0]), OK);
+    }
+
+    /// `GetQueueLevel` has two outs and a null-shift, per SharpEmu's tip.
+    #[test]
+    fn queue_level_shifts_a_null_level_out_and_reports_available_depth() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // 2-arg spelling: the level pointer arrives where `available` would be
+        // and must still receive the drained depth.
+        assert!(mem.write(0x300, &u32::MAX.to_le_bytes()));
+        assert_eq!(hle_context_get_queue_level(&ctx, &[1, 0, 0x300]), OK);
+        assert_eq!(
+            read_u32(&mem, 0x300),
+            0,
+            "shifted level out must be written"
+        );
+
+        // 3-arg spelling: distinct outs — level drained, available = depth 4
+        // (the value GTA V compares against).
+        assert!(mem.write(0x310, &u32::MAX.to_le_bytes()));
+        assert!(mem.write(0x320, &u32::MAX.to_le_bytes()));
+        assert_eq!(hle_context_get_queue_level(&ctx, &[1, 0x310, 0x320]), OK);
+        assert_eq!(read_u32(&mem, 0x310), 0, "level is drained");
+        assert_eq!(
+            read_u32(&mem, 0x320),
+            DEFAULT_QUEUE_DEPTH,
+            "available reports the queue depth"
+        );
+
+        // Aliased outs must be written exactly once, not twice.
+        assert!(mem.write(0x330, &u32::MAX.to_le_bytes()));
+        assert_eq!(hle_context_get_queue_level(&ctx, &[1, 0x330, 0x330]), OK);
+        assert_eq!(
+            read_u32(&mem, 0x330),
+            0,
+            "aliased out keeps the level value"
+        );
     }
 
     #[test]

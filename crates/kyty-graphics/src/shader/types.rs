@@ -168,6 +168,10 @@ pub enum ShaderInstructionType {
     ImageGetResinfo,
     ImageLoad,
     ImageSample,
+    /// MIMG 0x24: sampled image read with an explicit LOD supplied after the
+    /// dimensional coordinate tuple in VADDR. Measured on ASTRO.BOT scene
+    /// compute (raw 0xf0900718).
+    ImageSampleL,
     /// MIMG 0x2f: comparison sample with an explicit zero LOD.
     ImageSampleCLz,
     ImageSampleLz,
@@ -609,6 +613,10 @@ pub mod shader_instruction_format {
     /// Beyond Kyty: two-channel ZW image-load mask. Measured on four
     /// ASTRO.BOT scene compute shaders after the mixed-storage path advanced.
     pub const DMASK_C: u64 = 57;
+    /// Beyond Kyty: single-channel Z mask. Only reachable through the gather
+    /// family, where the dmask names the ONE channel gathered rather than a
+    /// destination-component subset (see [`Format::Vdata4Vaddr3StSsDmask4`]).
+    pub const DMASK_4: u64 = 58;
 
     /// Kyty: Shader.h `FormatDefine` (L293). Packs FormatByte tokens into a
     /// u64, first token in the highest-used byte.
@@ -668,6 +676,11 @@ pub mod shader_instruction_format {
         Sdst4SbaseSoffset = format_define(&[DA4, S0A2, S1]),
         Sdst4SvSoffset = format_define(&[DA4, S0A4, S1]),
         Sdst8SbaseSoffset = format_define(&[DA8, S0A2, S1]),
+        /// Beyond Kyty (upstream `KYTY_NI`s SMEM/SMRD opcode 0x04):
+        /// `s_load_dwordx16 s[dst:dst+15], s[base:base+1], soffset` — 64 bytes
+        /// into 16 consecutive SGPRs. Same operand shape as the x2/x4/x8 rows,
+        /// only wider. Measured on Avatar: Frontiers of Pandora.
+        Sdst16SbaseSoffset = format_define(&[DA16, S0A2, S1]),
         Sdst8SvSoffset = format_define(&[DA8, S0A4, S1]),
         SdstSvSoffset = format_define(&[D, S0A4, S1]),
         SmaskVsrc0Vsrc1 = format_define(&[DA2, S0, S1]),
@@ -730,6 +743,16 @@ pub mod shader_instruction_format {
         /// consecutive VGPRs (one per gathered texel) while the dmask names
         /// the one channel gathered.
         Vdata4Vaddr3StSsDmask1 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_1]),
+        /// Beyond Kyty: the same four-texel gather selecting channel Y —
+        /// measured on ASTRO.BOT (`image_gather4_lz` dmask 0x2, the first
+        /// blocker after the mixed-dim storage-image refusal was fixed).
+        Vdata4Vaddr3StSsDmask2 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_2]),
+        /// Beyond Kyty: four-texel gather of channel Z. Same mechanism as the
+        /// dmask 0x1/0x2 rows (the gather's SPIR-V `Component` operand is the
+        /// dmask bit index), so it is decided by the encoding, not guessed.
+        Vdata4Vaddr3StSsDmask4 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_4]),
+        /// Beyond Kyty: four-texel gather of channel W (see the dmask 0x4 row).
+        Vdata4Vaddr3StSsDmask8 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_8]),
         Vdata4Vaddr3StSsDmaskF = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_F]),
         Vdata4Vaddr4StDmaskF = format_define(&[DA4, S0A4, S1A8, DMASK_F]),
         Vdata4VaddrSvSoffsIdxen = format_define(&[DA4, S0, S1A4, S2, IDXEN]),
@@ -975,6 +998,11 @@ pub struct ShaderInstruction {
     /// export is `0xf`, a partial one (e.g. a `vec2` texcoord) `0x3`. Set by
     /// `shader_parse_exp`; the recompiler writes 0 to the disabled channels.
     pub export_enable: u32,
+    /// Raw EXP target. Fragment colour targets 0..=7 map directly to Vulkan
+    /// output locations 0..=7. Kept separately from `format` so the existing
+    /// MRT0 operand-shape rows can lower every MRT without multiplying the
+    /// format enum by eight identical variants.
+    pub export_target: u8,
     /// Beyond Kyty (SharpEmu PR #587 `Gen5GlobalMemoryControl.UsesFlatAddress`):
     /// only meaningful for the FLAT-class ops (`Flat*`). `true` when the guest
     /// address is a complete 64-bit pointer held in the VGPR pair
@@ -1207,6 +1235,7 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
             sif::DMASK_5 => "dmask:0x5".to_string(),
             sif::DMASK_7 => "dmask:0x7".to_string(),
             sif::DMASK_9 => "dmask:0x9".to_string(),
+            sif::DMASK_4 => "dmask:0x4".to_string(),
             sif::DMASK_C => "dmask:0xc".to_string(),
             sif::DMASK_F => "dmask:0xf".to_string(),
             sif::GDS => "gds".to_string(),

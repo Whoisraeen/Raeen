@@ -31,6 +31,13 @@ proprietary SDK/headers, using only the community sources credited below.
   values as layout-compatible. Raeen's Rust implementation additionally
   validates unsupported operations and preserves the guest's separate test and
   operation reference values.
+- **Divergence recorded (vertex-input numeric classes, 2026-07-28).** Kyty's
+  `Spirv::WriteGlobalVariables` (`ShaderSpirv.cpp` L7229) declares vertex
+  attributes as **float only** and `EXIT`s on any other width; it has no
+  integer vertex-input concept. `kyty-graphics`' shared
+  `vertex_input_types` resolver therefore goes beyond Kyty for the raw
+  integer classes (see the SharpEmu section below), while keeping Kyty's
+  structure and `fetch_*` helper functions unchanged.
 
 MIT is compatible with GPL-2.0: MIT-derived portions may be combined into this
 GPL-2.0-only work, and this notice preserves the required MIT attribution for
@@ -120,7 +127,16 @@ SOFTWARE.
   `(object, key, value)`) re-implemented in
   `crates/raeen-hle/src/libsce_np_trophy2.rs` and
   `libsce_np_universal_data.rs`; KytyPS5's fabricated one-bronze-trophy
-  "Kyty" game info is deliberately not ported. No C++ is
+  "Kyty" game info is deliberately not ported. The instruction-coverage batch
+  (`crates/kyty-graphics/src/shader/`, 2026-07-28) uses
+  `src/graphics/shader/recompiler/MemoryOps.cpp`'s `SMEM_OPS` table and
+  `ImageOps.cpp`'s `MIMG_GATHER_OPS` table purely as **opcode-identity
+  evidence** — that SMEM/SMRD opcode `0x04` is `s_load_dwordx16` (16 dwords),
+  that MIMG `0x47`/`0x61` are `image_gather4_lz`/`image_gather4h`, and that a
+  gather's destination is always 4 dwords with a single-bit dmask
+  (`data_dwords = gather ? 4 : CountDmaskComponents(dmask)` plus
+  `IsSingleDmaskBit`). The Rust decode arms, the SPIR-V `OpImageGather`
+  component mapping, and all tests are Raeen's own. No C++ is
   vendored or compiled into Raeen.
 
 ---
@@ -202,6 +218,15 @@ SOFTWARE.
   SharpEmu's native import trampoline state/ABI preservation; Raeen's
   implementation is original Rust plus generated x86-64 code and retains the
   existing VEH route for context-changing calls.
+  Raeen's pthread-mutex acquisition queue and direct ownership handoff were
+  behaviorally re-implemented from SharpEmu's
+  `KernelPthreadCompatExports.cs` waiter/grant model: each waiter has a private
+  host wake object, unlock transfers ownership to the FIFO head under the
+  mutex-state lock, and arrivals cannot barge ahead. The Windows host-thread
+  priority bands in `crates/raeen-runtime/src/thread.rs` follow SharpEmu's
+  `DirectExecutionBackend.cs::MapGuestThreadPriority`; KytyPS5
+  `src/kernel/pthread.cpp` independently confirms the same Orbis thresholds.
+  Both implementations are original Rust and no C# or C++ is vendored.
   From upstream `5228335` (PR #587, "Gen5 flat memory and 3D images"):
   `OpImageQuerySizeLod`'s result vector is sized from the descriptor's
   dimensionality (`%v3int` for 3D and 2D-array, `%v2int` for 2D) in
@@ -262,6 +287,24 @@ SOFTWARE.
   options 0x40 and the `GetOutputStatus` 0x30 layout, which Raeen already
   matched); the audit, the guard API, the Rust code, and all of its tests are
   original. Findings recorded in `docs/sharpemu-port/outbuffer-audit.md`.
+  **Gen5 vertex-input numeric classes (2026-07-28).** The model in
+  `Gen5SpirvTranslator.DeclareVertexInputs` /`TryEmitVertexInputFetch`
+  (`SharpEmu.ShaderCompiler.Vulkan/Gen5SpirvTranslator.cs` L1307-1353, L3234;
+  read from SharpEmu's live working tree, since `6db095e`/`db4339f` make
+  per-commit reads misleading) — build a vertex attribute's SPIR-V interface
+  type as `componentKind(numberFormat) x componentCount` for **all** widths
+  1..=4 and all three numeric classes (`numberFormat 4 => Uint`, `5 => Sint`,
+  else `Float`), and **bitcast** raw integer components into the float-backed
+  register representation rather than numerically converting them — is
+  re-implemented in `kyty-graphics`' shared `vertex_input_types` resolver
+  (`src/shader/spirv.rs`), consumed by `Spirv::WriteGlobalVariables`,
+  `Recompile_Fetch` and the `RAEEN_VS_PASSTHROUGH` diagnostic. This closed the
+  measured GTA V blocker (`invalid registers_num/input format: 2/5` = two
+  components of unified format 5 = `8_UINT`). Unified-format decoding uses
+  Raeen's existing classifier, itself already attributed to SharpEmu's
+  `Gfx10UnifiedFormat.cs`; the Rust resolver, the diagnostics counter, the
+  refusal messages, and all tests are original. Findings recorded in
+  `docs/sharpemu-port/gtav-shader-inputs.md`.
   From the GTA V / UE5 boot-unblocker family (upstream `a1cbff8` PR #454,
   `db4339f` PR #650, `daaeb62` PR #406, `2764aaa` PR #542): three semantics were
   re-implemented after reading SharpEmu's current tree.

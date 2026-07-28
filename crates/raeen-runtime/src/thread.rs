@@ -44,6 +44,37 @@ fn allocated_guest_stack_size(requested: u64) -> u64 {
         + GUEST_PTHREAD_RUNTIME_HEADROOM
 }
 
+/// Opt-in A/B gate for mapping Orbis pthread priorities onto live Windows
+/// threads. KytyPS5 and SharpEmu independently use the same Orbis thresholds:
+/// <=478 is high, >=733 is low, and the middle band is normal.
+fn host_thread_priority_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RAEEN_HOST_THREAD_PRIORITY").is_some())
+}
+
+#[cfg(windows)]
+fn windows_thread_priority(orbis_priority: i32) -> i32 {
+    use windows_sys::Win32::System::Threading::{
+        THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+    };
+    if orbis_priority <= 478 {
+        THREAD_PRIORITY_HIGHEST
+    } else if orbis_priority >= 733 {
+        THREAD_PRIORITY_LOWEST
+    } else {
+        THREAD_PRIORITY_NORMAL
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_thread_priority(handle: u64, orbis_priority: i32) -> bool {
+    use windows_sys::Win32::System::Threading::SetThreadPriority;
+    // SAFETY: callers pass either a live duplicated thread handle owned by the
+    // process table or `GetCurrentThread`'s pseudo-handle. The priority value is
+    // one of Windows' documented constants.
+    unsafe { SetThreadPriority(handle as *mut _, windows_thread_priority(orbis_priority)) != 0 }
+}
+
 struct GuestThread {
     join: Option<JoinHandle<Result<RunOutcome, RuntimeError>>>,
     detached: bool,
@@ -51,10 +82,10 @@ struct GuestThread {
 
 /// Record the calling OS thread's handle under `guest_thread`.
 ///
-/// Diagnostic only, and the only way to see a title that stops making HLE calls:
-/// when the guest spins inside its own code the per-thread call ring freezes and
-/// says nothing about *where*. With a handle we can suspend the thread and read
-/// its RIP. The duplicate is owned by the map for the process lifetime.
+/// This is the only way to see a title that stops making HLE calls: with a
+/// handle diagnostics can suspend the thread and read its RIP. The same handle
+/// also applies live guest-priority changes under the scheduler A/B gate. The
+/// duplicate is owned by the map until this guest thread exits.
 #[cfg(windows)]
 pub(crate) fn record_host_thread_handle(kernel: &OrbisKernel, guest_thread: u64) {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
@@ -450,7 +481,7 @@ impl GuestProcess {
         }))
     }
 
-    fn attributes(&self, attr: u64) -> (u64, bool) {
+    fn attributes(&self, attr: u64) -> (u64, bool, i32) {
         let state = (attr != 0)
             .then(|| self.kernel.pthread_attrs.get(&attr).map(|state| *state))
             .flatten();
@@ -458,6 +489,10 @@ impl GuestProcess {
         (
             allocated_guest_stack_size(requested),
             state.is_some_and(|state| state.detach_state != 0),
+            state.map_or_else(
+                || raeen_kernel::PthreadAttr::default().sched_priority,
+                |state| state.sched_priority,
+            ),
         )
     }
 
@@ -580,7 +615,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
             return SCE_KERNEL_ERROR_EINVAL;
         }
 
-        let (stack_size, detached) = self.attributes(attr);
+        let (stack_size, detached, priority) = self.attributes(attr);
         // Round down to a 16-byte multiple so the entry RSP (`stack_base +
         // stack_size - 8`, over a 16-aligned base) meets the SysV AMD64 entry
         // contract (RSP ≡ 8 mod 16). A guest-supplied odd stack size would
@@ -616,6 +651,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
         // than be handed the TCB itself.
         let static_tls_block = (tls_area > 0).then_some(tcb_base);
         let handle = self.next_thread.fetch_add(1, Ordering::Relaxed);
+        self.kernel.thread_priorities.insert(handle, priority);
         let process = self.clone();
         let host = std::thread::Builder::new()
             .name(format!("raeen-guest-{handle}"))
@@ -625,6 +661,7 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     entry,
                     stack_base,
                     stack_size,
+                    orbis_priority = priority,
                     "guest pthread started"
                 );
                 process.kernel.diagnostics.record(
@@ -635,18 +672,19 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     format!("entry={entry:#x}"),
                 );
                 record_host_thread_handle(&process.kernel, handle);
-                // Publish this worker's stack bounds so the HLE out-buffer
-                // guard can tell a caller local from a heap object. A
-                // secondary thread's stack is an ordinary arena allocation,
-                // so nothing about its ADDRESS distinguishes it — without
-                // this registration the guard would have to fall back to a
-                // window around `caller_rsp`, and an oversized out-struct
-                // write deep in a frame would go unnoticed until it landed
-                // on the caller's `__stack_chk_guard` canary.
-                process
-                    .kernel
-                    .guest_thread_stacks
-                    .insert(handle, (stack_base, stack_base + stack_size));
+                #[cfg(windows)]
+                if host_thread_priority_enabled() {
+                    use windows_sys::Win32::System::Threading::GetCurrentThread;
+                    // SAFETY: returns a pseudo-handle valid on this thread.
+                    let current = unsafe { GetCurrentThread() } as u64;
+                    if !set_windows_thread_priority(current, priority) {
+                        tracing::warn!(
+                            guest_thread = handle,
+                            orbis_priority = priority,
+                            "failed to apply guest pthread priority to host thread"
+                        );
+                    }
+                }
                 // SAFETY: all process resources are Arc-owned by this worker;
                 // entry and stack were validated in the live identity-mapped
                 // arena, and dispatch installs this OS thread's TLS context
@@ -828,6 +866,24 @@ impl GuestThreadScheduler for GuestProcessHandle {
         SCE_OK
     }
 
+    fn set_priority(&self, thread: u64, priority: i32) -> bool {
+        if !host_thread_priority_enabled() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let Some(handle) = self.kernel.host_thread_handles.get(&thread) else {
+                return false;
+            };
+            set_windows_thread_priority(*handle, priority)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (thread, priority);
+            false
+        }
+    }
+
     // The two calls below are per-thread questions, and the process cannot
     // answer them: HLE always holds the running thread's `ActiveContext`
     // (`dispatch.rs`, `guest_threads: ctx`), which answers both from its own
@@ -853,6 +909,8 @@ impl GuestThreadScheduler for GuestProcessHandle {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::windows_thread_priority;
     use super::{
         GUEST_PTHREAD_MAX_STACK_SIZE, GUEST_PTHREAD_MIN_STACK_SIZE, GUEST_PTHREAD_RUNTIME_HEADROOM,
         allocated_guest_stack_size,
@@ -875,5 +933,21 @@ mod tests {
             allocated_guest_stack_size(u64::MAX),
             GUEST_PTHREAD_MAX_STACK_SIZE + GUEST_PTHREAD_RUNTIME_HEADROOM
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn orbis_priorities_map_to_the_reference_host_bands() {
+        use windows_sys::Win32::System::Threading::{
+            THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+        };
+
+        assert_eq!(windows_thread_priority(256), THREAD_PRIORITY_HIGHEST);
+        assert_eq!(windows_thread_priority(478), THREAD_PRIORITY_HIGHEST);
+        assert_eq!(windows_thread_priority(479), THREAD_PRIORITY_NORMAL);
+        assert_eq!(windows_thread_priority(700), THREAD_PRIORITY_NORMAL);
+        assert_eq!(windows_thread_priority(732), THREAD_PRIORITY_NORMAL);
+        assert_eq!(windows_thread_priority(733), THREAD_PRIORITY_LOWEST);
+        assert_eq!(windows_thread_priority(767), THREAD_PRIORITY_LOWEST);
     }
 }

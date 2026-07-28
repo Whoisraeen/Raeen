@@ -537,7 +537,7 @@ pub struct ScalarLoadRef {
     pub base_register: i32,
     /// Byte offset added to the base before the load (0 when not a constant).
     pub byte_offset: u32,
-    /// Number of 32-bit dwords fetched: 1, 2, 4, or 8.
+    /// Number of 32-bit dwords fetched: 1, 2, 4, 8, or 16.
     pub dwords: u32,
 }
 
@@ -554,6 +554,7 @@ pub fn find_scalar_load_bases(code: &ShaderCode) -> Vec<ScalarLoadRef> {
                 ShaderInstructionType::SLoadDwordx2 => 2,
                 ShaderInstructionType::SLoadDwordx4 => 4,
                 ShaderInstructionType::SLoadDwordx8 => 8,
+                ShaderInstructionType::SLoadDwordx16 => 16,
                 _ => return None,
             };
             // src[0] = base SGPR pair; src[1] = byte offset. The SRT/EUD pattern
@@ -637,6 +638,7 @@ pub fn shader_capture_runtime_scalar_loads(
             T::SLoadDwordx2 => Some(2),
             T::SLoadDwordx4 => Some(4),
             T::SLoadDwordx8 => Some(8),
+            T::SLoadDwordx16 => Some(16),
             _ => None,
         }
     }
@@ -672,6 +674,21 @@ pub fn shader_capture_runtime_scalar_loads(
             continue;
         }
         let base_reg = load.src[0].register_id;
+        // A recovered EUD pointer has a stronger lowering contract than this
+        // generic live-user-pointer snapshot. `sload_dword_extended` maps
+        // descriptor dwords through the push-constant table, whose dword 0
+        // has been rewritten from the guest address to the compact Vulkan
+        // descriptor-array index. Snapshotting the same load here would
+        // materialize the raw guest V#/T#/S# dwords first and bypass that
+        // rewrite (measured ASTRO.BOT PS 0x500652400: index 0x026f6a70 into
+        // a one-element storage-buffer array -> AMD VK_ERROR_DEVICE_LOST).
+        //
+        // PC-relative embedded loads are discovered by the dedicated pass
+        // below, after proving their base was built by s_getpc_b64; they do
+        // not need this live-in user-pointer fallback.
+        if bind.extended.used && base_reg == bind.extended.start_register {
+            continue;
+        }
         if instructions[..at]
             .iter()
             .any(|prior| writes_sgpr(prior, base_reg) || writes_sgpr(prior, base_reg + 1))
@@ -872,12 +889,12 @@ pub fn shader_detect_embedded_constant_loads(
     for (i, load) in insts.iter().enumerate() {
         // Only the widths the recompiler routes through `sload_dword_extended`
         // (where the materialization lives) — x1 has a distinct fetch-only
-        // path and x16 has no recompiler row, so capturing them would record
-        // dwords nothing can consume.
+        // path, so capturing it would record dwords nothing can consume.
         let dwords = match load.type_ {
             T::SLoadDwordx2 => 2u32,
             T::SLoadDwordx4 => 4,
             T::SLoadDwordx8 => 8,
+            T::SLoadDwordx16 => 16,
             _ => continue,
         };
         if out.find(load.pc).is_some() {
@@ -1038,7 +1055,7 @@ pub fn shader_detect_embedded_buffer_fetch(
 /// SGPR range starting at `reg` from, or `None` if no such load seeds `reg`.
 ///
 /// A descriptor delivered through the raw EUD window is read into the register
-/// file by an `s_load_dword{,x2,x4,x8} s[reg..], s[eud_base:eud_base+1],
+/// file by an `s_load_dword{,x2,x4,x8,x16} s[reg..], s[eud_base:eud_base+1],
 /// <const>` (the exact shape `sload_dword_extended` and
 /// `shader_detect_eud_raw_window` accept). The returned dword offset is the
 /// load's byte offset >> 2 — the EUD dword whose captured-descriptor coverage
@@ -1053,7 +1070,11 @@ pub(crate) fn eud_load_offset_for_register(
     use crate::shader::types::ShaderInstructionType as T;
     for load in code.get_instructions() {
         match load.type_ {
-            T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
+            T::SLoadDword
+            | T::SLoadDwordx2
+            | T::SLoadDwordx4
+            | T::SLoadDwordx8
+            | T::SLoadDwordx16 => {}
             _ => continue,
         }
         if load.src[0].type_ != ShaderOperandType::Sgpr
@@ -2556,8 +2577,10 @@ pub fn shader_capture_eud_storage_buffers(
     let mut dynamic = Vec::<(i32, i32, ShaderStorageUsage)>::new();
     for &(reg, writes) in &resource_regs {
         for load in code.get_instructions() {
-            if !matches!(load.type_, T::SLoadDwordx4 | T::SLoadDwordx8)
-                || load.src[0].type_ != ShaderOperandType::Sgpr
+            if !matches!(
+                load.type_,
+                T::SLoadDwordx4 | T::SLoadDwordx8 | T::SLoadDwordx16
+            ) || load.src[0].type_ != ShaderOperandType::Sgpr
                 || load.src[0].register_id != eud_base
                 || load.dst.type_ != ShaderOperandType::Sgpr
                 || load.dst.register_id != reg
@@ -2609,8 +2632,10 @@ pub fn shader_capture_eud_storage_buffers(
     let every_operand_resolved = resource_regs.iter().all(|(reg, _)| {
         (0..existing_num).any(|i| !existing.extended[i] && existing.start_register[i] == *reg)
             || code.get_instructions().iter().any(|load| {
-                matches!(load.type_, T::SLoadDwordx4 | T::SLoadDwordx8)
-                    && load.src[0].type_ == ShaderOperandType::Sgpr
+                matches!(
+                    load.type_,
+                    T::SLoadDwordx4 | T::SLoadDwordx8 | T::SLoadDwordx16
+                ) && load.src[0].type_ == ShaderOperandType::Sgpr
                     && load.src[0].register_id == eud_base
                     && load.dst.type_ == ShaderOperandType::Sgpr
                     && load.dst.register_id == *reg
@@ -3654,6 +3679,7 @@ fn read_extended_user_data(
                     | ShaderInstructionType::SLoadDwordx2
                     | ShaderInstructionType::SLoadDwordx4
                     | ShaderInstructionType::SLoadDwordx8
+                    | ShaderInstructionType::SLoadDwordx16
             ) {
                 return None;
             }
@@ -5322,6 +5348,27 @@ mod tests {
         assert_eq!(info.resources_dst[0].registers_num, 3);
     }
 
+    /// GTA V's measured vertex-attribute shape: a `size_in_elements = 2`
+    /// semantic over a V# whose unified format is **5** = `(FMT_8, UINT)` — two
+    /// RAW INTEGER components. This is where the `2/5` pair that the SPIR-V
+    /// input declaration used to refuse actually comes from: `registers_num`
+    /// is the SEMANTIC's element count, the numeric class is the V#'s, and the
+    /// two are independent — a 1-component hardware format feeding a
+    /// 2-component fetch is normal (the absent channel reads back the default).
+    #[test]
+    fn parse_attrib_carries_the_measured_gta_two_component_uint_pair() {
+        let sem = ShaderSemantic {
+            raw: (2 << 8) | (2 << 16),
+        };
+        let attrib = [0u32]; // V# index 0, no format/offset/fetch overrides
+        let mut buffer = vec![0u32; 4];
+        buffer[3] = 5 << 12; // unified FORMAT lives in dword 3 bits 12..18
+        let mut info = ShaderVertexInputInfo::default();
+        shader_parse_attrib(&mut info, &[sem], &attrib, &buffer).unwrap();
+        assert_eq!(info.resources_dst[0].registers_num, 2);
+        assert_eq!(info.resources[0].format(), 5);
+    }
+
     /// A GAPPED semantics table — Minecraft's measured shape: array positions
     /// 0,1,2 carry semantics 0,2,3 (semantic 1 absent). Each slot must record
     /// the semantic it came from, because `recompile_fetch` resolves by
@@ -6777,6 +6824,115 @@ mod tests {
                 .values[..8],
             fields
         );
+    }
+
+    #[test]
+    fn runtime_scalar_load_does_not_snapshot_eud_descriptor_as_literal() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        // Measured ASTRO.BOT PS 0x500652400 shape: s28:s29 is the recovered
+        // EUD pointer and an s_load_dwordx4 reads a V# from it. Capturing those
+        // four raw dwords as an "embedded constant" makes the recompiler seed
+        // the destination with the guest base (0x026f6a70) instead of the
+        // rewritten Vulkan descriptor-array index 0. The resulting valid
+        // SPIR-V indexes a one-element descriptor array out of bounds and
+        // resets the AMD device.
+        let mut load = ShaderInstruction {
+            pc: 0x1c,
+            type_: T::SLoadDwordx4,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(28, 2);
+        load.src[1] = imm_op(32);
+        load.src_num = 2;
+        load.dst = sgpr_op(0, 4);
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        let descriptor = [0x026f_6a70, 0x0010_0005, 0x0000_0002, 0x0004_dfac];
+        let mem = TestMem {
+            regions: vec![(0x0500_1000 + 32, descriptor.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(28, 0x0500_1000, UserSgprType::Unknown);
+        user_sgpr.set(29, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        bind.extended.used = true;
+        bind.extended.start_register = 28;
+
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+
+        assert!(
+            bind.embedded_constant_loads.find(0x1c).is_none(),
+            "EUD loads must flow through sload_dword_extended so descriptor \
+             dword 0 is rewritten to the Vulkan array index"
+        );
+    }
+
+    /// `s_load_dwordx16` (SMEM/SMRD opcode 0x04, measured on Avatar: Frontiers
+    /// of Pandora) must capture all SIXTEEN dwords — the analysis width tables
+    /// were 1/2/4/8-only, so an x16 load previously recorded nothing at all and
+    /// the recompiler had no dwords to materialize.
+    #[test]
+    fn runtime_scalar_load_captures_sixteen_dwords() {
+        let load = ShaderInstruction {
+            pc: 0x10,
+            type_: ShaderInstructionType::SLoadDwordx16,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 16,
+                size: 16,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 12,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::LiteralConstant,
+                    constant: ShaderConstant::from_u(0x40),
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            src_num: 2,
+            ..Default::default()
+        };
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        // 16 distinct dwords at (s[12:13] = 0x30_0000) + 0x40.
+        let dwords: Vec<u32> = (0..16u32).map(|i| 0xdead_0000 | i).collect();
+        let mem = TestMem {
+            regions: vec![(0x0030_0040, dwords.clone())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(12, 0x0030_0000, UserSgprType::Unknown);
+        user_sgpr.set(13, 0, UserSgprType::Unknown);
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_runtime_scalar_loads(&code, &mem, &user_sgpr, &mut bind);
+
+        let captured = bind
+            .embedded_constant_loads
+            .find(0x10)
+            .expect("x16 scalar load captured");
+        assert_eq!(captured.dwords_num, 16);
+        assert_eq!(captured.values[..16], dwords[..]);
+
+        // The width also has to reach the load-reference scan the EUD resolver
+        // reads its bases from.
+        let refs = find_scalar_load_bases(&code);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].dwords, 16);
+        assert_eq!(refs[0].base_register, 12);
+        assert_eq!(refs[0].byte_offset, 0x40);
     }
 
     /// A sharp at s16 with NO extended buffer is a direct read from the Gen5

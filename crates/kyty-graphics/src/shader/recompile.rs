@@ -36,7 +36,7 @@ use super::spirv::{
     operand_load_int, operand_load_uint, operand_variable_to_str, operand_variable_to_str_shift,
     sampled_key_of, sampled_key_suffix, sampled_keys_present, spirv_generate_source,
     spirv_get_embedded_ps, spirv_get_embedded_vs, storage_key_of, storage_key_suffix,
-    storage_keys_present,
+    storage_keys_present, vertex_input_class, vertex_input_types,
 };
 use crate::shader::resources::{
     ShaderBindResources, ShaderComputeInputInfo, ShaderEmbeddedBufferFetch, ShaderPixelInputInfo,
@@ -850,6 +850,17 @@ fn recompile_exp_mrt0_off_off_compr_vm_done(
     Ok(true)
 }
 
+fn mrt_output_variable(target: u8, func: &'static str) -> Result<String, ShaderRecompileError> {
+    match target {
+        0 => Ok("%outColor".to_owned()),
+        1..=7 => Ok(format!("%outColor{target}")),
+        _ => Err(not_supported(
+            func,
+            format!("EXP colour target {target} is outside MRT0..7"),
+        )),
+    }
+}
+
 /// Kyty: `Recompile_Exp_Mrt0Vsrc0Vsrc1ComprVmDone` (ShaderSpirv.cpp L2310).
 fn recompile_exp_mrt0_vsrc0_vsrc1_compr_vm_done(
     index: u32,
@@ -862,12 +873,19 @@ fn recompile_exp_mrt0_vsrc0_vsrc1_compr_vm_done(
     const FUNC: &str = "Recompile_Exp_Mrt0Vsrc0Vsrc1ComprVmDone";
     let inst = inst_at(code, index, FUNC)?;
 
-    if !spirv
+    let target = usize::from(inst.export_target);
+    let mode = spirv
         .get_ps_input_info()
-        .is_some_and(|i| i.target_output_mode[0] == 4)
-    {
-        return Err(not_supported(FUNC, "target_output_mode[0] != 4"));
+        .and_then(|info| info.target_output_mode.get(target))
+        .copied()
+        .unwrap_or(0);
+    if mode != 4 {
+        return Err(not_supported(
+            FUNC,
+            format!("target_output_mode[{target}] = {mode}, expected 4"),
+        ));
     }
+    let output = mrt_output_variable(inst.export_target, FUNC)?;
 
     // `en` selects individual channels after each packed source is unpacked.
     // A disabled pair's source fields are don't-care, so requiring/loading
@@ -934,8 +952,8 @@ fn recompile_exp_mrt0_vsrc0_vsrc1_compr_vm_done(
 
     text += &format!(
         "         %t11_<index> = OpCompositeConstruct %v4float {} {} {} {}\n\
-                       OpStore %outColor %t11_<index>\n",
-        channels[0], channels[1], channels[2], channels[3]
+                       OpStore {output} %t11_<index>\n",
+        channels[0], channels[1], channels[2], channels[3],
     );
     *dst_source += &text.replace("<index>", &format!("{index}"));
 
@@ -955,19 +973,25 @@ fn recompile_exp_mrt0_vsrc0123_vm_done(
     const FUNC: &str = "Recompile_Exp_Mrt0Vsrc0Vsrc1Vsrc2Vsrc3VmDone";
     let inst = inst_at(code, index, FUNC)?;
 
-    // SPI_SHADER_EX_FORMAT for MRT0 must be an uncompressed 32-bit form:
+    // SPI_SHADER_EX_FORMAT for the selected MRT must be an uncompressed 32-bit form:
     // 1 = 32_R, 2 = 32_GR, 3 = 32_AR, 9 = 32_ABGR. Kyty accepted only 9
     // (full en==0xf); the partial-en forms measured on ASTRO.BOT (en=0x3, a
     // 32_GR target) arrive with the matching partial output mode.
+    let target = usize::from(inst.export_target);
     let mode = spirv
         .get_ps_input_info()
-        .map_or(0, |i| i.target_output_mode[0]);
+        .and_then(|info| info.target_output_mode.get(target))
+        .copied()
+        .unwrap_or(0);
     if !matches!(mode, 1 | 2 | 3 | 9) {
         return Err(not_supported(
             FUNC,
-            format!("target_output_mode[0] = {mode} is not an uncompressed 32-bit form (1/2/3/9)"),
+            format!(
+                "target_output_mode[{target}] = {mode} is not an uncompressed 32-bit form (1/2/3/9)"
+            ),
         ));
     }
+    let output = mrt_output_variable(inst.export_target, FUNC)?;
 
     // The en mask selects which of the four VGPRs this export writes; the
     // disabled channels' vsrc fields are don't-care in the hardware encoding,
@@ -1000,8 +1024,8 @@ fn recompile_exp_mrt0_vsrc0123_vm_done(
     // TODO() check EXEC
 
     let text = format!(
-        "{loads}         %t11_<index> = OpCompositeConstruct %v4float {} {} {} {}\n               OpStore %outColor %t11_<index>\n",
-        channels[0], channels[1], channels[2], channels[3]
+        "{loads}         %t11_<index> = OpCompositeConstruct %v4float {} {} {} {}\n               OpStore {output} %t11_<index>\n",
+        channels[0], channels[1], channels[2], channels[3],
     );
 
     *dst_source += &text.replace("<index>", &format!("{index}"));
@@ -1145,10 +1169,7 @@ fn recompile_exp_pos0(
         *dst_source += &vs_passthrough_source(
             index,
             info.resources_dst[0].registers_num,
-            matches!(
-                SampledClass::from_unified_format(u16::from(info.resources[0].format())),
-                SampledClass::Uint
-            ),
+            vertex_input_class(&info.resources[0]),
         )?;
         return Ok(true);
     }
@@ -1173,47 +1194,82 @@ fn recompile_exp_pos0(
     Ok(true)
 }
 
+/// Build the `RAEEN_VS_PASSTHROUGH` diagnostic body for attribute 0 of any
+/// supported (component count, numeric class) pair, using the same shared
+/// resolver the real declaration and fetch use — the three sites used to
+/// enumerate three different subsets of the pair space.
 fn vs_passthrough_source(
     index: u32,
     registers_num: i32,
-    raw_uint: bool,
+    class: SampledClass,
 ) -> Result<String, ShaderRecompileError> {
     const FUNC: &str = "Recompile_Exp_Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done";
-    let load = match (registers_num, raw_uint) {
-        (1, false) => format!(
-            "         %px_{index} = OpLoad %float %attr0\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %float_0_000000 %float_0_000000 %float_1_000000\n"
-        ),
-        (1, true) => format!(
-            "         %pu_{index} = OpLoad %uint %attr0\n\
-             %px_{index} = OpBitcast %float %pu_{index}\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %float_0_000000 %float_0_000000 %float_1_000000\n"
-        ),
-        (2, false) => format!(
-            "         %p0_{index} = OpLoad %v2float %attr0\n\
-             %px_{index} = OpCompositeExtract %float %p0_{index} 0\n\
-             %py_{index} = OpCompositeExtract %float %p0_{index} 1\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %py_{index} %float_0_000000 %float_1_000000\n"
-        ),
-        (3, false) => format!(
-            "         %p0_{index} = OpLoad %v3float %attr0\n\
-             %px_{index} = OpCompositeExtract %float %p0_{index} 0\n\
-             %py_{index} = OpCompositeExtract %float %p0_{index} 1\n\
-             %pz_{index} = OpCompositeExtract %float %p0_{index} 2\n\
-             %pv_{index} = OpCompositeConstruct %v4float %px_{index} %py_{index} %pz_{index} %float_1_000000\n"
-        ),
-        (4, false) => format!("         %pv_{index} = OpLoad %v4float %attr0\n"),
-        (n, _) => {
-            return Err(not_supported(
-                FUNC,
-                format!("VS passthrough invalid attr0 registers_num/format: {n}/raw={raw_uint}"),
-            ));
-        }
+    let Some(types) = vertex_input_types(registers_num, class) else {
+        return Err(not_supported(
+            FUNC,
+            format!(
+                "VS passthrough attr0: {registers_num} components of a {class:?} vertex format \
+                 — only 1..=4 components are supported"
+            ),
+        ));
     };
-    Ok(format!(
+    let n = registers_num as usize;
+
+    // A full-width float attribute needs no rebuild: load it straight into the
+    // clip position.
+    if n == 4 && !types.bitcast {
+        return Ok(passthrough_store(
+            index,
+            format!("         %pv_{index} = OpLoad %v4float %attr0\n"),
+        ));
+    }
+
+    let mut load = format!("         %p0_{index} = OpLoad {} %attr0\n", types.load_type);
+    let value = if types.bitcast {
+        load += &format!(
+            "             %pf_{index} = OpBitcast {} %p0_{index}\n",
+            types.float_type
+        );
+        format!("%pf_{index}")
+    } else {
+        format!("%p0_{index}")
+    };
+
+    // Widen to vec4: present components first, then (0, 0, 0, 1) defaults —
+    // the same fill the hardware fetch applies to absent channels.
+    const COMPONENTS: [&str; 4] = ["px", "py", "pz", "pw"];
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if n == 1 {
+        parts.push(value);
+    } else {
+        for (c, component) in COMPONENTS.iter().enumerate().take(n) {
+            let name = format!("%{component}_{index}");
+            load += &format!("             {name} = OpCompositeExtract %float {value} {c}\n");
+            parts.push(name);
+        }
+    }
+    while parts.len() < 4 {
+        parts.push(
+            if parts.len() == 3 {
+                "%float_1_000000"
+            } else {
+                "%float_0_000000"
+            }
+            .to_string(),
+        );
+    }
+    load += &format!(
+        "             %pv_{index} = OpCompositeConstruct %v4float {}\n",
+        parts.join(" ")
+    );
+    Ok(passthrough_store(index, load))
+}
+
+fn passthrough_store(index: u32, load: String) -> String {
+    format!(
         "{load}         %pa_{index} = OpAccessChain %_ptr_Output_v4float %outPerVertex %int_per_vertex_0\n\
                        OpStore %pa_{index} %pv_{index}\n"
-    ))
+    )
 }
 
 /// Beyond Kyty: auxiliary position exports pos1..pos3 (exp targets
@@ -1833,17 +1889,18 @@ fn sload_dword_extended(
     Ok(true)
 }
 
-/// Kyty: `Recompile_SLoadDwordx4_Sdst4SbaseSoffset` (ShaderSpirv.cpp L4311).
-fn recompile_sload_dwordx4(
+/// Shared body of the wide `s_load_dword{x4,x8,x16}` rows: skip the loads that
+/// only exist to bring the embedded vertex-fetch descriptors into SGPRs, then
+/// hand `n` dwords to [`sload_dword_extended`].
+fn sload_dword_wide(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
+    n: i32,
+    func: &'static str,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SLoadDwordx4_Sdst4SbaseSoffset";
-    let inst = inst_at(code, index, FUNC)?;
+    let inst = inst_at(code, index, func)?;
     let vs_info = spirv.get_vs_input_info();
 
     let shift_regs = if vs_info.is_some_and(|v| v.gs_prolog) {
@@ -1863,10 +1920,29 @@ fn recompile_sload_dwordx4(
     }
 
     if spirv.get_bind_info().is_some_and(|b| b.extended.used) && shift_regs != 0 {
-        return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
+        return Err(not_supported(func, "extended path with gs_prolog shift"));
     }
 
-    sload_dword_extended(index, code, &inst, dst_source, spirv, 4, FUNC)
+    sload_dword_extended(index, code, &inst, dst_source, spirv, n, func)
+}
+
+/// Kyty: `Recompile_SLoadDwordx4_Sdst4SbaseSoffset` (ShaderSpirv.cpp L4311).
+fn recompile_sload_dwordx4(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        4,
+        "Recompile_SLoadDwordx4_Sdst4SbaseSoffset",
+    )
 }
 
 /// Kyty: `Recompile_SLoadDwordx8_Sdst8SbaseSoffset` (ShaderSpirv.cpp L4374).
@@ -1878,31 +1954,36 @@ fn recompile_sload_dwordx8(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_SLoadDwordx8_Sdst8SbaseSoffset";
-    let inst = inst_at(code, index, FUNC)?;
-    let vs_info = spirv.get_vs_input_info();
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        8,
+        "Recompile_SLoadDwordx8_Sdst8SbaseSoffset",
+    )
+}
 
-    let shift_regs = if vs_info.is_some_and(|v| v.gs_prolog) {
-        8
-    } else {
-        0
-    };
-
-    if vs_info.is_some_and(|v| {
-        v.fetch_embedded
-            && !v.fetch_external
-            && !v.fetch_inline
-            && (inst.src[0].register_id == v.fetch_attrib_reg + shift_regs
-                || inst.src[0].register_id == v.fetch_buffer_reg + shift_regs)
-    }) {
-        return Ok(true);
-    }
-
-    if spirv.get_bind_info().is_some_and(|b| b.extended.used) && shift_regs != 0 {
-        return Err(not_supported(FUNC, "extended path with gs_prolog shift"));
-    }
-
-    sload_dword_extended(index, code, &inst, dst_source, spirv, 8, FUNC)
+/// Beyond Kyty (upstream `KYTY_NI`s SMEM/SMRD opcode 0x04):
+/// `s_load_dwordx16` — the 16-dword row of the same family, reached through
+/// the identical `sload_dword_extended` materialization as x4/x8. Measured as
+/// the first shader blocker of Avatar: Frontiers of Pandora.
+fn recompile_sload_dwordx16(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    sload_dword_wide(
+        index,
+        code,
+        dst_source,
+        spirv,
+        16,
+        "Recompile_SLoadDwordx16_Sdst16SbaseSoffset",
+    )
 }
 
 /// Kyty: `Recompile_SMovB32_SVdstSVsrc0` (ShaderSpirv.cpp L4480). Also
@@ -3099,26 +3180,24 @@ fn recompile_fetch(
         // channels beyond the fetch are dropped into a scratch. Beyond Kyty
         // (upstream EXITs on any mismatch). Measured on Minecraft's menu VS:
         // attrib 2 as 2ch feeding a vec3 (fill z=0.0) and as 4ch (drop w).
-        let raw_uint = matches!(
-            SampledClass::from_unified_format(u16::from(info.resources[attrib_pos].format())),
-            SampledClass::Uint
-        );
-        let (temp_ty, load_ty, helper) = match (n_attr, raw_uint) {
-            (1, true) => ("%temp_float", "%uint", "%fetch_f1_f1_"),
-            (1, false) => ("%temp_float", "%float", "%fetch_f1_f1_"),
-            (2, false) => ("%temp_v2float", "%v2float", "%fetch_f1_f1_vf2_"),
-            (3, false) => ("%temp_v3float", "%v3float", "%fetch_f1_f1_f1_vf3_"),
-            (4, false) => ("%temp_v4float", "%v4float", "%fetch_f1_f1_f1_f1_vf4_"),
-            _ => {
-                return Err(not_supported(
-                    FUNC,
-                    format!(
-                        "raw integer vertex format {} with {n_attr} channels",
-                        info.resources[attrib_pos].format()
-                    ),
-                ));
-            }
+        //
+        // The attribute's declared width and numeric class come from the ONE
+        // shared resolver, so this load can never disagree with the
+        // `%attrN` OpVariable `Spirv::WriteGlobalVariables` declared for it.
+        let class = vertex_input_class(&info.resources[attrib_pos]);
+        let Some(types) = vertex_input_types(n_attr, class) else {
+            return Err(not_supported(
+                FUNC,
+                format!(
+                    "vertex attribute {attrib_pos} (attrib id {attrib_id}): {n_attr} components \
+                     of unified format {} ({class:?}) — only 1..=4 components are supported",
+                    info.resources[attrib_pos].format()
+                ),
+            ));
         };
+        let temp_ty = types.temp;
+        let load_ty = types.load_type.as_str();
+        let helper = types.helper;
         let mut params = String::new();
         for i in 0..n_attr {
             if i < n_dst {
@@ -3129,13 +3208,20 @@ fn recompile_fetch(
                 params += "%temp_float ";
             }
         }
-        let raw_bitcast = if raw_uint {
-            "%t1_f_<index> = OpBitcast %float %t1_<index>
-"
+        // A raw integer attribute keeps its BITS: the guest VGPR is
+        // float-backed, so the loaded uint/int vector is bitcast (not
+        // numerically converted) into the same-width float type the fetch
+        // helper takes. Componentwise `OpBitcast` on equal-width vectors is
+        // exactly the reinterpretation the hardware fetch performs.
+        let raw_bitcast = if types.bitcast {
+            format!(
+                "%t1_f_<index> = OpBitcast {} %t1_<index>\n",
+                types.float_type
+            )
         } else {
-            ""
+            String::new()
         };
-        let stored_value = if raw_uint {
+        let stored_value = if types.bitcast {
             "%t1_f_<index>"
         } else {
             "%t1_<index>"
@@ -4788,13 +4874,13 @@ fn sgpr_dst_span(inst: &ShaderInstruction) -> Option<(i32, i32)> {
     Some((inst.dst.register_id, opcode_width.max(inst.dst.size.max(1))))
 }
 
-/// The EUD dword offset a covered `s_load{,x2,x4,x8} s[reg..], s[eud_base..],
-/// <const>` loads `reg`'s dword 0 from, or `None` when `inst` is not exactly
-/// that shape (the same acceptance as [`sload_dword_extended`]).
+/// The EUD dword offset a covered `s_load{,x2,x4,x8,x16} s[reg..],
+/// s[eud_base..], <const>` loads `reg`'s dword 0 from, or `None` when `inst` is
+/// not exactly that shape (the same acceptance as [`sload_dword_extended`]).
 fn eud_load_into_reg_offset(inst: &ShaderInstruction, eud_base: i32, reg: i32) -> Option<i32> {
     use ShaderInstructionType as T;
     match inst.type_ {
-        T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 => {}
+        T::SLoadDword | T::SLoadDwordx2 | T::SLoadDwordx4 | T::SLoadDwordx8 | T::SLoadDwordx16 => {}
         _ => return None,
     }
     if inst.src[0].type_ == ShaderOperandType::Sgpr
@@ -5297,6 +5383,7 @@ fn mimg_descriptor_guard(
                 T::SLoadDwordx2 => 2i32,
                 T::SLoadDwordx4 => 4,
                 T::SLoadDwordx8 => 8,
+                T::SLoadDwordx16 => 16,
                 _ => continue,
             };
             if load.src[0].type_ != ShaderOperandType::Sgpr
@@ -5802,6 +5889,95 @@ fn sample_coord_snippet(
     })
 }
 
+/// Beyond Kyty: `image_sample_l` with `dmask == 0x7`, measured in
+/// ASTRO.BOT scene compute. VADDR contains the dimensional coordinate tuple
+/// followed immediately by the explicit floating-point LOD.
+fn recompile_image_sample_l_dmask7(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleL_Vdata3Vaddr4StSsDmask7";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info()
+        && bind_info.textures2d.textures2d_sampled_num > 0
+        && bind_info.samplers.samplers_num > 0
+    {
+        let matched = mimg_descriptor_guard(
+            index,
+            spirv,
+            code,
+            &inst,
+            FUNC,
+            MimgDescriptorClass::Sampled,
+            true,
+        )?;
+        let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+        let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+        let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
+        let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+        let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
+        let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
+        let lod_value = operand_variable_to_str_shift(inst.src[0], dim.coord_components() as i32);
+
+        if dst_value0.type_ != SpirvType::Float
+            || src1_value0.type_ != SpirvType::Uint
+            || src2_value0.type_ != SpirvType::Uint
+            || lod_value.type_ != SpirvType::Float
+        {
+            return Err(not_supported(FUNC, "unexpected operand types"));
+        }
+
+        let coord = sample_coord_snippet(
+            dim,
+            inst.src[0],
+            FUNC,
+            sampled_site_is_guest_cube(spirv, matched),
+        )?;
+        let mut body = r#"
+         %isl_t24_<index> = OpLoad %uint %<src1_value0>
+         %isl_t26_<index> = OpAccessChain %_ptr_UniformConstant_ImageS %textures2D_S %isl_t24_<index>
+         %isl_t27_<index> = OpLoad %ImageS %isl_t26_<index>
+         %isl_t33_<index> = OpLoad %uint %<src2_value0>
+         %isl_t35_<index> = OpAccessChain %_ptr_UniformConstant_Sampler %samplers %isl_t33_<index>
+         %isl_t36_<index> = OpLoad %Sampler %isl_t35_<index>
+         %isl_t38_<index> = OpSampledImage %SampledImage %isl_t27_<index> %isl_t36_<index>
+
+<coord>
+         %isl_lod_<index> = OpLoad %float %<lod_value>
+         %isl_sample_<index> = OpImageSampleExplicitLod %v4float %isl_t38_<index> %t42_<index> Lod %isl_lod_<index>
+               OpStore %temp_v4float %isl_sample_<index>
+         %isl_c0p_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
+         %isl_c0_<index> = OpLoad %float %isl_c0p_<index>
+               OpStore %<dst_value0> %isl_c0_<index>
+         %isl_c1p_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
+         %isl_c1_<index> = OpLoad %float %isl_c1p_<index>
+               OpStore %<dst_value1> %isl_c1_<index>
+         %isl_c2p_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
+         %isl_c2_<index> = OpLoad %float %isl_c2p_<index>
+               OpStore %<dst_value2> %isl_c2_<index>
+"#
+        .replace("<coord>", &coord)
+        .replace("<index>", &format!("{index}"))
+        .replace("<src1_value0>", &src1_value0.value)
+        .replace("<src2_value0>", &src2_value0.value)
+        .replace("<lod_value>", &lod_value.value)
+        .replace("<dst_value0>", &dst_value0.value)
+        .replace("<dst_value1>", &dst_value1.value)
+        .replace("<dst_value2>", &dst_value2.value);
+        route_sampled_ids(&mut body, suffix);
+        route_sampled_class(&mut body, class);
+        *dst_source += &body;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 /// Kyty: `Recompile_ImageSampleLz_Vdata3Vaddr3StSsDmask7` (ShaderSpirv.cpp
 /// L2821).
 #[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
@@ -6173,21 +6349,26 @@ fn recompile_image_sample_lz_dmask2(
 }
 
 /// Beyond-Kyty (`image_gather4_lz` is `KYTY_NI` upstream): four-texel gather
-/// of channel 0 (dmask 0x1) — measured on ASTRO.BOT scene compute
-/// (raw 0xf11c0108). `OpImageGather` samples the base level, and every
-/// uploaded image carries exactly one mip, so the plain gather IS the LZ
-/// semantic. The four gathered texels land in `vdata..vdata+3` in the
-/// hardware's (i0j1, i1j1, i1j0, i0j0) order, which `OpImageGather` shares.
-fn recompile_image_gather4_lz_dmask1(
+/// of one channel — measured on ASTRO.BOT scene compute (raw 0xf11c0108,
+/// dmask 0x1; dmask 0x2 on the later `rendering`-stage run).
+/// `OpImageGather` samples the base level, and every uploaded image carries
+/// exactly one mip, so the plain gather IS the LZ semantic. The four gathered
+/// texels land in `vdata..vdata+3` in the hardware's (i0j1, i1j1, i1j0, i0j0)
+/// order, which `OpImageGather` shares.
+///
+/// `component` is the dmask's single set bit's index, which is exactly
+/// `OpImageGather`'s `Component` operand — the gather dmask selects the
+/// channel sampled, not a subset of the destination registers (the
+/// destination is always 4 dwords; see KytyPS5 `ImageOps.cpp`).
+fn image_gather4_lz_component(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
-    _param: &Params,
-    _scc_check: SccCheck,
+    func: &'static str,
+    component: u32,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask1";
-    let inst = inst_at(code, index, FUNC)?;
+    let inst = inst_at(code, index, func)?;
 
     let Some(bind_info) = spirv.get_bind_info() else {
         return Ok(false);
@@ -6200,14 +6381,14 @@ fn recompile_image_gather4_lz_dmask1(
         spirv,
         code,
         &inst,
-        FUNC,
+        func,
         MimgDescriptorClass::Sampled,
         true,
     )?;
     // Gathers are 2D-only in Vulkan (no 3D gather; cube gathers unmeasured).
-    let (g4_suffix, g4_dim, g4_class) = sampled_site_route(spirv, matched, FUNC)?;
+    let (g4_suffix, g4_dim, g4_class) = sampled_site_route(spirv, matched, func)?;
     if g4_dim != SampledDim::Two {
-        return Err(not_supported(FUNC, "gather from a non-2D texture"));
+        return Err(not_supported(func, "gather from a non-2D texture"));
     }
 
     let src0_value0 = operand_variable_to_str_shift(inst.src[0], 0);
@@ -6219,7 +6400,7 @@ fn recompile_image_gather4_lz_dmask1(
         || src1_value0.type_ != SpirvType::Uint
         || src2_value0.type_ != SpirvType::Uint
     {
-        return Err(not_supported(FUNC, "unexpected operand types"));
+        return Err(not_supported(func, "unexpected operand types"));
     }
 
     const HEAD: &str = r#"
@@ -6233,7 +6414,7 @@ fn recompile_image_gather4_lz_dmask1(
          %g4_c0_<index> = OpLoad %float %<src0_value0>
          %g4_c1_<index> = OpLoad %float %<src0_value1>
          %g4_c_<index> = OpCompositeConstruct %v2float %g4_c0_<index> %g4_c1_<index>
-         %g4_r_<index> = OpImageGather %v4float %g4_si_<index> %g4_c_<index> %uint_0
+         %g4_r_<index> = OpImageGather %v4float %g4_si_<index> %g4_c_<index> %uint_<component>
                OpStore %temp_v4float %g4_r_<index>
 "#;
     const TAIL: &str = r#"         %g4_p_<index>_<k> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_<k>
@@ -6241,11 +6422,11 @@ fn recompile_image_gather4_lz_dmask1(
                OpStore %<dst_value> %g4_v_<index>_<k>
 "#;
 
-    let mut text = HEAD.to_string();
+    let mut text = HEAD.replace("<component>", &format!("{component}"));
     for k in 0..4i32 {
         let dst_value = operand_variable_to_str_shift(inst.dst, k);
         if dst_value.type_ != SpirvType::Float {
-            return Err(not_supported(FUNC, "unexpected vdata type"));
+            return Err(not_supported(func, "unexpected vdata type"));
         }
         text += &TAIL
             .replace("<k>", &format!("{k}"))
@@ -6257,12 +6438,90 @@ fn recompile_image_gather4_lz_dmask1(
         .replace("<src0_value1>", &src0_value1.value)
         .replace("<src1_value0>", &src1_value0.value)
         .replace("<src2_value0>", &src2_value0.value)
+        .replace("<component>", &format!("{component}"))
         .replace("<index>", &format!("{index}"));
     route_sampled_ids(&mut body, g4_suffix);
     route_sampled_class(&mut body, g4_class);
     *dst_source += &body;
 
     Ok(true)
+}
+
+/// `image_gather4_lz` gathering channel X (dmask 0x1).
+fn recompile_image_gather4_lz_dmask1(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask1",
+        0,
+    )
+}
+
+/// `image_gather4_lz` gathering channel Y (dmask 0x2) — the measured
+/// ASTRO.BOT blocker.
+fn recompile_image_gather4_lz_dmask2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask2",
+        1,
+    )
+}
+
+/// `image_gather4_lz` gathering channel Z (dmask 0x4).
+fn recompile_image_gather4_lz_dmask4(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask4",
+        2,
+    )
+}
+
+/// `image_gather4_lz` gathering channel W (dmask 0x8).
+fn recompile_image_gather4_lz_dmask8(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    image_gather4_lz_component(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_ImageGather4Lz_Vdata4Vaddr3StSsDmask8",
+        3,
+    )
 }
 
 /// Kyty: `Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7` (ShaderSpirv.cpp
@@ -10420,6 +10679,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_dmask9,     T::ImageSample,    F::Vdata2Vaddr3StSsDmask9, p1("")),
     f(recompile_image_sample_dmask7,     T::ImageSample,    F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_dmask_f,    T::ImageSample,    F::Vdata4Vaddr3StSsDmaskF, p1("")),
+    f(recompile_image_sample_l_dmask7,   T::ImageSampleL,   F::Vdata3Vaddr4StSsDmask7, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata1Vaddr3StSsDmask1, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata1Vaddr3StSsDmask8, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata2Vaddr3StSsDmask3, p1("")),
@@ -10438,6 +10698,9 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // Beyond Kyty: four-texel single-channel gather at LOD 0 (ASTRO.BOT
     // scene compute, MIMG 0x47 dmask 0x1).
     f(recompile_image_gather4_lz_dmask1, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask1, p1("")),
+    f(recompile_image_gather4_lz_dmask2, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask2, p1("")),
+    f(recompile_image_gather4_lz_dmask4, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask4, p1("")),
+    f(recompile_image_gather4_lz_dmask8, T::ImageGather4Lz, F::Vdata4Vaddr3StSsDmask8, p1("")),
     f(recompile_image_store_dmask1,        T::ImageStore,     F::Vdata1Vaddr3StDmask1,   p1("")),
     f(recompile_image_store_dmask3,        T::ImageStore,     F::Vdata2Vaddr3StDmask3,   p1("")),
     f(recompile_image_store_dmask_f,       T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
@@ -10464,6 +10727,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_sload_dwordx2, T::SLoadDwordx2, F::Sdst2Ssrc02Ssrc1,  p1("")),
     f(recompile_sload_dwordx4, T::SLoadDwordx4, F::Sdst4SbaseSoffset, p1("")),
     f(recompile_sload_dwordx8, T::SLoadDwordx8, F::Sdst8SbaseSoffset, p1("")),
+    f(recompile_sload_dwordx16, T::SLoadDwordx16, F::Sdst16SbaseSoffset, p1("")),
 
     fs(recompile_s_xxx_b64_sdst2_ssrc02_ssrc12, T::SAndn2B64, F::Sdst2Ssrc02Ssrc12, p4("%ta_<index> = OpNot %uint %t2_<index>",
         "%tb_<index> = OpBitwiseAnd %uint %t0_<index> %ta_<index>",
@@ -11142,7 +11406,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            348,
+            353,
             "the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
              VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
              the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),            the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
@@ -11174,11 +11438,14 @@ mod tests {
              min/max quartet (VMinU32/VMaxU32/VMinI32/VMaxI32), the four \
              BufferStoreDwordX2 rows, VBfeU32 wired from staged, and the \
              ASTRO.BOT pixel ImageSample dmask2 + ImageSampleLzO dmask1/2 rows, \
-             and the measured VCmpxLeU32 + DsAddRtnU32 rows"
+             and the measured VCmpxLeU32 + DsAddRtnU32 rows, and the \
+             instruction-coverage batch: ImageGather4Lz dmask2/4/8 (the dmask \
+             bit index is the SPIR-V gather Component operand) and \
+             SLoadDwordx16 (SMEM/SMRD opcode 0x04)"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 340,
+            implemented, 345,
             "the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
@@ -11205,6 +11472,8 @@ mod tests {
               the integer min/max quartet, four BufferStoreDwordX2 rows, \
               VBfeU32, ImageSample dmask2, ImageSampleLzO dmask1/2, VCmpxLeU32, \
               DsAddRtnU32, \
+              and the instruction-coverage batch: ImageGather4Lz dmask2/4/8 \
+              and SLoadDwordx16, \
               and the exp-null row: EXP target 9 accepted and dropped)"
         );
         assert_eq!(
@@ -15541,14 +15810,14 @@ mod tests {
 
     #[test]
     fn vertex_passthrough_matches_declared_attribute_width() {
-        let vec3 = vs_passthrough_source(7, 3, false).expect("vec3 passthrough");
+        let vec3 = vs_passthrough_source(7, 3, SampledClass::Float).expect("vec3 passthrough");
         assert!(vec3.contains("%p0_7 = OpLoad %v3float %attr0"), "{vec3}");
         assert!(
             vec3.contains("OpCompositeConstruct %v4float %px_7 %py_7 %pz_7 %float_1_000000"),
             "{vec3}"
         );
 
-        let vec4 = vs_passthrough_source(9, 4, false).expect("vec4 passthrough");
+        let vec4 = vs_passthrough_source(9, 4, SampledClass::Float).expect("vec4 passthrough");
         assert!(vec4.contains("%pv_9 = OpLoad %v4float %attr0"), "{vec4}");
         assert!(
             !vec4.contains("OpLoad %v3float"),
@@ -15625,6 +15894,132 @@ mod tests {
         // This synthetic Fetch* omits the scalar prolog registers a complete
         // shader carries. Source-level assertions are intentional here; the
         // live Minecraft verification exercises the assembled Vulkan module.
+    }
+
+    /// GTA V's measured blocker: `registers_num = 2` over unified format 5 =
+    /// `(FMT_8, UINT)`. Two RAW INTEGER components — a width the raw-integer
+    /// path did not cover ("invalid registers_num/input format: 2/5"), which
+    /// refused the whole vertex shader.
+    ///
+    /// The declaration, the fetch load and the bitcast must all agree on the
+    /// same width: a `%v2uint` variable read through a `%v2float` pointer, or
+    /// a scalar `OpBitcast` of a vector, are both invalid SPIR-V. The
+    /// assembled-and-validated module lives in
+    /// `tests/gcn_to_spirv.rs::gta_two_channel_uint_vertex_attribute_translates_to_validated_spirv`.
+    #[test]
+    fn two_channel_uint_vertex_fetch_loads_a_uint_vector() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let mut fetch = ShaderInstruction {
+            type_: T::FetchXy,
+            format: F::Vdata2VaddrSvSoffsIdxen,
+            src_num: 3,
+            ..Default::default()
+        };
+        fetch.dst = ShaderOperand {
+            type_: ShaderOperandType::Vgpr,
+            register_id: 2,
+            size: 2,
+            ..Default::default()
+        };
+        fetch.src[2] = ShaderOperand {
+            type_: ShaderOperandType::IntegerInlineConstant,
+            constant: crate::shader::types::ShaderConstant::from_i(0),
+            size: 1,
+            ..Default::default()
+        };
+        code.get_instructions_mut().push(fetch);
+
+        let mut info = ShaderVertexInputInfo {
+            resources_num: 1,
+            fetch_embedded: true,
+            gs_prolog: true,
+            ..Default::default()
+        };
+        info.resources[0].fields[3] = 5 << 12; // unified format 5 = (FMT_8, UINT)
+        info.resources_dst[0].semantic = 0;
+        info.resources_dst[0].register_start = 2;
+        info.resources_dst[0].registers_num = 2;
+
+        let source = spirv_generate_source(&code, Some(&info), None, None)
+            .expect("2 raw-integer components must translate");
+        assert!(
+            source.contains("%attr0 = OpVariable %_ptr_Input_v2uint Input"),
+            "two uint components must declare a v2uint interface:\n{source}"
+        );
+        assert!(
+            source.contains("OpLoad %v2uint %attr0"),
+            "the load must use the declared width:\n{source}"
+        );
+        assert!(
+            source.contains("OpBitcast %v2float %t1_0_0"),
+            "the bitcast must be componentwise over the same width:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %temp_v2float %t1_f_0_0"),
+            "the reinterpreted vector feeds the vec2 fetch helper:\n{source}"
+        );
+        assert!(
+            source.contains("OpFunctionCall %void %fetch_f1_f1_vf2_ %v2 %v3 %temp_v2float"),
+            "both channels must reach the guest VGPRs:\n{source}"
+        );
+    }
+
+    /// Every (component count, numeric class) pair the shared resolver claims
+    /// support for must name a type the SPIR-V prelude actually declares — the
+    /// declaration, the load and the pointer are three separate strings, and a
+    /// typo in any of them assembles to "id is used but never defined" only at
+    /// runtime, on one title's one attribute layout.
+    #[test]
+    fn every_supported_vertex_input_pair_names_declared_types() {
+        let types_block = super::super::spirv::spirv_generate_source(
+            &{
+                let mut c = ShaderCode::new();
+                c.set_type(ShaderType::Vertex);
+                c
+            },
+            Some(&ShaderVertexInputInfo::default()),
+            None,
+            None,
+        )
+        .expect("empty vs");
+        for n in 1..=4 {
+            for class in [SampledClass::Float, SampledClass::Uint, SampledClass::Sint] {
+                let t = vertex_input_types(n, class)
+                    .unwrap_or_else(|| panic!("{n} components of {class:?} must be supported"));
+                assert!(
+                    types_block.contains(&format!("{} = OpTypePointer Input", t.ptr_type)),
+                    "{n}/{class:?} declares {} but the types block has no such pointer",
+                    t.ptr_type
+                );
+                assert_eq!(
+                    t.bitcast,
+                    class != SampledClass::Float,
+                    "only the raw integer classes are reinterpreted, never converted"
+                );
+            }
+        }
+    }
+
+    /// An unsupported width must name the exact pair (not just the count) and
+    /// be counted, so a log line identifies which attribute of which title is
+    /// still refused instead of reporting an anonymous whole-shader drop.
+    #[test]
+    fn unsupported_vertex_input_pair_is_named_and_counted() {
+        let before = super::super::spirv::vertex_input_pair_skips();
+        assert!(vertex_input_types(5, SampledClass::Uint).is_none());
+        assert!(vertex_input_types(0, SampledClass::Float).is_none());
+        assert!(
+            super::super::spirv::vertex_input_pair_skips() >= before + 2,
+            "each refused pair must be counted in the shader diagnostics"
+        );
+
+        let err = vs_passthrough_source(0, 5, SampledClass::Uint).expect_err("5 components");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("5 components") && msg.contains("Uint"),
+            "the refusal must name the pair, got: {msg}"
+        );
     }
 
     // ---- 3. acceptance: minimal PS ----------------------------------------
@@ -15947,6 +16342,60 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble full-en mrt0 export");
         naga_parse_and_validate(&words, "exp mrt0 compr=0 en=f");
+    }
+
+    /// The pipeline already carries MRT1..7 attachments; pin the missing
+    /// shader half with a real two-export sequence. MRT0 is not `done` because
+    /// MRT1 follows, while MRT1 terminates the export sequence.
+    #[test]
+    fn fragment_mrt0_and_mrt1_exports_validate_with_distinct_locations() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xF800_100F, // exp mrt0 v0..v3, vm, done=0
+                0x0302_0100,
+                0xF800_181F, // exp mrt1 v0..v3, vm, done=1
+                0x0302_0100,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse MRT0+MRT1 fragment exports");
+
+        let exports: Vec<_> = code
+            .get_instructions()
+            .iter()
+            .filter(|inst| inst.type_ == T::Exp)
+            .collect();
+        assert_eq!(exports.len(), 2);
+        assert_eq!(exports[0].export_target, 0);
+        assert_eq!(exports[1].export_target, 1);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 9;
+        input_info.target_output_mode[1] = 9;
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile MRT0+MRT1 fragment exports");
+
+        assert!(
+            source.contains("OpDecorate %outColor Location 0")
+                && source.contains("OpDecorate %outColor1 Location 1"),
+            "both fragment output locations must be declared:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %outColor %t11_4")
+                && source.contains("OpStore %outColor1 %t11_5"),
+            "each EXP target must store to its own output:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble MRT0+MRT1 fragment exports");
+        naga_parse_and_validate(&words, "fragment MRT0+MRT1 exports");
     }
 
     /// `v_cmpx_ge_f32` / `v_cmpx_nle_f32` (VOPC 0x16 / 0x1c) — the ASTRO.BOT
@@ -17441,6 +17890,214 @@ mod tests {
         // NOTE: assemble-only — naga's SPIR-V front end does not support
         // OpImageGather (UnsupportedInstruction), which real Vulkan accepts.
         let _ = spirv_run(&source).expect("assemble image_gather4_lz");
+    }
+
+    /// `image_gather4_lz` with each single-bit dmask must translate all the
+    /// way to spirv-val-clean SPIR-V, and the dmask bit index MUST land in
+    /// `OpImageGather`'s `Component` operand — dmask 0x2 is the measured
+    /// ASTRO.BOT blocker ("unknown mimg format for opcode: 0x47 ... dmask:
+    /// 0x2").
+    #[test]
+    fn image_gather4_lz_dmask_selects_the_gather_component() {
+        for (word0, dmask, component) in [
+            (0xF11C_0108u32, 0x1, 0u32),
+            (0xF11C_0208, 0x2, 1),
+            (0xF11C_0408, 0x4, 2),
+            (0xF11C_0808, 0x8, 3),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[word0, 0x0040_0206, V_MOV_V0_0, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("parse gather4_lz dmask {dmask:#x}: {e:?}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, T::ImageGather4Lz);
+            // Always four destination dwords: one per gathered texel.
+            assert_eq!(inst.dst.size, 4, "dmask {dmask:#x}");
+
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            input_info.bind.push_constant_size = 64;
+            input_info.bind.textures2d.textures_num = 1;
+            input_info.bind.textures2d.textures2d_sampled_num = 1;
+            input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+            input_info.bind.samplers.samplers_num = 1;
+            input_info.bind.samplers.start_register[0] = 8;
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .unwrap_or_else(|e| panic!("recompile gather4_lz dmask {dmask:#x}: {e:?}"));
+            assert!(
+                source.contains(&format!("%g4_c_0 %uint_{component}")),
+                "dmask {dmask:#x} must gather component {component}:\n{source}"
+            );
+            // Four texel stores into v[2:5], independent of the dmask.
+            for k in 0..4 {
+                assert!(
+                    source.contains(&format!("OpStore %v{} %g4_v_0_{k}", 2 + k)),
+                    "dmask {dmask:#x} texel {k} store:\n{source}"
+                );
+            }
+            let words = spirv_run(&source)
+                .unwrap_or_else(|e| panic!("assemble gather4_lz dmask {dmask:#x}: {e:?}"));
+            // naga cannot gate this module (its SPIR-V front end rejects
+            // OpImageGather outright); spirv-val is the real bar.
+            spirv_val_ok(&words, &format!("image_gather4_lz_dmask{dmask:#x}"));
+        }
+    }
+
+    /// `s_load_dwordx16` (SMEM opcode 0x04) — Avatar: Frontiers of Pandora's
+    /// first shader blocker. All SIXTEEN destination SGPRs must materialize;
+    /// a width bug would silently drop dwords 8..16.
+    #[test]
+    fn s_load_dwordx16_materializes_all_sixteen_dwords() {
+        // s_load_dwordx16 s[16:31], s[12:13], 0x100 — the EUD base pair with a
+        // constant byte offset (the shape `sload_dword_extended` accepts).
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF410_0406, 0xFA00_0100, V_MOV_V0_0, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse s_load_dwordx16");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLoadDwordx16);
+        assert_eq!(inst.format, F::Sdst16SbaseSoffset);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (16, 16));
+        assert_eq!((inst.src[0].register_id, inst.src[0].size), (12, 2));
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 12;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+        input_info.bind.storage_buffers.extended[0] = true;
+
+        // No captured descriptor covers EUD dword 0x40..0x50, so the raw
+        // window must be sized to the load's LAST dword — evidence the x16
+        // width reached the detection pass, not just the parser.
+        crate::shader::spirv::shader_detect_eud_raw_window(&code, &mut input_info.bind);
+        let raw = input_info.bind.eud_raw;
+        assert!(raw.used);
+        assert_eq!(
+            raw.required_dwords,
+            0x100 / 4 + 16,
+            "raw window must cover all 16 loaded dwords"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile s_load_dwordx16");
+        assert_eq!(
+            source.matches("OpArrayLength %uint %eud_raw 0").count(),
+            16,
+            "one clamped read per loaded dword:\n{source}"
+        );
+        // Destinations are s16..s31 — the last one proves the width.
+        for i in 0..16 {
+            assert!(
+                source.contains(&format!("OpStore %s{} %eudraw_res_0_{i}", 16 + i)),
+                "dword {i} store:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble s_load_dwordx16");
+        spirv_val_ok(&words, "s_load_dwordx16");
+    }
+
+    #[test]
+    fn astro_image_sample_l_uses_explicit_vgpr_lod() {
+        // Captured ASTRO.BOT opcode word 0xf0900718: image_sample_l dmask:7.
+        // The compact fixture keeps the known descriptor tuple and supplies
+        // XY followed by the explicit LOD in the third VADDR register.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF090_0718, 0x0040_0206, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_sample_l");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSampleL);
+        assert_eq!(inst.format, F::Vdata3Vaddr4StSsDmask7);
+        assert_eq!(inst.src[0].size, 4);
+        assert_eq!(inst.dst.size, 3);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_sample_l");
+        assert!(
+            source.contains("OpImageSampleExplicitLod %v4float"),
+            "explicit sample:\n{source}"
+        );
+        assert!(source.contains("Lod %isl_lod_0"), "LOD operand:\n{source}");
+        assert!(
+            source.contains("%isl_lod_0 = OpLoad %float"),
+            "VGPR LOD load:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble image_sample_l");
+        naga_parse_and_validate(&words, "image_sample_l");
+    }
+
+    #[test]
+    fn astro_image_gather4_lz_dmask2_gathers_green_channel() {
+        // ASTRO.BOT pairs raw 0xf11c0108 and 0xf11c0208 gathers in four
+        // captured scene-compute shaders. Keep the compact fixture's known
+        // descriptor registers while exercising the exact dmask-2 opcode
+        // word: four green-channel texels must land in four VGPRs.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF11C_0208, 0x0040_0206, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_gather4_lz dmask2");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageGather4Lz);
+        assert_eq!(inst.format, F::Vdata4Vaddr3StSsDmask2);
+        assert_eq!(inst.dst.size, 4);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_gather4_lz dmask2");
+        assert!(
+            source.contains("OpImageGather %v4float"),
+            "gather op:\n{source}"
+        );
+        assert!(
+            source.contains("%g4_c_0 %uint_1"),
+            "component 1 from dmask 2:\n{source}"
+        );
+        for k in 0..4 {
+            assert!(
+                source.contains(&format!("OpStore %v{} %g4_v_0_{k}", 2 + k)),
+                "texel {k} store:\n{source}"
+            );
+        }
+        let _ = spirv_run(&source).expect("assemble image_gather4_lz dmask2");
     }
 
     #[test]

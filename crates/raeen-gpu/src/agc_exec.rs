@@ -2339,6 +2339,12 @@ impl AgcGpuSession {
                 dispatch_reason = dispatch_skip_reason.unwrap_or("(none)"),
                 texture_cap_skips = crate::draw_translate::stage_texture_cap_skips(),
                 storage_addressing_skips = crate::draw_translate::storage_addressing_skips(),
+                // A non-zero count here means a vertex shader was dropped for
+                // an unsupported (component count, unified format) attribute
+                // pair — the class of failure that held GTA V at 192 flips
+                // with no other blocker. The `Spirv::WriteGlobalVariables`
+                // error line names the exact pair.
+                vertex_input_pair_skips = kyty_graphics::shader::vertex_input_pair_skips(),
                 vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
                 es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
                 gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),

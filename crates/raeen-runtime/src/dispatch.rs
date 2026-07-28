@@ -264,10 +264,137 @@ static HLE_VEH_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static HLE_DIRECT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static LAST_HLE_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_HLE_RETURN: AtomicU64 = AtomicU64::new(0);
+static GUEST_WATCHPOINT_HITS: AtomicU64 = AtomicU64::new(0);
 static TRACE_HLE: OnceLock<bool> = OnceLock::new();
 static TRACE_HLE_INDEX: OnceLock<Option<u64>> = OnceLock::new();
 static TRACE_HLE_FUNCTION: OnceLock<Option<String>> = OnceLock::new();
 static TRACE_EINVAL: OnceLock<bool> = OnceLock::new();
+static WATCH_REQUEST: OnceLock<Option<GuestWatchRequest>> = OnceLock::new();
+static WATCH_CANARY_FRAME_DEPTH: OnceLock<usize> = OnceLock::new();
+
+const EXCEPTION_SINGLE_STEP_CODE: i32 = 0x8000_0004_u32 as i32;
+const CONTEXT_DEBUG_REGISTERS_AMD64_FLAG: u32 = 0x0010_0010;
+const STACK_CANARY_SLOT_FROM_RBP: u64 = 0x30;
+
+#[derive(Debug)]
+enum GuestWatchRequest {
+    /// Arm an eight-byte write watch at the exact guest address supplied by
+    /// `RAEEN_WATCH_ADDR`.
+    Explicit(u64),
+    /// Read one guest pointer from `RAEEN_WATCH_PTR_ADDR` and watch the
+    /// eight-byte value it names. This is useful for imported data symbols:
+    /// the module-relative GOT address is stable while the HLE data-page
+    /// address stored there is process-local.
+    Indirect(u64),
+    /// When this HLE function returns, watch a guest frame's stack-protector
+    /// slot at `[rbp - 0x30]`. `RAEEN_WATCH_CANARY_FRAME_DEPTH` selects how
+    /// many saved-frame-pointer links to follow (default 0 = the frame that
+    /// called HLE).
+    ///
+    /// This is the useful automatic mode for a deterministic canary smash:
+    /// set `RAEEN_WATCH_CANARY_AFTER_HLE=sceKernelGetdents`, and the next
+    /// guest instruction that changes the protected slot is reported.
+    CallerCanaryAfter(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveGuestWatch {
+    address: u64,
+    initial_value: u64,
+    armed_by_hle_index: u64,
+}
+
+fn parse_watch_address(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if digits.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
+}
+
+fn parse_watch_frame_depth(value: &str) -> Option<usize> {
+    value.trim().parse().ok().filter(|depth| *depth <= 64)
+}
+
+fn watch_canary_frame_depth() -> usize {
+    *WATCH_CANARY_FRAME_DEPTH.get_or_init(|| {
+        let Ok(value) = std::env::var("RAEEN_WATCH_CANARY_FRAME_DEPTH") else {
+            return 0;
+        };
+        match parse_watch_frame_depth(&value) {
+            Some(depth) => depth,
+            None => {
+                tracing::warn!(
+                    "ignoring invalid RAEEN_WATCH_CANARY_FRAME_DEPTH={value:?}; \
+                     expected an integer from 0 through 64"
+                );
+                0
+            }
+        }
+    })
+}
+
+fn stack_canary_address(
+    mem: &dyn GuestMemory,
+    mut frame_pointer: u64,
+    frame_depth: usize,
+) -> Option<u64> {
+    for _ in 0..frame_depth {
+        frame_pointer = read_guest_u64(mem, frame_pointer)?;
+    }
+    frame_pointer.checked_sub(STACK_CANARY_SLOT_FROM_RBP)
+}
+
+/// Encode one local x64 data breakpoint in DR7.
+///
+/// L0 is enabled, RW0=01 selects writes, and LEN0 uses Intel's non-linear
+/// length encoding (00=1, 01=2, 11=4, 10=8). Execute and I/O breakpoints are
+/// deliberately unsupported here.
+fn write_watch_dr7(byte_len: usize) -> Option<u64> {
+    let len_bits = match byte_len {
+        1 => 0b00,
+        2 => 0b01,
+        4 => 0b11,
+        8 => 0b10,
+        _ => return None,
+    };
+    // Bit 10 is architecturally fixed to one. Windows normalizes it when an
+    // exception CONTEXT is resumed, so include it in the value we compare and
+    // restore instead of reporting every HLE boundary as lost debug state.
+    Some((1 << 10) | 1 | (0b01 << 16) | (len_bits << 18))
+}
+
+fn guest_watch_request() -> Option<&'static GuestWatchRequest> {
+    WATCH_REQUEST
+        .get_or_init(|| {
+            if let Ok(value) = std::env::var("RAEEN_WATCH_ADDR") {
+                match parse_watch_address(&value) {
+                    Some(address) => return Some(GuestWatchRequest::Explicit(address)),
+                    None => tracing::warn!(
+                        "ignoring invalid RAEEN_WATCH_ADDR={value:?}; expected hexadecimal address"
+                    ),
+                }
+            }
+            if let Ok(value) = std::env::var("RAEEN_WATCH_PTR_ADDR") {
+                match parse_watch_address(&value) {
+                    Some(address) => return Some(GuestWatchRequest::Indirect(address)),
+                    None => tracing::warn!(
+                        "ignoring invalid RAEEN_WATCH_PTR_ADDR={value:?}; \
+                         expected hexadecimal address"
+                    ),
+                }
+            }
+            std::env::var("RAEEN_WATCH_CANARY_AFTER_HLE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(GuestWatchRequest::CallerCanaryAfter)
+        })
+        .as_ref()
+}
 
 /// `RAEEN_TIME_HLE`: accumulate per-(thread, function) time spent inside HLE
 /// calls, so a stalled thread's wall-clock can be attributed to a specific
@@ -288,6 +415,16 @@ const CALL_STATS_BOOT_WINDOW: std::time::Duration = std::time::Duration::from_se
 /// [`FSBASE_REARMS`]. Monotonic; never reset.
 pub fn fsbase_rearm_count() -> u64 {
     FSBASE_REARMS.load(Ordering::Relaxed)
+}
+
+/// Number of guest data-write watchpoints consumed by the VEH.
+///
+/// This diagnostic counter is monotonic and process-wide. It exists so a
+/// controlled native-guest fixture can prove the complete DR0/DR7 ->
+/// `EXCEPTION_SINGLE_STEP` -> DR6.B0 path, rather than treating successful
+/// register encoding as evidence that Windows delivered the trap.
+pub fn guest_watchpoint_hit_count() -> u64 {
+    GUEST_WATCHPOINT_HITS.load(Ordering::Relaxed)
 }
 
 /// Monotonic HLE dispatch counters used by compatibility reports and the
@@ -918,6 +1055,11 @@ impl GuestThreadScheduler for ActiveContext {
         unsafe { &*self.thread_scheduler }.detach(thread)
     }
 
+    fn set_priority(&self, thread: u64, priority: i32) -> bool {
+        // SAFETY: same lifetime invariant as `create`.
+        unsafe { &*self.thread_scheduler }.set_priority(thread, priority)
+    }
+
     fn request_exit(&self, retval: u64) -> bool {
         self.thread_exit.set(Some(retval));
         true
@@ -1095,6 +1237,12 @@ thread_local! {
     /// touched synchronously on its owning thread, so a plain `Cell` (not an
     /// atomic) is correct.
     static ACTIVE_CONTEXT: Cell<*mut ActiveContext> = const { Cell::new(ptr::null_mut()) };
+
+    /// One hardware data breakpoint owned by this guest OS thread. DR0/DR7
+    /// are thread-local CPU state, and Windows delivers the resulting
+    /// single-step exception synchronously on the same thread, so the
+    /// attribution must be thread-local as well.
+    static ACTIVE_GUEST_WATCH: Cell<Option<ActiveGuestWatch>> = const { Cell::new(None) };
 }
 
 /// Target of the generated executable leaf-import bridge. The bridge switches
@@ -1198,6 +1346,22 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         };
         ctx.active_hle
             .set(Some((index, args[..6].try_into().unwrap())));
+        // Keep diagnostic parity with the VEH dispatcher. Without this, every
+        // executable-gateway call vanished from RAEEN_TRACE_EINVAL's recent
+        // call ring, so a thread parked in a direct mutex/condvar handler
+        // appeared as "between calls" in STALL_DUMP even while it was the
+        // measured owner of a title-wide streaming convoy.
+        if *TRACE_EINVAL.get_or_init(|| std::env::var_os("RAEEN_TRACE_EINVAL").is_some())
+            || std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some()
+        {
+            let tid = ctx.current_thread();
+            let ring = kernel.recent_hle_calls.entry(tid).or_default();
+            let mut q = ring.lock();
+            if q.len() >= 24 {
+                q.pop_front();
+            }
+            q.push_back(format!("{}::{}", t.library, t.function));
+        }
         // Mark this dispatch as gateway-hosted for the duration of the
         // handler, so a `call_guest` attempt from inside it is refused (see
         // `ActiveContext::direct_gateway_active`). Save/restore rather than
@@ -1451,6 +1615,7 @@ pub(crate) unsafe fn run(
 
     // `ctx` is a local; its address is stable for the rest of this function
     // (never moved), which is exactly the lifetime the VEH needs it for.
+    ACTIVE_GUEST_WATCH.with(|slot| slot.set(None));
     ACTIVE_CONTEXT.with(|slot| slot.set(&ctx as *const ActiveContext as *mut ActiveContext));
 
     // RT2c-b (design doc §3): if a guest TCB was set up and FSGSBASE is
@@ -1574,6 +1739,7 @@ pub(crate) unsafe fn run(
 
     set_direct_state_slot(direct_state.previous_teb_slot);
 
+    ACTIVE_GUEST_WATCH.with(|slot| slot.set(None));
     ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
 
     // Design doc §4: on the resumed arrival, an exit-family termination is
@@ -2301,6 +2467,127 @@ fn diagnostic_disassembly(mem: &dyn GuestMemory, start: u64, len: usize) -> Opti
     Some(lines.join("\n"))
 }
 
+fn read_guest_u64(mem: &dyn GuestMemory, address: u64) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    mem.read(address, &mut bytes)
+        .then(|| u64::from_le_bytes(bytes))
+}
+
+/// Return every valid x64 instruction ending at `rip_after`.
+///
+/// A data breakpoint is delivered after the write has retired, so Windows
+/// reports the following RIP. x64 has no architecturally unique backwards
+/// decode point; retaining every 1..=15-byte candidate is more honest than
+/// guessing one and calling it the writer. The true instruction is always in
+/// this bounded set, and the surrounding disassembly logged with it resolves
+/// any ambiguity.
+fn writer_instruction_candidates(mem: &dyn GuestMemory, rip_after: u64) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for distance in 1..=15u64 {
+        let Some(start) = rip_after.checked_sub(distance) else {
+            continue;
+        };
+        let mut bytes = [0u8; 15];
+        if !mem.read(start, &mut bytes) {
+            continue;
+        }
+        let mut decoder = Decoder::with_ip(64, &bytes, start, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        if instruction.is_invalid() || instruction.next_ip() != rip_after {
+            continue;
+        }
+        let mut rendered = String::new();
+        let mut formatter = IntelFormatter::new();
+        formatter.format(&instruction, &mut rendered);
+        candidates.push(format!("{start:#x}: {rendered}"));
+    }
+    candidates
+}
+
+fn maybe_arm_guest_watchpoint(
+    context: &mut CONTEXT,
+    mem: &dyn GuestMemory,
+    function: &str,
+    hle_index: u64,
+) {
+    if let Some(active) = ACTIVE_GUEST_WATCH.with(|slot| slot.get()) {
+        let expected_dr7 = write_watch_dr7(8).expect("8-byte watchpoints are supported");
+        if context.Dr0 != active.address || context.Dr7 != expected_dr7 {
+            tracing::warn!(
+                "guest write watch debug registers were not preserved across HLE #{hle_index} \
+                 ({function}); restoring dr0={:#x} dr7={expected_dr7:#x} \
+                 (observed dr0={:#x} dr7={:#x})",
+                active.address,
+                context.Dr0,
+                context.Dr7
+            );
+            context.ContextFlags |= CONTEXT_DEBUG_REGISTERS_AMD64_FLAG;
+            context.Dr0 = active.address;
+            context.Dr6 = 0;
+            context.Dr7 = expected_dr7;
+        }
+        return;
+    }
+    let Some(request) = guest_watch_request() else {
+        return;
+    };
+    let address = match request {
+        GuestWatchRequest::Explicit(address) => *address,
+        GuestWatchRequest::Indirect(pointer_address) => {
+            let Some(address) = read_guest_u64(mem, *pointer_address) else {
+                tracing::warn!(
+                    "cannot arm indirect guest write watch: unreadable pointer at {pointer_address:#x}"
+                );
+                return;
+            };
+            address
+        }
+        GuestWatchRequest::CallerCanaryAfter(target) => {
+            if target != function {
+                return;
+            }
+            let frame_depth = watch_canary_frame_depth();
+            let Some(address) = stack_canary_address(mem, context.Rbp, frame_depth) else {
+                tracing::warn!(
+                    "cannot auto-arm canary watch after {function}: cannot resolve depth \
+                     {frame_depth} from rbp {:#x}",
+                    context.Rbp,
+                );
+                return;
+            };
+            address
+        }
+    };
+    if !address.is_multiple_of(8) {
+        tracing::warn!(
+            "cannot arm 8-byte guest write watch at unaligned address {address:#x}; \
+             choose an aligned RAEEN_WATCH_ADDR"
+        );
+        return;
+    }
+    let Some(initial_value) = read_guest_u64(mem, address) else {
+        tracing::warn!("cannot arm guest write watch at unreadable address {address:#x}");
+        return;
+    };
+
+    context.ContextFlags |= CONTEXT_DEBUG_REGISTERS_AMD64_FLAG;
+    context.Dr0 = address;
+    context.Dr6 = 0;
+    context.Dr7 = write_watch_dr7(8).expect("8-byte watchpoints are supported");
+    ACTIVE_GUEST_WATCH.with(|slot| {
+        slot.set(Some(ActiveGuestWatch {
+            address,
+            initial_value,
+            armed_by_hle_index: hle_index,
+        }));
+    });
+    tracing::info!(
+        "armed guest write watch address={address:#x} initial={initial_value:#018x} \
+         after HLE #{hle_index} ({function}), canary_frame_depth={}",
+        watch_canary_frame_depth()
+    );
+}
+
 /// The VEH callback. Services `EXCEPTION_ACCESS_VIOLATION`s whose faulting
 /// address falls inside the currently-active `TrampolineGuard` region (an
 /// HLE call) by dispatching to HLE and resuming the guest; genuine faults
@@ -2322,6 +2609,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let is_access_violation = record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
     let is_illegal_instruction = record.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION;
     let is_breakpoint = record.ExceptionCode == EXCEPTION_BREAKPOINT;
+    let is_single_step = record.ExceptionCode == EXCEPTION_SINGLE_STEP_CODE;
     // An x86 divide-error trap (`#DE`). Not handling this used to mean a `div`
     // by zero anywhere — guest or host — took `EXCEPTION_CONTINUE_SEARCH` and
     // killed the process with `0xC000_0094` and no log line whatsoever. See
@@ -2331,7 +2619,12 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
         EXCEPTION_INT_OVERFLOW => Some(crate::DivideFault::Overflow),
         _ => None,
     };
-    if !is_access_violation && !is_illegal_instruction && !is_breakpoint && divide_fault.is_none() {
+    if !is_access_violation
+        && !is_illegal_instruction
+        && !is_breakpoint
+        && !is_single_step
+        && divide_fault.is_none()
+    {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -2363,6 +2656,76 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     // access is required to redirect execution (Rip/Rsp/Rax) below.
     let context = unsafe { &mut *info.ContextRecord };
     let fault_addr = context.Rip;
+
+    if is_single_step {
+        // DR6.B0 identifies the local DR0 breakpoint. Do not consume an
+        // unrelated trap-flag/debugger single-step merely because a guest
+        // data watch is active.
+        if context.Dr6 & 1 == 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let Some(watch) = ACTIVE_GUEST_WATCH.with(|slot| slot.take()) else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        GUEST_WATCHPOINT_HITS.fetch_add(1, Ordering::Relaxed);
+        // Disable the local data breakpoint before doing any more work. The
+        // watched address is guest memory, but logging/unwinding below can
+        // inspect that memory and must not recursively re-enter this handler.
+        context.ContextFlags |= CONTEXT_DEBUG_REGISTERS_AMD64_FLAG;
+        context.Dr0 = 0;
+        context.Dr6 = 0;
+        context.Dr7 = 0;
+
+        let mem = unsafe { &*ctx.mem };
+        let current_value = read_guest_u64(mem, watch.address);
+        let candidates = writer_instruction_candidates(mem, context.Rip);
+        let candidate_text = if candidates.is_empty() {
+            "<no valid backwards decode>".to_string()
+        } else {
+            candidates.join(" | ")
+        };
+        let module = unsafe { &*ctx.kernel }
+            .unwind_module_for_addr(context.Rip)
+            .map(|module| {
+                format!(
+                    "{}+{:#x}",
+                    module.name,
+                    context.Rip.saturating_sub(module.start)
+                )
+            })
+            .unwrap_or_else(|| format!("{:#x}", context.Rip));
+        let trigger = unsafe { &*ctx.trampolines }
+            .get(watch.armed_by_hle_index as usize)
+            .map(|trampoline| format!("{}::{}", trampoline.library, trampoline.function))
+            .unwrap_or_else(|| format!("HLE #{}", watch.armed_by_hle_index));
+        tracing::error!(
+            "guest write watchpoint hit: address={:#x} initial={:#018x} current={} \
+             rip_after={:#x} ({module}) writer_candidates=[{candidate_text}] armed_by={trigger}",
+            watch.address,
+            watch.initial_value,
+            current_value
+                .map(|value| format!("{value:#018x}"))
+                .unwrap_or_else(|| "<unreadable>".to_string()),
+            context.Rip,
+        );
+        if let Some(disassembly) =
+            diagnostic_disassembly(mem, context.Rip.saturating_sub(0x20), 0x80)
+        {
+            tracing::error!(
+                "guest write watchpoint surrounding disassembly (rip_after={:#x}):\n{disassembly}",
+                context.Rip
+            );
+        }
+
+        // A Windows exception dispatch can clear the user-set FS base just
+        // like a scheduler preemption. Resume through the established TLS
+        // re-arm stub so the instruction after the writer sees the guest TCB,
+        // not the host's cleared FS base.
+        let resume_rip = context.Rip;
+        let resume_rsp = context.Rsp;
+        resume_guest_with_tls(ctx, context, mem, resume_rip, resume_rsp);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     // Process exit is cooperative across native guest workers. Every import,
     // guarded return, or FS-rearm fault is a safe point at which a worker can
@@ -3361,6 +3724,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 *context = unsafe { *ctx.recovery_ctx };
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            maybe_arm_guest_watchpoint(context, mem, &t.function, idx);
             // Remember it: if the guest later faults on a null we handed back,
             // this history is the only thing that names the culprit (see
             // `CallTrace`). Index, not name — no allocation in the VEH.
@@ -3444,6 +3808,47 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    struct WatchTestMemory(RefCell<Vec<u8>>);
+
+    impl WatchTestMemory {
+        fn new(len: usize) -> Self {
+            Self(RefCell::new(vec![0; len]))
+        }
+    }
+
+    impl GuestMemory for WatchTestMemory {
+        fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
+            let Ok(start) = usize::try_from(guest_addr) else {
+                return false;
+            };
+            let memory = self.0.borrow();
+            let Some(end) = start.checked_add(out.len()) else {
+                return false;
+            };
+            let Some(source) = memory.get(start..end) else {
+                return false;
+            };
+            out.copy_from_slice(source);
+            true
+        }
+
+        fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
+            let Ok(start) = usize::try_from(guest_addr) else {
+                return false;
+            };
+            let mut memory = self.0.borrow_mut();
+            let Some(end) = start.checked_add(data.len()) else {
+                return false;
+            };
+            let Some(destination) = memory.get_mut(start..end) else {
+                return false;
+            };
+            destination.copy_from_slice(data);
+            true
+        }
+    }
 
     #[test]
     fn direct_state_teb_slot_round_trips_without_touching_guest_fs() {
@@ -3586,5 +3991,48 @@ mod tests {
         assert_eq!(xmm0.Low, ONE_F32_BITS);
         assert_eq!(f32::from_bits(xmm0.Low as u32), 1.0);
         assert_eq!(xmm0.High, 0);
+    }
+
+    #[test]
+    fn eight_byte_write_watchpoint_uses_x64_dr7_encoding() {
+        // Fixed bit 10 + L0=1, RW0=01 (write), LEN0=10 (8 bytes).
+        assert_eq!(write_watch_dr7(8), Some(0x9_0401));
+        assert_eq!(write_watch_dr7(1), Some(0x1_0401));
+        assert_eq!(write_watch_dr7(3), None);
+    }
+
+    #[test]
+    fn watch_address_accepts_prefixed_and_plain_hex() {
+        assert_eq!(parse_watch_address("0x1234"), Some(0x1234));
+        assert_eq!(parse_watch_address("ABCDEF"), Some(0xAB_CDEF));
+        assert_eq!(parse_watch_address("0x"), None);
+        assert_eq!(parse_watch_address("not-an-address"), None);
+    }
+
+    #[test]
+    fn canary_watch_follows_requested_parent_frame_depth() {
+        let memory = WatchTestMemory::new(0x400);
+        let helper_rbp = 0x100;
+        let parent_rbp = 0x200u64;
+        assert!(memory.write(helper_rbp, &parent_rbp.to_le_bytes()));
+
+        assert_eq!(
+            stack_canary_address(&memory, helper_rbp, 0),
+            Some(helper_rbp - STACK_CANARY_SLOT_FROM_RBP)
+        );
+        assert_eq!(
+            stack_canary_address(&memory, helper_rbp, 1),
+            Some(parent_rbp - STACK_CANARY_SLOT_FROM_RBP)
+        );
+        assert_eq!(stack_canary_address(&memory, helper_rbp, 2), None);
+    }
+
+    #[test]
+    fn watch_frame_depth_is_bounded() {
+        assert_eq!(parse_watch_frame_depth("0"), Some(0));
+        assert_eq!(parse_watch_frame_depth(" 64 "), Some(64));
+        assert_eq!(parse_watch_frame_depth("65"), None);
+        assert_eq!(parse_watch_frame_depth("-1"), None);
+        assert_eq!(parse_watch_frame_depth("not-a-number"), None);
     }
 }

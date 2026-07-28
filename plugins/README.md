@@ -13,9 +13,37 @@ Any upscaler or frame generator — FSR, XeSS, a community experiment, or an
 NVIDIA **DLSS** shim — implements the same `PresentPlugin` trait and registers
 itself via `AgcGpuSession::register_present_plugin(...)`.
 
-Raeen itself ships only the **built-in, GPL-2.0-clean** reference plugins
-(`passthrough`, `nearest`, and — once integrated — an MIT-licensed FSR pass).
-Those are all original Rust with no proprietary dependencies.
+Raeen itself ships only **GPL-2.0-clean** code. The default build includes the
+`passthrough` and `nearest` reference plugins. Builds made with
+`--features upscale-plugins` also include the in-tree `raeen-upscale` backends
+described below. None of them link a proprietary vendor SDK.
+
+## Available backends
+
+The plugin system is vendor-neutral; it is not limited to DLSS.
+
+| Backend | Status | Notes |
+|---|---|---|
+| `passthrough` | Working, built in | Identity/reference implementation |
+| `nearest` | Working, built in | Simple reference upscaler |
+| `bilinear` | Working, optional | Spatial 2x2 linear upscale |
+| `bicubic` | Working, optional | Spatial Catmull-Rom upscale |
+| `sharpen` | Working, optional | Native-resolution unsharp pass |
+| `fsr` | Working, optional | Original FSR1-class EASU + RCAS implementation |
+| `dlss` | Scaffolding/fallback only | Real inference needs a user-supplied NVIDIA runtime, GPU frames, depth, and motion vectors |
+| `xess` | Scaffolding/fallback only | Real inference needs a user-supplied Intel runtime, GPU frames, depth, and motion vectors |
+
+The optional backends are registered by `crates/raeen-upscale` when Raeen is
+built with:
+
+```text
+cargo build -p raeen-gui --features upscale-plugins
+```
+
+FSR2/FSR3, DLSS, and XeSS are temporal techniques. The ABI reserves their
+inputs, but Raeen does not yet populate GPU frames, depth, or motion vectors.
+Until that work lands, selecting the current `dlss` or `xess` probe produces a
+bicubic fallback rather than running the vendor technology.
 
 ## The license boundary (read before adding a proprietary plugin)
 
@@ -148,7 +176,7 @@ dependency-free and single-file, so it builds with one command:
 rustc --edition 2024 --crate-type cdylib --crate-name raeen_example_plugin -O --out-dir plugins docs/examples/present-plugin-example.rs
 ```
 
-Restart Raeen and it appears in **Settings ▸ Video** as `example-nearest`.
+Restart Raeen and it appears in **Settings ▸ Plugins** as `example-nearest`.
 
 That file is not a sketch: the integration test
 `crates/raeen-gpu/tests/present_plugin_dylib.rs` compiles **that exact source**
@@ -156,6 +184,9 @@ into a real shared library and loads it through the same `scan_dir` the Shell
 uses, asserting the upscale is a correct 2D nearest map, that a declined frame
 comes back as the source, and that 250 consecutive frames neither leak nor
 fault. Copy it as your starting point.
+
+For a short copy/build/test walkthrough, see
+[`docs/examples/README.md`](../docs/examples/README.md).
 
 ## Sketch of the same thing, inline
 
@@ -236,9 +267,25 @@ plugins/my-upscaler.dll     (Windows)
 plugins/libmy-upscaler.so   (Linux)
 ```
 
-Restart Raeen. The plugin appears in **Settings ▸ Video** by the name it
+Restart Raeen. The plugin appears in **Settings ▸ Plugins** by the name it
 reported. Refusals are logged with the reason and the filename — check the log
 if yours does not appear.
+
+### Package files
+
+Raeen currently loads platform shared libraries directly; it does **not**
+execute or install ZIP files. The supported distribution artifact today is:
+
+```text
+raeen_example_plugin.dll       Windows
+libraeen_example_plugin.so     Linux
+libraeen_example_plugin.dylib  macOS
+```
+
+A future `.raeen-plugin` archive can wrap a manifest, binaries, licenses, and
+checksums, but it must be validated and extracted before the existing loader
+loads its platform library. Renaming a ZIP or placing one in `plugins/` will
+not load it. Keep package installation separate from the stable C ABI.
 
 ## In-tree Rust plugins
 
