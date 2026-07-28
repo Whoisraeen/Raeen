@@ -136,8 +136,19 @@ SOFTWARE.
   gather's destination is always 4 dwords with a single-bit dmask
   (`data_dwords = gather ? 4 : CountDmaskComponents(dmask)` plus
   `IsSingleDmaskBit`). The Rust decode arms, the SPIR-V `OpImageGather`
-  component mapping, and all tests are Raeen's own. No C++ is
-  vendored or compiled into Raeen.
+  component mapping, and all tests are Raeen's own. The SMEM
+  register-soffset batch (`crates/kyty-graphics/src/shader/`, 2026-07-28)
+  additionally uses `src/graphics/shader/recompiler/MemoryOps.cpp`'s
+  `DecodeSmem` (the immediate offset and the soffset operand are stored as two
+  INDEPENDENT simultaneous fields — `inst.offset = SignExtendU32(word1 &
+  0x1fffff, 21)` alongside `DecodeScalarSource(soffset, ..., inst.src1)`) and
+  `spirvEmitter/spirvEmitterMemory.cpp`'s `EmitRelativeAddress` /
+  `EmitSLoadDword` as **addressing-rule evidence**: the scalar-load address is
+  `base + soffset + immediate` in bytes, dword-aligned by masking the low two
+  bits (`align_components`), with the dword index taken as `address >> 2`.
+  Raeen's three-operand instruction format, the analysis-side soffset
+  resolution, the honesty flag on the raw EUD window, and all tests are its
+  own. No C++ is vendored or compiled into Raeen.
 
 ---
 
@@ -170,6 +181,20 @@ SOFTWARE.
   because this generator has no per-body `NoContraction` decoration hook.
   The type-driven 3D-image `volume` flag in `crates/raeen-gpu/src/vulkan/`
   and `draw_translate.rs` completes the host half of PR #587 (`5228335`).
+- **SMEM register-soffset batch 2026-07-28**
+  (`docs/sharpemu-port/smem-register-soffset.md`): the RDNA2 scalar-load
+  addressing rule Raeen implements is corroborated against
+  `Shader/Gen5ShaderTranslator.cs` (the `Gen5ShaderEncoding.Smem` case keeps the
+  sign-extended immediate and an optional `dynamicOffsetRegister` as two
+  simultaneous fields of `Gen5ScalarMemoryControl`) and
+  `Shader/Gen5ShaderScalarEvaluator.cs` L1889-1900, whose evaluation is exactly
+  `byteOffset = immediateOffset + dynamicOffset;`
+  `address = (baseAddress + byteOffset) & ~3UL;` — i.e. both offsets are byte
+  quantities, they ADD, and the sum is dword-aligned by truncation. Raeen's
+  soffset resolution is bounded and its own (an unwritten live-in user-data
+  register, or a preceding `s_mov_b32`/`s_movk_i32` constant); SharpEmu's
+  general abstract scalar interpreter is not ported. Anything unresolved keeps a
+  named refusal carrying the width and format. No C# is copied.
 - **Exception-delivery model 2026-07-28**
   (`docs/sharpemu-port/loading-blockers.md`): the queue-at-raise /
   deliver-at-the-target's-next-HLE-boundary model in

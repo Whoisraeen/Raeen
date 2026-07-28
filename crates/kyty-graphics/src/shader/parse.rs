@@ -2886,6 +2886,13 @@ fn shader_parse_smem(
         return Err(feature(S, "soffset is a literal", pc));
     }
 
+    // Beyond Kyty (upstream L2400 is `EXIT_NOT_IMPLEMENTED(offset != 0)`):
+    // RDNA2 SMEM sums a 64-bit SGPR-pair base, the soffset register value and
+    // the 21-bit signed immediate — see [`Format::SdstSbaseSoffsetOffset`] for
+    // the rule and its two reference sources. When both offset terms are live
+    // the immediate cannot be folded into `src[1]`, so it takes `src[2]` and
+    // the instruction wears a three-operand format.
+    let mut register_soffset_with_offset = false;
     if inst.src[1].type_ == O::Null {
         // Kyty L2386-2397: NULL soffset means the 21-bit signed immediate
         // offset is used (sign-extended via a 21-bit bitfield).
@@ -2894,8 +2901,12 @@ fn shader_parse_smem(
         inst.src[1].constant.u = imm21 as u32;
         inst.src[1].size = 0;
     } else if offset != 0 {
-        // Kyty L2400: EXIT_NOT_IMPLEMENTED(offset != 0).
-        return Err(feature(S, "offset != 0 with register soffset", pc));
+        let imm21 = ((offset << 11) as i32) >> 11;
+        inst.src[2].type_ = O::IntegerInlineConstant;
+        inst.src[2].constant.u = imm21 as u32;
+        inst.src[2].size = 0;
+        inst.src_num = 3;
+        register_soffset_with_offset = true;
     }
 
     match opcode {
@@ -2967,6 +2978,27 @@ fn shader_parse_smem(
             inst.dst.size = 16;
         }
         _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
+    }
+
+    if register_soffset_with_offset {
+        inst.format = match inst.format {
+            F::SdstSbaseSoffset => F::SdstSbaseSoffsetOffset,
+            F::Sdst2Ssrc02Ssrc1 => F::Sdst2SbaseSoffsetOffset,
+            F::Sdst4SbaseSoffset => F::Sdst4SbaseSoffsetOffset,
+            F::Sdst8SbaseSoffset => F::Sdst8SbaseSoffsetOffset,
+            F::Sdst16SbaseSoffset => F::Sdst16SbaseSoffsetOffset,
+            // The `s_buffer_load` family addresses through a four-SGPR V#, so
+            // the base is a descriptor rather than a pointer and the combined
+            // soffset+immediate rule above does NOT transfer. Nothing measured
+            // needs it; refuse by name instead of guessing the semantics.
+            _ => {
+                return Err(feature(
+                    S,
+                    "offset != 0 with register soffset on an s_buffer_load (V# base)",
+                    pc,
+                ));
+            }
+        };
     }
 
     dst.get_instructions_mut().push(inst);
@@ -5379,6 +5411,132 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(code.get_instructions()[0].src[1].constant.i(), -1);
+    }
+
+    /// Beyond Kyty (upstream `EXIT_NOT_IMPLEMENTED(offset != 0)`): RDNA2 SMEM
+    /// sums the SGPR-pair base, the soffset register value and the 21-bit
+    /// signed immediate — all in BYTES. Sources for the rule (not guessed):
+    /// KytyPS5 `spirvEmitterMemory.cpp::EmitRelativeAddress` (L286-315, called
+    /// from `EmitSLoadDword` L1174) and SharpEmu
+    /// `Gen5ShaderScalarEvaluator.cs:1889-1900`
+    /// (`byteOffset = immediateOffset + dynamicOffset`,
+    /// `address = (baseAddress + byteOffset) & ~3UL`).
+    ///
+    /// Encoding: `b0` = `0x3d << 26 | opcode << 18 | sdst << 6 | sbase`,
+    /// `b1` = `soffset << 25 | offset`. This is GTA V's exact measured
+    /// addressing (`s_load_dwordx4 s[20:23], s[12:13], 64`) with a register
+    /// soffset added.
+    #[test]
+    fn smem_register_soffset_with_immediate_offset_decodes_three_operands() {
+        // opcode 0x02 (x4), sdst = s20, sbase field 6 => s[12:13];
+        // soffset = s4, immediate offset = 64 bytes.
+        let (code, result) = parse(
+            &[0xF408_0506, 0x0800_0040, S_ENDPGM],
+            ShaderType::Vertex,
+            true,
+        );
+        result.expect("register soffset + non-zero immediate offset must parse");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SLoadDwordx4);
+        assert_eq!(inst.format, F::Sdst4SbaseSoffsetOffset);
+        assert_eq!(inst.src_num, 3, "the immediate takes a third operand slot");
+        assert_eq!(
+            (inst.dst.type_, inst.dst.register_id, inst.dst.size),
+            (O::Sgpr, 20, 4)
+        );
+        assert_eq!(
+            (inst.src[0].type_, inst.src[0].register_id, inst.src[0].size),
+            (O::Sgpr, 12, 2)
+        );
+        assert_eq!(
+            (inst.src[1].type_, inst.src[1].register_id),
+            (O::Sgpr, 4),
+            "src[1] keeps the soffset REGISTER"
+        );
+        assert_eq!(inst.src[2].type_, O::IntegerInlineConstant);
+        assert_eq!(inst.src[2].constant.i(), 64, "immediate offset is in bytes");
+        // The shared accessors route consumers to the right operand.
+        assert_eq!(
+            crate::shader::types::smem_offset_operand(inst).constant.i(),
+            64
+        );
+        assert_eq!(
+            crate::shader::types::smem_register_soffset(inst).map(|op| op.register_id),
+            Some(4)
+        );
+    }
+
+    /// Every scalar-load width carries the combined addressing mode, and the
+    /// three-operand format is chosen per width.
+    #[test]
+    fn smem_register_soffset_with_offset_covers_every_width() {
+        for (opcode, type_, format, size) in [
+            (0x00u32, T::SLoadDword, F::SdstSbaseSoffsetOffset, 1),
+            (0x01, T::SLoadDwordx2, F::Sdst2SbaseSoffsetOffset, 2),
+            (0x02, T::SLoadDwordx4, F::Sdst4SbaseSoffsetOffset, 4),
+            (0x03, T::SLoadDwordx8, F::Sdst8SbaseSoffsetOffset, 8),
+            (0x04, T::SLoadDwordx16, F::Sdst16SbaseSoffsetOffset, 16),
+        ] {
+            // sdst = s32, sbase field 4 => s[8:9], soffset = s6, offset = 0x30.
+            let b0 = 0xF400_0000 | (opcode << 18) | (32 << 6) | 4;
+            let (code, result) = parse(&[b0, 0x0C00_0030, S_ENDPGM], ShaderType::Compute, true);
+            result.unwrap_or_else(|e| panic!("opcode {opcode:#04x} must parse: {e}"));
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, type_, "opcode {opcode:#04x}");
+            assert_eq!(inst.format, format, "opcode {opcode:#04x}");
+            assert_eq!(inst.dst.size, size, "opcode {opcode:#04x}");
+            assert_eq!((inst.src[0].register_id, inst.src[0].size), (8, 2));
+            assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Sgpr, 6));
+            assert_eq!(inst.src[2].constant.i(), 0x30);
+        }
+    }
+
+    /// A register soffset with a ZERO immediate keeps the long-standing
+    /// two-operand shape — the combined form is only used when both terms are
+    /// live, so nothing that already parsed changes format.
+    #[test]
+    fn smem_register_soffset_without_offset_keeps_two_operand_format() {
+        let (code, result) = parse(
+            &[0xF408_0506, 0x0800_0000, S_ENDPGM],
+            ShaderType::Vertex,
+            true,
+        );
+        result.expect("register soffset with zero offset already parsed");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.format, F::Sdst4SbaseSoffset);
+        assert_eq!(inst.src_num, 2);
+        assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Sgpr, 4));
+        // Still a runtime soffset, and the offset operand is src[1] here.
+        assert!(crate::shader::types::smem_register_soffset(inst).is_some());
+    }
+
+    /// The immediate keeps its 21-bit signed interpretation in the combined
+    /// form (the offset field is the same bits as the NULL-soffset case).
+    #[test]
+    fn smem_register_soffset_immediate_sign_extends_21_bits() {
+        let (code, result) = parse(
+            &[0xF408_0506, 0x081F_FFFF, S_ENDPGM],
+            ShaderType::Vertex,
+            true,
+        );
+        result.expect("negative combined immediate parses");
+        assert_eq!(code.get_instructions()[0].src[2].constant.i(), -1);
+    }
+
+    /// `s_buffer_load` addresses through a four-SGPR V#, so the pointer rule
+    /// above does not transfer. Nothing measured needs it: it stays a refusal
+    /// that NAMES the form rather than a guess.
+    #[test]
+    fn smem_buffer_load_register_soffset_with_offset_refuses_by_name() {
+        // opcode 0x0a (s_buffer_load_dwordx4), soffset = s4, offset = 64.
+        let b0 = 0xF400_0000 | (0x0a << 18) | (20 << 6) | 4;
+        let (_, result) = parse(&[b0, 0x0800_0040, S_ENDPGM], ShaderType::Compute, true);
+        let err = result.expect_err("V#-based combined addressing is not modeled");
+        let text = err.to_string();
+        assert!(
+            text.contains("register soffset") && text.contains("s_buffer_load"),
+            "refusal must name the form, got: {text}"
+        );
     }
 
     #[test]
