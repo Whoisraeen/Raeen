@@ -1516,3 +1516,75 @@ site, register file, and call chain to do it from.
   obstacle is silent — these need a different instrument (frame-path tracing)
   rather than another log read.
 * No title is playable. Every claim here is a stage/flip/blocker measurement.
+
+---
+
+## ★ THIRD LIVE MEASUREMENT — 2026-07-28, build with SMEM/scalar-capture fix
+
+Artifact: `artifacts/compat/post-smem-validated-20260728.json` (vs
+`post-shaderfix-validated-20260728.json`). Main is green at **2503 tests**,
+clippy `--workspace --all-targets -D warnings` and fmt clean.
+
+| Title | before | after | blocker now |
+|---|---|---|---|
+| Minecraft | 12288 flips | **13184 flips** | (none) |
+| ASTRO.BOT | 36 flips, exited 74 s | **128 flips**, full 180 s | s_buffer_load (V# base) soffset |
+| GTA V | 256 flips | 192 flips | `SBufferLoadDwordx8 [Sdst8SvSoffset]` |
+| Avatar | 256 flips | 192 flips | `BufferLoadFormatXyzw` (no table entry) |
+| A Plague Tale | exited 0, divide fault | unchanged | INTEGER DIVIDE FAULT (diagnosed) |
+| Until Dawn / Subnautica / Dragon Ball | 0 flips | unchanged | (none logged) |
+
+### What the fix actually did
+
+**The diagnosis in my brief was half wrong, and the agent disproved it from
+evidence rather than accepting it.** The three titles were TWO defects:
+
+* **Avatar + GTA V were never a soffset problem.** Ruled out from the log
+  formatting itself: the third operand printed as a bare decimal (`0`, `64`), and
+  `operand_to_str` renders inline constants as decimals but SGPRs as `sN` — so
+  both were plain immediate offsets. The message was also bare `can't recompile:`
+  rather than `no table entry for …`, meaning a dispatch row existed and returned
+  `Ok(false)`. Real hole: `shader_capture_runtime_scalar_loads` ran only from
+  `translate_ps`/`translate_cs`, and the pixel call site's comment **falsely
+  claimed** "VS and CS already run this capture". The vertex stage never ran it.
+* A second layer under that: a next-gen VS runs as a gs-prolog where shader
+  register N is user-data slot **N−8**, so the fix needed a shifted variant —
+  otherwise Avatar's `s[8:9]` and GTA V's `s[12:13]` resolve to nothing.
+* **Only ASTRO was genuinely register soffset.** Addressing rule established
+  from two independent references: `addr = base + zext(SGPR[soffset]) +
+  sext21(imm)`, both in bytes, additive, dword-aligned by truncation.
+
+### All three previous blockers cleared; a new family is now the frontier
+
+Every one of the three moved, which is the confirmation that matters. The new
+blockers are all the **`s_buffer_load` / buffer-fetch with a V# (buffer
+descriptor) base** family — GTA V `SBufferLoadDwordx8 [Sdst8SvSoffset]`, ASTRO
+the same on `s_buffer_load`, Avatar `BufferLoadFormatXyzw` with no table entry.
+The agent explicitly declined the V#-base combined form because no reference it
+read establishes those semantics — so this is a known, named ceiling rather than
+a surprise. That is the single next root cause, and it again spans three titles.
+
+### Honest reading of the numbers
+
+* **ASTRO improved substantially** (36 → 128 flips, and it now survives the whole
+  180 s window instead of exiting at 74 s). Its stage label moved `rendering` →
+  `timed_out`, which is a **classifier artifact**, not a regression: the old
+  clean early exit scored `rendering`, while surviving the full window with 3.5x
+  the frames scores `timed_out`.
+* **GTA V and Avatar each dropped 256 → 192 flips.** Ambiguous. Both now fail on
+  a different instruction at a different point, and these counts have shown
+  run-to-run swings of this size before under host load. Not claimed as either
+  progress or regression.
+* Until Dawn, Subnautica and Dragon Ball are unchanged at 0 flips with **nothing
+  logged** — their next obstacle is silent and needs frame-path tracing, not
+  another log read.
+* Also fixed in passing, a silent-failure trap: `shader_detect_eud_raw_window`
+  used to skip register-soffset loads quietly, recording a window that looks
+  authoritative but may be short — and a short window clamps reads to 0, i.e.
+  silence. It now refuses by name.
+
+**Soffset resolution ceiling (named, not hidden):** only provable cases are
+handled — an unwritten live-in user-data register, or a preceding
+`s_mov_b32`/`s_movk_i32` constant. Anything else is a named refusal instead of a
+wrong answer. A general scalar interpreter is the real fix and is recorded as the
+follow-up.
