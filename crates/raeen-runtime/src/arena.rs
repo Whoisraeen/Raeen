@@ -140,17 +140,42 @@ fn demand_commit_batch_pages() -> u64 {
 /// the CLI process was clean there by luck, not by design.
 ///
 /// [`reserve_title_va_window`] closes that race: called as the first statement
-/// of `main`, it `MEM_RESERVE`s every free hole in the window so no later host
+/// of `main`, it `MEM_RESERVE`s every free hole in each window so no later host
 /// allocation can squat there, and [`GuestAllocator::map_at`] serves guest
 /// fixed maps out of those process-lifetime reservations with `MEM_COMMIT`
-/// alone. The window spans the full direct-memory size a title can map
+/// alone. Each window spans the full direct-memory size a title can map
 /// (`sceKernelGetDirectMemorySize` = `PS5_DIRECT_MEMORY_SIZE` = 0x3_5800_0000
-/// in `raeen-hle`) from the measured mspace base, so any fixed map of any
-/// direct-memory slice based at `0x3_0000_0000` fits.
-const TITLE_VA_WINDOW_MIN: u64 = 0x3_0000_0000; // 12 GiB — ASTRO.BOT's mspace base
-const TITLE_VA_WINDOW_LIMIT: u64 = TITLE_VA_WINDOW_MIN + 0x3_5800_0000;
+/// in `raeen-hle`) from a measured base, so any fixed map of any direct-memory
+/// slice based there fits.
+///
+/// A title uses more than one such base. ASTRO.BOT has two, and defending only
+/// the first cost the whole title: measured 2026-07-28
+/// (`artifacts/compat/raw/baseline-1785273714952/PPSA21564-*.stdout.log`) its
+/// engine allocator mapped `len=0xc8000000` at the literal `0x10_0000_0000`,
+/// eleven host thread stacks had been placed at `0x1090ca0000..0x1093000000`
+/// — inside that range — the fixed `VirtualAlloc` failed, and the title
+/// asserted at `DirectMemoryAllocator.cpp:122` and executed `int 0x41`. It
+/// presented 0 frames where the previous build presented 128; nothing in the
+/// memory path had changed, only which host allocations ran before the launch
+/// and therefore where Windows placed those stacks. Every base a title is
+/// measured to map at belongs in this list, or the same coin-flip returns.
+const TITLE_VA_WINDOW_SPAN: u64 = 0x3_5800_0000;
 
-/// The process-lifetime claim on [`TITLE_VA_WINDOW_MIN`]`..`[`TITLE_VA_WINDOW_LIMIT`]:
+/// Measured fixed direct-memory bases, each defended for `TITLE_VA_WINDOW_SPAN`
+/// bytes. Address-ordered and non-overlapping.
+const TITLE_VA_WINDOWS: [(u64, u64); 2] = [
+    // 12 GiB — ASTRO.BOT's libc mspace base.
+    (0x3_0000_0000, TITLE_VA_WINDOW_SPAN),
+    // 64 GiB — ASTRO.BOT's engine `DirectMemoryAllocator` reserve base.
+    (0x10_0000_0000, TITLE_VA_WINDOW_SPAN),
+];
+
+/// First defended base — the anchor tests use when they need "a window address"
+/// rather than a specific one. Production code iterates [`TITLE_VA_WINDOWS`].
+#[cfg(test)]
+const TITLE_VA_WINDOW_MIN: u64 = TITLE_VA_WINDOWS[0].0;
+
+/// The process-lifetime claim on every range in [`TITLE_VA_WINDOWS`]:
 /// each entry is one whole `MEM_RESERVE` block covering one free hole
 /// (disjoint, address-ordered). Never released — the window must stay claimed
 /// for as long as the process can launch a title. Committed pages inside the
@@ -207,8 +232,41 @@ fn claim_title_va_window() -> TitleVaWindow {
     let mut blocks = Vec::new();
     let mut squatters = Vec::new();
     let mut reserved_bytes = 0u64;
-    let mut cursor = TITLE_VA_WINDOW_MIN;
-    while cursor < TITLE_VA_WINDOW_LIMIT {
+    for &(window_start, window_span) in &TITLE_VA_WINDOWS {
+        let window_limit = window_start + window_span;
+        claim_one_window(
+            window_start,
+            window_limit,
+            &mut blocks,
+            &mut squatters,
+            &mut reserved_bytes,
+        );
+    }
+    TitleVaWindow {
+        report: crate::TitleVaWindowReport {
+            windows: TITLE_VA_WINDOWS
+                .iter()
+                .map(|&(start, span)| (start, start + span))
+                .collect(),
+            reserved_blocks: blocks.len(),
+            reserved_bytes,
+            squatters,
+        },
+        blocks,
+    }
+}
+
+/// `MEM_RESERVE` every free hole of one window, recording the blocks claimed and
+/// describing anything that was already there.
+fn claim_one_window(
+    window_start: u64,
+    window_limit: u64,
+    blocks: &mut Vec<(u64, u64)>,
+    squatters: &mut Vec<String>,
+    reserved_bytes: &mut u64,
+) {
+    let mut cursor = window_start;
+    while cursor < window_limit {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: `VirtualQuery` only inspects the region containing `cursor`;
         // `info` is a valid, correctly sized out-buffer.
@@ -226,7 +284,7 @@ fn claim_title_va_window() -> TitleVaWindow {
         let Some(region_end) = region_base.checked_add(info.RegionSize as u64) else {
             break;
         };
-        let usable_end = region_end.min(TITLE_VA_WINDOW_LIMIT);
+        let usable_end = region_end.min(window_limit);
         if info.State == MEM_FREE {
             if let Some(candidate) =
                 align_up(cursor.max(region_base), WINDOWS_ALLOCATION_GRANULARITY)
@@ -248,7 +306,7 @@ fn claim_title_va_window() -> TitleVaWindow {
                 };
                 if !raw.is_null() && raw as u64 == candidate {
                     blocks.push((candidate, len));
-                    reserved_bytes += len;
+                    *reserved_bytes += len;
                 } else if !raw.is_null() {
                     // Defensive only: explicit VirtualAlloc does not relocate.
                     // SAFETY: `raw` is a fresh, unpublished reservation.
@@ -269,16 +327,6 @@ fn claim_title_va_window() -> TitleVaWindow {
             break;
         }
         cursor = next;
-    }
-    TitleVaWindow {
-        report: crate::TitleVaWindowReport {
-            window_start: TITLE_VA_WINDOW_MIN,
-            window_end: TITLE_VA_WINDOW_LIMIT,
-            reserved_blocks: blocks.len(),
-            reserved_bytes,
-            squatters,
-        },
-        blocks,
     }
 }
 
@@ -2218,6 +2266,45 @@ impl GuestAllocator for GuestArena {
                 return Some(start);
             }
         }
+
+        // The startup title-VA claim is FOR the guest, not against it. A
+        // reservation whose whole span lies inside one of those process-lifetime
+        // blocks already has its address space; re-`MEM_RESERVE`ing our own
+        // block would fail with `ERROR_INVALID_ADDRESS` and push the guest off
+        // its hint. That matters concretely: `0x10_0000_0000` is both ASTRO.BOT's
+        // engine direct-memory base (why the block is claimed) and Minecraft's
+        // V8 pointer-compression cage hint. V8 rejects a placement that is not
+        // 4 GiB-aligned and retries, so relocating it off the hint is the very
+        // regression hint support was added to fix — serve it from the block
+        // instead, at the address the guest asked for.
+        //
+        // Deliberately not recorded in `os_reservations`/`external_mappings`:
+        // the block is not this arena's to release. `window_commits` carries the
+        // span so `Drop` decommits whatever `commit_on_demand` later backed.
+        if hint != 0
+            && let Some((block_base, block_len)) = title_va_block_containing(start)
+            && block_base
+                .checked_add(block_len)
+                .is_some_and(|block_end| requested_end <= block_end)
+        {
+            let mut state = self.lock_state();
+            // Deduplicated: a title that reserves, unmaps and re-reserves the
+            // same span in a loop must not grow this list without bound.
+            if !state.window_commits.contains(&(start, length)) {
+                state.window_commits.push((start, length));
+            }
+            state.vmm.map_range(
+                start,
+                length,
+                VmaType::Reserved,
+                prot::NO_ACCESS,
+                None,
+                RESERVE_NAME,
+                false,
+            );
+            return Some(start);
+        }
+
         let limit = if fixed { requested_end } else { self.base };
         // `MEM_RESERVE` with `PAGE_NOACCESS` takes address space without
         // committing memory, so a 512 GiB reservation costs no RAM. The block
@@ -3353,8 +3440,10 @@ mod tests {
         assert!(!squatter.is_null(), "host allocation should succeed");
         let squatter_addr = squatter as u64;
         assert!(
-            !(TITLE_VA_WINDOW_MIN..TITLE_VA_WINDOW_LIMIT).contains(&squatter_addr),
-            "a post-reservation host allocation must not land in the window \
+            !TITLE_VA_WINDOWS
+                .iter()
+                .any(|&(start, span)| (start..start + span).contains(&squatter_addr)),
+            "a post-reservation host allocation must not land in any window \
              (got {squatter_addr:#x})"
         );
         // An explicit grab AT the defended address must be refused outright.
@@ -3418,6 +3507,67 @@ mod tests {
         // SAFETY: exact base of the squatter reservation made above.
         unsafe {
             VirtualFree(squatter, 0, MEM_RELEASE);
+        }
+    }
+
+    /// ASTRO.BOT's SECOND fixed direct-memory base. Measured 2026-07-28
+    /// (`artifacts/compat/raw/baseline-1785273714952/PPSA21564-*.stdout.log`):
+    /// after the libc mspace at `0x3_0000_0000` the engine's
+    /// `DirectMemoryAllocator` maps `len=0xc8000000` at the literal
+    /// `0x10_0000_0000`. That base was NOT defended, eleven host thread stacks
+    /// had landed at `0x1090ca0000..0x1093000000` inside it, the fixed
+    /// `VirtualAlloc` failed, and the title asserted and trapped with 0 frames
+    /// presented where the previous build presented 128.
+    ///
+    /// Every base in [`TITLE_VA_WINDOWS`] must therefore be claimed at startup
+    /// and servable afterwards — the same guarantee the test above makes for the
+    /// first window, asserted for all of them so adding a base cannot silently
+    /// leave it undefended.
+    #[test]
+    fn every_measured_fixed_va_base_is_claimed_and_servable() {
+        let _lock = crate::dispatch::call_lock();
+        let report = reserve_title_va_window();
+        assert_eq!(
+            report.windows.len(),
+            TITLE_VA_WINDOWS.len(),
+            "the report must describe every defended window: {report:?}"
+        );
+
+        let len = 0x20_0000u64; // 2 MiB — a small direct-memory slice
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        for &(base, span) in &TITLE_VA_WINDOWS {
+            // The base itself when the claim covers it; otherwise the first
+            // claimed block inside this window that fits, so a hostile
+            // test-process layout cannot fake a failure.
+            let target = title_va_block_containing(base)
+                .filter(|&(block_base, block_len)| block_base + block_len >= base + len)
+                .map(|_| base)
+                .or_else(|| {
+                    title_va_blocks()
+                        .iter()
+                        .find(|&&(block_base, block_len)| {
+                            block_base >= base && block_base < base + span && block_len >= len
+                        })
+                        .map(|&(block_base, _)| block_base)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "window {base:#x}..{:#x} claimed nothing that fits",
+                        base + span
+                    )
+                });
+
+            assert_eq!(
+                arena.map_at(target, len, PAGE_SIZE),
+                Some(target),
+                "a fixed direct-memory map at {target:#x} must be servable"
+            );
+            // And the memory is real, not just an accepted address.
+            let mut byte = [0u8; 1];
+            assert!(arena.write(target + 0x20, &[0xAB]));
+            assert!(arena.read(target + 0x20, &mut byte));
+            assert_eq!(byte, [0xAB]);
+            arena.munmap(target, len);
         }
     }
 

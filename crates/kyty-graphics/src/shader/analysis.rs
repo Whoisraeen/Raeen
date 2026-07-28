@@ -962,9 +962,12 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
 /// into the destination SGPRs — the same mechanism `sload_dword_extended`
 /// already uses for pointer-based loads.
 ///
-/// Only fully-proved loads are captured: the V# quad must be inside the
-/// captured user-data window, never written earlier in the shader, buffer-typed
-/// and non-null; the soffset must resolve through
+/// Only fully-proved loads are captured. The V# quad must be buffer-typed and
+/// non-null, and its provenance must be one of exactly two proved shapes: a
+/// live-in inside the captured user-data window, or the destination of a single
+/// earlier scalar load whose own dwords this analysis already captured (the SRT
+/// descriptor-table shape GTA V's vertex shaders use). The soffset must resolve
+/// through
 /// [`resolve_scalar_soffset_bytes`]; the read must stay inside the descriptor's
 /// own `size` bound and be readable from guest memory. Anything else is left to
 /// the recompiler's named refusal.
@@ -1028,12 +1031,14 @@ pub fn shader_capture_vsharp_buffer_loads(
         {
             continue;
         }
-        // The descriptor must be a live-in: any in-shader write to the quad
-        // means the user-data snapshot is not what the load will read.
-        if instructions[..at]
+        // Where the V# comes from. Exactly one writer of the quad is tolerated;
+        // with two, which one reaches this load depends on control flow this
+        // pass does not model, so refuse.
+        let mut writers = instructions[..at]
             .iter()
-            .any(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)))
-        {
+            .filter(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)));
+        let producer = writers.next();
+        if writers.next().is_some() {
             continue;
         }
         // A register soffset adds a second runtime term. Prove it or skip —
@@ -1046,14 +1051,57 @@ pub fn shader_capture_vsharp_buffer_loads(
         else {
             continue;
         };
-        let Ok(base) = usize::try_from(base_reg - shift) else {
-            continue;
+        // Two proved provenances for the descriptor, and nothing else:
+        //
+        //  * **live-in** — no writer, so the captured user-data snapshot IS what
+        //    the load will read;
+        //  * **loaded from an SRT table** — the single writer is a scalar load
+        //    whose OWN dwords were already captured from guest memory by the
+        //    pointer-load pass that runs before this one. GTA V's vertex shaders
+        //    use only this shape: `s_load_dwordx4 s[20:23], s[12:13], 64` and
+        //    then `s_buffer_load_dwordx8 s[24:31], s[20:23], 0`, so the live-in
+        //    guard alone refused every one of them (998 of the run's 999 shader
+        //    errors, measured 2026-07-28 on PPSA04264).
+        //
+        // The second shape adds no staleness the module does not already carry:
+        // the producing load is itself materialized from that snapshot, so the
+        // translated shader is pinned to those dwords either way, and the shader
+        // cache key hashes every captured value — changed data re-keys and
+        // retranslates rather than silently reusing a stale descriptor.
+        //
+        // A quad assembled by `s_mov`s, a partial overwrite, or a producer whose
+        // own dwords were never proved all keep the named refusal.
+        let fields = if let Some(producer) = producer {
+            // The writer must define the WHOLE quad at exactly `base_reg` —
+            // a partial or offset write leaves fields this pass cannot name.
+            if producer.dst.type_ != ShaderOperandType::Sgpr
+                || producer.dst.register_id != base_reg
+                || producer.dst.size < 4
+            {
+                continue;
+            }
+            let Some(captured) = bind
+                .embedded_constant_loads
+                .find(producer.pc)
+                .filter(|captured| captured.dwords_num >= 4)
+            else {
+                continue;
+            };
+            let mut fields = [0u32; 4];
+            fields.copy_from_slice(&captured.values[..4]);
+            fields
+        } else {
+            // Live-in: the quad must sit inside the captured user-data window.
+            let Ok(base) = usize::try_from(base_reg - shift) else {
+                continue;
+            };
+            if base + 3 >= UserSgprInfo::SGPRS_MAX || base + 3 >= user_sgpr.count as usize {
+                continue;
+            }
+            let mut fields = [0u32; 4];
+            fields.copy_from_slice(&user_sgpr.value[base..base + 4]);
+            fields
         };
-        if base + 3 >= UserSgprInfo::SGPRS_MAX || base + 3 >= user_sgpr.count as usize {
-            continue;
-        }
-        let mut fields = [0u32; 4];
-        fields.copy_from_slice(&user_sgpr.value[base..base + 4]);
         if fields.iter().all(|field| *field == 0) {
             continue;
         }
