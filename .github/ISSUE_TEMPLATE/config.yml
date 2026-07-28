@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Compatibility status — check here first
+    url: https://github.com/Whoisraeen/Raeen/blob/main/compat/COMPATIBILITY.md
+    about: >
+      Measured per-title results, including each title's exact first blocker.
+      One title (Minecraft Bedrock) currently reaches an interactive 3D world;
+      most others do not render. Please confirm your title's known status before
+      filing.
+  - name: Questions and discussion
+    url: https://github.com/Whoisraeen/Raeen/discussions
+    about: For questions, ideas, and "is X supported yet" — not a bug tracker.

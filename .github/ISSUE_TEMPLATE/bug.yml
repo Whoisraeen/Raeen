@@ -1,0 +1,66 @@
+name: Bug in Raeen itself
+description: The Shell/UI, build, installer, updater, or tooling misbehaves — not a game-specific issue.
+title: "short description of the bug"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a title that crashes or fails to render, use **Game compatibility
+        report** instead. This form is for Raeen's own surfaces: the Shell and
+        settings, launching and the library, the installer or auto-updater,
+        building from source, and the `cargo xtask` tooling.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Settings ▸ Game Folders
+        2. Add a folder containing a space in its name
+        3. Observe …
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Raeen version / commit
+      placeholder: "v0.1.0 or 60c63f9"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: How did you get this build?
+      options:
+        - Installer from a GitHub release
+        - Portable ZIP from a GitHub release
+        - Built from source
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        From `logs/raeen.log`. For a build failure, the full `cargo` error
+        instead. Please paste text rather than a screenshot of text.
+      render: text
+
+  - type: textarea
+    id: host
+    attributes:
+      label: Hardware and OS
+      description: Logged at Raeen startup; copying that block is easiest.
+    validations:
+      required: true

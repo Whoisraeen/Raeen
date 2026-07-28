@@ -1,0 +1,98 @@
+name: Game compatibility report
+description: A title crashes, hangs, renders wrong, or renders nothing.
+title: "[title] short description of what you saw"
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Please read first.** Raeen is early alpha: exactly one title
+        (Minecraft Bedrock) currently reaches an interactive 3D world. Most
+        titles do not render, and that is expected rather than a bug worth a new
+        issue. Check [compat/COMPATIBILITY.md](https://github.com/Whoisraeen/Raeen/blob/main/compat/COMPATIBILITY.md)
+        for your title's measured status and its known first blocker.
+
+        A report is most useful when it shows something **different** from the
+        recorded status — a new blocker, a regression against a previous build,
+        or a title not in the table at all.
+
+        **Do not attach game files, firmware, or keys.** Raeen requires
+        user-owned dumps; we cannot accept or discuss copyrighted material, and
+        such issues will be closed.
+
+  - type: input
+    id: title-name
+    attributes:
+      label: Title and ID
+      description: Name plus the title ID Raeen shows in the library.
+      placeholder: "Minecraft Bedrock (PPSA17221) v01.008.000"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What happened
+      options:
+        - Does not launch at all
+        - Launches but presents no frames
+        - Presents frames but the image is wrong / unrecognizable
+        - Renders recognizably but has visual glitches
+        - Crashes (process dies)
+        - Hangs (frozen frame, still running)
+        - Regression — this worked in an earlier build
+    validations:
+      required: true
+
+  - type: textarea
+    id: crash-report
+    attributes:
+      label: Crash report
+      description: >
+        If the run faulted, Raeen writes a self-contained report to
+        `logs/crashes/<title-id>_<timestamp>.report.md`. Paste its contents here
+        — it carries the fault site, recent HLE calls, unresolved NIDs and GPU
+        state, and it is by far the most useful thing you can provide. Settings ▸
+        System ▸ Export Diagnostics bundles it for you.
+      render: markdown
+
+  - type: textarea
+    id: first-blocker
+    attributes:
+      label: First ERROR line in the log
+      description: >
+        From `logs/raeen.log`, the first line at ERROR level. This is usually the
+        single most diagnostic detail, especially for "no frames" and "wrong
+        image" cases which may log nothing else unusual.
+      render: text
+
+  - type: input
+    id: build
+    attributes:
+      label: Raeen version / commit
+      description: Shown in Settings ▸ System. For a self-built binary, the commit hash.
+      placeholder: "v0.1.0 or 60c63f9"
+    validations:
+      required: true
+
+  - type: textarea
+    id: host
+    attributes:
+      label: Hardware and OS
+      description: >
+        CPU, GPU + driver version, RAM, OS build. Raeen logs all of this at
+        startup, so copying that block is easiest. **GPU driver version matters
+        a lot** for shader and device-loss issues.
+      placeholder: "Ryzen 5 7640HS / Radeon 760M driver 24.x / 16 GB / Windows 11 26200"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots and anything else
+      description: >
+        For "renders but wrong", a screenshot (F12 in-session) is worth more than
+        any log — visual corruption does not appear in text. Also mention any
+        non-default settings, especially anything under Settings ▸ Advanced or
+        `RAEEN_*` environment variables.
