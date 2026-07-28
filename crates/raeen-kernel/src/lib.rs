@@ -256,6 +256,11 @@ pub struct OrbisKernel {
     pub pthread_mutexes: DashMap<u64, Arc<PthreadMutexShared>>,
     /// Guest pthread mutex-attribute type, keyed by the attr object address.
     pub pthread_mutex_attrs: DashMap<u64, i32>,
+    /// The process's futex-style parking lot: threads blocked in
+    /// `sceKernelSyncOnAddress{Wait,Wait32,Wait64}` (and the `futex` syscall),
+    /// keyed by the watched guest address. Per-process, like the other lock
+    /// tables.
+    pub sync_addresses: SyncAddressTable,
     /// Guest pthread read-write lock state, keyed by both the guest
     /// `pthread_rwlock_t` address and its allocated handle.
     pub pthread_rwlocks: DashMap<u64, Arc<PthreadRwlockShared>>,
@@ -831,7 +836,11 @@ impl LockReleaseSummary {
 /// slot and an opaque handle for the same object. Ported from SharpEmu's
 /// `PthreadMutexState` (GPL-2.0). See the `raeen-hle` `pthread_sync` module for
 /// the state machine.
-#[derive(Clone, Copy, Debug)]
+///
+/// Not `Copy`/`Clone`: the FIFO of blocked threads lives here, under the same
+/// lock as `owner`, because ownership transfer and dequeue must be one atomic
+/// step (see [`Self::try_grant_head`]).
+#[derive(Debug)]
 pub struct PthreadMutex {
     /// Mutex type: 1 = error-check, 2 = recursive, 3 = normal, 4 = adaptive.
     pub ty: i32,
@@ -839,17 +848,22 @@ pub struct PthreadMutex {
     pub owner: u64,
     /// Lock recursion count (0 = unlocked).
     pub recursion: i32,
+    /// Threads blocked on this mutex, oldest first. Ownership is handed to the
+    /// head on release, so this is the *grant* order, not a wake hint.
+    waiters: std::collections::VecDeque<Arc<GuestWaiter>>,
 }
 
-/// One guest mutex's shared state plus the host condvar its HLE waiters park
-/// on. Before this existed, every blocked guest thread spun on
-/// `yield_now()` at full host-CPU — measured on Minecraft's in-game
-/// "Streaming Pool" workers, where 7 spinning waiters starved the very owner
-/// they were waiting for (4 FPS in-world). `unlocked` is notified whenever
-/// ownership clears, including owner-death recovery.
+/// One guest mutex's shared state. Before this existed, every blocked guest
+/// thread spun on `yield_now()` at full host-CPU — measured on Minecraft's
+/// in-game "Streaming Pool" workers, where 7 spinning waiters starved the very
+/// owner they were waiting for (4 FPS in-world).
+///
+/// There is deliberately **no shared per-mutex condvar** any more. Waiters park
+/// on their own [`GuestWaiter`] bit so a release can wake *exactly* the thread
+/// it handed ownership to; `notify_one` on a shared condvar wakes an arbitrary
+/// parked thread, which is precisely the barging the handoff exists to stop.
 pub struct PthreadMutexShared {
     pub state: parking_lot::Mutex<PthreadMutex>,
-    pub unlocked: parking_lot::Condvar,
 }
 
 impl PthreadMutex {
@@ -861,8 +875,8 @@ impl PthreadMutex {
                 ty,
                 owner: 0,
                 recursion: 0,
+                waiters: std::collections::VecDeque::new(),
             }),
-            unlocked: parking_lot::Condvar::new(),
         })
     }
 
@@ -875,9 +889,82 @@ impl PthreadMutex {
                 ty,
                 owner,
                 recursion,
+                waiters: std::collections::VecDeque::new(),
             }),
-            unlocked: parking_lot::Condvar::new(),
         })
+    }
+
+    /// Join the acquisition FIFO. Called with the state lock held, before the
+    /// caller drops it to park on the returned waiter.
+    ///
+    /// Any earlier entry for the same guest thread is pruned first. A thread is
+    /// either running or blocked on exactly one acquisition, so a leftover entry
+    /// is one it abandoned (most often a `cond_timedwait` timeout whose
+    /// re-acquire handoff was lost). Stale entries clog the FIFO head with
+    /// threads nobody is parked on, and the handoff then grants the mutex to a
+    /// waiter that will never wake — wedging it permanently. (SharpEmu hit
+    /// exactly this deadlocking Hades.)
+    #[must_use]
+    pub fn enqueue_waiter(&mut self, thread: u64) -> Arc<GuestWaiter> {
+        if thread != 0 {
+            self.waiters.retain(|waiter| waiter.thread != thread);
+        }
+        let waiter = Arc::new(GuestWaiter::new(thread));
+        self.waiters.push_back(Arc::clone(&waiter));
+        waiter
+    }
+
+    /// Remove a waiter that timed out or whose process is terminating.
+    ///
+    /// `false` means it is no longer queued because [`Self::try_grant_head`]
+    /// already granted it the mutex — the caller **owns the mutex** and must
+    /// report success, not a timeout.
+    pub fn cancel_waiter(&mut self, waiter: &Arc<GuestWaiter>) -> bool {
+        let Some(position) = self
+            .waiters
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, waiter))
+        else {
+            return false;
+        };
+        self.waiters.remove(position);
+        true
+    }
+
+    /// **Direct handoff.** If the mutex is free and someone is queued, transfer
+    /// ownership to the head waiter and wake exactly it; returns the new owner.
+    ///
+    /// Ownership moves *while the state lock is held*, so the woken thread finds
+    /// `owner == self` already and never re-contends. Waking-then-reacquiring
+    /// instead lets any arriving thread barge in and take the mutex before the
+    /// woken waiter runs, which under load starves the head indefinitely.
+    ///
+    /// Ported from SharpEmu's `TryGrantMutexWaiterLocked` (GPL-2.0).
+    pub fn try_grant_head(&mut self) -> Option<u64> {
+        if self.owner != 0 {
+            return None;
+        }
+        let waiter = self.waiters.pop_front()?;
+        self.owner = waiter.thread;
+        self.recursion = 1;
+        waiter.wake();
+        Some(waiter.thread)
+    }
+
+    /// Whether any thread is blocked waiting to acquire this mutex.
+    ///
+    /// A free mutex with a queued waiter must **not** be taken by an arriving
+    /// thread: the head has already been granted it or is next in line, and
+    /// letting arrivals barge past is the starvation this queue removes.
+    #[must_use]
+    pub fn has_waiters(&self) -> bool {
+        !self.waiters.is_empty()
+    }
+
+    /// Number of threads blocked on this mutex (diagnostics/tests).
+    #[must_use]
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.len()
     }
 }
 
@@ -892,20 +979,31 @@ pub struct PosixSem {
     pub posted: parking_lot::Condvar,
 }
 
-/// One guest thread parked on a [`PthreadCond`].
+/// One parked guest thread — the single waiter primitive shared by every
+/// blocking HLE synchronization object in the tree.
 ///
-/// A waiter owns its wake bit so `pthread_cond_signal` can wake exactly one
-/// queued thread. A condition-wide generation counter cannot provide that
-/// contract: once incremented, every waiter observes the new generation on its
-/// next bounded host wake and a signal-one silently becomes a broadcast.
+/// A waiter owns its wake bit so a wake-one can wake exactly one queued thread.
+/// An object-wide generation counter cannot provide that contract: once
+/// incremented, every waiter observes the new generation on its next bounded
+/// host wake and a signal-one silently becomes a broadcast.
+///
+/// The private bit is also what closes the *unpark race*. A waiter registers
+/// (under whichever queue lock owns it), then drops that lock before parking.
+/// A wake landing inside that window sets `signaled` under the waiter's own
+/// lock, so [`Self::wait_for_signal`] sees it already set and returns at once
+/// instead of parking on a wake that will never come again.
+///
+/// Three users: [`PthreadCond`] (`scePthreadCondWait`), [`PthreadMutex`]'s
+/// ownership-handoff FIFO (`scePthreadMutexUnlock`), and [`SyncAddressTable`]
+/// (`sceKernelSyncOnAddressWait` / `sys_futex`).
 #[derive(Debug)]
-pub struct PthreadCondWaiter {
+pub struct GuestWaiter {
     thread: u64,
     signaled: parking_lot::Mutex<bool>,
     changed: parking_lot::Condvar,
 }
 
-impl PthreadCondWaiter {
+impl GuestWaiter {
     fn new(thread: u64) -> Self {
         Self {
             thread,
@@ -917,6 +1015,12 @@ impl PthreadCondWaiter {
     fn wake(&self) {
         *self.signaled.lock() = true;
         self.changed.notify_one();
+    }
+
+    /// The guest thread handle this waiter parks on behalf of.
+    #[must_use]
+    pub fn thread(&self) -> u64 {
+        self.thread
     }
 
     /// Whether this waiter has been selected by signal/broadcast.
@@ -937,40 +1041,35 @@ impl PthreadCondWaiter {
     }
 }
 
-/// Host-backed FIFO wait queue for one guest pthread condition.
+/// Host-backed FIFO wait queue of [`GuestWaiter`]s.
+///
+/// The generic park/unpark queue behind `scePthreadCond*` and
+/// `sceKernelSyncOnAddress*`. Wake selection completes *while holding the queue
+/// lock*, which is what lets [`Self::cancel_waiter`] returning `false` mean
+/// "a waker already took me, and my private wake bit is ready to observe" —
+/// the timeout/wake race resolves without a second round of locking.
 #[derive(Debug, Default)]
-pub struct PthreadCond {
-    waiters: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc<PthreadCondWaiter>>>,
-    /// Which clock this condition's `pthread_cond_timedwait` deadlines are on,
-    /// as chosen by `pthread_condattr_setclock` before `pthread_cond_init`.
-    ///
-    /// POSIX lets a condition variable pick its clock, and the deadline is
-    /// meaningless without knowing which one: `CLOCK_MONOTONIC` counts from an
-    /// arbitrary origin (here, process start) while the default
-    /// `CLOCK_REALTIME` counts from the Unix epoch. Reading a monotonic
-    /// deadline as a realtime one puts it ~1.78e9 seconds in the past, so every
-    /// wait expires instantly and the caller spins.
-    ///
-    /// `false` (the `Default`) is `CLOCK_REALTIME` — the POSIX default, and the
-    /// right answer for a statically-initialized cond that never saw an attr.
-    pub monotonic: std::sync::atomic::AtomicBool,
+pub struct GuestWaitQueue {
+    waiters: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc<GuestWaiter>>>,
 }
 
-impl PthreadCond {
-    /// Join the condition's FIFO before the caller releases its guest mutex.
+impl GuestWaitQueue {
+    /// Join the FIFO. The caller must publish itself here *before* releasing
+    /// whatever lock guards the condition it is about to wait on, so no wake
+    /// can slip into the gap.
     #[must_use]
-    pub fn enqueue_waiter(&self, thread: u64) -> std::sync::Arc<PthreadCondWaiter> {
-        let waiter = std::sync::Arc::new(PthreadCondWaiter::new(thread));
+    pub fn enqueue_waiter(&self, thread: u64) -> std::sync::Arc<GuestWaiter> {
+        let waiter = std::sync::Arc::new(GuestWaiter::new(thread));
         self.waiters.lock().push_back(waiter.clone());
         waiter
     }
 
     /// Remove a waiter that timed out or whose process is terminating.
     ///
-    /// False means a signaler already removed it and, because wake selection is
+    /// False means a waker already removed it and, because wake selection is
     /// completed while holding the same queue lock, its private wake bit is
     /// ready to observe.
-    pub fn cancel_waiter(&self, waiter: &std::sync::Arc<PthreadCondWaiter>) -> bool {
+    pub fn cancel_waiter(&self, waiter: &std::sync::Arc<GuestWaiter>) -> bool {
         let mut waiters = self.waiters.lock();
         let Some(position) = waiters
             .iter()
@@ -982,7 +1081,7 @@ impl PthreadCond {
         true
     }
 
-    /// Wake the oldest queued waiter, preserving pthread signal-one semantics.
+    /// Wake the oldest queued waiter, preserving wake-one semantics.
     pub fn signal_one(&self) -> bool {
         let mut waiters = self.waiters.lock();
         let Some(waiter) = waiters.pop_front() else {
@@ -990,6 +1089,21 @@ impl PthreadCond {
         };
         waiter.wake();
         true
+    }
+
+    /// Wake up to `count` waiters in FIFO order, returning how many were woken.
+    /// `usize::MAX` is the wake-all spelling.
+    pub fn signal_many(&self, count: usize) -> usize {
+        let mut waiters = self.waiters.lock();
+        let mut woken = 0;
+        while woken < count {
+            let Some(waiter) = waiters.pop_front() else {
+                break;
+            };
+            waiter.wake();
+            woken += 1;
+        }
+        woken
     }
 
     /// Wake the queued waiter belonging to one guest thread.
@@ -1037,6 +1151,141 @@ impl PthreadCond {
     }
 }
 
+/// Host-backed FIFO wait queue for one guest pthread condition: a
+/// [`GuestWaitQueue`] plus the condition's chosen clock.
+#[derive(Debug, Default)]
+pub struct PthreadCond {
+    queue: GuestWaitQueue,
+    /// Which clock this condition's `pthread_cond_timedwait` deadlines are on,
+    /// as chosen by `pthread_condattr_setclock` before `pthread_cond_init`.
+    ///
+    /// POSIX lets a condition variable pick its clock, and the deadline is
+    /// meaningless without knowing which one: `CLOCK_MONOTONIC` counts from an
+    /// arbitrary origin (here, process start) while the default
+    /// `CLOCK_REALTIME` counts from the Unix epoch. Reading a monotonic
+    /// deadline as a realtime one puts it ~1.78e9 seconds in the past, so every
+    /// wait expires instantly and the caller spins.
+    ///
+    /// `false` (the `Default`) is `CLOCK_REALTIME` — the POSIX default, and the
+    /// right answer for a statically-initialized cond that never saw an attr.
+    pub monotonic: std::sync::atomic::AtomicBool,
+}
+
+impl PthreadCond {
+    /// Join the condition's FIFO before the caller releases its guest mutex.
+    #[must_use]
+    pub fn enqueue_waiter(&self, thread: u64) -> std::sync::Arc<GuestWaiter> {
+        self.queue.enqueue_waiter(thread)
+    }
+
+    /// Remove a waiter that timed out or whose process is terminating.
+    ///
+    /// False means a signaler already removed it and, because wake selection is
+    /// completed while holding the same queue lock, its private wake bit is
+    /// ready to observe.
+    pub fn cancel_waiter(&self, waiter: &std::sync::Arc<GuestWaiter>) -> bool {
+        self.queue.cancel_waiter(waiter)
+    }
+
+    /// Wake the oldest queued waiter, preserving pthread signal-one semantics.
+    pub fn signal_one(&self) -> bool {
+        self.queue.signal_one()
+    }
+
+    /// Wake the queued waiter belonging to one guest thread.
+    pub fn signal_thread(&self, thread: u64) -> bool {
+        self.queue.signal_thread(thread)
+    }
+
+    /// Wake and remove every currently queued waiter.
+    pub fn broadcast(&self) -> usize {
+        self.queue.broadcast()
+    }
+
+    /// Number of currently parked waiters, primarily for diagnostics/tests.
+    #[must_use]
+    pub fn waiter_count(&self) -> usize {
+        self.queue.waiter_count()
+    }
+}
+
+/// The process-wide **address-keyed parking lot** behind libkernel's
+/// `sceKernelSyncOnAddress{Wait,Wait32,Wait64,Wake}` and the `futex` syscall.
+///
+/// These are the PS5's futex primitives: a thread parks on a *guest address*
+/// until another thread writes that address and wakes it. Guest runtimes build
+/// their own spinlocks and work queues on top, and call the wait in a hot loop
+/// — so a wait that returns success without ever parking turns the guest's
+/// "block until the word changes" into a busy-spin with no forward progress.
+///
+/// One [`GuestWaitQueue`] is materialized per watched address on first wait, so
+/// a wake reaches exactly the threads parked on that address (rather than a
+/// process-wide broadcast). Queues are kept after they drain: a guest futex
+/// address is reused for the lifetime of the object that owns it, and dropping
+/// the queue would race a wait that has registered but not yet parked.
+///
+/// The **value compare** belongs to the caller, not here: it needs
+/// [`GuestMemory`](crate::GuestMemory)-style access that this crate's kernel
+/// state does not own. The caller must enqueue *first* and read the watched word
+/// *second* (see the `raeen-hle` `libkernel` module) — that order is what makes
+/// the compare race-free, because a waker that writes the word after our read
+/// necessarily sees us already queued.
+///
+/// Ported from SharpEmu's `KernelSyncOnAddressCompatExports` (GPL-2.0): the
+/// address-keyed park/wake shape and the bounded self-heal deadline are theirs;
+/// the per-waiter FIFO replaces their per-address wake *generation* counter, and
+/// the enqueue-then-compare ordering replaces the compare value they could not
+/// recover.
+#[derive(Debug, Default)]
+pub struct SyncAddressTable {
+    queues: DashMap<u64, Arc<GuestWaitQueue>>,
+}
+
+impl SyncAddressTable {
+    /// The wait queue for `address`, created on first use.
+    #[must_use]
+    pub fn queue(&self, address: u64) -> Arc<GuestWaitQueue> {
+        Arc::clone(
+            self.queues
+                .entry(address)
+                .or_insert_with(|| Arc::new(GuestWaitQueue::default()))
+                .value(),
+        )
+    }
+
+    /// Park the calling guest thread on `address`. The returned waiter must be
+    /// either woken or [`GuestWaitQueue::cancel_waiter`]-ed by the caller.
+    #[must_use]
+    pub fn enqueue(&self, address: u64, thread: u64) -> Arc<GuestWaiter> {
+        self.queue(address).enqueue_waiter(thread)
+    }
+
+    /// Wake up to `count` waiters parked on `address` in FIFO order, returning
+    /// how many were woken. `usize::MAX` is the wake-all spelling.
+    ///
+    /// An address nobody is parked on is not an error — a wake that arrives
+    /// before its wait is the common uncontended case.
+    pub fn wake(&self, address: u64, count: usize) -> usize {
+        self.queues
+            .get(&address)
+            .map_or(0, |queue| queue.signal_many(count))
+    }
+
+    /// How many threads are parked on `address` (diagnostics/tests).
+    #[must_use]
+    pub fn waiter_count(&self, address: u64) -> usize {
+        self.queues
+            .get(&address)
+            .map_or(0, |queue| queue.waiter_count())
+    }
+
+    /// Number of distinct addresses that have ever been waited on.
+    #[must_use]
+    pub fn tracked_addresses(&self) -> usize {
+        self.queues.len()
+    }
+}
+
 #[cfg(test)]
 mod pthread_cond_wait_queue_tests {
     use super::PthreadCond;
@@ -1058,6 +1307,225 @@ mod pthread_cond_wait_queue_tests {
         assert!(cond.signal_one());
         assert!(second.is_signaled());
         assert_eq!(cond.waiter_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod sync_address_table_tests {
+    use super::SyncAddressTable;
+
+    /// The core contract the old `sceKernelSyncOnAddressWait` stub had none of:
+    /// a wake reaches the threads parked on *that* address and nobody else.
+    #[test]
+    fn wake_reaches_only_the_waiters_on_that_address() {
+        let table = SyncAddressTable::default();
+        let on_a = table.enqueue(0x4000, 11);
+        let on_b = table.enqueue(0x4008, 22);
+
+        assert_eq!(table.wake(0x4000, usize::MAX), 1);
+        assert!(on_a.is_signaled());
+        assert!(
+            !on_b.is_signaled(),
+            "a wake on one address must not release parkers on another"
+        );
+        assert_eq!(table.waiter_count(0x4000), 0);
+        assert_eq!(table.waiter_count(0x4008), 1);
+    }
+
+    /// `Wake(addr, 1)` is wake-one, in FIFO order — not a broadcast.
+    #[test]
+    fn wake_one_releases_the_oldest_waiter_only() {
+        let table = SyncAddressTable::default();
+        let first = table.enqueue(0x5000, 1);
+        let second = table.enqueue(0x5000, 2);
+        let third = table.enqueue(0x5000, 3);
+
+        assert_eq!(table.wake(0x5000, 1), 1);
+        assert!(first.is_signaled());
+        assert!(!second.is_signaled());
+        assert!(!third.is_signaled());
+        assert_eq!(table.waiter_count(0x5000), 2);
+
+        // A count larger than the queue wakes what is there and reports the
+        // real number, without erroring.
+        assert_eq!(table.wake(0x5000, 10), 2);
+        assert!(second.is_signaled());
+        assert!(third.is_signaled());
+        assert_eq!(table.waiter_count(0x5000), 0);
+    }
+
+    /// A wake on an address nobody waits on is a no-op, not an error: a wake
+    /// that beats its wait is the ordinary uncontended case.
+    #[test]
+    fn wake_with_no_waiters_is_a_no_op() {
+        let table = SyncAddressTable::default();
+        assert_eq!(table.wake(0x6000, usize::MAX), 0);
+        assert_eq!(table.waiter_count(0x6000), 0);
+        assert_eq!(
+            table.tracked_addresses(),
+            0,
+            "a bare wake must not materialize a queue"
+        );
+    }
+
+    /// The timeout/wake race: `cancel_waiter` returning false is the caller's
+    /// proof that a waker already took it, so the timeout must lose.
+    #[test]
+    fn cancel_loses_to_a_wake_that_already_selected_the_waiter() {
+        let table = SyncAddressTable::default();
+        let queue = table.queue(0x7000);
+        let waiter = queue.enqueue_waiter(7);
+
+        assert_eq!(table.wake(0x7000, 1), 1);
+        assert!(
+            !queue.cancel_waiter(&waiter),
+            "a woken waiter is no longer cancellable — the timeout must report success"
+        );
+        assert!(waiter.is_signaled());
+    }
+}
+
+#[cfg(test)]
+mod pthread_mutex_handoff_tests {
+    use super::PthreadMutex;
+
+    const MUTEX_NORMAL: i32 = 3;
+
+    /// Direct handoff: releasing transfers ownership to the FIFO head *and* wakes
+    /// exactly that waiter. Before this, unlock cleared `owner` and notified a
+    /// shared condvar, so an arriving thread could barge in and take the mutex
+    /// before the woken waiter reacquired.
+    #[test]
+    fn release_hands_ownership_to_the_head_waiter_and_wakes_only_it() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+
+        let first = state.enqueue_waiter(0x201);
+        let second = state.enqueue_waiter(0x202);
+        assert_eq!(state.waiter_count(), 2);
+        assert_eq!(
+            state.try_grant_head(),
+            None,
+            "a held mutex must not be granted away"
+        );
+
+        // Final unlock.
+        state.recursion -= 1;
+        state.owner = 0;
+        assert_eq!(state.try_grant_head(), Some(0x201));
+
+        assert_eq!(
+            state.owner, 0x201,
+            "ownership must move under the state lock, not be left to a re-acquire"
+        );
+        assert_eq!(state.recursion, 1);
+        assert!(first.is_signaled());
+        assert!(
+            !second.is_signaled(),
+            "handoff must wake exactly the granted waiter"
+        );
+        assert_eq!(state.waiter_count(), 1);
+    }
+
+    /// FIFO order across two successive releases — no barging, no reordering.
+    #[test]
+    fn successive_releases_grant_in_fifo_order() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+        let _first = state.enqueue_waiter(0x201);
+        let second = state.enqueue_waiter(0x202);
+
+        state.owner = 0;
+        assert_eq!(state.try_grant_head(), Some(0x201));
+        state.owner = 0;
+        assert_eq!(state.try_grant_head(), Some(0x202));
+        assert!(second.is_signaled());
+        assert_eq!(state.waiter_count(), 0);
+        assert_eq!(state.try_grant_head(), None, "queue drained");
+    }
+
+    /// `has_waiters` is the anti-barging gate: a free mutex with someone queued
+    /// belongs to that waiter, so an arriving thread must queue rather than take
+    /// it.
+    #[test]
+    fn a_free_mutex_with_a_queued_waiter_is_not_available_to_arrivals() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        assert!(!state.has_waiters(), "fresh mutex is free and unqueued");
+
+        state.owner = 0x100;
+        state.recursion = 1;
+        let _queued = state.enqueue_waiter(0x201);
+        state.owner = 0;
+        state.recursion = 0;
+        assert!(
+            state.has_waiters(),
+            "free-with-waiters must be refused by the fast acquire path"
+        );
+    }
+
+    /// A timeout that races the handoff loses: `cancel_waiter` reports false, and
+    /// the caller owns the mutex it was about to give up on.
+    #[test]
+    fn a_granted_waiter_can_no_longer_cancel_its_wait() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        let waiter = state.enqueue_waiter(0x201);
+        assert_eq!(state.try_grant_head(), Some(0x201));
+
+        assert!(
+            !state.cancel_waiter(&waiter),
+            "a granted waiter is no longer queued — it must report success, not ETIMEDOUT"
+        );
+        assert_eq!(state.owner, 0x201);
+    }
+
+    /// A waiter that timed out and left must not still sit at the FIFO head:
+    /// the handoff would grant the mutex to a thread nobody is parked on and
+    /// wedge it forever.
+    #[test]
+    fn cancelling_removes_the_waiter_so_the_next_release_grants_the_survivor() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+        let leaving = state.enqueue_waiter(0x201);
+        let staying = state.enqueue_waiter(0x202);
+
+        assert!(state.cancel_waiter(&leaving));
+        assert_eq!(state.waiter_count(), 1);
+
+        state.owner = 0;
+        assert_eq!(state.try_grant_head(), Some(0x202));
+        assert!(staying.is_signaled());
+        assert!(!leaving.is_signaled());
+    }
+
+    /// A stale entry from a thread that abandoned an earlier acquisition (a
+    /// `cond_timedwait` timeout whose handoff was lost) must be pruned when that
+    /// thread comes back, or it clogs the head. SharpEmu hit this deadlocking
+    /// Hades.
+    #[test]
+    fn re_enqueueing_a_thread_prunes_its_abandoned_entry() {
+        let shared = PthreadMutex::shared(MUTEX_NORMAL);
+        let mut state = shared.state.lock();
+        state.owner = 0x100;
+        state.recursion = 1;
+        let stale = state.enqueue_waiter(0x201);
+        let live = state.enqueue_waiter(0x201);
+        assert_eq!(state.waiter_count(), 1, "one acquisition per thread");
+
+        state.owner = 0;
+        assert_eq!(state.try_grant_head(), Some(0x201));
+        assert!(live.is_signaled());
+        assert!(
+            !stale.is_signaled(),
+            "the pruned entry must not be the one granted"
+        );
     }
 }
 
@@ -1152,9 +1620,11 @@ impl OrbisKernel {
                 state.owner = 0;
                 state.recursion = 0;
                 released += 1;
-                // Wake every parked waiter — the lock they were waiting for
-                // just became available via owner death.
-                shared.unlocked.notify_all();
+                // Hand it to the FIFO head — the lock they were waiting for
+                // just became available via owner death. Leaving it merely free
+                // would strand the queue: the anti-barging acquire path refuses a
+                // free-with-waiters mutex, so nobody would ever take it.
+                state.try_grant_head();
             }
         }
         released
@@ -1214,8 +1684,12 @@ impl OrbisKernel {
                 state.owner = 0;
                 state.recursion = 0;
                 summary.mutexes += 1;
-                // Owner died holding this — wake the parked waiters.
-                shared.unlocked.notify_all();
+                // Owner died holding this — hand it straight to the head waiter,
+                // the same direct transfer a normal unlock does. Merely clearing
+                // `owner` would leave the mutex "free with a queued waiter",
+                // which the anti-barging acquire path refuses, so every later
+                // locker would pile up behind a head nobody ever grants.
+                state.try_grant_head();
             }
         }
 
@@ -1316,6 +1790,7 @@ impl OrbisKernel {
             user_service_login_event_delivered: std::sync::atomic::AtomicBool::new(false),
             pthread_mutexes: DashMap::new(),
             pthread_mutex_attrs: DashMap::new(),
+            sync_addresses: SyncAddressTable::default(),
             pthread_rwlocks: DashMap::new(),
             pthread_rwlock_read_holds: DashMap::new(),
             hle_call_time: DashMap::new(),

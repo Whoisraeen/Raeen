@@ -1876,17 +1876,28 @@ pub fn register(registry: &HleRegistry) {
     // catalogue merge; appeared as an unnamed unresolved import in a real run).
     registry.register("libkernel", "sceKernelIsTrinityMode", hle_is_trinity_mode);
     registry.register("libSceAgc", "sceAgcGetIsTrinityMode", hle_is_trinity_mode);
-    // Address-parking primitives (futex-like): a thread waits until another
-    // writes the watched word and wakes it. Raeen has no true parking lot here,
-    // so `Wait` returns after a short slice as a PERMITTED SPURIOUS WAKEUP (the
-    // same model as scePthreadCondWait, pthread_cond.rs) — the caller re-checks
-    // its condition and either proceeds or waits again, so no deadlock and no
-    // tight spin. `Wake` reports success. Names recovered via the catalogue
-    // merge (Wake = 0xab6cbfc032155990); both appeared unnamed in a real run.
+    // Address-parking primitives (the PS5's futex): a thread waits until another
+    // writes the watched word and wakes it. REAL parking lot — an address-keyed
+    // FIFO in `OrbisKernel::sync_addresses`, with a value compare on entry for
+    // the sized variants and `Wake` releasing N waiters on that exact address.
+    // See `sync_on_address_wait` for the enqueue-then-compare ordering that makes
+    // it race-free, and for why the generic (unsized) `Wait` skips the compare.
+    // Names recovered via the catalogue merge (Wake = 0xab6cbfc032155990);
+    // Wait/Wake both appeared unnamed in a real run.
     registry.register(
         "libkernel",
         "sceKernelSyncOnAddressWait",
         hle_sync_on_address_wait,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelSyncOnAddressWait32",
+        hle_sync_on_address_wait32,
+    );
+    registry.register(
+        "libkernel",
+        "sceKernelSyncOnAddressWait64",
+        hle_sync_on_address_wait64,
     );
     registry.register(
         "libkernel",
@@ -2965,28 +2976,204 @@ fn hle_is_trinity_mode(_ctx: &HleContext, _args: &[u64]) -> u64 {
     0
 }
 
-/// `sceKernelSyncOnAddressWait(addr, ...)`: park until the watched address is
-/// woken. No true parking lot yet, so this returns after a short slice as a
-/// permitted spurious wakeup (mirrors `scePthreadCondWait`) — the caller
-/// re-checks its own condition and either proceeds or waits again. Safe: it
-/// never deadlocks and the slice keeps it off a tight spin.
-fn hle_sync_on_address_wait(_ctx: &HleContext, args: &[u64]) -> u64 {
-    debug!(
-        "sceKernelSyncOnAddressWait(addr={:#x}) -> spurious wakeup",
-        args.first().copied().unwrap_or(0)
-    );
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    SCE_OK
+/// `EAGAIN` (errno 11) in SCE coding: the futex value compare failed, so the
+/// guest must re-read its own condition instead of parking. Same numeric code as
+/// [`SCE_KERNEL_ERROR_EAGAIN_ALLOC`], spelled separately because here it is the
+/// futex "value already changed" answer, not an allocation failure.
+const SCE_KERNEL_ERROR_EAGAIN: u64 = 0x8002_000B;
+/// `ETIMEDOUT` (errno 60) in SCE coding. Same split as
+/// `scePthreadCondTimedwait` / `scePthreadMutexTimedlock`: a bare POSIX 60 is
+/// unclassifiable by the title's own libc wrappers.
+const SCE_KERNEL_ERROR_ETIMEDOUT: u64 = 0x8002_003C;
+
+/// How long a wait with **no decodable deadline** stays parked before returning
+/// success as a permitted spurious wakeup.
+///
+/// This is the safety net, not the mechanism: real releases come from
+/// [`hle_sync_on_address_wake`], which wakes the queued waiter immediately. It
+/// exists so a genuinely missed wake — or a guest that drives these through a
+/// path Raeen has not resolved — self-heals into the caller re-checking its own
+/// condition instead of hanging. Kept large on purpose: a short bound turns
+/// every parked waiter into a hot re-poll that steals host bandwidth from the
+/// threads making progress, including the one that would issue the wake.
+const SYNC_ADDRESS_SELF_HEAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Park slice, so process teardown and deadlines are observed even when no wake
+/// ever arrives. Not a spurious guest wakeup: the loop re-parks.
+const SYNC_ADDRESS_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Largest value accepted as a *relative microsecond* timeout (60 s). Anything
+/// larger is far more likely a guest pointer or an unset register than a real
+/// deadline, and is treated as "no deadline" rather than gambled on.
+const SYNC_ADDRESS_MAX_TIMEOUT_US: u64 = 60_000_000;
+
+/// The compare width of a `sceKernelSyncOnAddressWait*` variant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncWidth {
+    /// `sceKernelSyncOnAddressWait32` — compare the 32-bit word at the address.
+    Bits32,
+    /// `sceKernelSyncOnAddressWait64` — compare the 64-bit word at the address.
+    Bits64,
 }
 
-/// `sceKernelSyncOnAddressWake(addr, count)`: wake up to `count` parkers on
-/// `addr`. Parkers here self-release on their spurious-wakeup slice, so this is
-/// an accounted no-op that reports success.
-fn hle_sync_on_address_wake(_ctx: &HleContext, args: &[u64]) -> u64 {
+/// Read the watched word, or `None` if the address is not mapped.
+fn read_sync_word(ctx: &HleContext, addr: u64, width: SyncWidth) -> Option<u64> {
+    match width {
+        SyncWidth::Bits32 => {
+            let mut buf = [0u8; 4];
+            ctx.mem
+                .read(addr, &mut buf)
+                .then(|| u64::from(u32::from_le_bytes(buf)))
+        }
+        SyncWidth::Bits64 => {
+            let mut buf = [0u8; 8];
+            ctx.mem
+                .read(addr, &mut buf)
+                .then(|| u64::from_le_bytes(buf))
+        }
+    }
+}
+
+/// Turn the raw timeout argument into a deadline.
+///
+/// 0 is the futex `NULL`-timeout spelling: wait indefinitely (bounded only by
+/// [`SYNC_ADDRESS_SELF_HEAL`]). A plausible microsecond count becomes a real
+/// deadline that must surface as `ETIMEDOUT`. Anything else is not trusted — see
+/// [`SYNC_ADDRESS_MAX_TIMEOUT_US`].
+fn decode_sync_timeout(raw: u64) -> Option<std::time::Instant> {
+    if raw == 0 || raw > SYNC_ADDRESS_MAX_TIMEOUT_US {
+        return None;
+    }
+    Some(std::time::Instant::now() + std::time::Duration::from_micros(raw))
+}
+
+/// The shared body of every `sceKernelSyncOnAddressWait*` variant: a real
+/// address-keyed futex wait.
+///
+/// `width` is `None` for the generic `sceKernelSyncOnAddressWait`, whose
+/// argument layout beyond the address is not recovered (SharpEmu records the
+/// same gap) — that variant parks without a compare rather than gamble on which
+/// register holds the expected value. The `*32`/`*64` spellings name their own
+/// width, so they do the real compare.
+///
+/// **Ordering is the whole correctness argument.** The waiter joins the
+/// address's FIFO *before* the watched word is read. A waker that writes the
+/// word after our read therefore necessarily finds us already queued and wakes
+/// us; a waker that wrote before our read is observed by the compare and we
+/// return `EAGAIN` without parking. There is no window where a wake is lost, and
+/// no need for the wake-generation counter SharpEmu used to approximate this.
+fn sync_on_address_wait(ctx: &HleContext, args: &[u64], width: Option<SyncWidth>) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let expected = args.get(1).copied().unwrap_or(0);
+    let deadline = decode_sync_timeout(args.get(2).copied().unwrap_or(0));
+
+    let queue = ctx.kernel.sync_addresses.queue(addr);
+    let waiter = queue.enqueue_waiter(ctx.guest_threads.current_thread());
+
+    if let Some(width) = width {
+        let expected = match width {
+            SyncWidth::Bits32 => expected & u64::from(u32::MAX),
+            SyncWidth::Bits64 => expected,
+        };
+        match read_sync_word(ctx, addr, width) {
+            None => {
+                if !queue.cancel_waiter(&waiter) {
+                    return SCE_OK;
+                }
+                warn!("sceKernelSyncOnAddressWait: addr={addr:#x} not readable — EFAULT");
+                return SCE_KERNEL_ERROR_EFAULT;
+            }
+            Some(observed) if observed != expected => {
+                // The condition already moved. Per the futex contract the guest
+                // must NOT park: it re-reads and proceeds. Returning success here
+                // (as the old stub did) is what let a guest treat "0" as "the
+                // value changed" and livelock on a word that never moves again.
+                if !queue.cancel_waiter(&waiter) {
+                    return SCE_OK;
+                }
+                debug!(
+                    "sceKernelSyncOnAddressWait(addr={addr:#x}) observed={observed:#x} \
+                     expected={expected:#x} -> EAGAIN"
+                );
+                return SCE_KERNEL_ERROR_EAGAIN;
+            }
+            Some(_) => {}
+        }
+    }
+
+    let parked_since = std::time::Instant::now();
+    loop {
+        if waiter.wait_for_signal(SYNC_ADDRESS_SLICE) {
+            return SCE_OK;
+        }
+        if ctx.guest_threads.process_is_terminating() {
+            queue.cancel_waiter(&waiter);
+            return SCE_OK;
+        }
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                // Wake and timeout can race; the queue lock decides. If we are
+                // already gone a waker took us, and success is the truth.
+                if !queue.cancel_waiter(&waiter) {
+                    return SCE_OK;
+                }
+                return SCE_KERNEL_ERROR_ETIMEDOUT;
+            }
+        } else if parked_since.elapsed() >= SYNC_ADDRESS_SELF_HEAL {
+            if !queue.cancel_waiter(&waiter) {
+                return SCE_OK;
+            }
+            // Permitted spurious wakeup: the guest re-checks its own condition
+            // and either proceeds or waits again. Never a hang.
+            return SCE_OK;
+        }
+    }
+}
+
+/// `sceKernelSyncOnAddressWait(addr, ...)`: park until another thread wakes this
+/// guest address. Generic variant — parks without a value compare, see
+/// [`sync_on_address_wait`].
+fn hle_sync_on_address_wait(ctx: &HleContext, args: &[u64]) -> u64 {
+    sync_on_address_wait(ctx, args, None)
+}
+
+/// `sceKernelSyncOnAddressWait32(addr, expected, timeout_us)`: park only while
+/// the 32-bit word at `addr` still equals `expected`.
+fn hle_sync_on_address_wait32(ctx: &HleContext, args: &[u64]) -> u64 {
+    sync_on_address_wait(ctx, args, Some(SyncWidth::Bits32))
+}
+
+/// `sceKernelSyncOnAddressWait64(addr, expected, timeout_us)`: the 64-bit twin.
+fn hle_sync_on_address_wait64(ctx: &HleContext, args: &[u64]) -> u64 {
+    sync_on_address_wait(ctx, args, Some(SyncWidth::Bits64))
+}
+
+/// `sceKernelSyncOnAddressWake(addr, count)`: wake up to `count` threads parked
+/// on `addr`, oldest first.
+///
+/// `count` of 1 is wake-one; a large or unset value is wake-all (SharpEmu's
+/// reading of the same argument). Waking an address nobody is parked on is not
+/// an error — a wake that beats its wait is the uncontended case, and the
+/// waiter's own compare-on-entry catches it.
+fn hle_sync_on_address_wake(ctx: &HleContext, args: &[u64]) -> u64 {
+    let addr = args.first().copied().unwrap_or(0);
+    if addr == 0 {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    let requested = args.get(1).copied().unwrap_or(0) as i64;
+    let count = if requested > 0 && requested < i64::from(i32::MAX) {
+        usize::try_from(requested).unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
+    };
+    let woken = ctx.kernel.sync_addresses.wake(addr, count);
     debug!(
-        "sceKernelSyncOnAddressWake(addr={:#x}, count={})",
-        args.first().copied().unwrap_or(0),
-        args.get(1).copied().unwrap_or(0)
+        "sceKernelSyncOnAddressWake(addr={addr:#x}, count={requested}) -> woke {woken}, \
+         {} still parked",
+        ctx.kernel.sync_addresses.waiter_count(addr)
     );
     SCE_OK
 }
@@ -7205,6 +7392,181 @@ mod tests {
         assert_eq!(
             hle_install_exception_handler(&ctx, &[2, 0x1234]),
             SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // sceKernelSyncOnAddress* — the futex parking lot.
+    //
+    // Deterministic by construction: nothing here starts a host thread or
+    // sleeps. `Wait` is only ever called on a value-mismatch (which returns
+    // without parking), and the park side is exercised by driving the
+    // address-keyed queue directly and asserting the per-waiter wake bit plus
+    // `waiter_count` — the same shape as the `PthreadCond` queue tests.
+    // ---------------------------------------------------------------------
+
+    /// All four spellings must be resolvable, or a guest futex import lands on a
+    /// null jump instead of the parking lot.
+    #[test]
+    fn sync_on_address_exports_are_all_registered() {
+        let registry = HleRegistry::new();
+        for name in [
+            "sceKernelSyncOnAddressWait",
+            "sceKernelSyncOnAddressWait32",
+            "sceKernelSyncOnAddressWait64",
+            "sceKernelSyncOnAddressWake",
+        ] {
+            assert!(
+                registry.is_implemented("libkernel", name),
+                "missing libkernel::{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_on_address_rejects_a_null_address() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_sync_on_address_wait(&ctx, &[0, 0, 0]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+        assert_eq!(
+            hle_sync_on_address_wake(&ctx, &[0, 1]),
+            SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    /// The futex contract, and the bug the old stub had: if the watched word no
+    /// longer holds the expected value the caller must be told to re-check
+    /// (`EAGAIN`) rather than parked — and it must **not** be handed a bare 0,
+    /// which a guest reads as "the value changed" and loops on forever.
+    #[test]
+    fn wait32_returns_eagain_without_parking_when_the_value_already_moved() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let addr = 0x200u64;
+        assert!(mem.write(addr, &7u32.to_le_bytes()));
+
+        // Expecting 0, memory holds 7.
+        assert_eq!(
+            hle_sync_on_address_wait32(&ctx, &[addr, 0, 0]),
+            SCE_KERNEL_ERROR_EAGAIN
+        );
+        assert_eq!(
+            kernel.sync_addresses.waiter_count(addr),
+            0,
+            "a mismatching wait must leave no waiter behind"
+        );
+    }
+
+    /// The compare is width-correct: `Wait32` looks at 32 bits and ignores the
+    /// high half of both the memory word and the expected value.
+    #[test]
+    fn wait32_and_wait64_compare_at_their_own_width() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let addr = 0x300u64;
+        assert!(mem.write(addr, &0xdead_beef_0000_0001u64.to_le_bytes()));
+
+        // Low 32 bits are 1: a 32-bit wait expecting 2 mismatches...
+        assert_eq!(
+            hle_sync_on_address_wait32(&ctx, &[addr, 2, 0]),
+            SCE_KERNEL_ERROR_EAGAIN
+        );
+        // ...and the high half of `expected` is masked off, so 0xffff_ffff_0000_0002
+        // is still a mismatch against 1 rather than an accidental match.
+        assert_eq!(
+            hle_sync_on_address_wait32(&ctx, &[addr, 0xffff_ffff_0000_0002, 0]),
+            SCE_KERNEL_ERROR_EAGAIN
+        );
+        // A 64-bit wait sees the whole word, so expecting only the low half is a
+        // mismatch where a 32-bit wait would have matched.
+        assert_eq!(
+            hle_sync_on_address_wait64(&ctx, &[addr, 1, 0]),
+            SCE_KERNEL_ERROR_EAGAIN
+        );
+    }
+
+    #[test]
+    fn wait32_on_unmapped_memory_is_efault() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(
+            hle_sync_on_address_wait32(&ctx, &[0x9000_0000, 0, 0]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+        assert_eq!(kernel.sync_addresses.waiter_count(0x9000_0000), 0);
+    }
+
+    /// `Wake` reaches the queue for its own address only, in FIFO order, and a
+    /// count of 1 is wake-one rather than a broadcast. Driven through the HLE
+    /// entry point so the argument decoding is covered too.
+    #[test]
+    fn wake_releases_fifo_waiters_on_that_address_only() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let watched = 0x400u64;
+        let other = 0x408u64;
+
+        let first = kernel.sync_addresses.enqueue(watched, 11);
+        let second = kernel.sync_addresses.enqueue(watched, 22);
+        let elsewhere = kernel.sync_addresses.enqueue(other, 33);
+
+        assert_eq!(hle_sync_on_address_wake(&ctx, &[watched, 1]), SCE_OK);
+        assert!(first.is_signaled());
+        assert!(
+            !second.is_signaled(),
+            "count=1 is wake-one, not a broadcast"
+        );
+        assert!(!elsewhere.is_signaled(), "a wake is address-scoped");
+        assert_eq!(kernel.sync_addresses.waiter_count(watched), 1);
+
+        // A count of 0 (unset register) is the wake-all spelling.
+        assert_eq!(hle_sync_on_address_wake(&ctx, &[watched, 0]), SCE_OK);
+        assert!(second.is_signaled());
+        assert_eq!(kernel.sync_addresses.waiter_count(watched), 0);
+        assert_eq!(kernel.sync_addresses.waiter_count(other), 1);
+    }
+
+    /// Waking an address nobody waits on is success, not an error: a wake that
+    /// beats its wait is the ordinary uncontended case, and the waiter's
+    /// compare-on-entry is what catches it.
+    #[test]
+    fn wake_with_no_parked_waiter_succeeds() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_sync_on_address_wake(&ctx, &[0x500, 1]), SCE_OK);
+    }
+
+    /// The timeout argument decoder. 0 is the futex `NULL` spelling (no
+    /// deadline); a plausible microsecond count becomes a real deadline; an
+    /// implausible one (a guest pointer, say) is refused rather than gambled on,
+    /// so a mis-decoded register can never manufacture an instant timeout.
+    #[test]
+    fn timeout_decoding_only_trusts_plausible_microsecond_counts() {
+        assert!(decode_sync_timeout(0).is_none(), "0 == no deadline");
+        assert!(decode_sync_timeout(1_000).is_some());
+        assert!(decode_sync_timeout(SYNC_ADDRESS_MAX_TIMEOUT_US).is_some());
+        assert!(
+            decode_sync_timeout(SYNC_ADDRESS_MAX_TIMEOUT_US + 1).is_none(),
+            "an absurd count is not a deadline"
+        );
+        assert!(
+            decode_sync_timeout(0x7fff_0000_0000).is_none(),
+            "a guest pointer must not be read as microseconds"
         );
     }
 }

@@ -9,8 +9,13 @@
 //! reports `EDEADLK` on self-relock, and normal/adaptive mutexes are lenient.
 //!
 //! Ownership uses the runtime's current guest-thread handle. Contended locks
-//! wait cooperatively on the host and re-check process termination; they never
-//! transfer ownership from another guest thread.
+//! join a per-mutex FIFO and park on their own wake bit; the final `Unlock`
+//! performs a **direct handoff** — it transfers ownership to the head waiter
+//! while still holding the state lock and wakes exactly that thread, so an
+//! arriving thread cannot barge in and take the mutex first (SharpEmu
+//! `PthreadMutexUnlockCore`, GPL-2.0). The corollary is that a free mutex with a
+//! queued waiter is *not* available to arrivals, and `Trylock` reports `EBUSY`
+//! in that window. See `docs/sharpemu-port/sync-primitives.md`.
 
 use crate::{HleContext, HleFunction, HleRegistry};
 use raeen_kernel::{PthreadMutex, PthreadRwlock};
@@ -398,13 +403,10 @@ fn lock_core(
     else {
         return EINVAL;
     };
-    // Parked waiting, not spinning: the guard is held across the condvar
-    // wait, which releases it while parked and reacquires on wake. The old
-    // `yield_now()` spin loop burned a full host core per blocked guest
-    // thread — Minecraft's seven in-game "Streaming Pool" workers spinning on
-    // one mutex starved the owner itself down to 4 FPS.
-    let mut state = shared.state.lock();
-    loop {
+
+    // Phase 1 — decide, and join the acquisition FIFO, under the state lock.
+    let waiter = {
+        let mut state = shared.state.lock();
         if state.owner == current {
             return match state.ty {
                 MUTEX_RECURSIVE => {
@@ -430,7 +432,12 @@ fn lock_core(
                 }
             };
         }
-        if state.owner == 0 {
+        // A free mutex with nobody queued is ours immediately. A free mutex with
+        // a queued waiter is NOT: it has been (or is about to be) handed to that
+        // waiter, and letting an arrival take it here is exactly the barging
+        // that starves the FIFO head. `Trylock` therefore reports EBUSY in that
+        // window — always a legal trylock answer, and callers already loop on it.
+        if state.owner == 0 && !state.has_waiters() {
             state.owner = current;
             state.recursion = 1;
             return OK;
@@ -441,13 +448,51 @@ fn lock_core(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return ETIMEDOUT;
         }
-        // A lock that never lands is a deadlock, and this loop would spin on it
+        // Publish ourselves before releasing the state lock, so a concurrent
+        // unlock's handoff cannot land in the gap between deciding to wait and
+        // actually parking.
+        let waiter = state.enqueue_waiter(current);
+        // The mutex may be free right now — either it was free-with-waiters
+        // above, or an unlock slipped in. Grant the head unconditionally: if
+        // that is us we are done, and if it is someone else this is the nudge
+        // that keeps a free-with-waiters mutex from stalling.
+        if state.try_grant_head() == Some(current) {
+            return OK;
+        }
+        waiter
+    };
+
+    // Phase 2 — parked, not spinning. The old `yield_now()` spin loop burned a
+    // full host core per blocked guest thread; Minecraft's seven in-game
+    // "Streaming Pool" workers spinning on one mutex starved the owner itself
+    // down to 4 FPS. Each waiter parks on its OWN wake bit rather than a shared
+    // per-mutex condvar, so a release wakes precisely the thread it handed
+    // ownership to instead of an arbitrary parked one.
+    loop {
+        if waiter.wait_for_signal(std::time::Duration::from_millis(10)) {
+            // Granted. `try_grant_head` set `owner`/`recursion` under the state
+            // lock *before* waking us, so the mutex is already ours — there is
+            // nothing to re-acquire and nothing to race.
+            return OK;
+        }
+        // The bounded slice exists only so termination and deadlines are
+        // observed even if no unlock ever comes; it is not a spurious wake.
+        if ctx.guest_threads.process_is_terminating() {
+            return abandon_wait(&shared, &waiter, EBUSY);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return abandon_wait(&shared, &waiter, ETIMEDOUT);
+        }
+        // A lock that never lands is a deadlock, and this loop would wait on it
         // forever in silence. Name it once: which mutex, who holds it, and what
         // that holder is called. (Measured: Minecraft's MAIN THREAD sits here
         // for the whole run, which is what stalls boot at the loading screen.)
         if !reported && spin_start.elapsed() >= std::time::Duration::from_secs(3) {
             reported = true;
-            let owner = state.owner;
+            let (owner, ty, recursion, queued) = {
+                let state = shared.state.lock();
+                (state.owner, state.ty, state.recursion, state.waiter_count())
+            };
             let owner_name = ctx
                 .kernel
                 .thread_names
@@ -464,17 +509,33 @@ fn lock_core(
                 waiter_name = %self_name,
                 owner,
                 owner_name = %owner_name,
-                ty = state.ty,
-                recursion = state.recursion,
+                ty,
+                recursion,
+                queued,
                 "scePthreadMutexLock stuck >3s — deadlock; naming the holder"
             );
         }
-        // Bounded so process termination and deadlines are observed even if
-        // no unlock ever notifies; a wake races are re-checked by the loop.
-        let _ = shared
-            .unlocked
-            .wait_for(&mut state, std::time::Duration::from_millis(10));
     }
+}
+
+/// Leave the acquisition FIFO after a timeout or process teardown.
+///
+/// Returns `OK` when we are no longer queued because the handoff already granted
+/// us the mutex: a timeout that raced a release **won** the lock, and reporting
+/// `ETIMEDOUT` would leak ownership the guest never learns it holds. Otherwise
+/// reports `give_up`, first nudging the queue so a mutex we leave behind as
+/// free-with-waiters is still granted to its head.
+fn abandon_wait(
+    shared: &raeen_kernel::PthreadMutexShared,
+    waiter: &Arc<raeen_kernel::GuestWaiter>,
+    give_up: u64,
+) -> u64 {
+    let mut state = shared.state.lock();
+    if !state.cancel_waiter(waiter) {
+        return OK;
+    }
+    state.try_grant_head();
+    give_up
 }
 
 /// `scePthreadMutexUnlock(mutex)`: drop one recursion level, releasing at zero.
@@ -505,11 +566,14 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     state.recursion -= 1;
     if state.recursion == 0 {
         state.owner = 0;
-        // Hand the lock to one parked waiter. The bounded 10 ms re-check in
-        // `lock_core` covers any wake/steal race, so one notify suffices
-        // without a thundering herd.
-        drop(state);
-        shared.unlocked.notify_one();
+        // DIRECT HANDOFF. Ownership moves to the head waiter *while the state
+        // lock is still held*, and only that waiter is woken. Clearing `owner`,
+        // dropping the guard and then notifying is what let an arriving thread
+        // barge in and take the mutex before the woken waiter could reacquire —
+        // starvation bounded only by the loser's next re-check slice.
+        //
+        // Ported from SharpEmu `PthreadMutexUnlockCore` (GPL-2.0).
+        state.try_grant_head();
     }
     OK
 }
@@ -1131,6 +1195,188 @@ mod tests {
         // Second lock by the same (only) thread → EDEADLK; trylock → EBUSY.
         assert_eq!(hle_mutex_lock(&ctx, &[mutex]), EDEADLK);
         assert_eq!(hle_mutex_trylock(&ctx, &[mutex]), EBUSY);
+    }
+
+    /// The shared kernel state behind a guest mutex, for driving the waiter FIFO
+    /// directly. All handoff tests below are deterministic: no host threads and
+    /// no sleeps — waiters are enqueued through the queue API and the assertion
+    /// is on the per-waiter wake bit plus `waiter_count`.
+    fn mutex_state(ctx: &HleContext, mutex: u64) -> Arc<raeen_kernel::PthreadMutexShared> {
+        let key = resolve_key(ctx, mutex).expect("mutex is registered");
+        ctx.kernel
+            .pthread_mutexes
+            .get(&key)
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("mutex state exists")
+    }
+
+    /// The regression this port exists for. Unlock must **hand ownership over**
+    /// to the FIFO head while holding the state lock, not clear `owner` and hope
+    /// the woken waiter wins the reacquire against every arriving thread.
+    #[test]
+    fn unlock_hands_ownership_to_the_head_waiter_and_wakes_only_it() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x600;
+        hle_mutex_init(&ctx, &[mutex, 0, 0]);
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+
+        let shared = mutex_state(&ctx, mutex);
+        let (first, second) = {
+            let mut state = shared.state.lock();
+            (state.enqueue_waiter(0x77), state.enqueue_waiter(0x88))
+        };
+
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+
+        let state = shared.state.lock();
+        assert_eq!(
+            state.owner, 0x77,
+            "the mutex must be OWNED by the head waiter after unlock, never free"
+        );
+        assert_eq!(state.recursion, 1);
+        assert!(first.is_signaled());
+        assert!(
+            !second.is_signaled(),
+            "handoff wakes exactly the granted waiter, not the whole queue"
+        );
+        assert_eq!(state.waiter_count(), 1);
+    }
+
+    /// The four mutex types keep their unlock semantics under handoff: a
+    /// RECURSIVE mutex only hands off at the last level.
+    #[test]
+    fn recursive_unlock_hands_off_only_at_the_final_level() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let attr = 0x90;
+        hle_mutexattr_init(&ctx, &[attr]);
+        hle_mutexattr_settype(&ctx, &[attr, MUTEX_RECURSIVE as u64]);
+        let mutex = 0x610;
+        hle_mutex_init(&ctx, &[mutex, attr, 0]);
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+
+        let shared = mutex_state(&ctx, mutex);
+        let waiter = shared.state.lock().enqueue_waiter(0x77);
+
+        // Inner unlock: still ours, nobody granted anything.
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+        {
+            let state = shared.state.lock();
+            assert_eq!(state.owner, CURRENT_THREAD);
+            assert_eq!(state.recursion, 1);
+        }
+        assert!(
+            !waiter.is_signaled(),
+            "a nested unlock must not hand the mutex away"
+        );
+
+        // Outer unlock: handoff.
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+        assert!(waiter.is_signaled());
+        assert_eq!(shared.state.lock().owner, 0x77);
+    }
+
+    /// The lenient NORMAL/ADAPTIVE self-relock still counts recursion, and each
+    /// level must be unwound before the queue is served.
+    #[test]
+    fn lenient_normal_self_relock_still_unwinds_before_handoff() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x620;
+        hle_mutex_init(&ctx, &[mutex, 0, 0]);
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+        // NORMAL self-relock is deliberately lenient rather than EDEADLK.
+        assert_eq!(hle_mutex_lock(&ctx, &[mutex]), OK);
+
+        let shared = mutex_state(&ctx, mutex);
+        let waiter = shared.state.lock().enqueue_waiter(0x77);
+        assert_eq!(shared.state.lock().recursion, 2);
+
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+        assert!(!waiter.is_signaled());
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+        assert!(waiter.is_signaled());
+        assert_eq!(shared.state.lock().owner, 0x77);
+
+        // The lenient `recursion <= 0` case survives: unlocking a NORMAL mutex
+        // that is not held is OK, and must not disturb the new owner.
+        let mutex2 = 0x628;
+        hle_mutex_init(&ctx, &[mutex2, 0, 0]);
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex2]), OK);
+    }
+
+    /// `EPERM` on a non-owner unlock, and the queued waiter must not be granted
+    /// anything by the rejected call.
+    #[test]
+    fn unlock_from_a_non_owner_is_eperm_and_grants_nothing() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x630;
+        hle_mutex_init(&ctx, &[mutex, 0, 0]);
+        let shared = mutex_state(&ctx, mutex);
+        let waiter = {
+            let mut state = shared.state.lock();
+            state.owner = 0x99; // some other guest thread holds it
+            state.recursion = 1;
+            state.enqueue_waiter(0x77)
+        };
+
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), EPERM);
+        assert_eq!(hle_sce_mutex_unlock(&ctx, &[mutex]), SCE_KERNEL_ERROR_EPERM);
+        let state = shared.state.lock();
+        assert_eq!(state.owner, 0x99, "a rejected unlock changes nothing");
+        assert!(!waiter.is_signaled());
+        assert_eq!(state.waiter_count(), 1);
+    }
+
+    /// Anti-barging: a free mutex with a queued waiter belongs to that waiter, so
+    /// an arriving `Trylock` must report EBUSY rather than jump the queue.
+    #[test]
+    fn trylock_does_not_barge_past_a_queued_waiter() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x640;
+        hle_mutex_init(&ctx, &[mutex, 0, 0]);
+        // Free and unqueued: trylock succeeds, as always.
+        assert_eq!(hle_mutex_trylock(&ctx, &[mutex]), OK);
+        assert_eq!(hle_mutex_unlock(&ctx, &[mutex]), OK);
+
+        let shared = mutex_state(&ctx, mutex);
+        let waiter = shared.state.lock().enqueue_waiter(0x77);
+        // Free, but someone is queued ahead of us.
+        assert_eq!(shared.state.lock().owner, 0);
+        assert_eq!(hle_mutex_trylock(&ctx, &[mutex]), EBUSY);
+        assert!(
+            !waiter.is_signaled(),
+            "a refused trylock must not consume the queue"
+        );
+    }
+
+    /// Owner-death recovery still works with a queue attached: the dead owner's
+    /// mutex is handed to its head waiter, not merely marked free (which the
+    /// anti-barging path would then refuse to anyone, wedging the mutex).
+    #[test]
+    fn owner_death_hands_the_mutex_to_the_head_waiter() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let mutex = 0x650;
+        hle_mutex_init(&ctx, &[mutex, 0, 0]);
+        let shared = mutex_state(&ctx, mutex);
+        let waiter = {
+            let mut state = shared.state.lock();
+            state.owner = 0xdead;
+            state.recursion = 3;
+            state.enqueue_waiter(0x77)
+        };
+
+        let summary = kernel.release_locks_owned_by(0xdead);
+        assert_eq!(summary.mutexes, 1);
+        assert!(waiter.is_signaled());
+        let state = shared.state.lock();
+        assert_eq!(state.owner, 0x77);
+        assert_eq!(state.recursion, 1);
     }
 
     #[test]
