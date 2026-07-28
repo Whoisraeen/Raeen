@@ -16,11 +16,31 @@
   <a href="https://github.com/Whoisraeen/Raeen/issues">Issues</a>
 </p>
 
-> **Status: early alpha.** Raeen currently runs homebrew-style test binaries
-> (process launch, TLS, printf/write observability). It does not play
-> commercial games yet. Releases include a built-in auto-updater
-> (Settings → System) that downloads new versions from GitHub Releases and
-> applies them on restart.
+> **Status: early alpha — one title renders, the rest do not.**
+>
+> The honest picture, measured rather than claimed:
+>
+> - **Minecraft Bedrock** (user-owned retail) reaches an **interactive 3D world
+>   with textures, HUD and working save data**, at ~56 FPS on the reference
+>   machine. This is the one title that genuinely plays.
+> - **GTA V, ASTRO.BOT, Avatar: Frontiers of Pandora** boot, link every import,
+>   and present frames, but do **not** render a recognizable image yet. They stop
+>   on specific, named shader-translation gaps.
+> - **Until Dawn, Subnautica: Below Zero, Dragon Ball Sparking Zero** launch and
+>   run without crashing but present **no frames**.
+> - **A Plague Tale Requiem** crashes, with a full diagnostic report.
+>
+> Every one of those statements comes from an automated per-title measurement
+> (`cargo xtask baseline run`), and the raw table — including each title's exact
+> first blocker — is in **[compat/COMPATIBILITY.md](compat/COMPATIBILITY.md)**.
+> "Recognizable frames" is not the same as "correct rendering", and none of this
+> is a playability or stability claim beyond the one title named above.
+>
+> Releases include a built-in auto-updater (Settings → System).
+>
+> **Development note:** Raeen is built with heavy AI assistance; commits carry a
+> `Co-Authored-By` trailer recording it. Design decisions, measurements and
+> acceptance criteria are reviewed by a human before they land.
 
 ---
 
