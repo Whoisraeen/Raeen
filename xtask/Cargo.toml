@@ -9,9 +9,14 @@ publish = false
 anyhow.workspace = true
 raeen-firmware.workspace = true
 raeen-hle.workspace = true
+# Soak-harness input scripts are validated with the exact parser the runner
+# uses at launch (`RAEEN_INPUT_SCRIPT`), so a typo fails before a 30-min run.
+raeen-input.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
+# Process-tree CPU/memory sampling for `cargo xtask soak`.
+sysinfo.workspace = true
 toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -6206,9 +6206,11 @@ dependencies = [
  "anyhow",
  "raeen-firmware",
  "raeen-hle",
+ "raeen-input",
  "serde",
  "serde_json",
  "sha1",
+ "sysinfo",
  "toml",
  "windows-sys 0.59.0",
 ]

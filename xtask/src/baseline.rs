@@ -162,7 +162,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 /// The prebuilt runner must exist and should postdate HEAD; xtask must never
 /// build it itself (a concurrent session sharing `target/` deadlocks cargo).
-fn ensure_prebuilt_binary(exe: &Path, allow_stale: bool) -> Result<()> {
+pub(crate) fn ensure_prebuilt_binary(exe: &Path, allow_stale: bool) -> Result<()> {
     let metadata = fs::metadata(exe).map_err(|_| {
         anyhow!(
             "{} does not exist. Build it in a SEPARATE invocation first \

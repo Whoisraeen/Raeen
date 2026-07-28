@@ -1,6 +1,7 @@
 mod baseline;
 mod nids;
 mod schema;
+mod soak;
 
 use anyhow::{Context, Result, anyhow, bail};
 use schema::{
@@ -55,6 +56,8 @@ fn main() -> Result<()> {
         baseline::run(rest)
     } else if area == "baseline" && command == "diff" {
         baseline::diff(rest)
+    } else if area == "soak" {
+        soak::run(args.get(1..).unwrap_or_default())
     } else if area == "nids" && command == "coverage" {
         nids::coverage(rest)
     } else if area == "acceptance" && command == "run" {
@@ -80,6 +83,9 @@ fn print_help() {
                            [--timeout SECONDS] [--tier all|nightly] [--profile NAME]
                            [--attempts N] [--parts-dir PATH] [--allow-stale]
   cargo xtask baseline diff <old.json> [new.json] [--strict]
+  cargo xtask soak [--game ID] [--minutes N] [--exe PATH] [--input none|SPEC|FILE]
+                   [--stall-secs N] [--boot-secs N] [--registry PATH]
+                   [--output-dir PATH] [--allow-stale]
   cargo xtask refs report [--state compat/reference-state.json] [--output PATH] [--fetch]
   cargo xtask nids coverage [--registry PATH] [--eboot PATH] [--output PATH] [--full]
   cargo xtask acceptance run [--output PATH] [--timeout SECONDS]

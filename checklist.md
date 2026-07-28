@@ -258,14 +258,33 @@ top-down, update statuses in place, and keep it committed.**
 ## P1 — Robustness / tooling
 
 ### 9. Soak test
-- [ ] `cargo xtask soak` (or test-ignored harness): drive Minecraft ≥30 min
-  with synthetic pad input; assert no frozen-frame window (frame-epoch must
-  advance), capture CPU/core usage.
+- [~] HARNESS DONE 2026-07-28 (worktree agent; xtask 55/55 green = baseline 25
+  + 30 new; fmt + `clippy -p xtask --all-targets -D warnings` green). LIVE
+  30-min run remains — main session, needs the local game install.
+  `cargo xtask soak [--game ID] [--minutes N (30)] [--exe PATH] [--input
+  none|SPEC|FILE] [--stall-secs N (10)] [--boot-secs N (180)]`: launches the
+  prebuilt exe (`--run-eboot`, baseline's staleness gate) and monitors LIVE:
+  epoch = high-water of `WORKER TIMING flips=` / `total_flips=` +
+  `sceVideoOutSubmitFlip` lines (log tailed incrementally); process-tree
+  CPU/mem via sysinfo. FAILS on: no epoch advance > stall limit (armed after
+  first advance; boot has its own budget), the pthread_sync
+  `scePthreadMutexLock stuck >3s — deadlock` warning (mutex/owner parsed),
+  or exit before deadline — prints frozen-window timestamps + 80-line log
+  tail, writes `artifacts/soak/<run-id>/report.txt`, exits nonzero. Success
+  prints min/avg/max window FPS, overall flips/s, worst stall, peak mem,
+  avg/peak CPU. Synthetic input EXISTS and is wired: `--input` forwards a
+  validated `raeen-input` replay spec via `RAEEN_INPUT_SCRIPT` +
+  `RAEEN_RUNNER_CHILD=1` (script outranks Shell IPC/native pads; final
+  snapshot holds forever, so `…:ls_up` walks for the rest of the soak).
+  `--input none` (default) still catches frozen frames/deadlocks but only on
+  the boot/idle path — reduced coverage, stated in the report.
+- [ ] LIVE: `cargo build --release -p raeen-gui` then
+  `cargo xtask soak --game minecraft --minutes 30` (add `--input` for
+  in-world coverage). Human-supervised run closes this.
 - [ ] Re-verify the in-world hang that did NOT reproduce post-fix (mutex
   `0x1019a1d48c0` / `0x1019a1d32e0`); if it recurs, instrument holder call
-  path via `RAEEN_TRACE_HLE` + owner name.
-- **Note:** needs the user's local game install; agents can build the harness
-  but a human-supervised run closes it.
+  path via `RAEEN_TRACE_HLE` + owner name. (The soak fails loudly on that
+  exact warning line now.)
 
 ### 10. Promote the baseline runner to `cargo xtask baseline`
 - [x] CODE DONE 2026-07-27 (worktree agent; xtask 25/25 green, 18 new tests;

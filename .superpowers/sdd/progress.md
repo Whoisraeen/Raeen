@@ -5294,3 +5294,51 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
   raeen-hle 496+1 green (one timing-flaky vblank test passed on isolated
   rerun; untouched by this diff). clippy -p kyty-graphics -p raeen-gpu
   --all-targets -D warnings green; cargo fmt --all --check green.
+
+## 2026-07-28 — checklist item 9: soak-test harness (`cargo xtask soak`)
+
+* Worktree agent (branch `worktree-agent-a02e09e7762605222`). Harness only —
+  the LIVE 30-minute Minecraft run stays with the main session.
+* `xtask/src/soak.rs`: launches ONE registered game via the prebuilt
+  `raeen.exe` (reuses baseline's `ensure_prebuilt_binary` staleness gate +
+  registry/schema plumbing; xtask still never builds) and monitors LIVE
+  instead of run-to-timeout-and-read-the-log:
+  - Epoch liveness: incremental log tailing (LogCursor offset + LineAssembler
+    partial-line reassembly) over the same markers baseline harvests post-hoc
+    — `WORKER TIMING … flips=N frame_ms=X` (every 32 presents under
+    RAEEN_TIME_WORKER=1, the primary ~0.5 s-cadence signal), AGC
+    `total_flips=N` progress lines, `sceVideoOutSubmitFlip` lines. High-water
+    increase or new flip line = advance. Stall clock arms at FIRST advance
+    (`--stall-secs`, default 10 s); the pre-present window has its own
+    `--boot-secs` budget (default 180 s) so a slow boot is not a false stall.
+  - Deadlock: fails on pthread_sync's `scePthreadMutexLock stuck >3s —
+    deadlock; naming the holder` warning (the line that located eef31c1's
+    Minecraft bug); mutex/owner/owner_name/waiter_name parsed, full line
+    kept. RAEEN_TRACE_COND lines deliberately NOT failures.
+  - Resources: sysinfo process-tree (parent-chain membership, cycle-safe)
+    CPU%/memory sampled every 2 s; first sweep records memory only (sysinfo's
+    first CPU sample is 0 by construction).
+  - Failure = stall / deadlock / exit-before-deadline → frozen-window
+    timestamps + 80-line log tail + report.txt under
+    artifacts/soak/<run-id>/, nonzero exit. Success = stability report
+    (min/avg/max window FPS from frame_ms, overall flips/s, worst stall incl.
+    trailing open gap, peak memory, avg/peak CPU).
+* Synthetic input EXISTS and is wired: `--input none|SPEC|FILE` forwards a
+  `raeen-input::InputScript` compact replay spec via RAEEN_INPUT_SCRIPT +
+  RAEEN_RUNNER_CHILD=1 (gui main.rs runner input thread; script outranks
+  Shell IPC and native pads). Spec validated at launch with the runner's own
+  parser (new xtask dep on raeen-input) so a typo fails in seconds. Honest
+  limitation: with `--input none` (default) coverage is boot/idle liveness
+  only — stated in the report. Scripts don't loop; the final snapshot holds
+  forever (a trailing `ls_up` walks for the whole soak).
+* Tests: xtask 55/55 green (25 baseline + 30 new pure-logic: synthetic epoch
+  timelines incl. boot-budget/arm-order/open-gap-at-deadline, deadlock line
+  parsing through ANSI, line reassembly across chunks, process-tree
+  membership w/ cycles, resource stats, report + failure rendering, game
+  selection, input-spec resolution, flag parsing). No live game faked.
+  `cargo fmt --all --check` green; `cargo clippy -p xtask --all-targets --
+  -D warnings` green.
+* NEXT (main session): `cargo build --release -p raeen-gui` then
+  `cargo xtask soak --game minecraft --minutes 30` (optionally `--input`
+  for in-world coverage); then checklist 9's mutex re-verify rides on the
+  soak's deadlock detector.
