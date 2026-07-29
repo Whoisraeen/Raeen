@@ -29,6 +29,52 @@ pub struct RemoteFrame {
     pub timing: PresentTiming,
 }
 
+/// The guest runner's diagnostics state, as the Shell sees it across the
+/// process boundary.
+///
+/// The Shell's F10 console is fed by a process-local tracing ring and the guest
+/// runs in a separate child, so this struct is the *only* path by which the
+/// console can say anything about a running or stalled title.
+///
+/// Every field is honest about not knowing: [`Self::default`] — which is also
+/// what a never-published or mid-write block reads as — carries `seq == 0` and
+/// `None` stages, which a renderer must show as "no report yet", never as
+/// "stage 0" or "0 blockers".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionStatus {
+    /// Publication counter. `0` = the child has never published.
+    pub seq: u64,
+    /// Furthest `raeen_core::frame_path::Stage` index reached, if any.
+    pub stage: Option<u8>,
+    /// Furthest `raeen_core::frame_path::Phase` index reached, if any.
+    pub phase: Option<u8>,
+    /// Distinct blockers retained by the child's table.
+    pub distinct_blockers: u64,
+    /// Occurrences across every retained blocker.
+    pub total_events: u64,
+    /// Distinct blockers the child dropped at its per-category cap.
+    pub dropped_distinct: u64,
+    /// Guest-process CPU time. Read against `wall_ms`, this separates a title
+    /// parked in a wait (CPU much less than wall) from one spinning — the
+    /// distinction that split the measured silent-zero-frame cluster into two
+    /// different bugs.
+    pub cpu_ms: u64,
+    /// Guest-process wall-clock time.
+    pub wall_ms: u64,
+    /// Human-readable digest: the frame-path summary and the ranked blocker
+    /// lines, truncated to the channel's byte budget on a `char` boundary.
+    pub digest: String,
+}
+
+impl SessionStatus {
+    /// Whether the child has ever published. `false` means "no report yet",
+    /// which is not the same as a report saying nothing happened.
+    #[must_use]
+    pub fn published(&self) -> bool {
+        self.seq > 0
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
@@ -98,6 +144,39 @@ mod platform {
     /// of `raeen_input::rumble::encode_word` (seq<<16 | large<<8 | small).
     /// A single aligned atomic needs no seqlock; 0 means "never set".
     const RUMBLE_WORD_OFFSET: usize = 104;
+
+    // ---- Child -> Shell session status (diagnostics) ----------------------
+    //
+    // The Shell's F10 console is fed by a *process-local* tracing ring, and the
+    // guest runs in a child spawned with inherited (not piped) stdio -- so
+    // without this block the console cannot see a single guest event, which is
+    // exactly the case a user hits when a title stalls. This page is already
+    // mapped between the two processes on every launch and has ~3,984 zeroed
+    // bytes spare after the rumble word, so the bridge costs no new mapping,
+    // no new thread and no new handle.
+    //
+    // Like the rumble word, this deliberately does NOT bump `VERSION`: it lives
+    // in previously-zeroed padding, moves no existing field, and a peer without
+    // it reads `STATUS_SEQ == 0`, which decodes as "never published". Bumping
+    // the version instead would hard-fail mismatched peers into "no video" --
+    // turning a diagnostics addition into a black screen.
+    /// Seqlock for the status block. Odd = a write is in flight; 0 = never
+    /// published (never "measured zero").
+    const STATUS_SEQ_OFFSET: usize = 112;
+    /// Furthest `frame_path::Stage` index **plus one**; 0 = no stage reached.
+    const STATUS_STAGE_OFFSET: usize = 120;
+    /// Furthest `frame_path::Phase` index **plus one**; 0 = no phase reached.
+    const STATUS_PHASE_OFFSET: usize = 128;
+    const STATUS_BLOCKERS_OFFSET: usize = 136;
+    const STATUS_EVENTS_OFFSET: usize = 144;
+    const STATUS_DROPPED_OFFSET: usize = 152;
+    const STATUS_CPU_MS_OFFSET: usize = 160;
+    const STATUS_WALL_MS_OFFSET: usize = 168;
+    const STATUS_TEXT_LEN_OFFSET: usize = 176;
+    const STATUS_TEXT_OFFSET: usize = 184;
+    /// Text budget for the human-readable digest. Ends at 3,984, inside the
+    /// 4,096-byte header -- asserted by a test, not by arithmetic in a comment.
+    const STATUS_TEXT_CAPACITY: usize = 3_800;
 
     struct Mapping {
         handle: HANDLE,
@@ -246,6 +325,10 @@ mod platform {
                 READBACK_US_OFFSET,
                 SRGB_ENCODE_US_OFFSET,
                 RUMBLE_WORD_OFFSET,
+                // Zeroing the status seqlock is what makes "never published"
+                // distinguishable from "published stage 0" on a reused page.
+                STATUS_SEQ_OFFSET,
+                STATUS_TEXT_LEN_OFFSET,
             ] {
                 mapping.atomic_u64(offset).store(0, Ordering::Relaxed);
             }
@@ -467,6 +550,82 @@ mod platform {
                     .load(Ordering::Acquire),
             )
         }
+
+        /// The guest runner's newest diagnostics status, or `None` when the
+        /// mapping is not a live protocol peer.
+        ///
+        /// `Some(status)` with `seq == 0` means the bridge is alive but the
+        /// child has not published yet — deliberately distinct from "the child
+        /// reported no progress", which is `seq > 0` with `stage: None`.
+        pub fn latest_status(&self) -> Option<SessionStatus> {
+            if self
+                .mapping
+                .atomic_u32(MAGIC_OFFSET)
+                .load(Ordering::Acquire)
+                != MAGIC
+                || self
+                    .mapping
+                    .atomic_u32(VERSION_OFFSET)
+                    .load(Ordering::Relaxed)
+                    != VERSION
+            {
+                return None;
+            }
+            let first = self
+                .mapping
+                .atomic_u64(STATUS_SEQ_OFFSET)
+                .load(Ordering::Acquire);
+            // Never published, or a write is in flight: report the bridge as
+            // alive but say nothing about its contents rather than read a torn
+            // block or invent a measurement.
+            if first == 0 || first & 1 != 0 {
+                return Some(SessionStatus::default());
+            }
+
+            let read = |offset| self.mapping.atomic_u64(offset).load(Ordering::Relaxed);
+            let stage = read(STATUS_STAGE_OFFSET);
+            let phase = read(STATUS_PHASE_OFFSET);
+            let distinct_blockers = read(STATUS_BLOCKERS_OFFSET);
+            let total_events = read(STATUS_EVENTS_OFFSET);
+            let dropped_distinct = read(STATUS_DROPPED_OFFSET);
+            let cpu_ms = read(STATUS_CPU_MS_OFFSET);
+            let wall_ms = read(STATUS_WALL_MS_OFFSET);
+            let len = (read(STATUS_TEXT_LEN_OFFSET) as usize).min(STATUS_TEXT_CAPACITY);
+            let mut bytes = vec![0u8; len];
+            // SAFETY: `len` is clamped to the text capacity, so the source
+            // range lies wholly inside the header and overlaps no atomic field.
+            // The sequence re-check below rejects a concurrent write.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.mapping.view.add(STATUS_TEXT_OFFSET).cast_const(),
+                    bytes.as_mut_ptr(),
+                    len,
+                );
+            }
+            std::sync::atomic::fence(Ordering::Acquire);
+            let second = self
+                .mapping
+                .atomic_u64(STATUS_SEQ_OFFSET)
+                .load(Ordering::Acquire);
+            if first != second || second & 1 != 0 {
+                return Some(SessionStatus::default());
+            }
+            Some(SessionStatus {
+                seq: second,
+                // The `+1` encoding is what keeps 0 free for "none reached",
+                // so a guest that reached nothing never reads as stage 0.
+                stage: (stage > 0).then(|| (stage - 1) as u8),
+                phase: (phase > 0).then(|| (phase - 1) as u8),
+                distinct_blockers,
+                total_events,
+                dropped_distinct,
+                cpu_ms,
+                wall_ms,
+                // The writer only ever copies whole UTF-8, but a torn or
+                // foreign page must degrade to readable text, not a panic.
+                digest: String::from_utf8_lossy(&bytes).into_owned(),
+            })
+        }
     }
 
     /// Child-owned reader for the Shell's merged controller snapshot.
@@ -562,6 +721,78 @@ mod platform {
                 .atomic_u64(RUMBLE_WORD_OFFSET)
                 .store(word, Ordering::Release);
         }
+
+        /// Publish the guest runner's diagnostics status for the Shell.
+        ///
+        /// This is what puts a stalled title's state in front of a user: the
+        /// Shell reads it every frame and renders it in the F10 Status tab,
+        /// and it keeps working after a hard `child.kill()` because the Shell
+        /// owns the mapping.
+        pub fn publish_status(&self, status: &SessionStatus) {
+            let sequence = self
+                .mapping
+                .atomic_u64(STATUS_SEQ_OFFSET)
+                .load(Ordering::Relaxed);
+            let writing = if sequence & 1 == 0 {
+                sequence.wrapping_add(1)
+            } else {
+                sequence.wrapping_add(2)
+            };
+            self.mapping
+                .atomic_u64(STATUS_SEQ_OFFSET)
+                .store(writing, Ordering::Release);
+
+            let store = |offset, value: u64| {
+                self.mapping
+                    .atomic_u64(offset)
+                    .store(value, Ordering::Relaxed);
+            };
+            store(
+                STATUS_STAGE_OFFSET,
+                status.stage.map_or(0, |s| u64::from(s) + 1),
+            );
+            store(
+                STATUS_PHASE_OFFSET,
+                status.phase.map_or(0, |p| u64::from(p) + 1),
+            );
+            store(STATUS_BLOCKERS_OFFSET, status.distinct_blockers);
+            store(STATUS_EVENTS_OFFSET, status.total_events);
+            store(STATUS_DROPPED_OFFSET, status.dropped_distinct);
+            store(STATUS_CPU_MS_OFFSET, status.cpu_ms);
+            store(STATUS_WALL_MS_OFFSET, status.wall_ms);
+
+            let text = truncate_on_char_boundary(&status.digest, STATUS_TEXT_CAPACITY);
+            store(STATUS_TEXT_LEN_OFFSET, text.len() as u64);
+            // SAFETY: `text.len()` is bounded by STATUS_TEXT_CAPACITY, so the
+            // destination range lies wholly inside the header and overlaps no
+            // atomic field. The seqlock guards concurrent readers.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    text.as_ptr(),
+                    self.mapping.view.add(STATUS_TEXT_OFFSET),
+                    text.len(),
+                );
+            }
+            std::sync::atomic::fence(Ordering::Release);
+            self.mapping
+                .atomic_u64(STATUS_SEQ_OFFSET)
+                .store(writing.wrapping_add(1), Ordering::Release);
+        }
+    }
+
+    /// Longest prefix of `text` that fits `max_bytes` without splitting a
+    /// `char`. Byte-truncating instead would hand the Shell invalid UTF-8 the
+    /// moment a digest carried a non-ASCII character (the report's own
+    /// em-dashes do).
+    fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+        if text.len() <= max_bytes {
+            return text;
+        }
+        let mut end = max_bytes;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
     }
 
     /// Child-owned publisher.
@@ -848,6 +1079,92 @@ mod platform {
             reader.publish_rumble_word(2 << 16);
             assert_eq!(receiver.latest_rumble_word(), Some(2 << 16));
         }
+
+        /// The status block must fit the header page and sit clear of the
+        /// rumble word. Arithmetic in a comment is not a guarantee.
+        #[test]
+        fn the_status_block_fits_the_header_page_and_clears_the_rumble_word() {
+            assert!(
+                STATUS_SEQ_OFFSET >= RUMBLE_WORD_OFFSET + 8,
+                "status block overlaps the rumble word"
+            );
+            assert!(
+                STATUS_TEXT_OFFSET >= STATUS_TEXT_LEN_OFFSET + 8,
+                "status text overlaps its own length field"
+            );
+            assert!(
+                STATUS_TEXT_OFFSET + STATUS_TEXT_CAPACITY <= HEADER_BYTES,
+                "status text runs past the header into pixel slot 0"
+            );
+        }
+
+        /// The whole point of the bridge: what the child knows must arrive in
+        /// the Shell intact, and what it has not said must not be invented.
+        #[test]
+        fn child_status_round_trips_to_shell_and_silence_is_not_a_measurement() {
+            let receiver = FrameIpcReceiver::create().expect("create mapping");
+            let reader = FrameIpcInputReader {
+                mapping: Mapping::open(receiver.name()).expect("open child mapping"),
+                cached: Mutex::new(None),
+            };
+
+            // A live bridge that has never published is `Some`, not `None` —
+            // and reads as "no report", not as "stage 0, zero blockers".
+            let fresh = receiver.latest_status().expect("bridge is alive");
+            assert_eq!(fresh, SessionStatus::default());
+            assert!(!fresh.published(), "seq 0 means the child never published");
+            assert_eq!(fresh.stage, None, "never publish a fabricated stage 0");
+
+            // A digest longer than the channel budget, with multi-byte chars on
+            // the truncation boundary — byte-truncating here would hand the
+            // Shell invalid UTF-8.
+            let long_digest = "é".repeat(5_000);
+            let status = SessionStatus {
+                seq: 0, // ignored by the writer; the seqlock owns it
+                stage: Some(4),
+                phase: Some(3),
+                distinct_blockers: 2,
+                total_events: 30_736,
+                dropped_distinct: 8,
+                cpu_ms: 3_200,
+                wall_ms: 180_100,
+                digest: long_digest.clone(),
+            };
+            reader.publish_status(&status);
+
+            let read = receiver.latest_status().expect("bridge is alive");
+            assert!(read.published(), "seq must advance on publication");
+            assert_eq!(read.stage, Some(4));
+            assert_eq!(read.phase, Some(3));
+            assert_eq!(read.distinct_blockers, 2);
+            assert_eq!(read.total_events, 30_736);
+            assert_eq!(read.dropped_distinct, 8);
+            assert_eq!(read.cpu_ms, 3_200);
+            assert_eq!(read.wall_ms, 180_100);
+            assert!(
+                read.digest.len() <= STATUS_TEXT_CAPACITY,
+                "budget respected"
+            );
+            assert!(
+                long_digest.starts_with(&read.digest),
+                "truncation must keep a valid prefix, not corrupt the text"
+            );
+            assert!(!read.digest.is_empty());
+
+            // A stage the guest genuinely has not reached stays `None` across
+            // the wire — the `+1` encoding is what keeps 0 free for "none".
+            let none_reached = SessionStatus {
+                stage: None,
+                phase: Some(0),
+                digest: "frame path: reached=nothing phase=process_loaded".to_string(),
+                ..SessionStatus::default()
+            };
+            reader.publish_status(&none_reached);
+            let read = receiver.latest_status().expect("bridge is alive");
+            assert_eq!(read.stage, None, "no stage reached must survive as None");
+            assert_eq!(read.phase, Some(0), "phase index 0 is a real phase");
+            assert!(read.digest.contains("reached=nothing"));
+        }
     }
 }
 
@@ -883,6 +1200,10 @@ mod platform {
         pub fn latest_rumble_word(&self) -> Option<u64> {
             None
         }
+
+        pub fn latest_status(&self) -> Option<SessionStatus> {
+            None
+        }
     }
 
     pub struct FrameIpcInputReader;
@@ -897,6 +1218,8 @@ mod platform {
         }
 
         pub fn publish_rumble_word(&self, _word: u64) {}
+
+        pub fn publish_status(&self, _status: &SessionStatus) {}
     }
 
     pub(crate) struct FrameIpcPublisher;
@@ -964,6 +1287,19 @@ pub fn latest_remote_rumble_word() -> Option<u64> {
         .read()
         .as_ref()
         .and_then(|receiver| receiver.latest_rumble_word())
+}
+
+/// The isolated runner's newest diagnostics status, or `None` when no bridge
+/// is installed (no title running, or an in-process launch).
+///
+/// This is what the Shell's F10 Status tab renders. `Some(status)` with
+/// `status.published() == false` means "a title is running but has not reported
+/// yet" — distinct from "it reported no progress".
+pub fn latest_remote_status() -> Option<SessionStatus> {
+    active_receiver()
+        .read()
+        .as_ref()
+        .and_then(|receiver| receiver.latest_status())
 }
 
 /// Publish one merged Shell controller snapshot to the active isolated title.

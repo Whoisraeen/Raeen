@@ -115,6 +115,33 @@ fn err(msg: impl Into<String>) -> DrawError {
     DrawError(msg.into())
 }
 
+/// A refusal site's cached [`raeen_core::blockers::Slot`].
+type BlockerCell = std::sync::OnceLock<Option<raeen_core::blockers::Slot>>;
+
+/// Count one occurrence of a refusal through a cached slot.
+///
+/// The sites below run per sampled texture, per stage, per draw — order
+/// 10^3–10^4/s in exactly the frames that trip them. `blockers::record` hashes
+/// the key and takes the table lock on *every* call; this pays that once and
+/// leaves the repeat path at one `OnceLock` load plus one relaxed `fetch_add`
+/// on a private cache line, with no allocation.
+///
+/// `key` is deliberately `&'static str` and the subject fixed at 0: a
+/// per-texture address in the identity would intern a fresh entry per
+/// descriptor and spend the category's 32-key cap inside a single frame. The
+/// varying values belong in `detail`, which the table captures once.
+fn bump_blocker(
+    cell: &'static BlockerCell,
+    category: raeen_core::blockers::BlockerCategory,
+    key: &'static str,
+    detail: impl FnOnce() -> String,
+) {
+    if let Some(slot) = cell.get_or_init(|| raeen_core::blockers::intern(category, key, 0, detail))
+    {
+        raeen_core::blockers::bump(*slot);
+    }
+}
+
 fn color_output_disabled(ctx: &Context) -> bool {
     ctx.render_target_mask == 0
 }
@@ -1886,6 +1913,27 @@ fn decode_texture(
     // untextured instead of the whole shader being skipped. Mirrors the
     // null-V#-as-4-byte-zero-dummy storage-buffer path.
     if t.base40() == 0 {
+        // The substitution is silent by design — the draw proceeds untextured
+        // rather than being skipped — so nothing downstream can tell an
+        // untextured draw from a correctly-transparent one. Count it: this is
+        // one of the two sites the Minecraft flat-terrain investigation had to
+        // hand-instrument across five headless runs plus an offline replay
+        // harness (docs/diagnosis/minecraft-terrain-atlas-descriptor.md), and
+        // the answer it produced was a number this line now produces for free.
+        static DUMMY_SERVED: BlockerCell = BlockerCell::new();
+        bump_blocker(
+            &DUMMY_SERVED,
+            raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
+            "texture-dummy-served",
+            || {
+                format!(
+                    "a base-0 T# was served a 1x1 transparent-black dummy, so the draw \
+                     samples nothing (first: type={} fields={:08x?})",
+                    t.type_(),
+                    t.fields
+                )
+            },
+        );
         return Ok(placeholder_texture_dummy());
     }
     note_mip_view_base_level(t);
@@ -3330,6 +3378,17 @@ fn prepare_stage_binding_inner(
                 size,
                 "storage buffer V# is null — binding 4-byte zero dummy (RDNA OOB semantics)"
             );
+            static NULL_VSHARP: BlockerCell = BlockerCell::new();
+            bump_blocker(
+                &NULL_VSHARP,
+                raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
+                "null-storage-vsharp",
+                || {
+                    "a null storage V# (base 0 or zero byte size) was bound as a 4-byte zero \
+                     dummy: its reads return 0 and its writes are dropped"
+                        .to_owned()
+                },
+            );
             vec![0u8; 4]
         } else {
             read_guest_bytes(resource.base48(), size, "storage buffer").map_err(|source| {
@@ -3510,6 +3569,28 @@ fn prepare_stage_binding_inner(
             let mut decoded = match sampled_render_target(&desc.texture) {
                 Some(upload) => upload,
                 None => {
+                    // The other half of the flat-terrain pair. A T# shaped like
+                    // a live colour attachment (plain 2D, single level) that
+                    // matched no live target falls through to a guest-memory
+                    // decode standing in for pixels that only ever existed on
+                    // the device — stale or black, and today announced nowhere.
+                    if texture_aliases_live_target(&desc.texture) {
+                        static TARGET_UNMATCHED: BlockerCell = BlockerCell::new();
+                        bump_blocker(
+                            &TARGET_UNMATCHED,
+                            raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
+                            "sampled-render-target-unmatched",
+                            || {
+                                format!(
+                                    "a render-target-shaped T# matched no live target and fell \
+                                     back to guest memory (first: base={:#x} {}x{})",
+                                    desc.texture.base40(),
+                                    u32::from(desc.texture.width5()) + 1,
+                                    u32::from(desc.texture.height5()) + 1
+                                )
+                            },
+                        );
+                    }
                     // Guest-memory decode: count it against the per-stage budget
                     // and refuse before allocating if the composite's samples
                     // would exceed the cap (a direct persistent-target bind
@@ -4317,6 +4398,13 @@ impl OffscreenDrawSink<'_> {
                 reason,
                 "translated graphics draw skipped by RAEEN_SKIP_SHADER_ADDR"
             );
+            static SKIP_SHADER_ADDR: BlockerCell = BlockerCell::new();
+            bump_blocker(
+                &SKIP_SHADER_ADDR,
+                raeen_core::blockers::BlockerCategory::DrawDropped,
+                "skip-shader-addr",
+                || reason.clone(),
+            );
             return Ok(());
         }
         let resolve_timer = crate::vulkan::offscreen::StageTimer::start(
@@ -4336,6 +4424,17 @@ impl OffscreenDrawSink<'_> {
                     self.draw_skips += 1;
                     self.last_draw_skip_reason = Some(e.to_string());
                     debug!(reason = %e, "draw skipped: bound guest shader is untranslatable");
+                    // One key for every lost draw, not one per shader: a single
+                    // Minecraft run produced 30,734 of these, and the address in
+                    // the reason would have interned 30,734 entries. The count
+                    // is the finding; `detail` keeps the first reason verbatim.
+                    static DRAW_UNTRANSLATABLE: BlockerCell = BlockerCell::new();
+                    bump_blocker(
+                        &DRAW_UNTRANSLATABLE,
+                        raeen_core::blockers::BlockerCategory::ShaderRefused,
+                        "draw",
+                        || e.to_string(),
+                    );
                     return Ok(());
                 }
             }
@@ -4884,6 +4983,13 @@ impl OffscreenDrawSink<'_> {
                 self.draw_skips += 1;
                 self.last_draw_skip_reason = Some(e.to_string());
                 debug!(reason = %e, "eliminate-fast-clear skipped");
+                static FCE_SKIPPED: BlockerCell = BlockerCell::new();
+                bump_blocker(
+                    &FCE_SKIPPED,
+                    raeen_core::blockers::BlockerCategory::DrawDropped,
+                    "fast-clear-eliminate",
+                    || e.to_string(),
+                );
                 return Ok(());
             }
         };
@@ -5036,6 +5142,13 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     user_sgpr = r.user_sgpr,
                     mode = format_args!("{mode:#x}"),
                     "compute dispatch skipped: bound shader is untranslatable"
+                );
+                static DISPATCH_UNTRANSLATABLE: BlockerCell = BlockerCell::new();
+                bump_blocker(
+                    &DISPATCH_UNTRANSLATABLE,
+                    raeen_core::blockers::BlockerCategory::ShaderRefused,
+                    "dispatch",
+                    || error.to_string(),
                 );
                 return Ok(());
             }
@@ -5369,6 +5482,17 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 debug!(
                     addr = format_args!("{addr:#x}"),
                     real_len, "compute storage writeback skipped: null V# (writes dropped)"
+                );
+                static WRITEBACK_DROPPED: BlockerCell = BlockerCell::new();
+                bump_blocker(
+                    &WRITEBACK_DROPPED,
+                    raeen_core::blockers::BlockerCategory::DrawDropped,
+                    "compute-writeback",
+                    || {
+                        "a dispatch output bound to a null V# was not written back to guest \
+                         memory; hardware drops those writes too (RDNA OOB semantics)"
+                            .to_owned()
+                    },
                 );
                 continue;
             }

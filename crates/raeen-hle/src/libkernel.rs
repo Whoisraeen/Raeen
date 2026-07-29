@@ -25,6 +25,7 @@ use crate::{
     GuestAccess, GuestAddress, GuestCallCompletion, GuestCallRequest, GuestRange, HleContext,
     HleRegistry, MAX_HLE_BULK_BYTES,
 };
+use raeen_core::blockers::{self, BlockerCategory};
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
@@ -546,6 +547,24 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
                             );
                         } else {
                             warn!("open: '{path}' matches no VFS mount — ENOENT");
+                            // Keyed by the MOUNT ROOT, not the full path: a
+                            // title that walks a thousand assets under one
+                            // unmounted root is one gap, and keying on the path
+                            // would spend the 32-key cap restating it. The
+                            // first offending path goes in the detail.
+                            //
+                            // Only this arm records. An ordinary missing file
+                            // is a normal guest-handled probe (see above), and
+                            // the devkit-only roots are ENOENT on retail
+                            // hardware too — neither is a gap in this tree.
+                            let root = path
+                                .split('/')
+                                .find(|segment| !segment.is_empty())
+                                .unwrap_or("<relative>")
+                                .to_string();
+                            blockers::record(BlockerCategory::VfsMiss, root, 0, || {
+                                format!("no VFS mount covers '{path}' — ENOENT")
+                            });
                         }
                     }
                 }
@@ -4577,6 +4596,19 @@ fn hle_cxa_throw(ctx: &HleContext, args: &[u64]) -> u64 {
         ctx.caller_return_addr,
         chain.join(" ")
     );
+    // Only reachable when the linker force-routes throws here
+    // (RAEEN_TRAP_CXA_THROW); a normal run uses the shipped libc's real
+    // `__cxa_throw`. Recorded anyway so a trap run's artifact carries the same
+    // terminator vocabulary as a default one. Constant key, subject 0: the
+    // thrown type name is guest-controlled and the throw site varies per call,
+    // and `GuestFault` is the rank-0 category whose 32 keys a report leads
+    // with — both belong in the detail, not in the intern identity.
+    blockers::record(BlockerCategory::GuestFault, "cxa-throw", 0, || {
+        format!(
+            "thread {thread} ('{name}') threw '{type_name}' at ra={:#x}; the trap terminated it",
+            ctx.caller_return_addr
+        )
+    });
     ctx.guest_threads.request_exit(0xa002_0008);
     0
 }
@@ -4627,6 +4659,20 @@ fn hle_debug_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
     if released > 0 {
         warn!("  released {released} mutex(es) held by dying thread {thread} ('{name}')");
     }
+    // The title itself declaring the run dead. `code` is safe as the intern
+    // subject where an address would not be: it is the guest's own fatal
+    // enumeration, a bounded set, and it is the identity a reader looks up.
+    blockers::record(
+        BlockerCategory::GuestFault,
+        "sceKernelDebugRaiseException",
+        code,
+        || {
+            format!(
+                "guest reported a fatal condition on thread {thread} ('{name}'), guest ra={:#x}",
+                ctx.caller_return_addr
+            )
+        },
+    );
 
     // On hardware this never returns — the process is killed. Returning here
     // is measurably worse than stopping the thread: the caller's code ends at
@@ -4648,12 +4694,38 @@ fn hle_install_exception_handler(ctx: &HleContext, args: &[u64]) -> u64 {
     const SCE_KERNEL_ERROR_EAGAIN: u64 = 0x8002_000B;
     let signum = args.first().copied().unwrap_or(u64::MAX) as i32;
     let handler = args.get(1).copied().unwrap_or(0);
+    // Every outcome logs at INFO, because a *rejected* install used to be
+    // indistinguishable from one that never happened. That ambiguity is what
+    // made Blasphemous II's 15-thread park unreadable: its IL2CPP thread
+    // raises a signal and then waits for the handler's acknowledgement, and
+    // whether a handler was ever registered decides whether the raise had
+    // anything to run. Three cheap lines settle it from one log.
     if !exception_signal_allowed(signum) || handler == 0 {
+        tracing::info!(
+            signum,
+            handler = format_args!("{handler:#x}"),
+            "sceKernelInstallExceptionHandler: REJECTED (signal not deliverable or null handler) \
+             -> EINVAL; no handler is registered for this signal"
+        );
         return SCE_KERNEL_ERROR_EINVAL;
     }
     match ctx.kernel.exception_handlers.entry(signum) {
-        dashmap::mapref::entry::Entry::Occupied(_) => SCE_KERNEL_ERROR_EAGAIN,
+        dashmap::mapref::entry::Entry::Occupied(existing) => {
+            tracing::info!(
+                signum,
+                handler = format_args!("{handler:#x}"),
+                installed = format_args!("{:#x}", *existing.get()),
+                "sceKernelInstallExceptionHandler: slot ALREADY OCCUPIED -> EAGAIN; the \
+                 previously installed handler stays in place"
+            );
+            SCE_KERNEL_ERROR_EAGAIN
+        }
         dashmap::mapref::entry::Entry::Vacant(entry) => {
+            tracing::info!(
+                signum,
+                handler = format_args!("{handler:#x}"),
+                "sceKernelInstallExceptionHandler: INSTALLED"
+            );
             entry.insert(handler);
             SCE_OK
         }
@@ -4667,6 +4739,23 @@ fn hle_remove_exception_handler(ctx: &HleContext, args: &[u64]) -> u64 {
     }
     ctx.kernel.exception_handlers.remove(&signum);
     SCE_OK
+}
+
+/// One WARN per `(thread, signum)` for a raise that found no handler, so a
+/// title that raises every frame cannot drown the log while a one-shot raise —
+/// the stalling shape — is still reported.
+fn warn_once_raise_without_handler(target_thread: u64, signum: i32) {
+    static SEEN: std::sync::LazyLock<dashmap::DashSet<(u64, i32)>> =
+        std::sync::LazyLock::new(dashmap::DashSet::new);
+    if SEEN.insert((target_thread, signum)) {
+        warn!(
+            target_thread = format_args!("{target_thread:#x}"),
+            signum,
+            "sceKernelRaiseException: NO HANDLER installed for this signal — the raise is \
+             accepted and nothing runs. If the caller then waits for the handler to \
+             acknowledge, it waits forever"
+        );
+    }
 }
 
 /// `sceKernelRaiseException(thread, signum)`: raise `signum` at a named guest
@@ -4692,10 +4781,12 @@ fn hle_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
     // No handler for this signal is not an error: the kernel accepts the raise
     // and there is simply no user callback to run.
     let Some(handler) = ctx.kernel.exception_handlers.get(&signum).map(|h| *h) else {
-        debug!(
-            target_thread = format_args!("{target_thread:#x}"),
-            signum, "sceKernelRaiseException: no handler installed for this signal"
-        );
+        // WARN, not DEBUG: accepting a raise with nothing to run is silent
+        // success for us and can be a permanent stall for the guest. A title
+        // that raises and then waits for the handler's acknowledgement (Unity's
+        // IL2CPP runtime does exactly this) parks forever, and every other
+        // thread parks behind it. This line is the only evidence that happened.
+        warn_once_raise_without_handler(target_thread, signum);
         return SCE_OK;
     };
     let raised_by = ctx.guest_threads.current_thread();
