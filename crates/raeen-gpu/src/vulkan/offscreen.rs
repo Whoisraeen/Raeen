@@ -2492,6 +2492,12 @@ pub(crate) static DRAW_STAGE_RESOLVE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_RESOLVE_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Resolve misses where the memo already held the SAME VS/PS program and only
+/// the surrounding register state differed — see
+/// `ResolvedShaderMemo::misses_same_program`. Tracking `resolve_misses` means
+/// the memo key is wider than what the shader analysis reads.
+pub(crate) static DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_MISSES: std::sync::atomic::AtomicU64 =
@@ -2579,6 +2585,7 @@ fn draw_stage_tick() {
     let resolve = DRAW_STAGE_RESOLVE_NS.swap(0, Relaxed);
     let resolve_hits = DRAW_STAGE_RESOLVE_HITS.swap(0, Relaxed);
     let resolve_misses = DRAW_STAGE_RESOLVE_MISSES.swap(0, Relaxed);
+    let resolve_misses_same_program = DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM.swap(0, Relaxed);
     let parse_hits = DRAW_STAGE_PARSE_HITS.swap(0, Relaxed);
     let parse_misses = DRAW_STAGE_PARSE_MISSES.swap(0, Relaxed);
     let setup = DRAW_STAGE_SETUP_NS.swap(0, Relaxed);
@@ -2627,6 +2634,7 @@ fn draw_stage_tick() {
         resolve_us = per_draw_us(resolve),
         resolve_hits,
         resolve_misses,
+        resolve_misses_same_program,
         parse_hits,
         parse_misses,
         setup_us = per_draw_us(setup),

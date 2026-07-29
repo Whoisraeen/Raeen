@@ -727,6 +727,30 @@ struct ResolvedShaderMemo {
     entries: Vec<Box<ResolvedShaderEntry>>,
     hits: u64,
     misses: u64,
+    /// Misses where the memo ALREADY held the same VS/PS program addresses and
+    /// only the surrounding register state differed.
+    ///
+    /// This is the field that decides the next move. `ResolvedShaderKey` is
+    /// deliberately the EXACT register state, which includes both stages' user
+    /// SGPRs — and titles rewrite those per draw for per-object constants. If
+    /// this counter tracks `misses`, the key is wider than what the analysis
+    /// actually reads and the fix is to cache the analyzed ABI per PROGRAM
+    /// (shadPS4's `Program { Shader::Info; ModuleList }` model) rather than per
+    /// exact register state. If it stays near zero, every draw really does bind
+    /// a different program and the resolve cost is irreducible without
+    /// caching further up.
+    misses_same_program: u64,
+}
+
+/// The guest code addresses that identify the PROGRAM a key binds, ignoring the
+/// surrounding register state — see [`ResolvedShaderMemo::misses_same_program`].
+fn resolved_shader_program_addrs(key: &ResolvedShaderKey) -> [u64; 4] {
+    [
+        key.vs.vs_regs.data_addr,
+        key.vs.es_regs.data_addr,
+        key.vs.gs_regs.data_addr,
+        key.ps.ps_regs.data_addr,
+    ]
 }
 
 /// The fetcher never reads more than 256 KiB for one guest shader. Treat that
@@ -850,6 +874,18 @@ impl ResolvedShaderMemo {
             self.misses += 1;
             crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Attribute the miss (see `misses_same_program`). Only on the miss
+            // path, which already costs the whole analysis chain.
+            let program = resolved_shader_program_addrs(&key);
+            if self
+                .entries
+                .iter()
+                .any(|entry| resolved_shader_program_addrs(&entry.key) == program)
+            {
+                self.misses_same_program += 1;
+                crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return None;
         };
         self.hits += 1;
@@ -7598,6 +7634,51 @@ mod tests {
             (memo.hits, memo.misses),
             (bindings.len() as u64, 0),
             "N draws behind N label writes must cost ZERO re-resolutions"
+        );
+    }
+
+    /// A miss on a program the memo already holds — same VS/PS addresses, only
+    /// the surrounding register state differs — is attributed separately, so a
+    /// run can tell "the key is too wide" from "every draw binds a new program".
+    #[test]
+    fn resolve_misses_distinguish_a_new_program_from_a_wider_key() {
+        let ctx = Context::default();
+        let mut base = Shader::default();
+        base.vs.vs_regs.data_addr = 0x10_0000;
+        base.ps.ps_regs.data_addr = 0x20_0000;
+
+        let mut memo = ResolvedShaderMemo::default();
+        memo.insert(
+            ResolvedShaderKey::new(&ctx, &base),
+            ResolvedShaders {
+                vs: Arc::new(vec![1]),
+                ps: Arc::new(vec![2]),
+                vs_info: ShaderVertexInputInfo::default(),
+                ps_info: ShaderPixelInputInfo::default(),
+            },
+        );
+
+        // Same program, a per-object constant pushed through a user SGPR.
+        let mut same_program = base.clone();
+        same_program.ps.ps_user_sgpr.count = 1;
+        same_program.ps.ps_user_sgpr.value[0] = 0xdead;
+        assert!(
+            memo.get(ResolvedShaderKey::new(&ctx, &same_program))
+                .is_none()
+        );
+        assert_eq!((memo.misses, memo.misses_same_program), (1, 1));
+
+        // A genuinely different program.
+        let mut new_program = base.clone();
+        new_program.ps.ps_regs.data_addr = 0x30_0000;
+        assert!(
+            memo.get(ResolvedShaderKey::new(&ctx, &new_program))
+                .is_none()
+        );
+        assert_eq!(
+            (memo.misses, memo.misses_same_program),
+            (2, 1),
+            "a new program must not be counted as a too-wide key"
         );
     }
 
