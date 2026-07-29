@@ -2891,6 +2891,80 @@ fn recompile_tbuffer_load_format_x_float1(
     Ok(false)
 }
 
+/// Beyond Kyty (`tbuffer_load_format_xy` is `KYTY_NI` upstream): the
+/// two-channel typed fetch, structured exactly like the x1 and xyzw rows.
+///
+/// `%temp_int_2` is the byte offset (SOFFSET plus the folded 12-bit immediate —
+/// see `shader_parse_mtbuf`), `%temp_int_3` the V#'s stride, `%temp_int_4` the
+/// buffer index, `%temp_int_5` the legacy packed format the guarded helper
+/// re-tests. **95** = dfmt 11, nfmt 7 (`32_32_FLOAT`) — the format
+/// `shader_parse_mtbuf` requires for this opcode, and one of the two the
+/// helper's guard admits.
+fn recompile_tbuffer_load_format_xy_float2(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_TBufferLoadFormatXy_Vdata2VaddrSvSoffsIdxenFloat2";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if let Some(bind_info) = spirv.get_bind_info() {
+        if bind_info.storage_buffers.buffers_num > 0 {
+            if !operand_is_constant(inst.src[2]) {
+                return Err(not_supported(FUNC, "src2 is not a constant"));
+            }
+
+            let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
+            let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
+            let src0_value = operand_variable_to_str(inst.src[0]);
+            let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
+            let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
+            let offset = spirv.get_constant(inst.src[2]);
+
+            if dst_value0.type_ != SpirvType::Float
+                || dst_value1.type_ != SpirvType::Float
+                || src0_value.type_ != SpirvType::Float
+                || src1_value0.type_ != SpirvType::Uint
+                || src1_value1.type_ != SpirvType::Uint
+            {
+                return Err(not_supported(FUNC, "unexpected operand types"));
+            }
+
+            const TEXT: &str = r#"
+        %t100_<index> = OpLoad %float %<src0>
+        %t101_<index> = OpBitcast %int %t100_<index>
+               OpStore %temp_int_1 %t101_<index>
+        %t148_<index> = OpLoad %uint %<src1_value1>
+        %t150_<index> = OpShiftRightLogical %uint %t148_<index> %int_16
+        %t152_<index> = OpBitwiseAnd %uint %t150_<index> %uint_0x00003fff
+        %t153_<index> = OpBitcast %int %t152_<index>
+               OpStore %temp_int_3 %t153_<index>
+        %t155_<index> = OpLoad %uint %<src1_value0>
+        %t156_<index> = OpBitcast %int %t155_<index>
+               OpStore %temp_int_4 %t156_<index>
+               OpStore %temp_int_2 %<offset>
+               OpStore %temp_int_5 %int_95
+        %t110_<index> = OpFunctionCall %void %tbuffer_load_format_xy %<p0> %<p1> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
+"#;
+            *dst_source += &TEXT
+                .replace("<index>", &format!("{index}"))
+                .replace("<src0>", &src0_value.value)
+                .replace("<offset>", &offset)
+                .replace("<src1_value0>", &src1_value0.value)
+                .replace("<src1_value1>", &src1_value1.value)
+                .replace("<p0>", &dst_value0.value)
+                .replace("<p1>", &dst_value1.value);
+
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Kyty: `Recompile_TBufferLoadFormatXyzw_Vdata4VaddrSvSoffsIdxenFloat4`
 /// (ShaderSpirv.cpp L4765).
 fn recompile_tbuffer_load_format_xyzw_float4(
@@ -6274,6 +6348,32 @@ fn recompile_image_sample_dmask7(
     )
 }
 
+/// Beyond Kyty: three-channel sample with the non-contiguous mask 0xb —
+/// components X, Y and W into three consecutive vdata registers.
+///
+/// Channel *sources* are 0, 1 and 3 (the RGBA components DMASK selects);
+/// destinations are the first three vdata registers, which is what
+/// `image_sample_channels` does with the index of each pair. The temp-id bases
+/// match the dmask7 row (46/50/54) — only the third source component differs.
+fn recompile_image_sample_dmask_b(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSample_Vdata3Vaddr3StSsDmaskB";
+    image_sample_channels(
+        index,
+        code,
+        dst_source,
+        spirv,
+        FUNC,
+        &[(46, 0), (50, 1), (54, 3)],
+    )
+}
+
 /// Kyty: `Recompile_ImageSample_Vdata4Vaddr3StSsDmaskF` (ShaderSpirv.cpp
 /// L2968).
 #[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
@@ -6955,6 +7055,19 @@ fn recompile_image_sample_lz_dmask2(
 ) -> Result<bool, ShaderRecompileError> {
     const FUNC: &str = "Recompile_ImageSampleLz_Vdata1Vaddr3StSsDmask2";
     image_sample_lz_single_channel(index, code, dst_source, spirv, FUNC, 1)
+}
+
+/// Beyond Kyty: `image_sample_lz` with `dmask == 0x8` (.w only).
+fn recompile_image_sample_lz_dmask8(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageSampleLz_Vdata1Vaddr3StSsDmask8";
+    image_sample_lz_single_channel(index, code, dst_source, spirv, FUNC, 3)
 }
 
 /// Beyond-Kyty (`image_gather4_lz` is `KYTY_NI` upstream): four-texel gather
@@ -11174,6 +11287,37 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_exp_param_xxx,                      T::Exp, F::Param2Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param2")),
     f(recompile_exp_param_xxx,                      T::Exp, F::Param3Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param3")),
     f(recompile_exp_param_xxx,                      T::Exp, F::Param4Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param4")),
+    // Beyond Kyty: param5..param31. Same body — only the destination slot
+    // differs, and `%paramN` is declared for every slot the body writes (see
+    // `max_exp_param`). RDNA 2 ISA doc 70648: EXP targets 32..63 are
+    // PARAM0..PARAM31.
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param5Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param5")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param6Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param6")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param7Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param7")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param8Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param8")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param9Vsrc0Vsrc1Vsrc2Vsrc3,     p1("param9")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param10Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param10")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param11Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param11")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param12Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param12")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param13Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param13")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param14Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param14")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param15Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param15")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param16Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param16")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param17Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param17")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param18Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param18")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param19Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param19")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param20Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param20")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param21Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param21")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param22Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param22")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param23Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param23")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param24Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param24")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param25Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param25")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param26Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param26")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param27Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param27")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param28Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param28")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param29Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param29")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param30Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param30")),
+    f(recompile_exp_param_xxx,                      T::Exp, F::Param31Vsrc0Vsrc1Vsrc2Vsrc3,    p1("param31")),
     f(recompile_exp_pos0,                           T::Exp, F::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done,   p1("")),
     // Auxiliary position exports (clip/cull distances via PA_CL_VS_OUT_CNTL);
     // accepted and dropped until VS_OUT_CNTL is plumbed — see
@@ -11200,6 +11344,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_dmask5,     T::ImageSample,    F::Vdata2Vaddr3StSsDmask5, p1("")),
     f(recompile_image_sample_dmask9,     T::ImageSample,    F::Vdata2Vaddr3StSsDmask9, p1("")),
     f(recompile_image_sample_dmask7,     T::ImageSample,    F::Vdata3Vaddr3StSsDmask7, p1("")),
+    f(recompile_image_sample_dmask_b,    T::ImageSample,    F::Vdata3Vaddr3StSsDmaskB, p1("")),
     f(recompile_image_sample_dmask_f,    T::ImageSample,    F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_l_dmask7,   T::ImageSampleL,   F::Vdata3Vaddr4StSsDmask7, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata1Vaddr3StSsDmask1, p1("")),
@@ -11211,6 +11356,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata4Vaddr3StSsDmaskF, p1("")),
     f(recompile_image_sample_lz_dmask1,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask1, p1("")),
     f(recompile_image_sample_lz_dmask2,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask2, p1("")),
+    f(recompile_image_sample_lz_dmask8,  T::ImageSampleLz,  F::Vdata1Vaddr3StSsDmask8, p1("")),
     f(recompile_image_sample_lz_dmask3,  T::ImageSampleLz,  F::Vdata2Vaddr3StSsDmask3, p1("")),
     f(recompile_image_sample_lz_dmask7,  T::ImageSampleLz,  F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_lz_dmask_f, T::ImageSampleLz,  F::Vdata4Vaddr3StSsDmaskF, p1("")),
@@ -11446,6 +11592,12 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_tbuffer_load_format_x_float1, T::TBufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxenFloat1, p1("")),
     ni("Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4", 4824, T::TBufferLoadFormatXyzw, F::Vdata4Vaddr2SvSoffsOffenIdxenFloat4, p1("")),
     f(recompile_tbuffer_load_format_xyzw_float4, T::TBufferLoadFormatXyzw, F::Vdata4VaddrSvSoffsIdxenFloat4, p1("")),
+    // Beyond Kyty: the two-channel typed fetch. The offen variant carries a
+    // per-thread voffset the float2 body does not add, so it is a named
+    // refusal rather than a silently dropped address term (same shape as the
+    // xyzw offen row above).
+    f(recompile_tbuffer_load_format_xy_float2, T::TBufferLoadFormatXy, F::Vdata2VaddrSvSoffsIdxenFloat2, p1("")),
+    ni("Recompile_TBufferLoadFormatXy_Vdata2Vaddr2SvSoffsOffenIdxenFloat2 (no Kyty upstream; the float2 body has no voffset term)", 0, T::TBufferLoadFormatXy, F::Vdata2Vaddr2SvSoffsOffenIdxenFloat2, p1("")),
 
     ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VAddI32,    F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>")),
     ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VSubI32,    F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpISubBorrow %ResTypeU %t0_<index> %t1_<index>")),
@@ -11951,7 +12103,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            367,
+            398,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -11992,11 +12144,11 @@ mod tests {
              and the V#-buffer-load batch: the five \
              Sdst/2/4/8/16-SvSoffsetOffset rows (the same combined addressing \
              through a V# base, ASTRO.BOT) plus BufferLoadFormatXyzw \
-             [Vdata4VaddrSvSoffsIdxen] (Avatar: Frontiers of Pandora)"
+             [Vdata4VaddrSvSoffsIdxen] (Avatar: Frontiers of Pandora), \n             and the Blasphemous II decoder-gap batch (+30): the 27 exp \n             param5..param31 rows (RDNA2 EXP targets 0x25..0x3f), the two \n             TBufferLoadFormatXy rows (one wired, one refused offen variant), \n             and ImageSample dmask 0xb, plus ImageSampleLz dmask 0x8"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 359,
+            implemented, 389,
             "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
@@ -12030,13 +12182,13 @@ mod tests {
               Sdst/2/4/8/16-SbaseSoffsetOffset rows, \
               and the V#-buffer-load batch: five Sdst/2/4/8/16-SvSoffsetOffset \
               rows and BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen], \
-              and the exp-null row: EXP target 9 accepted and dropped)"
+              and the exp-null row: EXP target 9 accepted and dropped, \n              and the Blasphemous II decoder-gap batch: 27 exp param5..param31 \n              rows, TBufferLoadFormatXy, ImageSample dmask 0xb, and ImageSampleLz \n              dmask 0x8)"
         );
         assert_eq!(
-            ni, 8,
+            ni, 9,
             "C2 remainder (BufferStoreFormatX/Xy wired out; BufferStoreFormatXyz staged in; \
              the mbcnt pair wired for the RDNA2 VOP3 lane-index idiom; VBfeU32 wired out \
-             of the staged VdstVsrc0Vsrc1Vsrc2 U32 set)"
+             of the staged VdstVsrc0Vsrc1Vsrc2 U32 set; plus TBufferLoadFormatXy's offen variant, \n             refused because the float2 body has no voffset term)"
         );
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
@@ -22183,5 +22335,571 @@ mod tests {
             msg.contains("unresolved register soffset"),
             "the refusal must stay identifiable by name; got: {msg}"
         );
+    }
+
+    // ---- Blasphemous II shader-decoder gaps -------------------------------
+    //
+    // Six register-independent decoder gaps, each reproduced with hand-built
+    // GCN words rather than dumped bytes. The encodings were recovered from a
+    // live run's `RAEEN_DUMP_SHADERS` output and re-spelled here from the ISA
+    // fields, so no guest bytes enter the tree.
+
+    /// EXP targets 0x25 and 0x26 — `param5` / `param6`.
+    ///
+    /// Pre-fix the parser matched only targets 0x20..=0x24, so the whole
+    /// vertex shader was refused with
+    /// `unknown exp target: 0x26 at addr 0x00000008 (en=0xf done=0 compr=0 vm=0)`
+    /// — six of thirteen "guest shader analysis failed" refusals in one
+    /// measured run, from just this gap.
+    ///
+    /// ISA fact (AMD RDNA 2 ISA reference, doc 70648, EXP target encoding):
+    /// 0..7 = MRT0-7, 8 = Z, 9 = NULL, 12..15 = POS0-3, 20 = PRIM, and
+    /// **32..63 = PARAM0..PARAM31**. 0x25/0x26 are 37/38, i.e. PARAM5/PARAM6:
+    /// ordinary vertex parameter exports with the same four-vsrc operand
+    /// shape as param0..4.
+    #[test]
+    fn exp_param5_and_param6_decode_and_recompile() {
+        // exp pos0 v0..v3 done; exp param5 v0..v3; exp param6 v0..v3; endpgm.
+        // EXP word0 = 0x3e << 26 | vm << 12 | done << 11 | compr << 10
+        //             | target << 4 | en.
+        let code = parse(
+            &[
+                0xF800_08CF,
+                0x0302_0100, // exp pos0 v[0:3] done
+                0xF800_025F,
+                0x0302_0100, // exp param5 v[0:3]  (target 0x25, en=0xf)
+                0xF800_026F,
+                0x0302_0100, // exp param6 v[0:3]  (target 0x26, en=0xf)
+                S_ENDPGM,
+            ],
+            ShaderType::Vertex,
+        );
+
+        let params: Vec<(F, u32)> = code
+            .get_instructions()
+            .iter()
+            .filter(|i| i.type_ == T::Exp)
+            .map(|i| (i.format, i.export_enable))
+            .collect();
+        assert_eq!(
+            params,
+            vec![
+                (F::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done, 0xf),
+                (F::Param5Vsrc0Vsrc1Vsrc2Vsrc3, 0xf),
+                (F::Param6Vsrc0Vsrc1Vsrc2Vsrc3, 0xf),
+            ],
+        );
+
+        // `export_count` deliberately under-reads the body (1), the way the
+        // measured `spi_vs_out_config` does: the declarations must follow the
+        // body or assembly dies on an undefined %param6.
+        let input_info = ShaderVertexInputInfo {
+            export_count: 1,
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, Some(&input_info), None, None)
+            .expect("param5/param6 exports must recompile");
+        for slot in 0..=6 {
+            assert!(
+                source.contains(&format!(
+                    "%param{slot} = OpVariable %_ptr_Output_v4float Output"
+                )),
+                "param{slot} must be declared:\n{source}"
+            );
+            assert!(
+                source.contains(&format!("OpDecorate %param{slot} Location {slot}")),
+                "param{slot} needs its Location:\n{source}"
+            );
+        }
+        assert!(source.contains("OpStore %param5"), "{source}");
+        assert!(source.contains("OpStore %param6"), "{source}");
+
+        let words = shader_recompile_vs(&code, &input_info).expect("assemble param5/param6 VS");
+        naga_parse_and_validate(&words, "exp param5/param6");
+    }
+
+    /// A partial-mask high param export (`exp param5 ... en=0x7`, the measured
+    /// three-channel form) rides the same path: the disabled channel is
+    /// written as 0.0, matching the param0..4 behaviour.
+    #[test]
+    fn exp_param5_partial_channel_mask_decodes() {
+        let code = parse(
+            &[
+                0xF800_08CF,
+                0x0302_0100, // exp pos0 v[0:3] done
+                0xF800_0257,
+                0x0302_0100, // exp param5 v[0:2] (en=0x7)
+                S_ENDPGM,
+            ],
+            ShaderType::Vertex,
+        );
+        let inst = code
+            .get_instructions()
+            .iter()
+            .find(|i| i.format == F::Param5Vsrc0Vsrc1Vsrc2Vsrc3)
+            .expect("param5 with a partial mask must decode");
+        assert_eq!(inst.export_enable, 0x7);
+
+        let input_info = ShaderVertexInputInfo {
+            export_count: 1,
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, Some(&input_info), None, None)
+            .expect("partial-mask param5 must recompile");
+        assert!(
+            source.contains("%float_0_000000"),
+            "the disabled channel must be a defined zero:\n{source}"
+        );
+        let words = shader_recompile_vs(&code, &input_info).expect("assemble partial param5");
+        naga_parse_and_validate(&words, "exp param5 en=0x7");
+    }
+
+    /// The parameter range ends at PARAM31 (target 0x3f). Target 0x40 does not
+    /// exist — the EXP target field is 6 bits — but the arms either side of the
+    /// range must behave: 0x3f decodes, and a target below 0x20 that no other
+    /// arm claims still refuses by name rather than being folded into param0.
+    #[test]
+    fn exp_param_range_ends_at_param31_and_refuses_outside_it() {
+        let code = parse(
+            &[
+                0xF800_08CF,
+                0x0302_0100, // exp pos0 v[0:3] done
+                0xF800_03FF,
+                0x0302_0100, // exp param31 v[0:3] (target 0x3f, en=0xf)
+                S_ENDPGM,
+            ],
+            ShaderType::Vertex,
+        );
+        assert!(
+            code.get_instructions()
+                .iter()
+                .any(|i| i.format == F::Param31Vsrc0Vsrc1Vsrc2Vsrc3),
+            "target 0x3f is PARAM31"
+        );
+
+        // Target 0x1f: below the parameter range and claimed by no other arm.
+        let mut bad = ShaderCode::new();
+        bad.set_type(ShaderType::Vertex);
+        let err = crate::shader::parse::shader_parse(
+            0,
+            &[0xF800_01FF, 0x0302_0100, S_ENDPGM],
+            &mut bad,
+            true,
+        )
+        .expect_err("target 0x1f must not be accepted as a param export");
+        assert!(
+            format!("{err}").contains("unknown exp target: 0x1f"),
+            "the refusal must name the target; got: {err}"
+        );
+    }
+
+    /// One MTBUF word, built from ISA fields.
+    ///
+    /// GFX10/RDNA2 layout (AMD RDNA 2 ISA reference, doc 70648): encoding
+    /// `0b111010` at `[31:26]`, `FORMAT[25:19]` (one **unified** 7-bit field —
+    /// GCN's split `DATA_FORMAT[22:19]` + `NUM_FORMAT[25:23]` is gone),
+    /// `OP[18:16]`, DLC`[15]`, `IDXEN[13]`, `OFFEN[12]`, `OFFSET[11:0]`.
+    fn mtbuf_word0(unified_format: u32, op: u32, idxen: u32, offen: u32, offset: u32) -> u32 {
+        (0x3a << 26)
+            | ((unified_format & 0x7f) << 19)
+            | ((op & 0x7) << 16)
+            | (idxen << 13)
+            | (offen << 12)
+            | (offset & 0xfff)
+    }
+
+    /// One MTBUF second word: `SOFFSET[31:24]`, `TFE[23]`, `SLC[22]`,
+    /// OP{3}`[21]`, `SRSRC[20:16]` (the T#/V# start register / 4),
+    /// `VDATA[15:8]`, `VADDR[7:0]`.
+    fn mtbuf_word1(soffset: u32, srsrc: u32, vdata: u32, vaddr: u32) -> u32 {
+        (soffset << 24) | ((srsrc & 0x1f) << 16) | ((vdata & 0xff) << 8) | (vaddr & 0xff)
+    }
+
+    /// Pixel-shader input info with one storage buffer bound, so the
+    /// `tbuffer_*` bodies (which index `%buf`) are reachable.
+    fn ps_info_with_one_buffer() -> ShaderPixelInputInfo {
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 48;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info
+    }
+
+    /// The GFX10 MTBUF element format is ONE 7-bit unified field, not GCN's
+    /// split `dfmt`/`nfmt`.
+    ///
+    /// Pre-fix, reading the split fields produced
+    /// `unknown format: dfmt = 6, nfmt = 1 at addr 0x00000000` on four pixel
+    /// shaders and `dfmt = 13, nfmt = 4` on one vertex shader — five of
+    /// thirteen refusals in one measured Blasphemous II run.
+    ///
+    /// The two numbers are the same bits read two ways: `6 | (1 << 4)` = 22 and
+    /// `13 | (4 << 4)` = 77. Unified 22 is `32_FLOAT` and 77 is
+    /// `32_32_32_32_FLOAT` (RDNA2 ISA table 47, already transcribed here as
+    /// [`crate::shader::spirv::gfx10_unified_to_dfmt_nfmt`]) — which are
+    /// exactly the formats their opcodes require. Two independently encoded
+    /// fields agreeing on the channel count, in both samples, is what
+    /// establishes the reading.
+    #[test]
+    fn mtbuf_gfx10_format_is_one_unified_field_not_split_dfmt_nfmt() {
+        // op 0 = tbuffer_load_format_x, unified 22 = 32_FLOAT (1 channel).
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                mtbuf_word0(22, 0, 1, 0, 0),
+                mtbuf_word1(0x80, 1, 6, 2),
+                0xBF80_0000, // s_nop x2: Recompile_SEndpgm_Empty needs index >= 2
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("unified format 22 is 32_FLOAT and must parse");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::TBufferLoadFormatX);
+        assert_eq!(inst.format, F::Vdata1VaddrSvSoffsIdxenFloat1);
+        assert_eq!(inst.dst.size, 1);
+
+        let input_info = ps_info_with_one_buffer();
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile unified-format tbuffer_load_format_x");
+        assert!(
+            source.contains("%tbuffer_load_format_x"),
+            "the typed load must be emitted:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble unified-format tbuffer_load_format_x");
+
+        // op 3 = tbuffer_load_format_xyzw, unified 77 = 32_32_32_32_FLOAT
+        // (4 channels). The pair below is the whole argument: the opcode's
+        // channel count and the format's agree only under the unified reading.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                mtbuf_word0(77, 3, 1, 0, 0),
+                mtbuf_word1(0x80, 1, 8, 4),
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("unified format 77 is 32_32_32_32_FLOAT and must parse");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::TBufferLoadFormatXyzw);
+        assert_eq!(inst.format, F::Vdata4VaddrSvSoffsIdxenFloat4);
+        assert_eq!(inst.dst.size, 4);
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile unified-format tbuffer_load_format_xyzw");
+        assert!(source.contains("%tbuffer_load_format_xyzw"), "{source}");
+        let _ = spirv_run(&source).expect("assemble unified-format tbuffer_load_format_xyzw");
+    }
+
+    /// The two readings are gated by generation, and the SAME word decodes
+    /// differently under each — which is the precise statement of the fix.
+    ///
+    /// The runtime tries next-gen first and falls back to legacy
+    /// (`raeen_gpu::shader_fetch::attempt_generations`), so a stream that
+    /// genuinely spells a legacy `dfmt`/`nfmt` pair still decodes through the
+    /// second attempt. That is why gating rather than replacing is safe.
+    #[test]
+    fn mtbuf_legacy_split_format_still_decodes_on_the_legacy_path() {
+        let parse_gen = |words: &[u32], next_gen: bool| {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Vertex);
+            crate::shader::parse::shader_parse(0, words, &mut code, next_gen).map(|_| code)
+        };
+
+        // Bits spelling legacy dfmt 14 / nfmt 7 (`32_32_32_32_FLOAT` on GCN):
+        // FORMAT[22:19] = 14, FORMAT[25:23] = 7, i.e. unified 14 | (7 << 4) =
+        // 126 — reserved in RDNA2 table 47.
+        let legacy = [
+            (0x3a << 26) | (14 << 19) | (7 << 23) | (3 << 16) | (1 << 13),
+            mtbuf_word1(0x80, 1, 4, 0),
+            S_ENDPGM,
+        ];
+        let code = parse_gen(&legacy, false).expect("the legacy split reading still applies");
+        assert_eq!(code.get_instructions()[0].type_, T::TBufferLoadFormatXyzw);
+
+        let err = parse_gen(&legacy, true)
+            .expect_err("unified 126 is reserved and must not be guessed at");
+        assert!(
+            format!("{err}").contains("unknown mtbuf unified format: 126"),
+            "the refusal must name the unified field that actually exists; got: {err}"
+        );
+
+        // And the converse: a real RDNA2 word (unified 77) is nonsense under
+        // the legacy split, where it reads as dfmt 13 / nfmt 4.
+        let next = [
+            mtbuf_word0(77, 3, 1, 0, 0),
+            mtbuf_word1(0x80, 1, 4, 0),
+            S_ENDPGM,
+        ];
+        parse_gen(&next, true).expect("unified 77 decodes on the next-gen path");
+        let err = parse_gen(&next, false).expect_err("the legacy split cannot serve unified 77");
+        assert!(
+            format!("{err}").contains("dfmt = 13, nfmt = 4"),
+            "the legacy refusal keeps naming legacy fields; got: {err}"
+        );
+    }
+
+    /// A unified FORMAT the RDNA2 table reserves is refused by name, not
+    /// silently mapped to something plausible. 30 is one such hole (the table
+    /// jumps 29 -> 36).
+    #[test]
+    fn mtbuf_reserved_unified_format_refuses_by_name() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let err = crate::shader::parse::shader_parse(
+            0,
+            &[
+                mtbuf_word0(30, 3, 1, 0, 0),
+                mtbuf_word1(0x80, 1, 4, 0),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect_err("a reserved unified format must refuse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown mtbuf unified format: 30") && msg.contains("table 47"),
+            "the refusal must name the encoding and where it is reserved; got: {msg}"
+        );
+    }
+
+    /// GFX10 moves MTBUF `OP{3}` to word1 bit 21, so the 3-bit `[18:16]` mask
+    /// cannot distinguish `tbuffer_load_format_x` from the D16 sibling that
+    /// moves half the bytes per channel. Decoding one as the other would read
+    /// the wrong element stride and return wrong vertex data silently, so it is
+    /// a named refusal. Measured Blasphemous II MTBUFs all have this bit clear.
+    #[test]
+    fn mtbuf_d16_opcode_high_bit_refuses_rather_than_aliasing_the_full_width_form() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let err = crate::shader::parse::shader_parse(
+            0,
+            &[
+                mtbuf_word0(22, 0, 1, 0, 0),
+                mtbuf_word1(0x80, 1, 6, 2) | (1 << 21),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect_err("op{3} set is a d16 opcode and must not alias the full-width form");
+        assert!(
+            format!("{err}").contains("d16 opcode (op{3} set)"),
+            "the refusal must name the family; got: {err}"
+        );
+    }
+
+    /// MTBUF's 12-bit immediate `OFFSET` is a plain byte addend of the same
+    /// address term as SOFFSET, so it folds into the constant soffset operand
+    /// the recompile bodies already route into `%temp_int_2`.
+    ///
+    /// Pre-fix this was `not implemented mtbuf feature: offset != 0 at addr
+    /// 0x00000000` — one Blasphemous II vertex shader per run. Behind it sat a
+    /// second gap: the opcode is 1, `tbuffer_load_format_xy`, which upstream
+    /// leaves `KYTY_NI`. Both are closed here, so this test also covers the
+    /// two-channel typed fetch end to end.
+    #[test]
+    fn mtbuf_immediate_offset_folds_and_format_xy_recompiles() {
+        // op 1 = tbuffer_load_format_xy, unified 64 = 32_32_FLOAT (2 channels),
+        // immediate offset 4, idxen, soffset = inline constant 0.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                mtbuf_word0(64, 1, 1, 0, 4),
+                mtbuf_word1(0x80, 1, 6, 4),
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("an immediate offset must fold, not refuse the shader");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::TBufferLoadFormatXy);
+        assert_eq!(inst.format, F::Vdata2VaddrSvSoffsIdxenFloat2);
+        assert_eq!(inst.dst.size, 2, "two channels, two vdata registers");
+        assert_eq!(
+            inst.src[2].type_,
+            crate::shader::types::ShaderOperandType::IntegerInlineConstant,
+        );
+        assert_eq!(
+            inst.src[2].constant.u, 4,
+            "soffset 0 + immediate 4 is a byte offset of 4"
+        );
+
+        let input_info = ps_info_with_one_buffer();
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile tbuffer_load_format_xy");
+        assert!(
+            source.contains("%tbuffer_load_format_xy = OpFunction")
+                && source.contains("%buffer_load_float2 = OpFunction"),
+            "both new helpers must be emitted:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %temp_int_2 %int_4"),
+            "the folded byte offset must reach the address slot:\n{source}"
+        );
+        assert!(
+            source.contains("OpStore %temp_int_5 %int_95"),
+            "packed 95 = dfmt 11, nfmt 7 is what the helper's guard admits:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble tbuffer_load_format_xy");
+    }
+
+    /// A register SOFFSET plus a non-zero immediate needs a runtime add that no
+    /// `tbuffer_*` body models, so it refuses by name rather than dropping one
+    /// of the two address terms. Same rule `shader_parse_mubuf` already applies.
+    #[test]
+    fn mtbuf_immediate_offset_with_register_soffset_refuses_by_name() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Vertex);
+        let err = crate::shader::parse::shader_parse(
+            0,
+            &[
+                mtbuf_word0(64, 1, 1, 0, 4),
+                // soffset = s3 (a register, not an inline constant).
+                mtbuf_word1(3, 1, 6, 4),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect_err("an unmodelled address term must refuse, not be dropped");
+        assert!(
+            format!("{err}").contains("offset != 0 with register soffset"),
+            "the refusal must say which combination; got: {err}"
+        );
+    }
+
+    /// `image_sample` with DMASK 0xb — components X, Y and W.
+    ///
+    /// Pre-fix: `unknown mimg format for opcode: 0x20 at addr 0x00000000,
+    /// dmask: 0xb`, which refused one whole Blasphemous II pixel shader.
+    ///
+    /// ISA fact (doc 70648, MIMG DMASK): the mask names which texel components
+    /// are RETURNED, and they are packed into consecutive VGPRs in ascending
+    /// component order. A gapped mask is therefore an ordinary
+    /// destination-component subset — the already-supported 0x5 (XZ) and 0x9
+    /// (XW) masks are the two-channel precedent, and 0xb is their three-channel
+    /// sibling: three vdata registers holding (R, G, A).
+    #[test]
+    fn image_sample_dmask_b_returns_x_y_and_w() {
+        // MIMG word0: encoding 0b111100 at [31:26], OP[24:18] = 0x20
+        // (image_sample), DMASK[11:8] = 0xb, DIM[5:3] = 1 (2D).
+        let w0 = (0x3c << 26) | (0x20 << 18) | (0xb << 8) | (1 << 3);
+        // word1: SSAMP[25:21] = 2, SRSRC[20:16] = 4, VDATA[15:8] = v8,
+        // VADDR[7:0] = v2.
+        let w1 = (2 << 21) | (4 << 16) | (8 << 8) | 2;
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[w0, w1, 0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("dmask 0xb must decode, not refuse the shader");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSample);
+        assert_eq!(inst.format, F::Vdata3Vaddr3StSsDmaskB);
+        assert_eq!(inst.dst.size, 3, "three enabled channels, three vdata regs");
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 16;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 1;
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile image_sample dmask 0xb");
+        // The three reads are components 0, 1 and 3 — W, not Z.
+        for chan in [0, 1, 3] {
+            assert!(
+                source.contains(&format!("%temp_v4float %uint_{chan}")),
+                "component {chan} must be read:\n{source}"
+            );
+        }
+        assert!(
+            !source.contains("%temp_v4float %uint_2"),
+            "component 2 (Z) is masked off and must not be read:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble image_sample dmask 0xb");
+        naga_parse_and_validate(&words, "image_sample dmask 0xb");
+    }
+
+    /// `image_sample_lz` with DMASK 0x8 — component W only, at LOD zero.
+    ///
+    /// This gap was *hidden* behind the MTBUF immediate-offset refusal: the one
+    /// vertex shader that contains it never reached this instruction, so the
+    /// live log never named it. Closing the earlier gap exposed
+    /// `unknown mimg format for opcode: 0x27 at addr 0x00000998, dmask: 0x8`.
+    ///
+    /// The plain `image_sample` (0x20) path has served dmask 0x8 since the
+    /// ASTRO.BOT batch and `image_sample_c_lz` (0x2f) serves it too; DMASK is
+    /// orthogonal to the LOD mode, so 0x27 takes the same single-channel body
+    /// with component index 3.
+    #[test]
+    fn image_sample_lz_dmask8_returns_w_at_lod_zero() {
+        // MIMG word0: OP[24:18] = 0x27 (image_sample_lz), DMASK[11:8] = 0x8,
+        // DIM[5:3] = 1 (2D).
+        let w0 = (0x3c << 26) | (0x27 << 18) | (0x8 << 8) | (1 << 3);
+        let w1 = (2 << 21) | (4 << 16) | (8 << 8) | 2;
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[w0, w1, 0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("image_sample_lz dmask 0x8 must decode");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSampleLz);
+        assert_eq!(inst.format, F::Vdata1Vaddr3StSsDmask8);
+        assert_eq!(inst.dst.size, 1);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 16;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 1;
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile image_sample_lz dmask 0x8");
+        assert!(
+            source.contains("Lod %float_0_000000"),
+            "LZ means an explicit LOD of zero:\n{source}"
+        );
+        assert!(
+            source.contains("%temp_v4float %uint_3"),
+            "component 3 (W) is the one enabled channel:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble image_sample_lz dmask 0x8");
+        naga_parse_and_validate(&words, "image_sample_lz dmask 0x8");
     }
 }

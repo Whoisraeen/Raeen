@@ -275,6 +275,9 @@ pub enum ShaderInstructionType {
     SXnorB64,
     SXorB64,
     TBufferLoadFormatX,
+    /// Beyond Kyty (`KYTY_NI` upstream): MTBUF opcode 1, the two-channel typed
+    /// fetch. Measured on Blasphemous II vertex shaders.
+    TBufferLoadFormatXy,
     TBufferLoadFormatXyzw,
     VAddF32,
     /// RDNA2 (`next_gen`) VOP3 0x36d: `vdst = vsrc0 + vsrc1 + vsrc2` (32-bit,
@@ -585,6 +588,9 @@ pub mod shader_instruction_format {
     pub const OFFEN: u64 = 28;
     pub const FLOAT1: u64 = 29;
     pub const FLOAT4: u64 = 30;
+    /// Beyond Kyty: two-channel typed-buffer element (`format:float2`), the
+    /// `tbuffer_*_format_xy` sibling of [`FLOAT1`] / [`FLOAT4`].
+    pub const FLOAT2: u64 = 87;
     pub const POS0: u64 = 31;
     pub const DONE: u64 = 32;
     pub const PARAM0: u64 = 33;
@@ -625,6 +631,45 @@ pub mod shader_instruction_format {
     /// family, where the dmask names the ONE channel gathered rather than a
     /// destination-component subset (see [`Format::Vdata4Vaddr3StSsDmask4`]).
     pub const DMASK_4: u64 = 58;
+    /// Beyond Kyty: three-channel XYW image mask — the non-contiguous sibling
+    /// of [`DMASK_7`] (XYZ). See [`Format::Vdata3Vaddr3StSsDmaskB`].
+    pub const DMASK_B: u64 = 86;
+
+    // Beyond Kyty: EXP targets 0x25..=0x3f (`PARAM5`..`PARAM31`). Upstream
+    // stops at param4 and EXITs on the rest, which refuses the whole vertex
+    // shader. Per the AMD RDNA 2 ISA reference (doc 70648) the EXP target
+    // space is 0..7 MRT0-7, 8 Z, 9 NULL, 12..15 POS0-3, 20 PRIM and
+    // **32..63 PARAM0..PARAM31** — so these are ordinary vertex parameter
+    // exports, nothing exotic. Token values continue past DMASK_4 rather
+    // than sitting next to PARAM0..4, so nothing already packed into a
+    // [`Format`] discriminant changes value.
+    pub const PARAM5: u64 = 59;
+    pub const PARAM6: u64 = 60;
+    pub const PARAM7: u64 = 61;
+    pub const PARAM8: u64 = 62;
+    pub const PARAM9: u64 = 63;
+    pub const PARAM10: u64 = 64;
+    pub const PARAM11: u64 = 65;
+    pub const PARAM12: u64 = 66;
+    pub const PARAM13: u64 = 67;
+    pub const PARAM14: u64 = 68;
+    pub const PARAM15: u64 = 69;
+    pub const PARAM16: u64 = 70;
+    pub const PARAM17: u64 = 71;
+    pub const PARAM18: u64 = 72;
+    pub const PARAM19: u64 = 73;
+    pub const PARAM20: u64 = 74;
+    pub const PARAM21: u64 = 75;
+    pub const PARAM22: u64 = 76;
+    pub const PARAM23: u64 = 77;
+    pub const PARAM24: u64 = 78;
+    pub const PARAM25: u64 = 79;
+    pub const PARAM26: u64 = 80;
+    pub const PARAM27: u64 = 81;
+    pub const PARAM28: u64 = 82;
+    pub const PARAM29: u64 = 83;
+    pub const PARAM30: u64 = 84;
+    pub const PARAM31: u64 = 85;
 
     /// Kyty: Shader.h `FormatDefine` (L293). Packs FormatByte tokens into a
     /// u64, first token in the highest-used byte.
@@ -656,6 +701,36 @@ pub mod shader_instruction_format {
         Param2Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM2, S0, S1, S2, S3]),
         Param3Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM3, S0, S1, S2, S3]),
         Param4Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM4, S0, S1, S2, S3]),
+        // Beyond Kyty: EXP targets 0x25..=0x3f. Identical operand shape to
+        // param0..4 — four vsrc channels selected by the `en` mask; only the
+        // destination parameter slot differs. See [`PARAM5`].
+        Param5Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM5, S0, S1, S2, S3]),
+        Param6Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM6, S0, S1, S2, S3]),
+        Param7Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM7, S0, S1, S2, S3]),
+        Param8Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM8, S0, S1, S2, S3]),
+        Param9Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM9, S0, S1, S2, S3]),
+        Param10Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM10, S0, S1, S2, S3]),
+        Param11Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM11, S0, S1, S2, S3]),
+        Param12Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM12, S0, S1, S2, S3]),
+        Param13Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM13, S0, S1, S2, S3]),
+        Param14Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM14, S0, S1, S2, S3]),
+        Param15Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM15, S0, S1, S2, S3]),
+        Param16Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM16, S0, S1, S2, S3]),
+        Param17Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM17, S0, S1, S2, S3]),
+        Param18Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM18, S0, S1, S2, S3]),
+        Param19Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM19, S0, S1, S2, S3]),
+        Param20Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM20, S0, S1, S2, S3]),
+        Param21Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM21, S0, S1, S2, S3]),
+        Param22Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM22, S0, S1, S2, S3]),
+        Param23Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM23, S0, S1, S2, S3]),
+        Param24Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM24, S0, S1, S2, S3]),
+        Param25Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM25, S0, S1, S2, S3]),
+        Param26Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM26, S0, S1, S2, S3]),
+        Param27Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM27, S0, S1, S2, S3]),
+        Param28Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM28, S0, S1, S2, S3]),
+        Param29Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM29, S0, S1, S2, S3]),
+        Param30Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM30, S0, S1, S2, S3]),
+        Param31Vsrc0Vsrc1Vsrc2Vsrc3 = format_define(&[PARAM31, S0, S1, S2, S3]),
         Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done = format_define(&[POS0, S0, S1, S2, S3, DONE]),
         // Beyond Kyty: auxiliary position exports (exp targets 0x0d-0x0f).
         // These carry clip/cull distances or point size as configured by
@@ -803,6 +878,15 @@ pub mod shader_instruction_format {
         Vdata2Vaddr2SvSoffsOffenIdxen = format_define(&[DA2, S0A2, S1A4, S2, OFFEN, IDXEN]),
         Vdata3Vaddr3StDmask7 = format_define(&[DA3, S0A3, S1A8, DMASK_7]),
         Vdata3Vaddr3StSsDmask7 = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_7]),
+        /// Beyond Kyty: three-channel sample with a **non-contiguous** mask —
+        /// dmask 0xb selects X, Y and W. Per the RDNA 2 ISA (doc 70648) DMASK
+        /// names which texel components are returned and they are packed into
+        /// consecutive VGPRs in ascending component order, so this is three
+        /// vdata registers holding (R, G, A) — the same shape as
+        /// [`Format::Vdata3Vaddr3StSsDmask7`], only the third channel differs.
+        /// The dmask 0x5 / 0x9 rows are the established two-channel precedent
+        /// for a gapped mask.
+        Vdata3Vaddr3StSsDmaskB = format_define(&[DA3, S0A3, S1A8, S2A4, DMASK_B]),
         Vdata3Vaddr4StSsDmask7 = format_define(&[DA3, S0A4, S1A8, S2A4, DMASK_7]),
         Vdata3VaddrSvSoffsIdxen = format_define(&[DA3, S0, S1A4, S2, IDXEN]),
         // Beyond Kyty: the three-dword MUBUF addressing variants completing
@@ -834,6 +918,11 @@ pub mod shader_instruction_format {
         Vdata4Vaddr4StDmaskF = format_define(&[DA4, S0A4, S1A8, DMASK_F]),
         Vdata4VaddrSvSoffsIdxen = format_define(&[DA4, S0, S1A4, S2, IDXEN]),
         Vdata4VaddrSvSoffsIdxenFloat4 = format_define(&[DA4, S0, S1A4, S2, IDXEN, FLOAT4]),
+        // Beyond Kyty: the two-channel typed fetch's two addressing modes,
+        // exactly mirroring the Float4 pair above.
+        Vdata2VaddrSvSoffsIdxenFloat2 = format_define(&[DA2, S0, S1A4, S2, IDXEN, FLOAT2]),
+        Vdata2Vaddr2SvSoffsOffenIdxenFloat2 =
+            format_define(&[DA2, S0A2, S1A4, S2, OFFEN, IDXEN, FLOAT2]),
         Vdata4SvSoffs = format_define(&[DA4, S1A4, S2]),
         Vdata4VaddrSvSoffsOffen = format_define(&[DA4, S0, S1A4, S2, OFFEN]),
         VdstGds = format_define(&[D, GDS]),
@@ -872,6 +961,104 @@ pub mod shader_instruction_format {
         VdstVsrc0Vsrc1Smask2 = format_define(&[D, S0, S1, S2A2]),
         VdstVsrc0Vsrc1Vsrc2 = format_define(&[D, S0, S1, S2]),
         VdstVsrcAttrChan = format_define(&[D, S0, ATTR]),
+    }
+
+    /// The [`Format`] of `exp paramN`, for `n` in `0..32`.
+    ///
+    /// One table, so the parser (which has the EXP target), the SPIR-V
+    /// declaration pass (which needs the highest param a body writes) and the
+    /// recompiler dispatch rows can never disagree about which slot a format
+    /// means. `None` for `n >= 32`: the RDNA 2 EXP target space (doc 70648)
+    /// ends the parameter range at PARAM31 (target 63), and the 6-bit target
+    /// field cannot encode more.
+    #[must_use]
+    pub const fn exp_param_format(n: u32) -> Option<Format> {
+        Some(match n {
+            0 => Format::Param0Vsrc0Vsrc1Vsrc2Vsrc3,
+            1 => Format::Param1Vsrc0Vsrc1Vsrc2Vsrc3,
+            2 => Format::Param2Vsrc0Vsrc1Vsrc2Vsrc3,
+            3 => Format::Param3Vsrc0Vsrc1Vsrc2Vsrc3,
+            4 => Format::Param4Vsrc0Vsrc1Vsrc2Vsrc3,
+            5 => Format::Param5Vsrc0Vsrc1Vsrc2Vsrc3,
+            6 => Format::Param6Vsrc0Vsrc1Vsrc2Vsrc3,
+            7 => Format::Param7Vsrc0Vsrc1Vsrc2Vsrc3,
+            8 => Format::Param8Vsrc0Vsrc1Vsrc2Vsrc3,
+            9 => Format::Param9Vsrc0Vsrc1Vsrc2Vsrc3,
+            10 => Format::Param10Vsrc0Vsrc1Vsrc2Vsrc3,
+            11 => Format::Param11Vsrc0Vsrc1Vsrc2Vsrc3,
+            12 => Format::Param12Vsrc0Vsrc1Vsrc2Vsrc3,
+            13 => Format::Param13Vsrc0Vsrc1Vsrc2Vsrc3,
+            14 => Format::Param14Vsrc0Vsrc1Vsrc2Vsrc3,
+            15 => Format::Param15Vsrc0Vsrc1Vsrc2Vsrc3,
+            16 => Format::Param16Vsrc0Vsrc1Vsrc2Vsrc3,
+            17 => Format::Param17Vsrc0Vsrc1Vsrc2Vsrc3,
+            18 => Format::Param18Vsrc0Vsrc1Vsrc2Vsrc3,
+            19 => Format::Param19Vsrc0Vsrc1Vsrc2Vsrc3,
+            20 => Format::Param20Vsrc0Vsrc1Vsrc2Vsrc3,
+            21 => Format::Param21Vsrc0Vsrc1Vsrc2Vsrc3,
+            22 => Format::Param22Vsrc0Vsrc1Vsrc2Vsrc3,
+            23 => Format::Param23Vsrc0Vsrc1Vsrc2Vsrc3,
+            24 => Format::Param24Vsrc0Vsrc1Vsrc2Vsrc3,
+            25 => Format::Param25Vsrc0Vsrc1Vsrc2Vsrc3,
+            26 => Format::Param26Vsrc0Vsrc1Vsrc2Vsrc3,
+            27 => Format::Param27Vsrc0Vsrc1Vsrc2Vsrc3,
+            28 => Format::Param28Vsrc0Vsrc1Vsrc2Vsrc3,
+            29 => Format::Param29Vsrc0Vsrc1Vsrc2Vsrc3,
+            30 => Format::Param30Vsrc0Vsrc1Vsrc2Vsrc3,
+            31 => Format::Param31Vsrc0Vsrc1Vsrc2Vsrc3,
+            _ => return None,
+        })
+    }
+
+    /// The parameter slot a `Param*Vsrc0Vsrc1Vsrc2Vsrc3` format names, or
+    /// `None` for any other format. The exact inverse of
+    /// [`exp_param_format`], derived from it so the two cannot drift.
+    #[must_use]
+    pub fn exp_param_index(format: Format) -> Option<u32> {
+        (0..32).find(|&n| exp_param_format(n) == Some(format))
+    }
+
+    /// The SPIR-V output variable name for parameter slot `n`, e.g. `param6`.
+    ///
+    /// The recompiler dispatch table needs these as `&'static str`, so the
+    /// full set is spelled once here rather than formatted at run time.
+    #[must_use]
+    pub const fn exp_param_name(n: u32) -> Option<&'static str> {
+        Some(match n {
+            0 => "param0",
+            1 => "param1",
+            2 => "param2",
+            3 => "param3",
+            4 => "param4",
+            5 => "param5",
+            6 => "param6",
+            7 => "param7",
+            8 => "param8",
+            9 => "param9",
+            10 => "param10",
+            11 => "param11",
+            12 => "param12",
+            13 => "param13",
+            14 => "param14",
+            15 => "param15",
+            16 => "param16",
+            17 => "param17",
+            18 => "param18",
+            19 => "param19",
+            20 => "param20",
+            21 => "param21",
+            22 => "param22",
+            23 => "param23",
+            24 => "param24",
+            25 => "param25",
+            26 => "param26",
+            27 => "param27",
+            28 => "param28",
+            29 => "param29",
+            30 => "param30",
+            31 => "param31",
+            _ => return None,
+        })
     }
 }
 
@@ -1357,6 +1544,7 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
             sif::IDXEN => "idxen".to_string(),
             sif::OFFEN => "offen".to_string(),
             sif::FLOAT1 => "format:float1".to_string(),
+            sif::FLOAT2 => "format:float2".to_string(),
             sif::FLOAT4 => "format:float4".to_string(),
             sif::POS0 => "pos0".to_string(),
             sif::DONE => "done".to_string(),
@@ -1365,6 +1553,9 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
             sif::PARAM2 => "param2".to_string(),
             sif::PARAM3 => "param3".to_string(),
             sif::PARAM4 => "param4".to_string(),
+            // param5..param31 (beyond Kyty) share one arm: the token values
+            // are consecutive, so the slot is the offset from PARAM5.
+            sif::PARAM5..=sif::PARAM31 => format!("param{}", fu - sif::PARAM5 + 5),
             sif::MRT0 => "mrt_color0".to_string(),
             sif::PRIM => "prim".to_string(),
             sif::OFF => "off".to_string(),
@@ -1387,6 +1578,7 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
             sif::DMASK_7 => "dmask:0x7".to_string(),
             sif::DMASK_9 => "dmask:0x9".to_string(),
             sif::DMASK_4 => "dmask:0x4".to_string(),
+            sif::DMASK_B => "dmask:0xb".to_string(),
             sif::DMASK_C => "dmask:0xc".to_string(),
             sif::DMASK_F => "dmask:0xf".to_string(),
             sif::GDS => "gds".to_string(),
