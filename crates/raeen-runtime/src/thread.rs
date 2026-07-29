@@ -771,6 +771,32 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     format!("entry={entry:#x}"),
                 );
                 record_host_thread_handle(&process.kernel, handle);
+                // Publish this worker's real stack BEFORE any guest code runs.
+                //
+                // `OrbisKernel::guest_thread_stacks` documents itself as holding
+                // "the freshly allocated stack for every `scePthreadCreate`
+                // worker", and the exit path below removes `handle` from it — but
+                // nothing ever inserted it, so only the main thread was ever in
+                // the map. Two things depended on the missing entry:
+                //
+                //   * `scePthreadAttrGet` (FreeBSD's `pthread_attr_get_np`) is how
+                //     a title learns another thread's stack extent, and a managed
+                //     runtime's collector scans exactly `[stack_ptr, base + size)`.
+                //     With no entry there is no honest base to report.
+                //   * `raeen_hle::out_buffer`'s caller-local test fell back to its
+                //     64 KiB window-above-RSP heuristic on every worker instead of
+                //     the exact bounds it claims to use.
+                //
+                // `stack_size` here is the ALLOCATED span (the requested size plus
+                // `GUEST_PTHREAD_RUNTIME_HEADROOM`), which is the range that is
+                // really the thread's stack — the entry RSP is `stack_base +
+                // stack_size - 8`.
+                if let Some(top) = stack_base.checked_add(stack_size) {
+                    process
+                        .kernel
+                        .guest_thread_stacks
+                        .insert(handle, (stack_base, top));
+                }
                 #[cfg(windows)]
                 if host_thread_priority_enabled() {
                     use windows_sys::Win32::System::Threading::GetCurrentThread;

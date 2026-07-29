@@ -11,10 +11,37 @@
 
 use crate::{HleContext, HleRegistry};
 use raeen_kernel::PthreadAttr;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 const OK: u64 = 0;
 const EINVAL: u64 = 22;
+
+/// How many `scePthreadAttrGet` answers are logged at `info` before dropping to
+/// `debug`.
+///
+/// A collector queries every thread it registers, so this floods at `info` if
+/// unbounded; the first few are the ones that prove the reported stack is the
+/// stack the kernel actually mapped, and that is exactly what a single
+/// retail-title run needs to show without turning on `debug` for everything.
+/// Same shape as `crate::exception`'s delivery counter.
+const VERBOSE_ATTR_GETS: u64 = 6;
+static ATTR_GETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many `scePthreadAttrGet` calls found **no** registered stack for the
+/// thread they were asked about, and therefore could not report a real one.
+///
+/// Diagnostics: a non-zero value means some guest thread learned its stack
+/// extent from a configured default instead of the mapping, which is the defect
+/// [`hle_attr_get`] exists to remove. Surfaced so a crash report can say so
+/// rather than leaving it to a log grep.
+static ATTR_GETS_WITHOUT_A_STACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `scePthreadAttrGet` calls could not report the thread's real stack.
+#[must_use]
+pub fn attr_get_without_stack_count() -> u64 {
+    ATTR_GETS_WITHOUT_A_STACK.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Size of the opaque attribute object handed to the guest.
 const ATTR_OBJECT_SIZE: u64 = 0x40;
@@ -40,6 +67,7 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadAttrSetstack", hle_set_stack);
     registry.register("libkernel", "scePthreadAttrGetstack", hle_get_stack);
     registry.register("libkernel", "scePthreadAttrGetstackaddr", hle_get_stackaddr);
+    registry.register("libkernel", "scePthreadAttrGet", hle_attr_get);
     registry.register(
         "libkernel",
         "scePthreadAttrSetsolosched",
@@ -101,6 +129,15 @@ fn register_posix(registry: &HleRegistry) {
         "pthread_attr_setsolosched_np",
         hle_set_solo_sched,
     );
+    // `pthread_attr_get_np(pthread_t, pthread_attr_t *)` is the FreeBSD name for
+    // what `scePthreadAttrGet` does, and shadPS4 exports the same body under
+    // both `libScePosix` and `libkernel` (NID `Ucsu-OK+els`) as well as under
+    // the SCE spelling. Registered here so a title that reaches for the POSIX
+    // name gets the real live-thread answer instead of an unresolved NID —
+    // Blasphemous II imports only the SCE spelling, but this is the *other* way
+    // a guest can learn a thread's stack extent and it must not be a hole.
+    registry.register("libScePosix", "pthread_attr_get_np", hle_attr_get);
+    registry.register("libkernel", "pthread_attr_get_np", hle_attr_get);
 }
 
 /// Resolve the attr-state key for a guest `pthread_attr_t` address: the address
@@ -299,6 +336,119 @@ fn hle_get_stackaddr(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
+/// `scePthreadAttrGet(ScePthread thread, ScePthreadAttr *attr)`: fill `*attr`
+/// from the **live** thread named by `thread` — *not* from whatever the guest
+/// had configured on that attribute object.
+///
+/// This is FreeBSD's `pthread_attr_get_np` under an SCE name; shadPS4 maps the
+/// very NID this title imports (`x1X76arYMxU`) straight onto
+/// `posix_pthread_attr_get_np`, which copies the running thread's own
+/// `PthreadAttr` — stack base and size included — into the destination
+/// (`core/libraries/kernel/threads/pthread_attr.cpp`, GPL-2.0; behaviour
+/// studied, re-implemented in Rust).
+///
+/// # Why the previous `hle_ok_stub` was not a harmless stub
+///
+/// It returned `SCE_OK` and wrote **nothing**, so a caller that did the standard
+///
+/// ```c
+/// scePthreadAttrInit(&attr);
+/// scePthreadAttrGet(scePthreadSelf(), &attr);      /* reported success */
+/// scePthreadAttrGetstackaddr(&attr, &base);        /* -> 0, the DEFAULT */
+/// scePthreadAttrGetstacksize(&attr, &size);        /* -> 1 MiB, the DEFAULT */
+/// bounds->stack_top = (char *)base + size;         /* -> 0x100000, garbage */
+/// ```
+///
+/// walked away believing its own stack lived at a low address it never mapped.
+/// Measured on Blasphemous II (Unity/IL2CPP, PPSA13580), whose Boehm collector
+/// does exactly this: `Il2CppUserAssemblies.prx+0x2B8F10`
+/// (`GC_push_all_stacks`) loads `lo = p->stop_info.stack_ptr` from `[p+0x18]`
+/// and `hi = p->stack_end` from `[p+0x100]`, then either
+///
+/// * aborts at `+0x2B908E` with `"GC_push_all_stacks: sp not set!"` when the
+///   bound is zero, or
+/// * pushes the bogus range and faults reading it in the mark loop at
+///   `+0x2B24AB` (`mov r12,[rax+0x10]`) at a low address with no high dword.
+///
+/// Both were observed from the same title on consecutive runs; they are one
+/// cause with two shapes. The title imports `scePthreadAttrGet`,
+/// `scePthreadAttrGetstackaddr` and `scePthreadAttrGetstacksize` and no
+/// `Setstack*` form, so the configured base is *always* the default 0 and this
+/// call is the only place the real base can come from.
+///
+/// # What is reported, and what is not
+///
+/// Reported from live state: the thread's real mapped stack
+/// ([`raeen_kernel::OrbisKernel::guest_stack_of`] — `[base, top)`, so
+/// `base + size` is exactly the top of the stack the thread is running on), its
+/// scheduling priority, and its scheduling policy.
+///
+/// **Not** reported: `detach_state` and `guard_size`, which Raeen tracks in the
+/// runtime's own thread table rather than the kernel, so there is no live value
+/// to copy; those fields keep whatever the destination attr already held.
+///
+/// An unknown or already-reaped thread keeps the previous behaviour — `SCE_OK`
+/// with the attr untouched — rather than the ABI's `ESRCH`, because a collector
+/// that treats a non-zero return as fatal would abort on it. It is logged once
+/// per thread at `warn` instead of passing silently.
+fn hle_attr_get(ctx: &HleContext, args: &[u64]) -> u64 {
+    let thread = args.first().copied().unwrap_or(0);
+    let attr_addr = args.get(1).copied().unwrap_or(0);
+    if thread == 0 || attr_addr == 0 {
+        return EINVAL;
+    }
+    let stack = ctx.kernel.guest_stack_of(thread);
+    let priority = ctx.kernel.thread_priorities.get(&thread).map(|e| *e);
+    let policy = ctx.kernel.thread_sched_policies.get(&thread).map(|e| *e);
+    let result = with_attr(ctx, attr_addr, |a| {
+        if let Some((base, top)) = stack {
+            a.stack_address = base;
+            a.stack_size = top - base;
+        }
+        if let Some(priority) = priority {
+            a.sched_priority = priority;
+        }
+        if let Some(policy) = policy {
+            a.sched_policy = policy;
+        }
+    });
+    match stack {
+        Some((base, top)) => {
+            let seen = ATTR_GETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let size = top - base;
+            if seen < VERBOSE_ATTR_GETS {
+                // At `info` so ONE retail run shows, without enabling `debug`
+                // everywhere, that the reported bounds are the mapped ones and
+                // carry their high dword. `base + size` is the value a Boehm
+                // collector scans up to.
+                info!(
+                    thread,
+                    stack_base = format_args!("{base:#x}"),
+                    stack_size = format_args!("{size:#x}"),
+                    stack_top = format_args!("{top:#x}"),
+                    "scePthreadAttrGet: reporting the thread's real mapped stack"
+                );
+            } else {
+                debug!(
+                    "scePthreadAttrGet(thread={thread:#x}, attr={attr_addr:#x}) -> stack \
+                     [{base:#x}, {top:#x})"
+                );
+            }
+        }
+        None if result == OK => {
+            ATTR_GETS_WITHOUT_A_STACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "scePthreadAttrGet(thread={thread:#x}, attr={attr_addr:#x}): no stack is \
+                 registered for that guest thread, so the attr keeps its configured stack \
+                 base/size. A caller computing `base + size` as the thread's stack top will get a \
+                 bogus address"
+            );
+        }
+        None => {}
+    }
+    result
+}
+
 /// `scePthreadAttrSetsolosched(attr, int solo)` /
 /// `pthread_attr_setsolosched_np(attr, solo)`: the SCE-specific "solo
 /// scheduler" attr flag — the title asks that the thread be scheduled on its
@@ -411,6 +561,143 @@ mod tests {
         let registry = HleRegistry::new();
         assert!(registry.is_implemented("libkernel", "scePthreadAttrGetstack"));
         assert!(registry.is_implemented("libkernel", "scePthreadAttrGetstackaddr"));
+    }
+
+    /// **The Blasphemous II collector fault, as a round-trip assertion.**
+    ///
+    /// `scePthreadAttrGet` is how a title learns another thread's stack extent,
+    /// and a Boehm collector turns the answer into `base + size` — the top of
+    /// the range it scans. What the kernel MAPPED must therefore be exactly what
+    /// the guest reads back, at full 64-bit width, through both the two-field
+    /// and the single-field getter.
+    ///
+    /// The old registration was `hle_ok_stub`: success, nothing written, so the
+    /// getters returned the default base of **0** and the collector computed a
+    /// low garbage top. The `0xDEAD_0000` poison below is the *configured* base;
+    /// a fix that only zero-filled, or that kept round-tripping the configured
+    /// value, leaves it in place and fails here.
+    #[test]
+    fn attr_get_reports_the_real_mapped_stack_of_the_named_thread() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        // A full 64-bit guest stack: the arena base is above 2^32, so a
+        // truncating write anywhere on this path loses the high dword.
+        const BASE: u64 = 0x1000_4000_8A20;
+        const TOP: u64 = BASE + 0x12_0000;
+        kernel.guest_thread_stacks.insert(15, (BASE, TOP));
+        kernel.thread_priorities.insert(15, 256);
+        kernel.thread_sched_policies.insert(15, 2);
+
+        let attr = 0x300;
+        assert_eq!(hle_attr_init(&ctx, &[attr]), OK);
+        // Poison with a *configured* base/size, so "kept what the guest set"
+        // cannot pass as "reported what the kernel mapped".
+        assert_eq!(hle_set_stack(&ctx, &[attr, 0xDEAD_0000, 0x1000]), OK);
+
+        assert_eq!(hle_attr_get(&ctx, &[15, attr]), OK);
+
+        let addr_out = 0x400;
+        let size_out = 0x408;
+        assert_eq!(hle_get_stack(&ctx, &[attr, addr_out, size_out]), OK);
+        let mut a = [0u8; 8];
+        let mut s = [0u8; 8];
+        assert!(mem.read(addr_out, &mut a));
+        assert!(mem.read(size_out, &mut s));
+        let base = u64::from_le_bytes(a);
+        let size = u64::from_le_bytes(s);
+        assert_eq!(
+            base, BASE,
+            "the base must be the stack the kernel really mapped, at full width"
+        );
+        assert_eq!(size, TOP - BASE);
+        assert_eq!(
+            base + size,
+            TOP,
+            "base + size is what a collector scans up to; it must be the real stack top"
+        );
+
+        // The single-field getter Unity's wrapper uses must agree.
+        assert!(mem.write(addr_out, &0u64.to_le_bytes()));
+        assert_eq!(hle_get_stackaddr(&ctx, &[attr, addr_out]), OK);
+        assert!(mem.read(addr_out, &mut a));
+        assert_eq!(u64::from_le_bytes(a), BASE);
+
+        // Live scheduling state is copied too.
+        let state = kernel.pthread_attrs.get(&attr).unwrap();
+        assert_eq!(state.sched_priority, 256);
+        assert_eq!(state.sched_policy, 2);
+    }
+
+    /// An unknown thread must not become a fatal return code: a collector that
+    /// treats non-zero as fatal aborts on it. It stays `SCE_OK` with the attr
+    /// untouched (and a `warn` names it), and a null thread or attr is `EINVAL`.
+    #[test]
+    fn attr_get_validates_its_arguments_and_survives_an_unknown_thread() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let attr = 0x300;
+        assert_eq!(hle_attr_init(&ctx, &[attr]), OK);
+        assert_eq!(hle_set_stack(&ctx, &[attr, 0xDEAD_0000, 0x1000]), OK);
+
+        assert_eq!(hle_attr_get(&ctx, &[0, attr]), EINVAL);
+        assert_eq!(hle_attr_get(&ctx, &[15, 0]), EINVAL);
+        let unreported = attr_get_without_stack_count();
+        assert_eq!(
+            hle_attr_get(&ctx, &[99, attr]),
+            OK,
+            "an unknown thread must not hand the guest a code it treats as fatal"
+        );
+        assert_eq!(
+            attr_get_without_stack_count(),
+            unreported + 1,
+            "a query that could not report a real stack must be counted, so a crash report can \
+             say the guest computed its scan bounds from a default"
+        );
+        let state = kernel.pthread_attrs.get(&attr).unwrap();
+        assert_eq!(
+            (state.stack_address, state.stack_size),
+            (0xDEAD_0000, 0x1000),
+            "with no live stack to report, the configured values must be left alone"
+        );
+
+        // Every spelling a guest can reach a live thread's stack extent through
+        // must resolve to the real implementation, not a success-and-write-nothing
+        // stub.
+        let registry = HleRegistry::new();
+        for (lib, name) in [
+            ("libkernel", "scePthreadAttrGet"),
+            ("libkernel", "pthread_attr_get_np"),
+            ("libScePosix", "pthread_attr_get_np"),
+        ] {
+            assert!(
+                registry.is_implemented(lib, name),
+                "{lib}::{name} must be registered"
+            );
+        }
+    }
+
+    /// `scePthreadAttrGet` describes a *live thread*; the plain setters still
+    /// describe a *configuration*. Fixing the former must not turn the latter
+    /// into a report of some thread's stack.
+    #[test]
+    fn attr_get_does_not_change_what_the_plain_setters_round_trip() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        kernel
+            .guest_thread_stacks
+            .insert(1, (0x1000_8000_0000, 0x1000_A000_0000));
+        let attr = 0x300;
+        assert_eq!(hle_attr_init(&ctx, &[attr]), OK);
+        assert_eq!(hle_set_stack(&ctx, &[attr, 0xDEAD_0000, 0x20_0000]), OK);
+        let addr_out = 0x400;
+        let size_out = 0x408;
+        assert_eq!(hle_get_stack(&ctx, &[attr, addr_out, size_out]), OK);
+        let mut a = [0u8; 8];
+        let mut s = [0u8; 8];
+        assert!(mem.read(addr_out, &mut a));
+        assert!(mem.read(size_out, &mut s));
+        assert_eq!(u64::from_le_bytes(a), 0xDEAD_0000);
+        assert_eq!(u64::from_le_bytes(s), 0x20_0000);
     }
 
     #[test]
