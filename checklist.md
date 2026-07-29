@@ -1644,3 +1644,70 @@ triaged (ported / already-have / N-A-with-reason / deliberately-skipped, all
 recorded above); 316 commits on stale pre-squash feature tags verified as
 ancestors whose content is present in main and already covered. Branch `pr-587`
 holds only a duplicate of `5228335`. **No SharpEmu ref is unexamined.**
+
+---
+
+## Blasphemous II (PPSA13580) — three blockers cleared, still `reached=nothing`
+
+Kyty runs this title fully in-game, so every gap here is ours and closable.
+Four hardware runs tonight, each after a real fix. **No stage change yet — this
+is a progress record, not a rendering claim.**
+
+### Cleared, each measured on hardware
+
+1. **`sceKernelDlsym(handle=0)`** — handle 0 is the **main program** (KytyPS5
+   `runtimeLinker.cpp:1532`, literal comment "Id 0 is reserved for main
+   program"), NOT `RTLD_DEFAULT` as I assumed; a miss is `ESRCH`, not `ENOENT`.
+   And `scriptingGetMem` is **not a module export at all** — it is an allocator
+   hook the runtime supplies, special-cased by both Unity-booting references.
+   So SharpEmu's deferred "bootstrap argument normalization" could never have
+   closed this alone. Confirmed: `-> 0x100001352330 (module 1)`, no ENOENT.
+2. **`.native` module-name drift** — three near-copies of "canonicalize a module
+   name" existed and only `dynlib/nid.rs` stripped `.native`, so a `.native`
+   import reached HLE but looked up module policy and LLE exports under a
+   different key than the loader registered. Now one source of truth. Four
+   already-implemented libraries were failing to link over this
+   (`libSceAjm`/`libSceAvPlayer`/`libSceSaveDataDialog`/`libSceMsgDialog`).
+3. **`libScePosix::mkdir` was never registered** — the `mkdir('././')` warning
+   hid this: 7 of 9 unresolved `libScePosix` imports were the whole filesystem
+   family (mkdir/rmdir/unlink/chmod/fchmod/utimes/futimes). `sceKernelMkdir`
+   worked all along; the POSIX spellings did not exist. Plus `.`/`./` path
+   normalization anchored at `/app0`, sandbox guards re-asserted by test.
+
+MEASURED: unresolved imports **149 → 122**, HLE-resolved 825 → 852 (static,
+`xtask nids coverage` on the retail eboot).
+
+### The stall moved class — this is the real finding
+
+| | before fixes | after fixes |
+|---|---|---|
+| in-flight HLE | 14 threads in `sceKernelWaitSema` | **`<none — all threads between calls>`** |
+| host backtrace | (not captured) | `WaitOnAddress ← RtlWaitOnAddress ← ZwWaitForAlertByThreadId` |
+
+`WaitOnAddress` is `parking_lot`'s primitive, so the threads are now parked in
+**Raeen's own host synchronization between guest HLE calls** — not blocked on a
+guest primitive. That is a different failure class than the one we started with
+and needs its own investigation: which host lock/condvar, and who was supposed
+to wake it. `STALL_DUMP` reports "(0 threads)" because by its own criteria
+nothing is stalled — the criteria need to cover host-parked-between-calls.
+
+### Two side findings
+
+* **`argv[0]` is a raw HOST path.** `crates/raeen-gui/src/main.rs:1700` passes
+  `&[path.as_str()]`, so the guest sees `E:\PS5\...\eboot.bin` and its launcher
+  banner prints `Arg 0 = <host path>`. Wrong on principle (leaks host paths into
+  guest space; a title that opens `argv[0]` fails) but **probably not the
+  blocker** — KytyPS5 passes the bare string `"KytyEmu"`
+  (`runtimeLinker.cpp:1359`) and the title works there. `envp` is empty too.
+  Fix as correctness, do not expect a stage change.
+* The guest's own stdout is a diagnostic channel we were not reading. Its
+  launcher banner (`File System Root = NONE SPECIFIED`, …) is how the argv issue
+  surfaced at all. Worth capturing deliberately for every title.
+
+### Next, in order
+
+1. Identify the host park: which `parking_lot` object, and the missing wake.
+   `STALL_DUMP`'s stall criteria must count host-parked threads.
+2. Fix `argv[0]` to a guest path (`/app0/eboot.bin`) and pass a plausible `envp`.
+3. Re-measure. Subnautica shares the Unity/IL2CPP fingerprint and should be
+   re-measured in the same run — items 1–3 above may already have moved it.
