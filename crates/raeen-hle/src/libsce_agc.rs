@@ -3755,6 +3755,14 @@ fn hle_get_size_5_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
     5 * 4
 }
 
+/// DWORDs `sceAgcDcbDrawIndex` emits, and therefore what
+/// `sceAgcDcbDrawIndexGetSize` must report: one `IT_DRAW_INDEX_2` packet.
+///
+/// Named so the emitter and the size query cannot drift apart again — they were
+/// 11 and 6 respectively, which under-reserved a guest's DCB by 20 bytes per
+/// draw. `emitted_draw_index_size_matches_what_get_size_reports` pins the pair.
+pub(crate) const DRAW_INDEX_GET_SIZE_DWORDS: u64 = 6;
+
 fn hle_get_size_6_dwords(_ctx: &HleContext, _args: &[u64]) -> u64 {
     6 * 4
 }
@@ -4300,16 +4308,43 @@ fn hle_dcb_set_index_buffer(ctx: &HleContext, args: &[u64]) -> u64 {
     addr
 }
 
-/// `sceAgcDcbDrawIndex(dcb, indexCount, indexAddress, modifier)`: emit an
-/// INDEX_BASE + INDEX_BUFFER_SIZE packet (5 DWORDs) then a DRAW_INDEX_2 packet
-/// (6 DWORDs). Returns the first (base) command address.
+/// `sceAgcDcbDrawIndex(dcb, indexCount, indexAddress, modifier)`: emit a single
+/// `DRAW_INDEX_2` packet (6 DWORDs). Returns its command address.
 ///
 /// `DRAW_INDEX_2`'s AMD body is
 /// `{MAX_SIZE, INDEX_BASE_LO, INDEX_BASE_HI, INDEX_COUNT, DRAW_INITIATOR}` —
 /// five body DWORDs, so a six-DWORD packet, and **the 64-bit index base lives
 /// inside the draw packet**. The command processor
 /// (`kyty_graphics::run::CommandProcessor::cp_op_draw_index`) reads the base
-/// from there; the `IT_INDEX_BASE` preamble only feeds `DRAW_INDEX_OFFSET_2`.
+/// from there, so this packet is self-sufficient.
+///
+/// # Why there is no `IT_INDEX_BASE` preamble
+///
+/// It used to emit one (5 DWORDs) ahead of the draw, for 11 total — while
+/// `sceAgcDcbDrawIndexGetSize` reported **6**. Two separate defects:
+///
+/// 1. A guest that reserves from `GetSize` under-reserved by 20 bytes per draw.
+///    `alloc_command_dwords` is bounds-checked, so there was no memory-safety
+///    issue, but on a tight buffer it returns `None` and the draw is dropped
+///    with only a `debug!` line — draws lost silently.
+/// 2. Worse, the preamble was an *incorrect side effect*. `IT_INDEX_BASE` sets
+///    `CommandProcessor::index_base`, which is the base a later
+///    `IT_DRAW_INDEX_OFFSET_2` fetches from (`run.rs`, `cp_op_draw_index_offset`).
+///    So a title doing `SetIndexBuffer(A)` → `DrawIndex(B)` →
+///    `DrawIndexOffset(n)` had its offset draw read **B**, where hardware would
+///    read **A**: a wrong-geometry bug with no diagnostic at all.
+///
+/// Real AGC's own `GetSize` of 6 DWORDs is the evidence that the hardware
+/// function emits only this one packet and therefore does *not* rebind the
+/// index base — so no title can legitimately depend on the preamble, and
+/// dropping it makes emitted == reported == 6 DWORDs. A title that does want a
+/// bound base calls `sceAgcDcbSetIndexBuffer`, which emits exactly that
+/// `IT_INDEX_BASE` + `IT_INDEX_BUFFER_SIZE` pair itself. (`IT_INDEX_BUFFER_SIZE`
+/// is in any case consumed by nothing on the read path — only a getter and a
+/// test observe `index_buffer_size`.)
+///
+/// SharpEmu emits the same preamble and exports no `DcbDrawIndexGetSize`, so it
+/// offers no evidence either way here.
 ///
 /// This function previously emitted a five-DWORD packet whose body was
 /// `[index_count, 0, 0, 0]` — the base zeroed. Every draw then reached the sink
@@ -4330,32 +4365,16 @@ fn hle_dcb_draw_index(ctx: &HleContext, args: &[u64]) -> u64 {
     if cb == 0 || modifier != DRAW_AUTO_MODIFIER {
         return 0;
     }
-    let Some(base) = alloc_command_dwords(ctx, cb, 5) else {
-        return 0;
-    };
-    let base_ok = ctx
-        .mem
-        .write(base, &pm4(3, IT_INDEX_BASE, R_ZERO).to_le_bytes())
-        && ctx.mem.write(base + 4, &(index_addr as u32).to_le_bytes())
-        && ctx
-            .mem
-            .write(base + 8, &((index_addr >> 32) as u32).to_le_bytes())
-        && ctx.mem.write(
-            base + 12,
-            &pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO).to_le_bytes(),
-        )
-        && ctx.mem.write(base + 16, &index_count.to_le_bytes());
-    if !base_ok {
-        return 0;
-    }
-    let Some(draw) = alloc_command_dwords(ctx, cb, 6) else {
+    // Exactly `DRAW_INDEX_GET_SIZE_DWORDS`, which is what
+    // `sceAgcDcbDrawIndexGetSize` promises the guest.
+    let Some(draw) = alloc_command_dwords(ctx, cb, DRAW_INDEX_GET_SIZE_DWORDS) else {
         return 0;
     };
     let draw_ok = ctx
         .mem
         .write(draw, &pm4(6, IT_DRAW_INDEX_2, R_ZERO).to_le_bytes())
-        // MAX_SIZE: the index buffer bound above holds exactly index_count
-        // elements, so it also bounds this draw.
+        // MAX_SIZE: this draw consumes exactly `index_count` elements, and with
+        // no separate bound buffer that count is also its own bound.
         && ctx.mem.write(draw + 4, &index_count.to_le_bytes())
         // INDEX_BASE_LO / INDEX_BASE_HI — what the walker actually reads.
         && ctx.mem.write(draw + 8, &(index_addr as u32).to_le_bytes())
@@ -4368,7 +4387,7 @@ fn hle_dcb_draw_index(ctx: &HleContext, args: &[u64]) -> u64 {
     if !draw_ok {
         return 0;
     }
-    base
+    draw
 }
 
 /// `sceAgcDcbResetQueue(dcb, op, state)`: emit a draw-reset packet. Requires
@@ -6206,7 +6225,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_index_emits_base_then_draw_packets() {
+    fn draw_index_emits_exactly_the_size_get_size_reports() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let cb = 0x40;
@@ -6219,34 +6238,99 @@ mod tests {
         );
         let ret = hle_dcb_draw_index(&ctx, &[cb, 6, ib, DRAW_AUTO_MODIFIER]);
         assert_eq!(ret, 0x400);
-        // Base packet (5 dw) then draw packet (6 dw) = 11 dw total.
-        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_INDEX_BASE, R_ZERO));
-        assert_eq!(read_u32(&ctx, 0x404), ib as u32);
-        assert_eq!(read_u32(&ctx, 0x408), (ib >> 32) as u32);
-        assert_eq!(read_u32(&ctx, 0x40C), pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO));
-        assert_eq!(read_u32(&ctx, 0x410), 6);
-        // The DRAW_INDEX_2 packet, at 0x400 + 20. AMD's body is
+        // ONE `DRAW_INDEX_2` packet and nothing else. AMD's body is
         // {MAX_SIZE, BASE_LO, BASE_HI, INDEX_COUNT, DRAW_INITIATOR} — five body
-        // DWORDs, so the packet is SIX DWORDs, and the 64-bit index base lives
-        // INSIDE it. A five-DWORD packet with a zero base is what made every
-        // Dead Cells draw refusable ("indexed draw with no index buffer:
-        // addr=0x0"): the command processor reads the base from this packet, not
-        // from the INDEX_BASE preamble above.
-        assert_eq!(read_u32(&ctx, 0x414), pm4(6, IT_DRAW_INDEX_2, R_ZERO));
-        assert_eq!(read_u32(&ctx, 0x418), 6, "MAX_SIZE");
+        // DWORDs, so a SIX-DWORD packet, and the 64-bit index base lives INSIDE
+        // it. A five-DWORD packet with a zero base is what made every Dead Cells
+        // draw refusable ("indexed draw with no index buffer: addr=0x0").
+        assert_eq!(read_u32(&ctx, 0x400), pm4(6, IT_DRAW_INDEX_2, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), 6, "MAX_SIZE");
         assert_eq!(
-            read_u32(&ctx, 0x41C),
+            read_u32(&ctx, 0x408),
             ib as u32,
-            "index base LO must be in the draw packet, not only the preamble"
+            "index base LO must be in the draw packet itself"
         );
         assert_eq!(
-            read_u32(&ctx, 0x420),
+            read_u32(&ctx, 0x40C),
             (ib >> 32) as u32,
-            "index base HI must be in the draw packet, not only the preamble"
+            "index base HI must be in the draw packet itself"
         );
-        assert_eq!(read_u32(&ctx, 0x424), 6, "INDEX_COUNT");
-        assert_eq!(read_u32(&ctx, 0x428), 0, "DRAW_INITIATOR");
-        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 44);
+        assert_eq!(read_u32(&ctx, 0x410), 6, "INDEX_COUNT");
+        assert_eq!(read_u32(&ctx, 0x414), 0, "DRAW_INITIATOR");
+
+        // THE SIZE CONTRACT. The emitter used to prepend an
+        // `IT_INDEX_BASE` + `IT_INDEX_BUFFER_SIZE` pair for 11 DWORDs while
+        // `sceAgcDcbDrawIndexGetSize` reported 6, so a guest sizing its DCB
+        // reservation from that query under-reserved by 20 bytes PER DRAW. The
+        // allocation is bounds-checked, so the failure mode was not corruption
+        // but silence: `alloc_command_dwords` returns `None` and the draw is
+        // dropped with only a `debug!` line.
+        let emitted = read_u64(&ctx, cb + CB_CURSOR_UP) - 0x400;
+        let reported = hle_get_size_6_dwords(&ctx, &[]);
+        assert_eq!(
+            emitted, reported,
+            "sceAgcDcbDrawIndex emitted {emitted} B but sceAgcDcbDrawIndexGetSize \
+             promises {reported} B — a guest reserving from the query loses draws"
+        );
+        assert_eq!(
+            emitted,
+            DRAW_INDEX_GET_SIZE_DWORDS * 4,
+            "both must equal the shared constant"
+        );
+    }
+
+    /// The dropped preamble was also an incorrect side effect, not merely 20
+    /// wasted bytes: `IT_INDEX_BASE` sets `CommandProcessor::index_base`, which
+    /// is the base a later `IT_DRAW_INDEX_OFFSET_2` fetches from. So
+    /// `SetIndexBuffer(A)` → `DrawIndex(B)` → `DrawIndexOffset(n)` used to make
+    /// the offset draw read **B** where hardware reads **A** — wrong geometry
+    /// with no diagnostic anywhere.
+    ///
+    /// Real AGC reporting 6 DWORDs is the evidence that the hardware function
+    /// emits one packet and therefore cannot rebind the base. A title that wants
+    /// a bound base calls `sceAgcDcbSetIndexBuffer`, which still emits exactly
+    /// that pair — asserted here so the capability is not lost with the preamble.
+    #[test]
+    fn draw_index_does_not_rebind_the_index_base_but_set_index_buffer_does() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+
+        // `sceAgcDcbSetIndexBuffer` is the API that binds a base.
+        let bound = 0x0000_7777_0000_1000u64;
+        let set = hle_dcb_set_index_buffer(&ctx, &[cb, bound, 128]);
+        assert_eq!(set, 0x400);
+        assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_INDEX_BASE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), bound as u32);
+        assert_eq!(read_u32(&ctx, 0x408), (bound >> 32) as u32);
+        assert_eq!(read_u32(&ctx, 0x40C), pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x410), 128);
+        let after_set = read_u64(&ctx, cb + CB_CURSOR_UP);
+
+        // A draw must not emit an INDEX_BASE of its own.
+        let other = 0x0000_3333_0000_2000u64;
+        let draw = hle_dcb_draw_index(&ctx, &[cb, 9, other, DRAW_AUTO_MODIFIER]);
+        assert_eq!(draw, after_set);
+        assert_eq!(
+            read_u32(&ctx, draw),
+            pm4(6, IT_DRAW_INDEX_2, R_ZERO),
+            "the first DWORD a draw emits must be the draw itself"
+        );
+        for dw in 0..DRAW_INDEX_GET_SIZE_DWORDS {
+            let word = read_u32(&ctx, draw + dw * 4);
+            assert_ne!(
+                word,
+                pm4(3, IT_INDEX_BASE, R_ZERO),
+                "draw DWORD {dw} rebinds the index base, clobbering it for a \
+                 later DRAW_INDEX_OFFSET_2"
+            );
+            assert_ne!(
+                word,
+                pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO),
+                "draw DWORD {dw} rewrites the bound index-buffer size"
+            );
+        }
     }
 
     /// End-to-end emitter → command-processor contract for
