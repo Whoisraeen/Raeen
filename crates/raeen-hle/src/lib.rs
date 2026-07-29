@@ -23,6 +23,7 @@
 
 pub mod exception;
 pub(crate) mod fmt;
+pub mod gpu_side_effect_waker;
 pub mod host_vblank;
 pub mod kernel_aio;
 pub mod kernel_equeue;

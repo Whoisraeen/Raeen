@@ -1797,6 +1797,14 @@ fn main() -> anyhow::Result<()> {
         // before its first flip has nothing else that could ever fire it.
         let _host_vblank = raeen_hle::host_vblank::HostVblankSource::start_from_env(&kernel);
 
+        // Let the GPU worker's ordered side-effect publishes wake the guest
+        // threads parked in `sceKernelWaitEqueue`, instead of those threads
+        // polling for them on a shortened park slice. Bound to a local for the
+        // same reason as the vblank source above: the slot it fills is
+        // process-global, and its `Weak` must not outlive this run.
+        let _gpu_side_effect_waker =
+            raeen_hle::gpu_side_effect_waker::SideEffectWakerGuard::install(&kernel);
+
         // The last rung of the load half of the chain: control is about to
         // leave us for guest code. A session that never gets past here has a
         // load problem, not a rendering one.

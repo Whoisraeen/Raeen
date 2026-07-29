@@ -191,6 +191,23 @@ top-down, update statuses in place, and keep it committed.**
   but caused 94 shader-error retries vs 18 with deferred-only. These are
   measured A/B results, not a default-on acceptance: both gates stay OFF
   pending the mixed-storage fix and a quiet Minecraft performance re-run.
+- [x] Step 6 (2026-07-29): the deferred queue notifies instead of being
+  polled. It was the last wait in the tree that genuinely relied on a slice —
+  the GPU worker has no kernel handle, so `sceKernelWaitEqueue` cut its park
+  slice from 50 ms to 1 ms under the gate to bound observation latency, waking
+  ~30 guest threads 50× more often on a title already short of CPU.
+  `raeen-gpu` now declares a `SideEffectObserverWaker` that `publish` calls;
+  `raeen-hle` installs one holding a `Weak<OrbisKernel>` (same shape as
+  `host_vblank`, so no kernel type crosses the GPU seam) which wakes every
+  live equeue, and the waiter's readiness predicate reports the pending queue
+  so the notify is not swallowed by `wait_until`'s own re-park. Slice restored
+  to the shared 50 ms `WAIT_SLICE` in both branches. Deterministic tests only:
+  publish→waker counted, waker→queues against a recording `WaitSubsystem`,
+  predicate, gate-independence of the slice, plus a threaded no-deadlock case.
+  **Not** claimed by test: "woken rather than slept out" — `wait_until`
+  re-checks `ready` on timeout too, so deleting the wake changes only latency
+  (verified: the outcome test still passed, 10 s slower). Latency needs a live
+  A/B under the gate.
 - **Context:** Steps 0–2 landed (gate + fail-open + IT_DMA_DATA in-stream,
   `cp_op_it_dma_data` in kyty-graphics run.rs). Design notes in ledger
   2026-07-25/26 ITEM 4; steps 3–5 implementation in ledger 2026-07-27.

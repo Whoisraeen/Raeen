@@ -132,6 +132,41 @@ pub(crate) fn wake_equeue_via(
     );
 }
 
+/// Wake **every** live event queue, and report how many were woken.
+///
+/// For a producer that cannot know which queues its work will end up firing.
+/// The GPU worker is the case this exists for: it publishes side effects
+/// ([`raeen_gpu::ordered_side_effects`]) whose *application* — and therefore
+/// the set of queues they trigger — happens later, on whichever guest thread
+/// drains them. So the wake has to reach every waiter and let each re-check.
+///
+/// A waiter woken with nothing for it re-evaluates its readiness predicate and
+/// parks again; that is one predicate evaluation, against a queue that a title
+/// has a handful of. The alternative this replaced was every equeue waiter
+/// re-checking on a 1 ms slice forever.
+///
+/// Only live queues are woken, which loses nothing: [`hle_wait`] refuses to
+/// park on a queue that does not exist, and a queue deleted underneath a parked
+/// waiter wakes it through [`hle_delete`] instead.
+pub(crate) fn wake_all_equeues_via(
+    kernel: &raeen_kernel::OrbisKernel,
+    waker: &dyn raeen_core::subsystems::WaitSubsystem,
+    guest_thread: u64,
+    reason: WakeReason,
+) -> usize {
+    // Collected before waking so no DashMap shard guard is held across a wake,
+    // which takes the kernel's notification lock.
+    let queues: Vec<u64> = kernel
+        .kernel_equeues
+        .iter()
+        .map(|entry| *entry.key())
+        .collect();
+    for eq in &queues {
+        wake_equeue_via(waker, *eq, guest_thread, reason);
+    }
+    queues.len()
+}
+
 /// `sceKernelAddUserEvent[Edge](eq, id)`: register an (initially un-triggered)
 /// user event on the queue.
 fn hle_add_user_event(ctx: &HleContext, args: &[u64]) -> u64 {
@@ -328,6 +363,23 @@ fn equeue_deadline_reached(deadline: Option<std::time::Instant>, now: std::time:
     raeen_core::subsystems::guest_deadline_reached(deadline, now)
 }
 
+/// How long a single host park inside [`hle_wait`] may last.
+///
+/// A NULL guest timeout is an indefinite wait; the slice exists only so process
+/// teardown and a queue deletion are noticed promptly, and its expiry is never
+/// reported to the guest as `ETIMEDOUT` (see [`equeue_deadline_reached`]).
+///
+/// It is emphatically **not** a polling interval. Every producer of an equeue
+/// event — guest triggers, VideoOut, AGC, the host vblank source, and the GPU
+/// worker's ordered side effects — notifies the waiter directly, so a wait ends
+/// on the event, not on the next slice boundary. When the last of those (the
+/// GPU worker) had no notify, this constant was cut to 1 ms under
+/// `RAEEN_DEFER_GPU_SIDE_EFFECTS` to bound its observation latency, which
+/// bought that bound by waking ~30 guest threads 50× more often. The notify
+/// seam (`crate::gpu_side_effect_waker`) replaced that, and the slice went back
+/// to one value for every wait.
+const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     let eq = args.first().copied().unwrap_or(0);
     let events_ptr = args.get(1).copied().unwrap_or(0);
@@ -364,15 +416,6 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
     // guest as ETIMEDOUT. The old implementation did exactly that after 50 ms:
     // Dragon Ball's AGC workers entered their fatal path after a fabricated
     // timeout. This mirrors the corrected WaitEventFlag contract.
-    const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
-    // The deferred worker queue has no kernel handle with which to notify this
-    // condvar. Keep its observation latency bounded without returning the
-    // slice as a guest timeout; normal eager/event producers wake immediately.
-    let wait_slice = if raeen_gpu::ordered_side_effects::defer_gpu_side_effects() {
-        std::time::Duration::from_millis(1)
-    } else {
-        WAIT_SLICE
-    };
     let deadline =
         timeout_us.map(|us| std::time::Instant::now() + std::time::Duration::from_micros(us));
 
@@ -406,17 +449,31 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
                     pending.push((id, entry.udata, entry.fflags, entry.filter, entry.data));
                 }
             }
-            if pending.is_empty() {
-                false
-            } else {
+            if !pending.is_empty() {
                 delivered.set(Some(deliver_events(
                     ctx, eq, events_ptr, out_count, &pending,
                 )));
-                true
+                return true;
             }
+            // Nothing triggered yet, but the GPU worker has published effects
+            // that have not been applied — and applying them is what may
+            // trigger this queue. It cannot happen here: the drain runs
+            // `submit_flip_from_agc` and `wake_equeue`, and this closure is
+            // called with the kernel's notification lock held (the same lock
+            // a wake takes). So report ready with nothing delivered; the loop
+            // below falls through to its next iteration, whose first act is
+            // the drain, and re-parks against the events that produced.
+            //
+            // This is the half of the notify seam that lives on the consumer
+            // side: without it the GPU worker's wake would be swallowed by
+            // `wait_until`'s own re-park loop — `ready` would say "no" and the
+            // waiter would sleep out the rest of its slice with the effects
+            // sitting undelivered, exactly the latency the 1 ms slice existed
+            // to paper over.
+            raeen_gpu::ordered_side_effects::has_pending()
         };
 
-        let wait = equeue_park_slice(deadline, std::time::Instant::now(), wait_slice);
+        let wait = equeue_park_slice(deadline, std::time::Instant::now(), WAIT_SLICE);
         let outcome = ctx.services.wait_until(
             WaitKey {
                 class: "kernel-equeue",
@@ -441,8 +498,12 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         {
             break;
         }
-        // An internal 50 ms slice elapsed. A NULL-timeout wait loops forever;
-        // a finite wait loops until its actual deadline.
+        // Either an internal slice elapsed — a NULL-timeout wait loops forever,
+        // a finite one until its actual deadline — or `ready` reported pending
+        // GPU side effects and delivered nothing, in which case the drain at
+        // the top of the next iteration is the whole point of coming back. That
+        // second case cannot spin: the drain empties the queue, so a waiter this
+        // one raced to it finds `has_pending()` false and parks.
     }
 
     // Waited out the caller's interval with nothing pending: report zero.
@@ -642,6 +703,155 @@ mod tests {
         assert_eq!(u32::from_le_bytes(cnt), 1);
     }
 
+    /// The GPU worker's broadcast wake, run against a **real parked waiter**:
+    /// it delivers, and it does not deadlock.
+    ///
+    /// The deadlock is the hazard worth a threaded test. The wake runs on a
+    /// host thread that is mutating `kernel_equeue_events`, and it takes the
+    /// kernel's notification lock — the same lock a waiter holds for the whole
+    /// of `wait_until`, while its `ready` closure walks that very map. Get the
+    /// order wrong and the two wedge; no single-threaded test can show that.
+    ///
+    /// What this deliberately does **not** claim is "resumed by the wake rather
+    /// than by its slice". That is not testable by outcome: `wait_until`
+    /// re-evaluates `ready` when a park expires as well as when a notify
+    /// arrives, so deleting the wake changes only *when* this returns, never
+    /// *what* — checked by deleting it, after which the test still passed, 10 s
+    /// slower. The latency claim is tested where it is falsifiable: that a
+    /// publish notifies the installed waker, and that the waker reaches every
+    /// live queue with the right key and reason (both in
+    /// [`crate::gpu_side_effect_waker`], counted and against a recording
+    /// `WaitSubsystem`), and that pending effects keep a waiter out of its park
+    /// ([`pending_gpu_effects_make_a_waiter_ready_to_drain`]). Each of those
+    /// fails immediately if its half is removed.
+    ///
+    /// The producer does what a drain would do on the woken thread (trigger the
+    /// event, as `signal_agc_equeue_event` does) and then the wake half of
+    /// `publish`. It deliberately does not route through the process-global
+    /// effect queue: any parallel test in this binary that reaches a drain
+    /// point may consume the entry. That theft is an artifact of test kernels
+    /// being separate — a guest process has one kernel, so a second thread
+    /// draining applies the effect to the same queues.
+    #[test]
+    fn the_gpu_worker_wake_reaches_a_parked_waiter_without_deadlocking() {
+        use raeen_gpu::ordered_side_effects::SideEffectObserverWaker;
+
+        let kernel = std::sync::Arc::new(raeen_kernel::OrbisKernel::new());
+        let mem = crate::TestMemory::new(0x400);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(kernel.as_ref(), &mem, &alloc);
+        let eq = create(&ctx);
+        assert_eq!(hle_add_user_event(&ctx, &[eq, 0x2A]), OK);
+        // A deliberately enormous guest deadline, as in
+        // `a_producer_thread_wakes_a_parked_equeue_waiter`: no scheduling delay
+        // this test could see can expire it, so a wedge surfaces as a hang
+        // rather than as a spurious `ETIMEDOUT`.
+        assert!(mem.write(0x120, &30_000_000u32.to_le_bytes()));
+
+        let producer = std::thread::spawn({
+            let kernel = std::sync::Arc::clone(&kernel);
+            move || {
+                let waker =
+                    crate::gpu_side_effect_waker::EqueueSideEffectWaker::for_kernel(&kernel);
+                let mut event = kernel
+                    .kernel_equeue_events
+                    .get_mut(&(eq, 0x2A))
+                    .expect("the registration is still there");
+                event.triggered = true;
+                event.data = 0x2A;
+                drop(event);
+                waker.wake_side_effect_observers()
+            }
+        });
+
+        let result = hle_wait(&ctx, &[eq, 0x200, 4, 0x1F0, 0x120]);
+
+        assert_eq!(
+            producer.join().expect("the producer must not panic"),
+            1,
+            "the wake must reach the process's one live queue"
+        );
+        assert_eq!(result, OK, "the waiter must receive the worker's event");
+        assert_eq!(hle_get_event_id(&ctx, &[0x200]), 0x2A);
+        let mut count = [0u8; 4];
+        assert!(mem.read(0x1F0, &mut count));
+        assert_eq!(u32::from_le_bytes(count), 1);
+    }
+
+    /// The slice this change restored: **one** value for every equeue wait.
+    ///
+    /// Under `RAEEN_DEFER_GPU_SIDE_EFFECTS` it dropped to 1 ms, because the GPU
+    /// worker had no way to notify and its effects would otherwise sit
+    /// undelivered for up to 50 ms. That bought bounded latency by waking ~30
+    /// guest threads 50× more often, essentially always to find nothing. The
+    /// notify seam replaced it, so the gate must no longer reach the slice —
+    /// exercised here with the gate ON, which is what used to select the short
+    /// one.
+    #[test]
+    fn the_park_slice_does_not_depend_on_the_defer_gate() {
+        let _guard = crate::SIDEFX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+            }
+        }
+        let _reset = EnvReset;
+
+        assert_eq!(
+            WAIT_SLICE,
+            std::time::Duration::from_millis(50),
+            "the equeue park slice is the shared 50 ms one, not a polling interval"
+        );
+
+        unsafe { std::env::set_var("RAEEN_DEFER_GPU_SIDE_EFFECTS", "1") };
+        assert!(
+            raeen_gpu::ordered_side_effects::defer_gpu_side_effects(),
+            "the gate is on for this case"
+        );
+        // A NULL guest timeout parks a full slice — the same full slice with
+        // the gate on as with it off, and still never a guest timeout. Under
+        // the old branch this park was 1 ms.
+        let now = std::time::Instant::now();
+        assert_eq!(equeue_park_slice(None, now, WAIT_SLICE), WAIT_SLICE);
+        assert!(!equeue_deadline_reached(None, now + WAIT_SLICE));
+    }
+
+    /// The consumer half of the seam: with effects pending and no equeue event
+    /// triggered, the readiness predicate still reports ready, so the wait
+    /// leaves its park and the next iteration's drain runs. Without it the
+    /// wake arrives and `wait_until`'s own re-park loop swallows it — the
+    /// waiter would sleep out its slice with the effects sitting undelivered,
+    /// which is the whole latency the 1 ms slice existed to paper over.
+    ///
+    /// Deliberately a two-line window between the publish and the observation:
+    /// any other test in this binary that reaches a drain point can consume the
+    /// entry, so `SIDEFX_ENV_LOCK` is held and nothing slow sits in between.
+    #[test]
+    fn pending_gpu_effects_make_a_waiter_ready_to_drain() {
+        let _guard = crate::SIDEFX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = raeen_gpu::ordered_side_effects::drain();
+        assert!(!raeen_gpu::ordered_side_effects::has_pending());
+        raeen_gpu::ordered_side_effects::publish([
+            raeen_gpu::ordered_side_effects::OrderedGpuSideEffect::EopInterrupt {
+                context_id: 0x55,
+            },
+        ]);
+        assert!(
+            raeen_gpu::ordered_side_effects::has_pending(),
+            "an undelivered effect must keep waiters out of their park"
+        );
+        let _ = raeen_gpu::ordered_side_effects::drain();
+        assert!(
+            !raeen_gpu::ordered_side_effects::has_pending(),
+            "once drained, waiters park again rather than spinning"
+        );
+    }
+
     #[test]
     fn wait_with_no_pending_events_times_out() {
         let (kernel, mem, alloc) = ctx_env();
@@ -675,7 +885,10 @@ mod tests {
     #[test]
     fn an_internal_slice_expiry_is_never_reported_as_the_guests_timeout() {
         use std::time::{Duration, Instant};
-        const SLICE: Duration = Duration::from_millis(50);
+        // The real constant, not a copy of its value: a slice that changes must
+        // re-prove these edges rather than silently leave them describing a
+        // number the wait no longer uses.
+        const SLICE: Duration = WAIT_SLICE;
         let t0 = Instant::now();
 
         // NULL timeout: parks a full slice, forever, and no number of elapsed
