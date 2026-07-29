@@ -1743,9 +1743,16 @@ mod tests {
         // NID. It is now an ordinary name-derived `register`, which is what this
         // test's "none could have used ordinary name-derived registration"
         // invariant asks for.
+        // 2026-07-29: +1 — libSceAgc 0x2247ddb7fac8a821 (`Ikfdt-rIqCE`), the
+        // in-place INDIRECT_BUFFER chain patcher Grand Theft Auto V (PPSA04264)
+        // calls from five sites. The name is in NEITHER the 185,088-entry
+        // in-tree catalogue nor SharpEmu's aerolib, so no label can hash to it;
+        // KytyPS5 carries the same NID as `GraphicsUnknownIkfdtRIqCE`. Bound in
+        // libsce_agc.rs under the placeholder label `sceAgcUnknownIkfdtRIqCE`,
+        // alongside its two existing unnamed siblings.
         assert_eq!(
             bindings.len(),
-            11,
+            12,
             "the explicit-NID surface changed; review every added/removed binding and update \
              this audited count"
         );

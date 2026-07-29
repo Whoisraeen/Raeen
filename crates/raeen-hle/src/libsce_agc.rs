@@ -186,6 +186,16 @@ pub fn register(registry: &HleRegistry) {
         0x7dde_41a7_9b46_4e0a,
         hle_unknown_agc_fd5_bp5t,
     );
+    // Known ONLY by its NID `Ikfdt-rIqCE`. Measured at five GTA V call sites as
+    // an in-place INDIRECT_BUFFER chain patch — see
+    // `hle_unknown_agc_ikfdt_r_iq_ce` for the disassembly that establishes the
+    // argument shape.
+    registry.register_nid(
+        "libSceAgc",
+        "sceAgcUnknownIkfdtRIqCE",
+        0x2247_ddb7_fac8_a821,
+        hle_unknown_agc_ikfdt_r_iq_ce,
+    );
     registry.register("libSceAgc", "sceAgcAcbResetQueue", hle_acb_reset_queue);
     registry.register(
         "libSceAgc",
@@ -3888,23 +3898,210 @@ fn hle_dcb_draw_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
 /// tail work lives in unexecuted chained buffers.
 fn hle_dcb_jump(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
-    let target = args.get(1).copied().unwrap_or(0);
-    let size_dwords = args.get(2).copied().unwrap_or(0) as u32;
+    let mode = args.get(1).copied().unwrap_or(0) as u32;
+    let cache_policy = args.get(2).copied().unwrap_or(0) as u32;
+    let target = args.get(3).copied().unwrap_or(0);
+    let size_dwords = args.get(4).copied().unwrap_or(0) as u32;
     if cb == 0 {
         return 0;
     }
     let Some(addr) = alloc_command_dwords(ctx, cb, 4) else {
         return 0;
     };
-    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
-    let ok = w(0, pm4(4, IT_INDIRECT_BUFFER, R_ZERO))
-        && w(4, target as u32)
-        && w(8, ((target >> 32) & 0xFFFF) as u32)
-        && w(12, size_dwords & 0xF_FFFF);
-    if !ok {
+    if !write_chain_packet(ctx, addr, target, size_dwords, mode, cache_policy) {
         return 0;
     }
     addr
+}
+
+/// Mandatory control bits in a Gen5 chain packet's size DWORD.
+///
+/// KytyPS5 `GraphicsDcbJump` (`src/libs/agc.cpp`) ORs `0x0f20_0000` into the
+/// control DWORD unconditionally, and its command processor checks
+/// `control & 0x0fe0_0000 == 0x0f20_0000` before following the chain
+/// (`pm4Handlers.cpp` `CpOpIndirectBuffer`). In AMD's field split these are
+/// `vmid = 0xF` (bits 24..27) plus bit 21. PS4 used a different constant
+/// (`0x0180_0000`, Kyty `GraphicsRun.cpp`), so this is generation-specific and
+/// must not be copied from the Gen4 path.
+const CHAIN_CONTROL_BITS: u32 = 0x0f20_0000;
+
+/// Bits a chain-packet patch must PRESERVE in the control DWORD: everything
+/// except the size (0..19) and the cache policy (28..29). Mirrors KytyPS5
+/// `GraphicsUnknownIkfdtRIqCE`'s `cmd[3] & 0xcff00000`.
+const CHAIN_CONTROL_PRESERVE: u32 = 0xcff0_0000;
+
+/// `SCE_AGC_ERROR_INVALID_PACKET` — KytyPS5 `GRAPHICS5_ERROR_INVALID_PACKET`
+/// (`src/libs/agc.cpp`), returned by every Gen5 `*Patch*` entry point when the
+/// packet it was handed is not the opcode it knows how to patch. The retail
+/// caller of the sibling NID `fd5Bp5tGTgo` compares against `0x8a6c0008`, i.e.
+/// the same `0x8a6c` facility.
+const SCE_AGC_ERROR_INVALID_PACKET: u64 = 0x8a6c_000c;
+
+/// Write a fresh 4-DWORD INDIRECT_BUFFER chain packet at `addr`.
+///
+/// Layout ported from KytyPS5 `GraphicsDcbJump` (`src/libs/agc.cpp`), which is
+/// the only reference implementation that both emits the Gen5 packet and
+/// round-trips it through its own command processor:
+///
+/// ```text
+/// dw0 = PM4(4, IT_INDIRECT_BUFFER, 0)
+/// dw1 = target[31:0] & !3            // 4-byte aligned
+/// dw2 = target[63:32]                // FULL 32 bits on Gen5 (Gen4 masked to 16)
+/// dw3 = 0x0f200000 | cachePolicy<<28 | mode<<20 | sizeDwords
+/// ```
+fn write_chain_packet(
+    ctx: &HleContext,
+    addr: u64,
+    target: u64,
+    size_dwords: u32,
+    mode: u32,
+    cache_policy: u32,
+) -> bool {
+    let w = |off: u64, v: u32| ctx.mem.write(addr + off, &v.to_le_bytes());
+    w(0, pm4(4, IT_INDIRECT_BUFFER, R_ZERO))
+        && w(4, (target as u32) & !0x3)
+        && w(8, (target >> 32) as u32)
+        && w(
+            12,
+            CHAIN_CONTROL_BITS
+                | ((cache_policy & 0x3) << 28)
+                | ((mode & 0x1) << 20)
+                | (size_dwords & 0xF_FFFF),
+        )
+}
+
+/// Unidentified `libSceAgc` entry point, known only by its NID `Ikfdt-rIqCE`
+/// (`0x2247_ddb7_fac8_a821`). The name is in **no** catalogue — neither the
+/// 185,088-entry in-tree `nid_names.txt` nor SharpEmu's `aerolib`, Kyty Gen5 or
+/// shadPS4 — so it is bound by NID rather than by a guessed name.
+///
+/// ## Measured ABI (Grand Theft Auto V, PPSA04264 01.005.000)
+///
+/// Five direct call sites, all reached through the import thunk at
+/// `module+0x45f10` → PLT `module+0x3079700` → GOT `module+0x392c4c8`, which
+/// relocation sym#1095 binds to this NID.
+///
+/// `f(void *packet /* rdi */, u32 cachePolicy /* esi */, u64 target /* rdx */,
+///    u32 sizeDwords /* ecx */)`
+///
+/// * **arg 0 is a raw pointer INTO a command buffer, not a DCB object.** At
+///   `module+0x2965ad6` it is `[dcb+0x50]`, which the same function sets to
+///   `bufferBase + alignedLen - sceAgcDcbJumpGetSize()` — i.e. the address of
+///   the JUMP packet sitting at the tail of the buffer. At `module+0x29667cb`
+///   it is `bufferBase + sceAgcDcbRewindGetSize()` (`lea rdi,[rax+r14]` right
+///   after calling `sceAgcDcbRewindGetSize`) — the slot just past a REWIND,
+///   again where a JUMP packet lives. Both confirm the tree's byte-unit
+///   `*GetSize` convention.
+/// * **arg 1 is a small enum, observed as both `2` and `0`** (`mov esi,2` at
+///   `module+0x2965ace`, `xor esi,esi` at `module+0x2967247`). It lines up with
+///   `sceAgcDcbJump`'s third argument (`mov edx,2` at `module+0x2965a90`), so
+///   it is the same cache-policy/flag enum. [`hle_dcb_jump`] does not model it
+///   either, and modelling it here alone would make the two disagree.
+/// * **args 2 and 3 are the chain target and its DWORD count.** The decisive
+///   evidence is the NULL-`packet` fallback the caller takes when there is no
+///   packet to patch (`module+0x2965add`): `mov rax,[dcb+0x48]; mov [rax],rbx;
+///   mov [rax+8],ecx` — it stores exactly this `{u64 address, u32 dwords}` pair
+///   into a descriptor instead. `rbx` is the written range's base and `ecx` is
+///   `(cursor - base) >> 2`, a DWORD count.
+/// * **The return value is ignored at all five call sites** — `module+0x2965adb`
+///   and `module+0x29667dd` are unconditional `jmp short`, with no
+///   `test eax,eax` / `cmp` anywhere after the call.
+///
+/// ## Behaviour
+///
+/// The measured ABI is confirmed by KytyPS5, which implements this exact NID as
+/// `GraphicsUnknownIkfdtRIqCE` (`src/libs/agc.cpp`, registered in
+/// `src/libs/libGraphicsDriver.cpp`). It is a **read-modify-write** patch, not a
+/// fresh emission — it validates the packet's opcode and preserves the control
+/// bits the command processor checks:
+///
+/// ```text
+/// if ((cmd[0] >> 8) & 0xff) != IT_INDIRECT_BUFFER  -> 0x8a6c000c
+/// cmd[1] = (cmd[1] & 3)          | (target[31:0] & !3)
+/// cmd[2] =                         target[63:32]
+/// cmd[3] = (cmd[3] & 0xcff00000) | cachePolicy<<28 | sizeDwords
+/// ```
+///
+/// Rewriting all four DWORDs instead (an obvious-looking simplification) would
+/// clear the mandatory [`CHAIN_CONTROL_BITS`] and the chain/mode bit, which is
+/// precisely what KytyPS5's `CpOpIndirectBuffer` validates before following the
+/// chain. Note this function does NOT touch the mode bit — only
+/// [`hle_dcb_jump`] sets it, at emission time.
+///
+/// Because the caller ignores the return value, an error code is not observable
+/// by the guest, so the packet really must be written; a destination that cannot
+/// be read or written is reported loudly in the log as well as in `eax`.
+///
+/// CONSUMPTION GAP: patching the packet is only half the story. Neither in-tree
+/// command processor follows INDIRECT_BUFFER chains yet (kyty-graphics
+/// classifies `pm4::IT_INDIRECT_BUFFER` as `PacketClass::Indirect` in
+/// `run.rs`, and `raeen_gpu::agc` records it as opaque), so a title that links
+/// its frame through Jump/Rewind still submits a head buffer whose tail work is
+/// never executed. This function makes the chain *correct*; following it is
+/// separate work, and is the reason GTA V presents a flat clear colour despite
+/// translating its shaders.
+fn hle_unknown_agc_ikfdt_r_iq_ce(ctx: &HleContext, args: &[u64]) -> u64 {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            "libSceAgc NID 0x2247ddb7fac8a821 (Ikfdt-rIqCE) has no catalogue name: bound by \
+             NID as an in-place INDIRECT_BUFFER chain patch, f(packet, cachePolicy, target, \
+             sizeDwords), per the measured GTA V call sites and KytyPS5's \
+             GraphicsUnknownIkfdtRIqCE. The chain is patched correctly, but no in-tree \
+             command processor FOLLOWS chain packets yet — a title that links its frame \
+             through Jump/Rewind will still render only its head buffer."
+        );
+    }
+    let packet = args.first().copied().unwrap_or(0);
+    let cache_policy = (args.get(1).copied().unwrap_or(0) as u32) & 0x3;
+    let target = args.get(2).copied().unwrap_or(0);
+    let size_dwords = args.get(3).copied().unwrap_or(0) as u32;
+    debug!(
+        "sceAgcUnknownIkfdtRIqCE(packet={packet:#x}, cachePolicy={cache_policy}, \
+         target={target:#x}, sizeDwords={size_dwords:#x})"
+    );
+    if packet == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+    // Read the packet back before touching it: the opcode gate is what makes a
+    // stale/garbage pointer an error instead of silent corruption of whatever
+    // command happens to live there. Same idiom as the other `*Patch*` entry
+    // points in this file (`hle_queue_eop_patch_type` and friends).
+    match packet_identity(ctx, packet) {
+        Some((op, _)) if op == IT_INDIRECT_BUFFER => {}
+        other => {
+            // Warned once, not per call: this runs inside frame construction,
+            // so a persistent mismatch would otherwise emit one line per chain
+            // per frame and drown the log it is meant to make readable.
+            static BAD_PACKET_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !BAD_PACKET_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "sceAgcUnknownIkfdtRIqCE: packet at {packet:#x} is {other:?}, not \
+                     IT_INDIRECT_BUFFER ({IT_INDIRECT_BUFFER:#x}) — refusing to patch it. \
+                     Warned once; further mismatches are silent."
+                );
+            }
+            return SCE_AGC_ERROR_INVALID_PACKET;
+        }
+    }
+    let low = read_u32_or_zero(ctx, packet + 4);
+    let control = read_u32_or_zero(ctx, packet + 12);
+    let w = |off: u64, v: u32| ctx.mem.write(packet + off, &v.to_le_bytes());
+    let ok = w(4, (low & 0x3) | ((target as u32) & !0x3))
+        && w(8, (target >> 32) as u32)
+        && w(
+            12,
+            (control & CHAIN_CONTROL_PRESERVE) | (cache_policy << 28) | (size_dwords & 0xF_FFFF),
+        );
+    if !ok {
+        warn!(
+            "sceAgcUnknownIkfdtRIqCE: cannot write the chain packet at {packet:#x} — the \
+             guest's chain target is left stale"
+        );
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    0
 }
 
 /// `sceAgcCbBranch(cb, mode, compareFunction, compareAddress, mask, reference,
@@ -7536,26 +7733,129 @@ mod tests {
         );
     }
 
-    /// SharpEmu `DcbJump` parity: 4-DWORD INDIRECT_BUFFER chain packet.
+    /// SharpEmu `DcbJump` packet parity, with the argument shape MEASURED at a
+    /// retail call site rather than assumed.
+    ///
+    /// `Grand Theft Auto V` (PPSA04264) calls `sceAgcDcbJump` at
+    /// `module+0x2965aa0` as
+    /// `mov rdi,r14; mov esi,1; mov edx,2; mov rcx,r12; mov r8d,ebx; call` —
+    /// five arguments, with the target address in `rcx` (arg 3) and the DWORD
+    /// count in `r8` (arg 4). Reading the target from arg 1 (as this test used
+    /// to) turns a retail chain packet into `IB(target=1, size=2)`.
     #[test]
-    fn dcb_jump_emits_the_chain_packet() {
+    fn dcb_jump_emits_the_chain_packet_from_the_measured_argument_shape() {
         let (kernel, mem, alloc) = ctx_env();
         let ctx = test_ctx(&kernel, &mem, &alloc);
         let cb = 0x40;
         setup_cb(&ctx, cb, 0x400, 0x800);
         let target = 0x0001_2345_6789_ABC0u64;
-        let ret = hle_dcb_jump(&ctx, &[cb, target, 0x12_3456]);
+        // (dcb, mode=1, cachePolicy=2, target, sizeDwords)
+        let ret = hle_dcb_jump(&ctx, &[cb, 1, 2, target, 0x3_3456]);
         assert_eq!(ret, 0x400);
         assert_eq!(read_u32(&ctx, 0x400), pm4(4, IT_INDIRECT_BUFFER, R_ZERO));
-        assert_eq!(read_u32(&ctx, 0x404), 0x6789_ABC0, "target lo32");
-        assert_eq!(read_u32(&ctx, 0x408), 0x0001_2345 & 0xFFFF, "target hi16");
+        assert_eq!(read_u32(&ctx, 0x404), 0x6789_ABC0, "target lo32, 4-aligned");
+        assert_eq!(
+            read_u32(&ctx, 0x408),
+            0x0001_2345,
+            "target hi32 — Gen5 keeps all 32 bits (Gen4 masked to 16)"
+        );
         assert_eq!(
             read_u32(&ctx, 0x40C),
-            0x12_3456 & 0xF_FFFF,
-            "size & 0xFFFFF"
+            CHAIN_CONTROL_BITS | (2 << 28) | (1 << 20) | 0x3_3456,
+            "control: mandatory chain bits | cachePolicy<<28 | mode<<20 | size"
         );
         assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x410);
-        assert_eq!(hle_dcb_jump(&ctx, &[0, target, 8]), 0, "null dcb → 0");
+        assert_eq!(hle_dcb_jump(&ctx, &[0, 1, 2, target, 8]), 0, "null dcb → 0");
+    }
+
+    /// `libSceAgc` NID `0x2247ddb7fac8a821` (`Ikfdt-rIqCE`) patches an
+    /// ALREADY-EMITTED chain packet in place. It must write all four DWORDs:
+    /// a stub that returned success and left the destination alone would hand
+    /// the command processor whatever bytes happened to be there.
+    ///
+    /// Poisoned-destination pattern, borrowed from
+    /// `pthread_attr::every_attr_getter_actually_writes_its_out_parameter`.
+    #[test]
+    fn unknown_agc_ikfdt_patches_a_chain_packet_over_a_poisoned_destination() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Emit a real chain packet, then poison every field the patcher owns.
+        // The header stays valid because the patcher validates the opcode.
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let dst = hle_dcb_jump(&ctx, &[cb, 1, 3, 0xDEAD_0000u64, 0xF_FFFF]);
+        assert_eq!(dst, 0x400);
+        let control_before = read_u32(&ctx, dst + 12);
+
+        let target = 0x0001_2345_6789_ABC0u64;
+        // Measured shape: f(packetPtr, cachePolicy, target, sizeDwords).
+        assert_eq!(
+            hle_unknown_agc_ikfdt_r_iq_ce(&ctx, &[dst, 2, target, 0x3_3456]),
+            0,
+            "a well-formed patch reports success"
+        );
+
+        assert_eq!(
+            read_u32(&ctx, dst),
+            pm4(4, IT_INDIRECT_BUFFER, R_ZERO),
+            "the header must be left alone"
+        );
+        assert_eq!(read_u32(&ctx, dst + 4), 0x6789_ABC0, "target lo32 patched");
+        assert_eq!(read_u32(&ctx, dst + 8), 0x0001_2345, "target hi32 patched");
+        let control_after = read_u32(&ctx, dst + 12);
+        assert_eq!(control_after & 0xF_FFFF, 0x3_3456, "size DWORD patched");
+        assert_eq!((control_after >> 28) & 0x3, 2, "cache policy patched");
+        // The decisive property: a patch is read-modify-write. The mandatory
+        // chain bits and the mode bit the emitter set must survive — clearing
+        // them is exactly what makes KytyPS5's CpOpIndirectBuffer refuse to
+        // follow the chain.
+        assert_eq!(
+            control_after & CHAIN_CONTROL_PRESERVE,
+            control_before & CHAIN_CONTROL_PRESERVE,
+            "patching must preserve the chain/mode/vmid control bits"
+        );
+        assert_eq!(
+            control_after & CHAIN_CONTROL_BITS,
+            CHAIN_CONTROL_BITS,
+            "the mandatory Gen5 chain control bits must still be set"
+        );
+        assert_eq!((control_after >> 20) & 1, 1, "the mode bit must survive");
+
+        // Never silent success: a null pointer, and a packet that is not a
+        // chain packet, are both refused.
+        assert_ne!(
+            hle_unknown_agc_ikfdt_r_iq_ce(&ctx, &[0, 2, target, 8]),
+            0,
+            "null packet pointer must be refused, not silently succeeded"
+        );
+        assert!(mem.write(0x600, &pm4(4, IT_NOP, R_ZERO).to_le_bytes()));
+        assert_eq!(
+            hle_unknown_agc_ikfdt_r_iq_ce(&ctx, &[0x600, 2, target, 8]),
+            SCE_AGC_ERROR_INVALID_PACKET,
+            "a non-INDIRECT_BUFFER packet must be refused, not overwritten"
+        );
+        assert_eq!(
+            read_u32(&ctx, 0x600),
+            pm4(4, IT_NOP, R_ZERO),
+            "the refused packet must be left untouched"
+        );
+    }
+
+    /// The two identities GTA V imports that are known only by NID must be
+    /// bound by NID — hashing the placeholder label would produce a different
+    /// NID and leave the title's import unresolved.
+    #[test]
+    fn gta5_agc_chain_patch_nid_is_bound_by_nid() {
+        let registry = HleRegistry::new();
+        let overrides = registry.registered_nid_overrides();
+        assert!(
+            overrides.iter().any(|(nid, key)| {
+                *nid == 0x2247_ddb7_fac8_a821 && key == "libSceAgc::sceAgcUnknownIkfdtRIqCE"
+            }),
+            "libSceAgc NID 0x2247ddb7fac8a821 (Ikfdt-rIqCE) must be bound by NID; \
+             registered overrides = {overrides:?}"
+        );
     }
 
     /// KytyPS5 `GraphicsCbBranch` parity: the 14-DWORD conditional chain,

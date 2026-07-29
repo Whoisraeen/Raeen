@@ -3604,6 +3604,12 @@ fn hle_clear_virtual_range_name(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// `DirectMemoryQuery` code for "no allocated direct memory owns this offset".
 const SCE_KERNEL_ERROR_EACCES: u64 = 0x8002_000D;
 
+/// `sizeof(OrbisQueryInfo)` — `{ uintptr_t start; uintptr_t end; s32
+/// memoryType }` is 24 bytes on x86-64, not 20: the trailing `s32` is followed
+/// by four bytes of tail padding. kyty (`Kernel/Memory.cpp`) and KytyPS5 both
+/// require `infoSize == sizeof(QueryInfo)` exactly; SharpEmu requires `>= 24`.
+const DIRECT_MEMORY_QUERY_INFO_SIZE: u64 = 0x18;
+
 /// `sceKernelDirectMemoryQuery(offset, flags, SceKernelDirectMemoryQueryInfo
 /// *info, infoSize)` — shadPS4 `memory.cpp` (NID `BHouLQzh0X0`): find the
 /// allocated direct-memory region containing `offset` (`flags == 1` searches
@@ -3636,12 +3642,25 @@ fn hle_direct_memory_query(ctx: &HleContext, args: &[u64]) -> u64 {
         debug!("sceKernelDirectMemoryQuery: no allocated region owns {offset:#x} — EACCES");
         return SCE_KERNEL_ERROR_EACCES;
     };
-    let mut info = [0u8; 0x14];
+    // `OrbisQueryInfo` is `{ uintptr_t start; uintptr_t end; s32 memoryType }`,
+    // which is 24 bytes on x86-64 — the trailing `s32` carries four bytes of
+    // tail padding. Writing only 20 left bytes 0x14..0x18 holding whatever the
+    // guest's buffer already contained. Write the padding as zero.
+    let mut info = [0u8; DIRECT_MEMORY_QUERY_INFO_SIZE as usize];
     info[0..8].copy_from_slice(&region.vaddr.to_le_bytes());
     info[8..16].copy_from_slice(&(region.vaddr + region.size).to_le_bytes());
-    // Memory type: Raeen models one CPU-coherent pool (Onion / WB_ONION = 0).
-    info[16..20].copy_from_slice(&0i32.to_le_bytes());
-    if !ctx.mem.write(info_out, &info) {
+    // Echo the `type` the range was allocated with. Hardcoding 0 here is the
+    // same "the kernel forgot the type I gave it" defect that tripped
+    // Minecraft's embedded V8 into `UNREACHABLE()` through
+    // `sceKernelVirtualQuery`; every reference (shadPS4 `memory.cpp`, kyty
+    // `Kernel/Memory.cpp`, SharpEmu) reports the stored type.
+    info[16..20].copy_from_slice(&region.direct_memory_type.to_le_bytes());
+    // Honour a caller that offered less room than the full struct rather than
+    // faulting it: the gate above only requires the pre-padding 0x14 bytes, so
+    // a title passing exactly 0x14 keeps working (shadPS4 ignores `infoSize`
+    // entirely; kyty and KytyPS5 demand exactly 0x18).
+    let writable = (info_size as usize).min(info.len());
+    if !ctx.mem.write(info_out, &info[..writable]) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     SCE_OK
@@ -6062,6 +6081,66 @@ mod tests {
         assert_eq!(
             hle_direct_memory_query(&ctx, &[0x40_1000, 0, 0x100, 0x8]),
             SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    /// `OrbisQueryInfo` is `{ uintptr_t start; uintptr_t end; s32 memoryType }`
+    /// — **24 bytes** on x86-64, not 20: the trailing `s32` is followed by four
+    /// bytes of tail padding. kyty (`Kernel/Memory.cpp`) and KytyPS5 both
+    /// require `infoSize == sizeof(QueryInfo)` exactly 24, and SharpEmu
+    /// requires `>= 24`; only shadPS4 ignores the size.
+    ///
+    /// Two things this pins that used to be wrong:
+    ///  * `memoryType` was hardcoded `0` instead of echoing the type the guest
+    ///    allocated the range with. That is the same "the kernel forgot the
+    ///    type I gave it" defect that tripped Minecraft's embedded V8 into
+    ///    `UNREACHABLE()` through `sceKernelVirtualQuery`.
+    ///  * only 20 of the 24 bytes were written, so bytes 0x14..0x18 kept
+    ///    whatever the guest's buffer already held.
+    ///
+    /// Poisoned-destination pattern: every byte of the struct must change.
+    #[test]
+    fn direct_memory_query_echoes_the_allocation_type_and_fills_the_whole_struct() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Allocated as direct memory with type 12 — the type Minecraft's
+        // allocator measured, and a value that cannot be confused with 0.
+        kernel.memory.record_mapping_of_kind(
+            0x40_0000,
+            0x8000,
+            0x3,
+            raeen_core::types::MappingKind::Direct,
+            0x40_0000,
+            12,
+        );
+
+        assert!(mem.write(0x100, &[0xAAu8; 0x18]));
+        assert_eq!(
+            hle_direct_memory_query(&ctx, &[0x40_1000, 0, 0x100, 0x18]),
+            SCE_OK
+        );
+        let mut info = [0u8; 0x18];
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(
+            u64::from_le_bytes(info[0..8].try_into().unwrap()),
+            0x40_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            0x40_8000
+        );
+        assert_eq!(
+            i32::from_le_bytes(info[16..20].try_into().unwrap()),
+            12,
+            "memoryType must echo the type the range was allocated with"
+        );
+        assert!(
+            info[0x14..0x18].iter().all(|&b| b == 0),
+            "the struct's tail padding must be written, not left poisoned: {:?}",
+            &info[0x14..0x18]
         );
     }
 
