@@ -5663,3 +5663,46 @@ warn-and-skip, semantically right); consider honoring CB_SHADER_MASK.
 * Honest status: the 30-minute / strict 10-second soak is still red. Phase 2
   and checklist item 9 remain open; no Phase 3 bulk work is authorized by the
   ordered workflow yet.
+
+## 2026-07-29 — Dead Cells at 52.9 fps: the PM4 walk's write-boundary invalidation
+
+Measured, not guessed: two synthetic cost probes were added FIRST, then the fixes
+followed what they said.
+
+`crates/kyty-graphics/tests/pm4_walk_cost.rs` (the walk floor, per packet class):
+`IT_NOP` 10.3 ns, `SET_CONTEXT_REG` 9.9 ns, one `SET_SH_REG` register 2.7 ns,
+`IT_WRITE_DATA` against a do-nothing sink 26.2 ns. The bare walk cannot account
+for milliseconds; the sink's per-packet work can.
+
+`resolved_shader_memo_cost_probe` (`raeen-gpu` `draw_translate.rs`), memo at its
+256-entry capacity with realistic binds:
+
+| operation | before | after |
+|---|---|---|
+| `invalidate_ranges`, one 4 B completion label | 9,988 ns | 3.3 ns |
+| same-program miss (99% of the retail profile) | 1,482 ns | ~266 ns |
+| exact-state hit | 78.6 ns | ~89 ns |
+
+Root cause: `DrawSink::guest_memory_write_boundary` fires once per
+`WRITE_DATA`/`RELEASE_MEM`/`DMA_DATA` packet, and `ResolvedShaderMemo::invalidate_ranges`
+re-derived `bind_eud_dependency` — descriptor/texture/sampler/GDS scans — for
+BOTH stages of EVERY entry on each one. Three fixes: dependency ranges
+precomputed at insert; a 64-bit 1 MiB-granule rejection mask (sound by
+construction, since overlapping ranges share a granule bit); and application
+deferred to the next read, which is the only observer.
+
+Also: the walk is now attributable by packet class
+(`kyty_graphics::run::WalkCensus` → the `WALK PACKET CLASSES` line under
+`RAEEN_TIME_DRAW`), and the unconditional per-register `debug!` on PS user-SGPR
+writes — the hottest register range in the walk — sits behind
+`RAEEN_TRACE_SHADER_BINDS`.
+
+Honest status: NOT verified on the retail title (this agent cannot run it). The
+per-label unit cost is measured; the per-frame total depends on `boundaries` per
+submission, which the new report line now names. The per-program resolve cache
+was deliberately NOT built: `kyty-graphics` `shader/analysis.rs:2211` latches
+`user_sgpr.value[start]` into the analysis output, and `:4476-4510` picks the EUD
+base by scanning the whole live user-SGPR file, so no key narrowing is sound —
+the real fix is shadPS4's ABI/value split, a refactor with a rendering-regression
+risk. New `miss_*_inside` / `miss_*_beyond` counters say which of the two applies
+for a given title.

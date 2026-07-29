@@ -2498,6 +2498,42 @@ pub(crate) static DRAW_STAGE_RESOLVE_MISSES: std::sync::atomic::AtomicU64 =
 /// the memo key is wider than what the shader analysis reads.
 pub(crate) static DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// WHICH component of the too-wide key differed on a same-program miss.
+///
+/// `resolve_misses_same_program` proved the key is wider than the analysis
+/// needs; these say wider in WHAT, and that decides the only two possible
+/// fixes:
+///
+/// * `..._beyond_count` — the difference sits OUTSIDE the analysis's live
+///   user-SGPR window (its reads are bounded by `count.max(4)`; see
+///   `kyty-graphics` `analysis.rs:4476` and the `count` gates at 831/1419/4822).
+///   A register the analysis cannot read must not be in the key: mask the tail
+///   and the misses become hits, with no change to what is analyzed.
+/// * `..._inside_count` — the difference is a register the analysis DOES read
+///   and LATCHES into its output (`analysis.rs:2211`
+///   `info.sgprs[index].field = user_sgpr.value[start]`, and the EUD pointer
+///   scan at `analysis.rs:4476-4510` picks its base by scanning the whole live
+///   file). No key narrowing is sound there; the fix is shadPS4's split — cache
+///   the analyzed ABI per program and re-derive the latched descriptor/constant
+///   values per draw.
+pub(crate) static DRAW_STAGE_MISS_DIFF_VS_SGPR_INSIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_MISS_DIFF_VS_SGPR_BEYOND: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_MISS_DIFF_GS_SGPR_INSIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_MISS_DIFF_GS_SGPR_BEYOND: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_MISS_DIFF_PS_SGPR_BEYOND: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The stage registers themselves (`rsrc2.user_sgpr`, checksums, embedded ids).
+pub(crate) static DRAW_STAGE_MISS_DIFF_STAGE_REGS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The shader-facing context registers (`SPI_*`, `DB_SHADER_CONTROL`).
+pub(crate) static DRAW_STAGE_MISS_DIFF_SH_REGS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_MISSES: std::sync::atomic::AtomicU64 =
@@ -2635,6 +2671,14 @@ fn draw_stage_tick() {
         resolve_hits,
         resolve_misses,
         resolve_misses_same_program,
+        miss_vs_sgpr_inside = DRAW_STAGE_MISS_DIFF_VS_SGPR_INSIDE.swap(0, Relaxed),
+        miss_vs_sgpr_beyond = DRAW_STAGE_MISS_DIFF_VS_SGPR_BEYOND.swap(0, Relaxed),
+        miss_gs_sgpr_inside = DRAW_STAGE_MISS_DIFF_GS_SGPR_INSIDE.swap(0, Relaxed),
+        miss_gs_sgpr_beyond = DRAW_STAGE_MISS_DIFF_GS_SGPR_BEYOND.swap(0, Relaxed),
+        miss_ps_sgpr_inside = DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE.swap(0, Relaxed),
+        miss_ps_sgpr_beyond = DRAW_STAGE_MISS_DIFF_PS_SGPR_BEYOND.swap(0, Relaxed),
+        miss_stage_regs = DRAW_STAGE_MISS_DIFF_STAGE_REGS.swap(0, Relaxed),
+        miss_sh_regs = DRAW_STAGE_MISS_DIFF_SH_REGS.swap(0, Relaxed),
         parse_hits,
         parse_misses,
         setup_us = per_draw_us(setup),
@@ -2645,7 +2689,7 @@ fn draw_stage_tick() {
         other_us = per_draw_us(other),
         other_of_draw_pct = dpct(other),
         predraw_us = per_draw_us(predraw),
-        "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, Vulkan backend (record = backend minus build), the untimed remainder, and the pre-draw_common index/compute work"
+        "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, Vulkan backend (record = backend minus build), the untimed remainder, and the pre-draw_common index/compute work. `miss_*` names WHICH part of a too-wide key churned: `_beyond` is outside the analysis's live user-SGPR window and can be masked out of the key; `_inside` is a register the analysis latches, which needs the per-program ABI split instead"
     );
     tracing::warn!(
         dispatches,

@@ -578,6 +578,126 @@ pub struct CommandProcessor {
     /// writer and this in-stream writer share ONE authoritative clock when
     /// the gate is on (the two-clock double-write was measured to disagree).
     timestamp_source: Option<fn() -> Option<u64>>,
+    /// Per-packet-class census of the walk, for the embedder's timing report.
+    /// Always counted (a `u64` increment); the `_ns` fields are only filled
+    /// when [`Self::set_walk_timing`] is on.
+    census: WalkCensus,
+    /// Whether to wrap the expensive packet classes in a clock — see
+    /// [`WalkCensus`].
+    time_walk: bool,
+}
+
+/// What the PM4 walk spent its time on, split by packet class.
+///
+/// `walk_us` in the embedder's `SUBMISSION PHASES` report is the whole walk; it
+/// once read 98% of a Dead Cells submission with only a third of that in
+/// measurable draw work, and there was no way to say which packet class owned
+/// the rest. This names them.
+///
+/// The whole census is opt-in ([`CommandProcessor::set_walk_timing`]): a
+/// `SET_CONTEXT_REG` packet walks in ~10 ns and a `SET_SH_REG` register in
+/// ~2.7 ns (`kyty-graphics/tests/pm4_walk_cost.rs`), and even
+/// classify-and-increment measured +1-2.5 ns on that. With the census on,
+/// register writes are still only COUNTED, never timed — `Instant::now()` costs
+/// more than the packet does, so timing them would report the probe rather than
+/// the work. The timed classes each cost hundreds of ns or more, where a clock
+/// read is noise.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WalkCensus {
+    /// `SET_CONTEXT_REG` / `SET_SH_REG` / `SET_UCONFIG_REG*` packets…
+    pub reg_packets: u64,
+    /// …and the individual registers they wrote (count-only, see above).
+    pub regs: u64,
+    /// Draw packets, and the nanoseconds their [`DrawSink`] calls took.
+    pub draws: u64,
+    pub draw_ns: u64,
+    /// Dispatch packets and their sink time.
+    pub dispatches: u64,
+    pub dispatch_ns: u64,
+    /// `WRITE_DATA` / `RELEASE_MEM` / `DMA_DATA` packets — the completion
+    /// labels a title interleaves with its draws.
+    pub write_packets: u64,
+    pub write_ns: u64,
+    /// The [`DrawSink::guest_memory_write_boundary`] notifications those
+    /// packets raised, and what the sink spent invalidating its
+    /// guest-memory-derived caches. This is the field that found Dead Cells'
+    /// missing 4.7 ms.
+    pub boundaries: u64,
+    pub boundary_ns: u64,
+    /// `WAIT_REG_MEM` and the AGC `R_WAIT_MEM_*` forms.
+    pub waits: u64,
+    pub wait_ns: u64,
+    /// Indirect register/draw/dispatch packets, which re-enter the walk.
+    pub indirects: u64,
+    pub indirect_ns: u64,
+    /// Packets consumed by encoded length with no state change: type-2 filler,
+    /// markers, `CONTEXT_CONTROL`, and the unknown-opcode skip path.
+    pub inert_packets: u64,
+}
+
+/// The [`WalkCensus`] bucket one packet belongs to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PacketClass {
+    RegWrite,
+    Draw,
+    Dispatch,
+    Write,
+    Wait,
+    Indirect,
+    Inert,
+}
+
+impl PacketClass {
+    /// Whether a clock read is cheap relative to this class's own cost. See
+    /// [`WalkCensus`]: register writes are ~3-10 ns, so timing them would
+    /// measure the probe.
+    const fn is_timed(self) -> bool {
+        matches!(
+            self,
+            Self::Draw | Self::Dispatch | Self::Write | Self::Wait | Self::Indirect
+        )
+    }
+}
+
+impl WalkCensus {
+    /// Attribute one dispatched packet. `consumed` is the handler's dword count
+    /// on success — for a register packet that is `registers + 1`, which is how
+    /// [`Self::regs`] is counted without touching the setters.
+    fn record(
+        &mut self,
+        class: PacketClass,
+        clock: Option<std::time::Instant>,
+        consumed: Option<u32>,
+    ) {
+        let ns = clock.map_or(0, |at| at.elapsed().as_nanos() as u64);
+        match class {
+            PacketClass::RegWrite => {
+                self.reg_packets += 1;
+                self.regs += u64::from(consumed.unwrap_or(1).saturating_sub(1));
+            }
+            PacketClass::Draw => {
+                self.draws += 1;
+                self.draw_ns += ns;
+            }
+            PacketClass::Dispatch => {
+                self.dispatches += 1;
+                self.dispatch_ns += ns;
+            }
+            PacketClass::Write => {
+                self.write_packets += 1;
+                self.write_ns += ns;
+            }
+            PacketClass::Wait => {
+                self.waits += 1;
+                self.wait_ns += ns;
+            }
+            PacketClass::Indirect => {
+                self.indirects += 1;
+                self.indirect_ns += ns;
+            }
+            PacketClass::Inert => self.inert_packets += 1,
+        }
+    }
 }
 
 impl CommandProcessor {
@@ -587,6 +707,24 @@ impl CommandProcessor {
             num_instances: 1,
             ..Self::default()
         }
+    }
+
+    /// Take the [`WalkCensus`] — classify and count every packet, and clock the
+    /// expensive classes. Off by default; see [`WalkCensus`] for why even
+    /// counting is gated.
+    pub const fn set_walk_timing(&mut self, on: bool) {
+        self.time_walk = on;
+    }
+
+    /// Drain the per-packet-class census accumulated since the last drain.
+    #[must_use]
+    pub fn take_walk_census(&mut self) -> WalkCensus {
+        std::mem::take(&mut self.census)
+    }
+
+    /// `Instant::now()` only when timing is on.
+    fn walk_clock(&self) -> Option<std::time::Instant> {
+        self.time_walk.then(std::time::Instant::now)
     }
 
     #[must_use]
@@ -992,6 +1130,12 @@ impl CommandProcessor {
                 pm4::r_code(cmd_id),
                 pm4::R_WRITE_DATA | pm4::R_RELEASE_MEM | pm4::R_DMA_DATA
             ));
+        // ONE branch for the whole census: classification, counting and the
+        // clock all live behind it. Measured on the synthetic probe, an
+        // unconditional class-and-count added 1-2.5 ns to an
+        // `IT_NOP`/`SET_CONTEXT_REG` packet whose whole cost is ~10 ns, so a
+        // diagnostic must not tax the default path.
+        let clock = self.walk_clock();
         // Per-PACKET scope: the ranges this packet writes, never the previous
         // one's. Cheap (a `clear` on an already-empty Vec) for the overwhelming
         // majority of packets, which write nothing.
@@ -1121,6 +1265,14 @@ impl CommandProcessor {
                 Ok(pm4::body_dw(cmd_id))
             }
         };
+        if let Some(at) = clock {
+            let class = Self::packet_class(cmd_id, op);
+            self.census.record(
+                class,
+                class.is_timed().then_some(at),
+                result.as_ref().ok().copied(),
+            );
+        }
         // Notify on the write-capable opcodes (even when they wrote nothing, so
         // a sink may keep a blanket-clear policy) AND on any packet that
         // actually wrote guest memory, so a future write site can never bypass
@@ -1128,9 +1280,56 @@ impl CommandProcessor {
         // a completion label written next to a texture must not throw away the
         // analysis of every shader in the frame.
         if (guest_memory_write_boundary || !self.packet_guest_writes.is_empty()) && result.is_ok() {
+            let at = self.walk_clock();
             sink.guest_memory_write_boundary(&self.packet_guest_writes);
+            if self.time_walk {
+                self.census.boundaries += 1;
+                if let Some(at) = at {
+                    self.census.boundary_ns += at.elapsed().as_nanos() as u64;
+                }
+            }
         }
         result
+    }
+
+    /// Which [`WalkCensus`] bucket a packet belongs to.
+    ///
+    /// Classified from the header alone — one `matches!` chain per packet, no
+    /// change to the dispatch table itself, so the walk's behaviour is
+    /// untouched.
+    fn packet_class(cmd_id: u32, op: pm4::ItOp) -> PacketClass {
+        match op {
+            pm4::IT_SET_CONTEXT_REG
+            | pm4::IT_SET_SH_REG
+            | pm4::IT_SET_UCONFIG_REG
+            | pm4::IT_SET_UCONFIG_REG_INDEX
+            | pm4::IT_SET_CONFIG_REG => PacketClass::RegWrite,
+            pm4::IT_DRAW_INDEX_AUTO
+            | pm4::IT_DRAW_INDEX_2
+            | pm4::IT_DRAW_INDEX_OFFSET_2
+            | pm4::IT_DRAW_INDIRECT
+            | pm4::IT_DRAW_INDIRECT_MULTI
+            | pm4::IT_DRAW_INDEX_INDIRECT
+            | pm4::IT_DRAW_INDEX_INDIRECT_MULTI => PacketClass::Draw,
+            pm4::IT_DISPATCH_DIRECT | pm4::IT_DISPATCH_INDIRECT => PacketClass::Dispatch,
+            pm4::IT_WRITE_DATA | pm4::IT_RELEASE_MEM | pm4::IT_DMA_DATA => PacketClass::Write,
+            pm4::IT_WAIT_REG_MEM => PacketClass::Wait,
+            pm4::IT_INDIRECT_BUFFER | pm4::IT_INDIRECT_BUFFER_CNST => PacketClass::Indirect,
+            // The AGC dialect rides on `IT_NOP`, discriminated by the R code.
+            pm4::IT_NOP => match pm4::r_code(cmd_id) {
+                pm4::R_DRAW_INDEX | pm4::R_DRAW_INDEX_AUTO => PacketClass::Draw,
+                pm4::R_DISPATCH_DIRECT => PacketClass::Dispatch,
+                pm4::R_WRITE_DATA | pm4::R_RELEASE_MEM | pm4::R_DMA_DATA => PacketClass::Write,
+                pm4::R_WAIT_MEM_32 | pm4::R_WAIT_MEM_64 | pm4::R_WAIT_FLIP_DONE => {
+                    PacketClass::Wait
+                }
+                pm4::R_CX_REGS_INDIRECT | pm4::R_SH_REGS_INDIRECT | pm4::R_UC_REGS_INDIRECT => {
+                    PacketClass::Indirect
+                }
+                _ => PacketClass::Inert,
+            },
+            _ => PacketClass::Inert,
+        }
     }
 
     /// Conditional execution packet: a zero 32-bit label skips the following
@@ -3026,11 +3225,20 @@ impl CommandProcessor {
                 .contains(&r) =>
             {
                 let id = r - pm4::SPI_SHADER_USER_DATA_PS_0;
-                tracing::debug!(
-                    id,
-                    value = format_args!("{value:#010x}"),
-                    "PS user SGPR write"
-                );
+                // Gated: this is the single hottest register range in the walk
+                // (a title rewrites up to 32 PS user SGPRs per draw for its
+                // per-object constants), and an UNCONDITIONAL per-register
+                // `debug!` puts a tracing dispatch on every one of them —
+                // free-ish at WARN, ruinous the moment anyone runs at DEBUG.
+                // The env gate is a cached `OnceLock`, so the diagnostic is
+                // still available on request and costs one load otherwise.
+                if trace_shader_binds_enabled() {
+                    tracing::debug!(
+                        id,
+                        value = format_args!("{value:#010x}"),
+                        "PS user SGPR write"
+                    );
+                }
                 self.sh_ctx.ps.ps_user_sgpr.set(id, value, marker);
             }
             r if (pm4::SPI_SHADER_USER_DATA_GS_0..pm4::SPI_SHADER_USER_DATA_GS_0 + SGPRS)
@@ -5798,5 +6006,108 @@ mod tests {
             .expect("resumed walk");
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(sink.draws.len(), 1, "the resumed remainder draws");
+    }
+
+    /// Every packet the walk consumes lands in exactly one [`WalkCensus`]
+    /// bucket, and the register bucket counts REGISTERS, not packets.
+    ///
+    /// `walk_us` alone could not say which packet class owned a submission. This
+    /// pins that the split is exhaustive — a packet that fell through every arm
+    /// would leave the buckets short of the packet count, which is the failure
+    /// mode that made the old report un-actionable.
+    #[test]
+    fn walk_census_attributes_every_packet_class() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let label = 0x2000u64;
+        let mem = BufMem {
+            base: label,
+            words: vec![0; 8],
+        };
+
+        let mut dcb = Vec::new();
+        // 1 context-register packet writing 4 registers.
+        dcb.extend_from_slice(&[
+            header(6, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::SPI_PS_INPUT_CNTL_0,
+            1,
+            2,
+            3,
+            4,
+        ]);
+        // 1 shader-register packet writing 2 registers.
+        dcb.extend_from_slice(&set_sh(pm4::SPI_SHADER_USER_DATA_PS_0, &[7, 8]));
+        // 1 user-config packet writing 1 register.
+        dcb.extend_from_slice(&[
+            header(3, pm4::IT_SET_UCONFIG_REG, pm4::R_ZERO),
+            pm4::VGT_PRIMITIVE_TYPE,
+            17,
+        ]);
+        // 1 draw.
+        dcb.extend_from_slice(&[header(7, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), 3, 0]);
+        dcb.extend(pad(4));
+        // 1 WRITE_DATA completion label (2 payload dwords into memory).
+        dcb.extend_from_slice(&[
+            header(6, pm4::IT_WRITE_DATA, pm4::R_ZERO),
+            1 << 8,
+            label as u32,
+            (label >> 32) as u32,
+            0xabcd,
+            0,
+        ]);
+        // 1 inert packet: CONTEXT_CONTROL.
+        dcb.extend_from_slice(&[header(3, pm4::IT_CONTEXT_CONTROL, pm4::R_ZERO), 0, 0]);
+
+        cp.set_walk_timing(true);
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("census stream must walk");
+        let census = cp.take_walk_census();
+
+        assert_eq!(census.reg_packets, 3, "three register packets");
+        assert_eq!(census.regs, 7, "4 + 2 + 1 individual registers");
+        assert_eq!(census.draws, 1);
+        assert_eq!(census.write_packets, 1);
+        assert_eq!(census.inert_packets, 1);
+        assert_eq!(census.dispatches, 0);
+        assert_eq!(census.waits, 0);
+        assert_eq!(census.indirects, 0);
+        // The write packet raised exactly one sink boundary notification.
+        assert_eq!(census.boundaries, 1);
+        assert_eq!(
+            sink.guest_memory_write_boundaries, 1,
+            "the census must agree with the sink"
+        );
+
+        // EXHAUSTIVE: every packet is in exactly one bucket.
+        let counted = census.reg_packets
+            + census.draws
+            + census.dispatches
+            + census.write_packets
+            + census.waits
+            + census.indirects
+            + census.inert_packets;
+        assert_eq!(counted, 6, "6 packets in, 6 packets attributed");
+
+        // Timing is opt-in and only for the classes where a clock read is noise.
+        assert!(census.draw_ns > 0, "a timed class must report time");
+        assert!(census.write_ns > 0);
+
+        // With the census OFF nothing is recorded at all — not even a count.
+        // That is deliberate: classify-and-increment measured +1-2.5 ns on a
+        // ~10 ns packet, and the default path must not pay for a diagnostic.
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("census stream must walk");
+        assert_eq!(
+            cp.take_walk_census(),
+            WalkCensus::default(),
+            "no packet may be classified, counted, or clocked unless the census \
+             was asked for"
+        );
+        assert_eq!(
+            sink.guest_memory_write_boundaries, 1,
+            "the walk itself must behave identically either way"
+        );
     }
 }

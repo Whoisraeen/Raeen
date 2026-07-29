@@ -713,6 +713,71 @@ const RESOLVED_SHADER_MEMO_CAPACITY: usize = 256;
 struct ResolvedShaderEntry {
     key: ResolvedShaderKey,
     shaders: Arc<ResolvedShaders>,
+    /// The PROGRAM this entry binds, for miss attribution — see
+    /// [`ResolvedShaderMemo::misses_same_program`]. Precomputed so attributing a
+    /// miss does not need a second pass over the key.
+    program: [u64; 4],
+    /// The guest ranges whose CONTENTS this analysis latched: both stages' code
+    /// windows and their EUD descriptor tables.
+    ///
+    /// Precomputed at insert because it is a pure function of the entry, while
+    /// the consumer — [`ResolvedShaderMemo::invalidate_ranges`] — runs once per
+    /// write-capable PM4 packet, and titles interleave completion labels with
+    /// their draws. Deriving it there instead re-ran
+    /// [`bind_eud_dependency`]'s descriptor/sampler/GDS scans twice per entry
+    /// per packet: measured by `resolved_shader_memo_cost_probe` at **9,988 ns
+    /// per label write** with the memo at capacity, which is where Dead Cells'
+    /// `walk_us` went (7,077 us per submission against 2.3 ms of actual draw
+    /// work).
+    deps: [(u64, u64); RESOLVED_SHADER_MAX_DEPS],
+    deps_len: u8,
+    /// [`address_granule_mask`] over this entry's own dependency ranges, so
+    /// rebuilding the memo-wide mask is a fold of `u64`s rather than a
+    /// re-derivation, and a pass can reject an entry before its range loop.
+    dep_mask: u64,
+}
+
+impl ResolvedShaderEntry {
+    fn deps(&self) -> &[(u64, u64)] {
+        &self.deps[..self.deps_len as usize]
+    }
+}
+
+/// Pending guest-write spans retained before the memo is next read. Past this
+/// the spans are applied eagerly: still correct, still bounded.
+const PENDING_WRITE_RANGES_MAX: usize = 64;
+
+/// Which 1 MiB granules of the guest address space a range touches, folded onto
+/// 64 bits.
+///
+/// This is the rejection filter that makes a completion label FREE. Batching the
+/// invalidation did not reduce the work — the cost is `entries x deps x writes`
+/// and deferring only changed when the product was paid — but a title's labels
+/// live nowhere near its shader code or descriptor tables, so almost every write
+/// can be discarded before any entry is touched.
+///
+/// SOUND BY CONSTRUCTION: two ranges that overlap share an address, that address
+/// lies in exactly one 1 MiB granule, and both masks set that granule's bit — so
+/// a zero AND proves no overlap. Aliasing (every 64 MiB) can only produce a
+/// FALSE POSITIVE, which costs a full pass and decides correctly.
+fn address_granule_mask(base: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let first = base >> 20;
+    let last = base.saturating_add(len - 1) >> 20;
+    if last - first >= 63 {
+        return u64::MAX;
+    }
+    let mut mask = 0u64;
+    for granule in first..=last {
+        // Fold the whole 44-bit granule index into 6 bits instead of taking the
+        // low 6 (which aliases every 64 MiB — and a title's code and label pages
+        // sit tens of MiB apart).
+        let bit = (granule ^ (granule >> 6) ^ (granule >> 12) ^ (granule >> 18)) & 63;
+        mask |= 1u64 << bit;
+    }
+    mask
 }
 
 #[derive(Default)]
@@ -725,6 +790,20 @@ struct ResolvedShaderMemo {
     // Measured on this shape: 217 us -> 113 ns per lookup.
     #[allow(clippy::vec_box, reason = "the LRU shifts slots; keep them pointers")]
     entries: Vec<Box<ResolvedShaderEntry>>,
+    /// Guest write spans reported since the memo was last READ.
+    ///
+    /// The memo is written by the PM4 walk (once per write-capable packet) and
+    /// read only by a draw or dispatch, so applying the spans at the next read
+    /// instead of at every notification is observationally identical — and it
+    /// collapses hundreds of per-packet passes over the entries into one pass
+    /// per draw. Nothing can observe an entry between the notification and the
+    /// drain: `apply_pending_writes` runs first in both `get` and `insert`.
+    pending_writes: Vec<(u64, u64)>,
+    /// Union of every live entry's [`address_granule_mask`]. A write whose mask
+    /// misses this cannot invalidate anything and is dropped in a few
+    /// instructions. Only ever a SUPERSET (eviction leaves it broad until the
+    /// next pass rebuilds it), so it can over-admit but never under-admit.
+    dep_mask: u64,
     hits: u64,
     misses: u64,
     /// Misses where the memo ALREADY held the same VS/PS program addresses and
@@ -751,6 +830,98 @@ fn resolved_shader_program_addrs(key: &ResolvedShaderKey) -> [u64; 4] {
         key.vs.gs_regs.data_addr,
         key.ps.ps_regs.data_addr,
     ]
+}
+
+/// The user-SGPR window the shader analysis can actually read.
+///
+/// Every read path is bounded by the declared count, floored at 4: the EUD
+/// pointer scans use `user_sgpr.count.max(4)` (`kyty-graphics`
+/// `shader/analysis.rs:4476`, `:3006`), the descriptor gathers gate on
+/// `< user_sgpr.count` (`:831`, `:1419`, `:4822`), and the direct-SGPR
+/// candidates are seeded from the shader's declared `user_sgpr_num` (`:2736`),
+/// which a stage whose declaration exceeds `count` refuses outright (`:5664`,
+/// `:5679`, `:5722`). A register at or past this bound therefore cannot reach
+/// any analysis output.
+///
+/// Used ONLY to attribute a miss (see [`resolved_shader_key_diff`]); the memo
+/// key itself is still the exact register state.
+fn analysis_sgpr_window(sgpr: &kyty_graphics::hw_regs::UserSgprInfo) -> usize {
+    (sgpr.count.max(4) as usize).min(kyty_graphics::hw_regs::UserSgprInfo::SGPRS_MAX)
+}
+
+/// `(differs inside the analysis window, differs only beyond it)` for one
+/// user-SGPR file.
+fn sgpr_file_diff(
+    a: &kyty_graphics::hw_regs::UserSgprInfo,
+    b: &kyty_graphics::hw_regs::UserSgprInfo,
+) -> (bool, bool) {
+    if a == b {
+        return (false, false);
+    }
+    // A different declared count changes the window itself — that is an
+    // inside-window difference by definition.
+    if a.count != b.count {
+        return (true, false);
+    }
+    let window = analysis_sgpr_window(a);
+    let inside = a.value[..window] != b.value[..window] || a.type_[..window] != b.type_[..window];
+    (inside, !inside)
+}
+
+/// Attribute a same-program miss to the key component that differed.
+///
+/// This is the next turn of the crank after `misses_same_program`: that counter
+/// proved the key is too wide, this says wider in WHAT — and therefore which of
+/// the two fixes applies. See [`crate::vulkan::offscreen::DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE`].
+fn resolved_shader_key_diff(a: &ResolvedShaderKey, b: &ResolvedShaderKey) {
+    use crate::vulkan::offscreen as counters;
+    use std::sync::atomic::Ordering::Relaxed;
+    let bump = |counter: &std::sync::atomic::AtomicU64| {
+        counter.fetch_add(1, Relaxed);
+    };
+    for (left, right, inside, beyond) in [
+        (
+            &a.vs.vs_user_sgpr,
+            &b.vs.vs_user_sgpr,
+            &counters::DRAW_STAGE_MISS_DIFF_VS_SGPR_INSIDE,
+            &counters::DRAW_STAGE_MISS_DIFF_VS_SGPR_BEYOND,
+        ),
+        (
+            &a.vs.gs_user_sgpr,
+            &b.vs.gs_user_sgpr,
+            &counters::DRAW_STAGE_MISS_DIFF_GS_SGPR_INSIDE,
+            &counters::DRAW_STAGE_MISS_DIFF_GS_SGPR_BEYOND,
+        ),
+        (
+            &a.ps.ps_user_sgpr,
+            &b.ps.ps_user_sgpr,
+            &counters::DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE,
+            &counters::DRAW_STAGE_MISS_DIFF_PS_SGPR_BEYOND,
+        ),
+    ] {
+        match sgpr_file_diff(left, right) {
+            (true, _) => bump(inside),
+            (false, true) => bump(beyond),
+            (false, false) => {}
+        }
+    }
+    // The stage registers, excluding the code addresses (equal by construction
+    // on a same-program miss).
+    if a.vs.vs_regs.rsrc2 != b.vs.vs_regs.rsrc2
+        || a.vs.gs_regs.rsrc2 != b.vs.gs_regs.rsrc2
+        || a.vs.gs_regs.chksum != b.vs.gs_regs.chksum
+        || a.vs.vs_embedded != b.vs.vs_embedded
+        || a.vs.vs_embedded_id != b.vs.vs_embedded_id
+        || a.ps.ps_regs.rsrc2 != b.ps.ps_regs.rsrc2
+        || a.ps.ps_regs.chksum != b.ps.ps_regs.chksum
+        || a.ps.ps_embedded != b.ps.ps_embedded
+        || a.ps.ps_embedded_id != b.ps.ps_embedded_id
+    {
+        bump(&counters::DRAW_STAGE_MISS_DIFF_STAGE_REGS);
+    }
+    if a.regs != b.regs {
+        bump(&counters::DRAW_STAGE_MISS_DIFF_SH_REGS);
+    }
 }
 
 /// The fetcher never reads more than 256 KiB for one guest shader. Treat that
@@ -837,54 +1008,94 @@ fn bind_eud_dependency(bind: &ShaderBindResources) -> Option<(u64, u64)> {
     Some((base, end_dwords.saturating_mul(4)))
 }
 
+/// Four code windows (VS/ES/GS/PS) plus each stage's EUD descriptor table.
+const RESOLVED_SHADER_MAX_DEPS: usize = 6;
+
+/// Every guest range whose CONTENTS one resolved pair latched.
+///
+/// Derived once, when the pair is memoized — see [`ResolvedShaderEntry::deps`]
+/// for why this must not run per write-capable packet.
+fn resolved_shader_dependency_ranges(
+    key: &ResolvedShaderKey,
+    shaders: &ResolvedShaders,
+) -> ([(u64, u64); RESOLVED_SHADER_MAX_DEPS], u8) {
+    let mut deps = [(0u64, 0u64); RESOLVED_SHADER_MAX_DEPS];
+    let mut len = 0usize;
+    let mut push = |base: u64, span: u64| {
+        if base != 0 && span != 0 && len < RESOLVED_SHADER_MAX_DEPS {
+            deps[len] = (base, span);
+            len += 1;
+        }
+    };
+    if !key.vs.vs_embedded {
+        push(key.vs.vs_regs.data_addr, SHADER_CODE_DEPENDENCY_BYTES);
+        push(key.vs.es_regs.data_addr, SHADER_CODE_DEPENDENCY_BYTES);
+        push(key.vs.gs_regs.data_addr, SHADER_CODE_DEPENDENCY_BYTES);
+    }
+    if !key.ps.ps_embedded {
+        push(key.ps.ps_regs.data_addr, SHADER_CODE_DEPENDENCY_BYTES);
+    }
+    if let Some((base, span)) = bind_eud_dependency(&shaders.vs_info.bind) {
+        push(base, span);
+    }
+    if let Some((base, span)) = bind_eud_dependency(&shaders.ps_info.bind) {
+        push(base, span);
+    }
+    (deps, len as u8)
+}
+
+/// True when any write span touches any dependency span.
+fn ranges_intersect(deps: &[(u64, u64)], writes: &[(u64, u64)]) -> bool {
+    writes.iter().any(|&(write_base, write_len)| {
+        deps.iter()
+            .any(|&(base, span)| ranges_overlap(base, span, write_base, write_len))
+    })
+}
+
+/// The pre-precomputation predicate, kept as the REFERENCE definition of the
+/// invariant: `resolved_shader_dependency_ranges` must decide identically. Pinned
+/// by `precomputed_dependency_ranges_match_deriving_them_per_write`.
+#[cfg(test)]
 fn resolved_shader_depends_on_ranges(
     key: &ResolvedShaderKey,
     shaders: &ResolvedShaders,
     writes: &[(u64, u64)],
 ) -> bool {
-    let mut code = [0u64; 4];
-    let code_count = if key.vs.vs_embedded {
-        0
-    } else {
-        code[0] = key.vs.vs_regs.data_addr;
-        code[1] = key.vs.es_regs.data_addr;
-        code[2] = key.vs.gs_regs.data_addr;
-        3
-    };
-    let ps_index = code_count;
-    if !key.ps.ps_embedded {
-        code[ps_index] = key.ps.ps_regs.data_addr;
-    }
-    let code_count = code_count + usize::from(!key.ps.ps_embedded);
-    let vs_eud = bind_eud_dependency(&shaders.vs_info.bind);
-    let ps_eud = bind_eud_dependency(&shaders.ps_info.bind);
-
-    writes.iter().any(|&(write_base, write_len)| {
-        code[..code_count].iter().any(|&program| {
-            program != 0
-                && ranges_overlap(program, SHADER_CODE_DEPENDENCY_BYTES, write_base, write_len)
-        }) || vs_eud.is_some_and(|(base, len)| ranges_overlap(base, len, write_base, write_len))
-            || ps_eud.is_some_and(|(base, len)| ranges_overlap(base, len, write_base, write_len))
-    })
+    let (deps, len) = resolved_shader_dependency_ranges(key, shaders);
+    ranges_intersect(&deps[..len as usize], writes)
 }
 
 impl ResolvedShaderMemo {
     fn get(&mut self, key: ResolvedShaderKey) -> Option<Arc<ResolvedShaders>> {
-        let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
+        self.apply_pending_writes();
+        let program = resolved_shader_program_addrs(&key);
+        // ONE pass: find the exact match and, failing that, learn whether the
+        // memo already held this program (the miss attribution below). The
+        // second pass this replaces re-derived `program` for every entry.
+        let mut index = None;
+        // The most recently inserted entry for this program, for miss
+        // attribution: the walk rewrites its per-object constants between
+        // adjacent draws, so the newest same-program key is the one whose
+        // difference names what churned.
+        let mut same_program: Option<&ResolvedShaderKey> = None;
+        for (at, entry) in self.entries.iter().enumerate() {
+            if entry.program == program {
+                same_program = Some(&entry.key);
+                if entry.key == key {
+                    index = Some(at);
+                    break;
+                }
+            }
+        }
+        let Some(index) = index else {
             self.misses += 1;
             crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Attribute the miss (see `misses_same_program`). Only on the miss
-            // path, which already costs the whole analysis chain.
-            let program = resolved_shader_program_addrs(&key);
-            if self
-                .entries
-                .iter()
-                .any(|entry| resolved_shader_program_addrs(&entry.key) == program)
-            {
+            if let Some(held) = same_program {
                 self.misses_same_program += 1;
                 crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                resolved_shader_key_diff(&key, held);
             }
             return None;
         };
@@ -901,29 +1112,96 @@ impl ResolvedShaderMemo {
     /// Memoize `shaders` under `key` and hand back the shared handle, so the
     /// resolving caller never pays a second lookup or a second copy.
     fn insert(&mut self, key: ResolvedShaderKey, shaders: ResolvedShaders) -> Arc<ResolvedShaders> {
+        // Apply first: `shaders` was analyzed against guest memory as it is
+        // NOW, so the pending spans must never be tested against this entry —
+        // only against the older ones.
+        self.apply_pending_writes();
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
             self.entries.remove(index);
         } else if self.entries.len() == RESOLVED_SHADER_MEMO_CAPACITY {
             self.entries.remove(0);
         }
+        let (deps, deps_len) = resolved_shader_dependency_ranges(&key, &shaders);
+        let dep_mask = deps[..deps_len as usize]
+            .iter()
+            .fold(0u64, |mask, &(base, span)| {
+                mask | address_granule_mask(base, span)
+            });
+        self.dep_mask |= dep_mask;
         let shaders = Arc::new(shaders);
         self.entries.push(Box::new(ResolvedShaderEntry {
+            program: resolved_shader_program_addrs(&key),
             key,
             shaders: Arc::clone(&shaders),
+            deps,
+            deps_len,
+            dep_mask,
         }));
         shaders
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.pending_writes.clear();
+        self.dep_mask = 0;
     }
 
+    #[cfg(test)]
+    fn entries_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Note that `writes` changed guest memory. Writes that no entry's
+    /// dependency granules admit are dropped here; the rest are deferred to the
+    /// next read — see [`Self::dep_mask`] and [`Self::pending_writes`].
     fn invalidate_ranges(&mut self, writes: &[(u64, u64)]) {
-        if writes.is_empty() {
+        if writes.is_empty() || self.entries.is_empty() {
             return;
         }
-        self.entries
-            .retain(|entry| !resolved_shader_depends_on_ranges(&entry.key, &entry.shaders, writes));
+        for &(base, len) in writes {
+            if len == 0 || address_granule_mask(base, len) & self.dep_mask == 0 {
+                continue;
+            }
+            // PM4 `WRITE_DATA` marches dword by dword, so abutting spans are
+            // the common case; merging them keeps the pending list short.
+            if let Some(last) = self.pending_writes.last_mut() {
+                let end = last.0.saturating_add(last.1);
+                if base >= last.0 && base <= end {
+                    last.1 = end.max(base.saturating_add(len)).saturating_sub(last.0);
+                    continue;
+                }
+            }
+            self.pending_writes.push((base, len));
+        }
+        if self.pending_writes.len() >= PENDING_WRITE_RANGES_MAX {
+            self.apply_pending_writes();
+        }
+    }
+
+    fn apply_pending_writes(&mut self) {
+        if self.pending_writes.is_empty() {
+            return;
+        }
+        let mut writes = std::mem::take(&mut self.pending_writes);
+        let write_mask = writes.iter().fold(0u64, |mask, &(base, len)| {
+            mask | address_granule_mask(base, len)
+        });
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            // Per-entry granule rejection before the range loop.
+            entry.dep_mask & write_mask == 0 || !ranges_intersect(entry.deps(), &writes)
+        });
+        writes.clear();
+        self.pending_writes = writes;
+        if self.entries.len() != before {
+            // Only an eviction can have left the memo-wide mask too broad. A
+            // broad mask still decides correctly (it only costs a pass), but a
+            // tightened one is what keeps the next label free.
+            self.dep_mask = self
+                .entries
+                .iter()
+                .fold(0u64, |mask, entry| mask | entry.dep_mask);
+        }
     }
 }
 
@@ -1582,30 +1860,83 @@ fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
 #[derive(Default)]
 struct GuestSampleHashMemo {
     values: std::cell::RefCell<HashMap<(u64, u64, u8), u64>>,
+    /// Guest write spans reported since the memo was last READ — the same
+    /// deferral [`ResolvedShaderMemo::pending_writes`] documents, for the same
+    /// reason: the notification fires once per write-capable PM4 packet, the
+    /// read happens once per draw.
+    pending_writes: std::cell::RefCell<Vec<(u64, u64)>>,
+    /// Union of the probed ranges' granules — see
+    /// [`ResolvedShaderMemo::dep_mask`].
+    dep_mask: std::cell::Cell<u64>,
 }
 
 impl GuestSampleHashMemo {
     fn get_or_compute(&self, base: u64, len: u64, tile_mode: u8) -> Option<u64> {
+        self.apply_pending_writes();
         let key = (base, len, tile_mode);
         if let Some(hash) = self.values.borrow().get(&key).copied() {
             return Some(hash);
         }
         let hash = guest_sample_hash(base, len, tile_mode)?;
         self.values.borrow_mut().insert(key, hash);
+        self.dep_mask
+            .set(self.dep_mask.get() | address_granule_mask(base, len));
         Some(hash)
     }
 
     fn clear(&self) {
         self.values.borrow_mut().clear();
+        self.pending_writes.borrow_mut().clear();
+        self.dep_mask.set(0);
+    }
+
+    /// Note that `writes` changed guest memory. Rejected outright when no
+    /// probe's granules admit it; otherwise deferred to the next read.
+    fn invalidate_ranges(&self, writes: &[(u64, u64)]) {
+        if writes.is_empty() || self.values.borrow().is_empty() {
+            return;
+        }
+        {
+            let dep_mask = self.dep_mask.get();
+            let mut pending = self.pending_writes.borrow_mut();
+            for &(base, len) in writes {
+                if len == 0 || address_granule_mask(base, len) & dep_mask == 0 {
+                    continue;
+                }
+                if let Some(last) = pending.last_mut() {
+                    let end = last.0.saturating_add(last.1);
+                    if base >= last.0 && base <= end {
+                        last.1 = end.max(base.saturating_add(len)).saturating_sub(last.0);
+                        continue;
+                    }
+                }
+                pending.push((base, len));
+            }
+            if pending.len() < PENDING_WRITE_RANGES_MAX {
+                return;
+            }
+        }
+        self.apply_pending_writes();
     }
 
     /// Drop only probes whose guest byte range can be changed by a compute
     /// output. Read-only dispatches and writes into unrelated allocations do
     /// not invalidate immutable texture hashes for the whole submission.
-    fn invalidate_ranges(&self, writes: &[(u64, u64)]) {
-        if writes.is_empty() {
-            return;
-        }
+    fn apply_pending_writes(&self) {
+        // The borrow MUST be released before `retain_disjoint`: nothing may hold
+        // a `RefCell` borrow across a call that can re-enter the memo.
+        let writes = {
+            let mut pending = self.pending_writes.borrow_mut();
+            if pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *pending)
+        };
+        self.retain_disjoint(&writes);
+    }
+
+    fn retain_disjoint(&self, writes: &[(u64, u64)]) {
+        let before = self.values.borrow().len();
         self.values.borrow_mut().retain(|&(base, len, _), _| {
             let end = base.saturating_add(len);
             !writes.iter().any(|&(write_base, write_len)| {
@@ -1616,6 +1947,18 @@ impl GuestSampleHashMemo {
                 base < write_end && write_base < end
             })
         });
+        // Only an eviction can have left the mask too broad — see
+        // `ResolvedShaderMemo::apply_pending_writes`.
+        if self.values.borrow().len() != before {
+            self.dep_mask.set(
+                self.values
+                    .borrow()
+                    .keys()
+                    .fold(0u64, |mask, &(base, len, _)| {
+                        mask | address_granule_mask(base, len)
+                    }),
+            );
+        }
     }
 }
 
@@ -8612,5 +8955,470 @@ mod tests {
             })
             .expect("2D texture decodes");
         assert!(!flat_tex.volume, "a type-9 T# is never a volume");
+    }
+
+    /// The precomputed dependency ranges must decide EXACTLY what deriving them
+    /// per write decided.
+    ///
+    /// `invalidate_ranges` no longer re-runs `bind_eud_dependency`; it tests the
+    /// spans captured at insert. That is only a speedup if the two agree, so
+    /// this pins them against the reference predicate over the shapes that
+    /// distinguish them: embedded stages (no code dependency), EUD-resident
+    /// versus direct descriptors, and a raw EUD window.
+    #[test]
+    fn precomputed_dependency_ranges_match_deriving_them_per_write() {
+        let ctx = Context::default();
+        let mut cases: Vec<(Shader, ResolvedShaders)> = Vec::new();
+
+        let base_shaders = || ResolvedShaders {
+            vs: Arc::new(vec![1]),
+            ps: Arc::new(vec![2]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+
+        // Plain guest VS + PS, no EUD.
+        let mut sh = Shader::default();
+        sh.vs.vs_regs.data_addr = 0x10_0000;
+        sh.ps.ps_regs.data_addr = 0x20_0000;
+        cases.push((sh.clone(), base_shaders()));
+
+        // Embedded VS: its three code addresses must NOT become dependencies.
+        let mut embedded = sh.clone();
+        embedded.vs.vs_embedded = true;
+        embedded.vs.es_regs.data_addr = 0x30_0000;
+        embedded.vs.gs_regs.data_addr = 0x40_0000;
+        cases.push((embedded, base_shaders()));
+
+        // Embedded PS.
+        let mut embedded_ps = sh.clone();
+        embedded_ps.ps.ps_embedded = true;
+        cases.push((embedded_ps, base_shaders()));
+
+        // gs-instead-of-vs, plus an EUD table on each stage.
+        let mut gs = Shader::default();
+        gs.vs.es_regs.data_addr = 0x50_0000;
+        gs.vs.gs_regs.chksum = 7;
+        gs.ps.ps_regs.data_addr = 0x60_0000;
+        let mut eud = base_shaders();
+        eud.vs_info.bind.extended.used = true;
+        eud.vs_info.bind.extended.start_register = 8;
+        eud.vs_info.bind.extended.data.update_address(0x70_0000);
+        eud.vs_info.bind.storage_buffers.buffers_num = 2;
+        eud.vs_info.bind.storage_buffers.extended[0] = true;
+        eud.vs_info.bind.storage_buffers.start_register[0] = 12;
+        eud.ps_info.bind.extended.used = true;
+        eud.ps_info.bind.extended.start_register = 4;
+        eud.ps_info.bind.extended.data.update_address(0x80_0000);
+        eud.ps_info.bind.eud_raw.used = true;
+        eud.ps_info.bind.eud_raw.required_dwords = 32;
+        eud.ps_info.bind.textures2d.textures_num = 1;
+        eud.ps_info.bind.textures2d.desc[0].extended = true;
+        eud.ps_info.bind.textures2d.desc[0].start_register = 20;
+        cases.push((gs, eud));
+
+        // Write spans: inside each code window, inside each EUD table, and well
+        // clear of both.
+        let writes: Vec<(u64, u64)> = [
+            0x10_0000,
+            0x20_0000,
+            0x30_0000,
+            0x40_0000,
+            0x50_0000,
+            0x60_0000,
+            0x70_0000,
+            0x70_0040,
+            0x80_0000,
+            0x80_0100,
+            0x7f00_0000,
+        ]
+        .iter()
+        .map(|&base| (base, 4u64))
+        .collect();
+
+        for (sh, shaders) in &cases {
+            let key = ResolvedShaderKey::new(&ctx, sh);
+            let (deps, len) = resolved_shader_dependency_ranges(&key, shaders);
+            for &write in &writes {
+                let reference = resolved_shader_depends_on_ranges(&key, shaders, &[write]);
+                let precomputed = ranges_intersect(&deps[..len as usize], &[write]);
+                assert_eq!(
+                    precomputed, reference,
+                    "precomputed deps disagree for write {write:?} on \
+                     vs={:#x} ps={:#x}",
+                    sh.vs.vs_regs.data_addr, sh.ps.ps_regs.data_addr
+                );
+            }
+        }
+    }
+
+    /// A completion label outside every entry's dependency GRANULES must be
+    /// rejected without touching a single entry, and one inside a granule but
+    /// outside the ranges must be applied ONCE, at the next read.
+    ///
+    /// Both halves of what cost Dead Cells its frame budget. Per-packet
+    /// invalidation over the whole memo measured 9,988 ns per label at capacity
+    /// 256 (`resolved_shader_memo_cost_probe`) — and batching alone does not fix
+    /// it, because the cost is `entries x deps x writes` and deferral only moves
+    /// when that product is paid. The granule mask is what removes it.
+    #[test]
+    fn label_writes_are_rejected_by_granule_then_applied_once_at_the_next_read() {
+        let ctx = Context::default();
+        let mut sh = Shader::default();
+        sh.vs.vs_regs.data_addr = 0x10_0000;
+        sh.ps.ps_regs.data_addr = 0x90_0000;
+        let key = ResolvedShaderKey::new(&ctx, &sh);
+        let mut memo = ResolvedShaderMemo::default();
+        memo.insert(
+            key,
+            ResolvedShaders {
+                vs: Arc::new(vec![1]),
+                ps: Arc::new(vec![2]),
+                vs_info: ShaderVertexInputInfo::default(),
+                ps_info: ShaderPixelInputInfo::default(),
+            },
+        );
+
+        // 32 labels in a granule no dependency covers: dropped outright.
+        for i in 0..32u64 {
+            memo.invalidate_ranges(&[(0x0a00_0000 + i * 64, 4)]);
+        }
+        assert!(
+            memo.pending_writes.is_empty(),
+            "a label whose granule no dependency covers must cost NOTHING"
+        );
+        assert_eq!(memo.entries_len(), 1);
+
+        // 32 labels inside the VS code window's 1 MiB granule but past its
+        // 256 KiB extent: admitted, deferred, and evicting nothing.
+        for i in 0..32u64 {
+            memo.invalidate_ranges(&[(0x1f_0000 + i * 64, 4)]);
+        }
+        assert_eq!(
+            memo.pending_writes.len(),
+            32,
+            "same-granule spans must be PENDING, not applied per packet"
+        );
+        assert_eq!(
+            memo.entries_len(),
+            1,
+            "no pass over the entries may have happened yet"
+        );
+        assert!(memo.get(key).is_some());
+        assert!(
+            memo.pending_writes.is_empty(),
+            "the read must have drained the pending spans"
+        );
+
+        // A label INSIDE the VS code window still evicts, on the next read.
+        memo.invalidate_ranges(&[(0x10_0100, 4)]);
+        assert!(
+            memo.get(key).is_none(),
+            "a deferred write inside the shader code window must still invalidate"
+        );
+    }
+
+    /// The granule mask may over-admit; it must never under-admit. Two ranges
+    /// that overlap share an address, so their masks share that granule's bit.
+    #[test]
+    fn granule_mask_never_rejects_an_overlapping_write() {
+        let spans: [u64; 6] = [1, 4, 0x1000, 0x4_0000, 0x10_0000, 0x100_0000];
+        for &base in &[
+            0u64,
+            0x1000,
+            0xf_ffff,
+            0x10_0000,
+            0x4_0000_0000,
+            u64::MAX / 2,
+        ] {
+            for &span in &spans {
+                let dep = address_granule_mask(base, span);
+                // Every write that genuinely overlaps [base, base+span).
+                for probe in [
+                    base,
+                    base + span / 2,
+                    base.saturating_add(span - 1),
+                    base.saturating_sub(4),
+                ] {
+                    let write_len = 8u64;
+                    let overlaps = ranges_overlap(base, span, probe, write_len);
+                    if overlaps {
+                        assert_ne!(
+                            dep & address_granule_mask(probe, write_len),
+                            0,
+                            "granule mask rejected an OVERLAPPING write: \
+                             dep=({base:#x},{span:#x}) write=({probe:#x},{write_len})"
+                        );
+                    }
+                }
+            }
+        }
+        // A range wider than the fold saturates rather than aliasing to a
+        // narrow mask.
+        assert_eq!(address_granule_mask(0, 1 << 30), u64::MAX);
+        assert_eq!(address_granule_mask(0, 0), 0);
+    }
+
+    /// Deferral must never let an entry inserted AFTER a write be evicted BY
+    /// that write: the analysis already read post-write guest memory.
+    #[test]
+    fn a_resolution_analyzed_after_a_write_is_not_evicted_by_it() {
+        let ctx = Context::default();
+        let mut sh = Shader::default();
+        sh.vs.vs_regs.data_addr = 0x10_0000;
+        sh.ps.ps_regs.data_addr = 0x90_0000;
+        let key = ResolvedShaderKey::new(&ctx, &sh);
+        let shaders = ResolvedShaders {
+            vs: Arc::new(vec![1]),
+            ps: Arc::new(vec![2]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+        let mut memo = ResolvedShaderMemo::default();
+        memo.insert(key, shaders.clone());
+        // A write into the VS code window, then a re-analysis of that shader.
+        memo.invalidate_ranges(&[(0x10_0100, 4)]);
+        assert!(memo.get(key).is_none(), "the stale entry must be gone");
+        memo.insert(key, shaders);
+        assert!(
+            memo.get(key).is_some(),
+            "the FRESH analysis read post-write memory; the same write must not \
+             evict it"
+        );
+    }
+
+    /// The same deferral, for the texture sample-hash memo.
+    #[test]
+    fn texture_hash_probes_apply_deferred_writes_at_the_next_read() {
+        let mut a: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let a_base = a.as_ptr() as u64;
+        let memo = GuestSampleHashMemo::default();
+        let ranges = [(a_base, a.len())];
+        let first = crate::guest_mem::with_test_ranges(&ranges, || {
+            memo.get_or_compute(a_base, a.len() as u64, 27).unwrap()
+        });
+
+        a[0] ^= 0xff;
+        // A label in a granule the probe does not cover costs nothing.
+        memo.invalidate_ranges(&[(a_base ^ (1 << 21), 4)]);
+        assert!(
+            memo.pending_writes.borrow().is_empty(),
+            "an out-of-granule write must be rejected outright"
+        );
+        memo.invalidate_ranges(&[(a_base, 4)]);
+        assert_eq!(
+            memo.pending_writes.borrow().len(),
+            1,
+            "the span must be deferred, not applied per packet"
+        );
+        assert_eq!(
+            memo.values.borrow().len(),
+            1,
+            "no pass over the probes may have happened yet"
+        );
+        let after = crate::guest_mem::with_test_ranges(&ranges, || {
+            memo.get_or_compute(a_base, a.len() as u64, 27).unwrap()
+        });
+        assert_ne!(first, after, "the deferred write must still rehash");
+        assert!(memo.pending_writes.borrow().is_empty());
+    }
+
+    /// A same-program miss must say WHICH register churned, and whether it sits
+    /// inside the window the analysis can read.
+    ///
+    /// That distinction is the whole decision: a difference the analysis cannot
+    /// read is a key that must be narrowed; a difference it latches needs the
+    /// per-program ABI split instead. `misses_same_program` alone could not tell
+    /// them apart, so it could not choose.
+    #[test]
+    fn a_same_program_miss_names_the_register_window_it_differs_in() {
+        // Beyond the window: `count = 4` floors the analysis window at 4, so
+        // s8 cannot reach any analysis output.
+        let mut a = kyty_graphics::hw_regs::UserSgprInfo {
+            count: 4,
+            ..Default::default()
+        };
+        let mut b = a;
+        b.value[8] = 0xdead;
+        assert_eq!(
+            sgpr_file_diff(&a, &b),
+            (false, true),
+            "a register past count.max(4) is outside what the analysis reads"
+        );
+
+        // Inside the window: s2 is within the floored window even at count 0.
+        let mut inside = a;
+        inside.value[2] = 0xbeef;
+        assert_eq!(
+            sgpr_file_diff(&a, &inside),
+            (true, false),
+            "s2 is inside the floored window — the analysis can read it"
+        );
+
+        // A larger declared count widens the window, so s8 becomes readable.
+        a.count = 16;
+        let mut wide = a;
+        wide.value[8] = 0xdead;
+        assert_eq!(
+            sgpr_file_diff(&a, &wide),
+            (true, false),
+            "count 16 makes s8 live"
+        );
+
+        // The declared count itself changing IS an inside-window difference: it
+        // moves the window.
+        let mut recount = a;
+        recount.count = 8;
+        assert_eq!(sgpr_file_diff(&a, &recount), (true, false));
+
+        // Identical files are no difference at all.
+        assert_eq!(sgpr_file_diff(&a, &a), (false, false));
+
+        // The type markers matter as much as the values: they route a register
+        // into a resource table instead of a direct constant.
+        let mut typed = a;
+        typed.type_[1] = kyty_graphics::hw_regs::UserSgprType::Vsharp;
+        assert_eq!(sgpr_file_diff(&a, &typed), (true, false));
+
+        // End to end through the memo: a per-object PS constant is attributed to
+        // the PS file, and to the window it lands in.
+        let ctx = Context::default();
+        let mut base = Shader::default();
+        base.vs.vs_regs.data_addr = 0x10_0000;
+        base.ps.ps_regs.data_addr = 0x20_0000;
+        base.ps.ps_user_sgpr.count = 4;
+        let mut memo = ResolvedShaderMemo::default();
+        memo.insert(
+            ResolvedShaderKey::new(&ctx, &base),
+            ResolvedShaders {
+                vs: Arc::new(vec![1]),
+                ps: Arc::new(vec![2]),
+                vs_info: ShaderVertexInputInfo::default(),
+                ps_info: ShaderPixelInputInfo::default(),
+            },
+        );
+        let before = crate::vulkan::offscreen::DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut churned = base.clone();
+        churned.ps.ps_user_sgpr.value[1] = 0x4142_4344;
+        assert!(memo.get(ResolvedShaderKey::new(&ctx, &churned)).is_none());
+        assert_eq!(
+            crate::vulkan::offscreen::DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "a live PS user-SGPR difference must be attributed to the PS file"
+        );
+    }
+
+    /// A memo entry shaped like a real title's bind: an EUD table, a few
+    /// storage buffers, textures and samplers.
+    fn probe_entry(program: u64) -> (Shader, ResolvedShaders) {
+        let mut sh = Shader::default();
+        sh.vs.vs_regs.data_addr = 0x1000_0000 + program * 0x1000;
+        sh.ps.ps_regs.data_addr = 0x2000_0000 + program * 0x1000;
+        let mut shaders = ResolvedShaders {
+            vs: Arc::new(vec![1, 2, 3]),
+            ps: Arc::new(vec![4, 5, 6]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+        for bind in [&mut shaders.vs_info.bind, &mut shaders.ps_info.bind] {
+            bind.extended.used = true;
+            bind.extended.start_register = 8;
+            bind.extended
+                .data
+                .update_address(0x3000_0000 + program * 0x1000);
+            bind.storage_buffers.buffers_num = 4;
+            bind.textures2d.textures_num = 4;
+            bind.samplers.samplers_num = 4;
+            for i in 0..4 {
+                bind.storage_buffers.extended[i] = true;
+                bind.storage_buffers.start_register[i] = 10 + i as i32 * 4;
+                bind.textures2d.desc[i].extended = true;
+                bind.textures2d.desc[i].start_register = 40 + i as i32 * 8;
+                bind.samplers.extended[i] = true;
+                bind.samplers.start_register[i] = 80 + i as i32 * 4;
+            }
+        }
+        (sh, shaders)
+    }
+
+    fn probe_time(label: &str, iters: u64, f: impl FnOnce()) {
+        let at = std::time::Instant::now();
+        f();
+        let ns = at.elapsed().as_nanos() as u64;
+        println!(
+            "{label:<44} total={:>9.3} ms   per-call={:>9.1} ns",
+            ns as f64 / 1e6,
+            ns as f64 / iters as f64
+        );
+    }
+
+    /// Cost probe for the two memo operations the PM4 walk performs per draw
+    /// and per write-capable packet. Run explicitly:
+    ///
+    /// ```text
+    /// cargo test -p raeen-gpu --release resolved_shader_memo_cost_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement probe; run explicitly with --ignored --nocapture"]
+    fn resolved_shader_memo_cost_probe() {
+        let ctx = Context::default();
+        let mut memo = ResolvedShaderMemo::default();
+        let mut programs = Vec::new();
+        for i in 0..RESOLVED_SHADER_MEMO_CAPACITY as u64 {
+            let (sh, shaders) = probe_entry(i);
+            memo.insert(ResolvedShaderKey::new(&ctx, &sh), shaders);
+            programs.push(sh);
+        }
+        println!(
+            "memo at capacity {} entries, key {} B",
+            memo.entries_len(),
+            std::mem::size_of::<ResolvedShaderKey>()
+        );
+
+        // A HIT: the same exact state a draw re-binds.
+        const REPS: u64 = 20_000;
+        probe_time("memo get (hit, exact state)", REPS, || {
+            for i in 0..REPS {
+                let sh = &programs[(i % programs.len() as u64) as usize];
+                assert!(memo.get(ResolvedShaderKey::new(&ctx, sh)).is_some());
+            }
+        });
+
+        // A MISS on a program the memo already holds — 99% of the measured
+        // retail profile (`resolve_misses_same_program`).
+        probe_time("memo get (miss, same program wider key)", REPS, || {
+            for i in 0..REPS {
+                let mut sh = programs[(i % programs.len() as u64) as usize].clone();
+                sh.ps.ps_user_sgpr.count = 8;
+                sh.ps.ps_user_sgpr.value[7] = i as u32 | 1;
+                assert!(memo.get(ResolvedShaderKey::new(&ctx, &sh)).is_none());
+            }
+        });
+
+        // One completion label per write-capable PM4 packet, with the draw that
+        // follows it — the real interleave. Before deferral this pass cost
+        // 9,988 ns per label at capacity 256.
+        let draw = programs[0].clone();
+        probe_time("label write + draw read (per label)", REPS, || {
+            for i in 0..REPS {
+                memo.invalidate_ranges(&[(0x7f00_0000 + (i % 64) * 8, 4)]);
+                assert!(memo.get(ResolvedShaderKey::new(&ctx, &draw)).is_some());
+            }
+        });
+        assert_eq!(
+            memo.entries_len(),
+            RESOLVED_SHADER_MEMO_CAPACITY,
+            "labels must not have evicted anything"
+        );
+
+        // Labels with NO read between them: the deferral's best case, which is
+        // the shape a title's completion-label block actually has.
+        probe_time("label write alone (deferred)", REPS, || {
+            for i in 0..REPS {
+                memo.invalidate_ranges(&[(0x7f00_0000 + (i % 64) * 8, 4)]);
+            }
+        });
     }
 }

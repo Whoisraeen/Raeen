@@ -2230,6 +2230,7 @@ impl AgcGpuSession {
         // State-only DCBs are still real GPU work. Process them without
         // forcing Vulkan initialization so their register writes are latched
         // for the next submission.
+        cp.set_walk_timing(crate::diagnostics::gpu_env().time_draw);
         if decoded.draw_packets == 0 && decoded.dispatch_packets == 0 {
             let mut sink = StateOnlySink;
             let walk_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_WALK_NS);
@@ -2240,6 +2241,7 @@ impl AgcGpuSession {
                 Some(&crate::guest_mem::IdentityGuestMemory),
             )?;
             drop(walk_timer);
+            accumulate_walk_census(cp.take_walk_census());
             let _post = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_POST_NS);
             let produced = cp.take_produced_labels();
             // In-stream completion side effects (events/EOP/flips), published
@@ -2281,6 +2283,7 @@ impl AgcGpuSession {
             Some(&crate::guest_mem::IdentityGuestMemory),
         );
         drop(walk_timer);
+        accumulate_walk_census(cp.take_walk_census());
         SUB_PHASE_DRAWS.fetch_add(sink.draws, Ordering::Relaxed);
         let flush_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_FLUSH_NS);
         if submission_compute_flush_required(sink.queued_compute, deferred_present) {
@@ -3492,6 +3495,54 @@ static SUB_PHASE_WORDS: AtomicU64 = AtomicU64::new(0);
 /// draw-bearing DCB per frame, so 32 is about a second of steady state.
 const SUB_PHASE_WINDOW: u64 = 32;
 
+/// The PM4 walk split by packet class, summed over the report window.
+///
+/// `walk_us` alone could not say WHICH packets owned a submission: measured on
+/// Dead Cells it was 98% of the submission while the per-draw stage timers
+/// accounted for only about a third of it. `WALK PACKET CLASSES` closes that
+/// gap. See [`kyty_graphics::run::WalkCensus`] for why register writes are
+/// counted but not timed.
+static WALK_CENSUS: parking_lot::Mutex<kyty_graphics::run::WalkCensus> =
+    parking_lot::Mutex::new(kyty_graphics::run::WalkCensus {
+        reg_packets: 0,
+        regs: 0,
+        draws: 0,
+        draw_ns: 0,
+        dispatches: 0,
+        dispatch_ns: 0,
+        write_packets: 0,
+        write_ns: 0,
+        boundaries: 0,
+        boundary_ns: 0,
+        waits: 0,
+        wait_ns: 0,
+        indirects: 0,
+        indirect_ns: 0,
+        inert_packets: 0,
+    });
+
+fn accumulate_walk_census(census: kyty_graphics::run::WalkCensus) {
+    if !crate::diagnostics::gpu_env().time_draw {
+        return;
+    }
+    let mut total = WALK_CENSUS.lock();
+    total.reg_packets += census.reg_packets;
+    total.regs += census.regs;
+    total.draws += census.draws;
+    total.draw_ns += census.draw_ns;
+    total.dispatches += census.dispatches;
+    total.dispatch_ns += census.dispatch_ns;
+    total.write_packets += census.write_packets;
+    total.write_ns += census.write_ns;
+    total.boundaries += census.boundaries;
+    total.boundary_ns += census.boundary_ns;
+    total.waits += census.waits;
+    total.wait_ns += census.wait_ns;
+    total.indirects += census.indirects;
+    total.indirect_ns += census.indirect_ns;
+    total.inert_packets += census.inert_packets;
+}
+
 /// Accumulates one submission's wall time into [`SUB_PHASE_TOTAL_NS`] and files
 /// the window report on drop.
 ///
@@ -3557,6 +3608,26 @@ fn submission_phase_tick() {
         words_per_sub = words / SUB_PHASE_WINDOW,
         walk_pct = walk.saturating_mul(100).checked_div(total).unwrap_or(0),
         "SUBMISSION PHASES: one draw-bearing DCB split into pre-decode, lock acquisition, PM4 walk (draws included — see DRAW COST), compute flush, and ordered side effects (per submission; RAEEN_TIME_DRAW)"
+    );
+    let census = std::mem::take(&mut *WALK_CENSUS.lock());
+    let per_sub = |x: u64| x / SUB_PHASE_WINDOW;
+    warn!(
+        reg_packets = per_sub(census.reg_packets),
+        regs = per_sub(census.regs),
+        draw_packets = per_sub(census.draws),
+        draw_us = per_sub_us(census.draw_ns),
+        dispatch_packets = per_sub(census.dispatches),
+        dispatch_us = per_sub_us(census.dispatch_ns),
+        write_packets = per_sub(census.write_packets),
+        write_us = per_sub_us(census.write_ns),
+        boundaries = per_sub(census.boundaries),
+        boundary_us = per_sub_us(census.boundary_ns),
+        waits = per_sub(census.waits),
+        wait_us = per_sub_us(census.wait_ns),
+        indirects = per_sub(census.indirects),
+        indirect_us = per_sub_us(census.indirect_ns),
+        inert_packets = per_sub(census.inert_packets),
+        "WALK PACKET CLASSES: which PM4 packets the walk spent itself on. Register writes are COUNTED, not timed (a clock read costs more than the packet — see WalkCensus); `boundary_us` is what the sink spent invalidating guest-memory-derived caches for the write packets (per submission; RAEEN_TIME_DRAW)"
     );
 }
 
