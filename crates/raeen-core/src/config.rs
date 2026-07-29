@@ -240,8 +240,16 @@ pub struct DebugConfig {
     /// Log per-HLE-function call counts, boot vs steady state. Drives
     /// `RAEEN_CALL_STATS`.
     pub call_stats: bool,
-    /// Periodically dump every guest thread's recent calls/backtrace when a
-    /// title stalls. Drives `RAEEN_STALL_DUMP`.
+    /// Periodically dump every guest thread's state — in-flight HLE call, host
+    /// park, recent calls, backtrace, how long it has been stuck — when a title
+    /// stalls. Drives `RAEEN_STALL_DUMP`.
+    ///
+    /// Self-arming, and deliberately so: it also switches on the per-call
+    /// instruments its own report reads (in-flight call, per-call timing, the
+    /// recent-call ring), so a dump can never print an unarmed field as an
+    /// observation. That costs a little work on every HLE call, which is why it
+    /// is off by default. See `docs/host-park-stall.md` for what the previous
+    /// arrangement cost.
     pub stall_dump: bool,
 }
 

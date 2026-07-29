@@ -396,10 +396,28 @@ fn guest_watch_request() -> Option<&'static GuestWatchRequest> {
         .as_ref()
 }
 
-/// `RAEEN_TIME_HLE`: accumulate per-(thread, function) time spent inside HLE
-/// calls, so a stalled thread's wall-clock can be attributed to a specific
-/// wait rather than guessed at from the call ring.
-static TIME_HLE: OnceLock<bool> = OnceLock::new();
+/// Whether the per-call stall instruments — [`OrbisKernel::in_flight_hle`],
+/// [`OrbisKernel::hle_call_time`] and [`OrbisKernel::recent_hle_calls`] — must be
+/// populated.
+///
+/// `RAEEN_STALL_DUMP` **implies** them. It used to imply nothing, and that cost a
+/// full hardware investigation: the Blasphemous II runs set `RAEEN_STALL_DUMP`
+/// alone, so `in_flight_hle` stayed empty and every dump printed
+/// `IN-FLIGHT HLE: <none — all threads between calls>` while 14 threads sat
+/// inside `sceKernelWaitSema`. The one run that also set `RAEEN_TIME_HLE` named
+/// them correctly — the *stall* never changed, only the arming did, and the
+/// difference was read as the stall having changed class.
+///
+/// A diagnostic knob that silently reports "nothing" when it was never armed is
+/// worse than one that is off, so the reader arms everything its own report
+/// depends on.
+fn stall_instruments_armed() -> bool {
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| {
+        std::env::var_os("RAEEN_TIME_HLE").is_some()
+            || std::env::var_os("RAEEN_STALL_DUMP").is_some()
+    })
+}
 
 /// `RAEEN_CALL_STATS`: count every HLE call per `library::function`, split
 /// into a boot window (first 30 s) and steady state after. A title that
@@ -1311,12 +1329,16 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
         HLE_DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
         let _hle_yield = GuestGilYield::during_hle();
-        let timed = *TIME_HLE.get_or_init(|| std::env::var_os("RAEEN_TIME_HLE").is_some());
+        let timed = stall_instruments_armed();
         let started = timed.then(std::time::Instant::now);
-        let function_key = (timed
-            || *CALL_STATS.get_or_init(|| std::env::var_os("RAEEN_CALL_STATS").is_some()))
-        .then(|| format!("{}::{}", t.library, t.function));
-        if *CALL_STATS.get().expect("initialized above") {
+        // Read `CALL_STATS` into a local *before* the `||`: as a short-circuited
+        // second operand it was skipped whenever `timed` was already true, and
+        // the `CALL_STATS.get()` below then depended on some earlier VEH dispatch
+        // having initialized it. Widening `timed` to include `RAEEN_STALL_DUMP`
+        // made that ordering assumption much easier to hit, so remove it.
+        let call_stats = *CALL_STATS.get_or_init(|| std::env::var_os("RAEEN_CALL_STATS").is_some());
+        let function_key = (timed || call_stats).then(|| format!("{}::{}", t.library, t.function));
+        if call_stats {
             let counters = kernel
                 .hle_call_counts
                 .entry(function_key.as_ref().expect("call-stat key").clone())
@@ -1361,6 +1383,7 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         // appeared as "between calls" in STALL_DUMP even while it was the
         // measured owner of a title-wide streaming convoy.
         if *TRACE_EINVAL.get_or_init(|| std::env::var_os("RAEEN_TRACE_EINVAL").is_some())
+            || stall_instruments_armed()
             || std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some()
         {
             let tid = ctx.current_thread();
@@ -3672,6 +3695,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // __cxa_throw trap can report what led to a throw (host threads are
             // pooled; the guest thread id is stable). Gated to the trap run.
             if *TRACE_EINVAL.get_or_init(|| std::env::var_os("RAEEN_TRACE_EINVAL").is_some())
+                || stall_instruments_armed()
                 || std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some()
             {
                 let tid = ctx.current_thread();
@@ -3687,7 +3711,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // so a thread parked for minutes inside one wait looks identical to
             // one cycling through thousands of fast calls. Timing each call and
             // accumulating per (thread, function) separates those two.
-            let timed = *TIME_HLE.get_or_init(|| std::env::var_os("RAEEN_TIME_HLE").is_some());
+            let timed = stall_instruments_armed();
             let started = timed.then(std::time::Instant::now);
             // `RAEEN_CALL_STATS`: per-function call counter, split into boot
             // (first 30 s) and steady-state windows. See `CALL_STATS`.
