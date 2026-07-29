@@ -22184,4 +22184,195 @@ mod tests {
             "the refusal must stay identifiable by name; got: {msg}"
         );
     }
+
+    /// RDNA2 names VCC's two halves as INDEPENDENT scalar destinations (ISA
+    /// 70648, "Scalar ALU Operands": the flat operand encoding puts 106 =
+    /// `VCC_LO` and 107 = `VCC_HI` beside the SGPRs, and SMEM's `SDATA` field
+    /// is that same encoding). So a ONE-dword `s_buffer_load` may target
+    /// `vcc_hi` directly rather than reaching it as dword 1 of a `vcc_lo`
+    /// pair.
+    ///
+    /// Measured as Blasphemous II's `s_buffer_load` translation blocker (PS
+    /// `0x10001d65c00` / `0x10001d68600` / `0x10001d6de00`, which emit all
+    /// three widths below):
+    ///
+    /// ```text
+    /// s_buffer_load_dword   vcc_lo, s[12:15], 0x10
+    /// s_buffer_load_dword   vcc_hi, s[12:15], 0x18   <-- refused the shader
+    /// s_buffer_load_dwordx2 vcc_lo, s[12:15], 0x8
+    /// ```
+    ///
+    /// `operand_variable_to_str_shift` had no `VccHi` arm, so shift 0 of a
+    /// `VccHi` destination fell through to `Unknown` and
+    /// `Recompile_SBufferLoadDword_SdstSvSoffset` refused with "unexpected
+    /// operand types". The pair is kept in the fixture so the lo->hi walk that
+    /// already worked is pinned alongside the new direct-hi form. Encodings are
+    /// hand-built from the SMEM field layout, not copied from the title.
+    #[test]
+    fn sbuffer_load_dword_into_vcc_hi_recompiles() {
+        // SMEM: [31:26]=0x3d, [25:18]=opcode, [12:6]=sdst, [5:0]=sbase (SGPR/2);
+        // word 1: [31:25]=soffset (125 = NULL -> use the imm21), [20:0]=offset.
+        const LOAD_VCC_LO_0X10: [u32; 2] = [0xF420_1A86, 0xFA00_0010];
+        const LOAD_VCC_HI_0X18: [u32; 2] = [0xF420_1AC6, 0xFA00_0018];
+        const LOAD_X2_VCC_0X08: [u32; 2] = [0xF424_1A86, 0xFA00_0008];
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                LOAD_VCC_LO_0X10[0],
+                LOAD_VCC_LO_0X10[1],
+                LOAD_VCC_HI_0X18[0],
+                LOAD_VCC_HI_0X18[1],
+                LOAD_X2_VCC_0X08[0],
+                LOAD_X2_VCC_0X08[1],
+                V_MOV_V0_0,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse s_buffer_load with VCC destinations");
+
+        // The encodings really do carry the destinations this test is about.
+        let insts = code.get_instructions();
+        assert_eq!(insts[0].type_, T::SBufferLoadDword);
+        assert_eq!(insts[0].format, F::SdstSvSoffset);
+        assert_eq!(insts[0].dst.type_, ShaderOperandType::VccLo);
+        assert_eq!(insts[0].src[0].register_id, 12, "V# is s[12:15]");
+        assert_eq!(insts[1].type_, T::SBufferLoadDword);
+        assert_eq!(
+            insts[1].dst.type_,
+            ShaderOperandType::VccHi,
+            "a one-dword load may name the HIGH half directly"
+        );
+        assert_eq!(insts[2].type_, T::SBufferLoadDwordx2);
+        assert_eq!(insts[2].dst.type_, ShaderOperandType::VccLo);
+        assert_eq!(insts[2].dst.size, 2);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 12;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("a VccHi scalar destination must recompile, not refuse");
+
+        assert!(
+            source.contains("%vcc_hi = OpVariable %_ptr_Function_uint Function"),
+            "vcc_hi is declared as a uint register variable:\n{source}"
+        );
+        assert!(
+            source.contains("%sbuffer_load_dword %vcc_hi "),
+            "the one-dword load writes vcc_hi directly:\n{source}"
+        );
+        assert!(
+            source.contains("%sbuffer_load_dword %vcc_lo "),
+            "the one-dword lo load is unchanged:\n{source}"
+        );
+        assert!(
+            source.contains("%sbuffer_load_dword_2 %vcc_lo %vcc_hi "),
+            "the x2 load still walks vcc_lo then vcc_hi:\n{source}"
+        );
+
+        let words = spirv_run(&source).expect("assemble s_buffer_load into VCC halves");
+        naga_parse_and_validate(&words, "sbuffer_load_vcc_hi");
+    }
+
+    /// A descriptor table deeper than Kyty's fixed 64-entry extended mapping.
+    ///
+    /// Measured as Blasphemous II's other translation blocker (PS
+    /// `0x10001d00300`): it addresses ONE descriptor-table pointer pair
+    /// (`s[28:29]`) with `s_load_dwordx8` at byte offsets
+    /// `0x00/0x20/0x40/0x60/0x80` (the T#s) and `s_load_dwordx4` at
+    /// `0xa0/0xb0/0xc0/0xd0/0xe0/0xf0/0x100` (the S#s). `0x100 >> 2 = 64`, so
+    /// the last sampler occupies EUD dwords 64..67 — one past Kyty's window.
+    /// The usage table declares it at `start_register = SGPRS_MAX + 64 = 96`,
+    /// `eud_rel_index` rebases that to 64, and `Spirv::WriteLocalVariables`
+    /// refused the whole shader ("extended mapping overflow").
+    ///
+    /// The second half pins the FLOOR: a table that fits Kyty's 64 keeps a
+    /// 64-long mapping and coverage map, so nothing that translates today moves.
+    #[test]
+    fn extended_mapping_grows_for_a_descriptor_table_deeper_than_kytys_window() {
+        use crate::shader::spirv::{eud_covered_map, extended_mapping_len};
+
+        // s_load_dwordx4 s[24:27], s[28:29], 0x100 (NULL soffset).
+        const SLOAD_X4_0X100: [u32; 2] = [0xF408_060E, 0xFA00_0100];
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[SLOAD_X4_0X100[0], SLOAD_X4_0X100[1], V_MOV_V0_0, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse s_load_dwordx4 at EUD byte 0x100");
+        let sload = &code.get_instructions()[0];
+        assert_eq!(sload.type_, T::SLoadDwordx4);
+        assert_eq!(sload.src[0].register_id, 28, "base pair is s[28:29]");
+        assert_eq!(
+            sload.src[1].constant.u >> 2,
+            64,
+            "byte 0x100 is EUD dword 64 — one past Kyty's fixed window"
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 16;
+        input_info.bind.extended.used = true;
+        input_info.bind.extended.start_register = 28;
+        input_info.bind.samplers.samplers_num = 1;
+        // SGPRS_MAX + 64: the "EUD continues the register file" declaration.
+        input_info.bind.samplers.start_register[0] = 96;
+        input_info.bind.samplers.extended[0] = true;
+
+        assert_eq!(
+            extended_mapping_len(&input_info.bind),
+            68,
+            "the window must span the declared S# at EUD dwords 64..67"
+        );
+        let covered = eud_covered_map(&input_info.bind);
+        assert_eq!(covered.len(), 68, "coverage map matches the mapping length");
+        assert!(
+            !covered[63],
+            "dword 63 belongs to no declared descriptor: {covered:?}"
+        );
+        assert!(
+            covered[64..68].iter().all(|c| *c),
+            "EUD dwords 64..67 are the S#'s captured descriptor fields: {covered:?}"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("a descriptor past EUD dword 63 must map, not overflow");
+        for reg in 24..28 {
+            assert!(
+                source.contains(&format!("OpStore %s{reg}")),
+                "S# dword must land in s{reg}:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble deep-EUD descriptor load");
+        naga_parse_and_validate(&words, "extended_mapping_dword_64");
+
+        // FLOOR: the same shape one descriptor lower (byte 0xf0 => dwords
+        // 60..63) still fits Kyty's window, and the window stays exactly 64 —
+        // so every shader that translates today keeps an identical mapping.
+        let mut shallow = input_info.bind;
+        shallow.samplers.start_register[0] = 92;
+        assert_eq!(
+            extended_mapping_len(&shallow),
+            crate::shader::spirv::EXTENDED_MAPPING_DWORDS,
+            "a table that fits Kyty's 64 keeps Kyty's 64"
+        );
+        let covered = eud_covered_map(&shallow);
+        assert_eq!(covered.len(), 64);
+        assert!(
+            covered[60..64].iter().all(|c| *c),
+            "EUD dwords 60..63 stay covered under the floor: {covered:?}"
+        );
+        assert!(!covered[59], "nothing below the S# is covered");
+    }
 }
