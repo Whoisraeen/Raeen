@@ -461,17 +461,30 @@ mod platform {
                 );
                 return cache.clone();
             }
-            pixels.resize(len, 0);
             let slot = ((first / 2) as usize) % FRAME_SLOTS;
-            // SAFETY: the validated length is within PIXEL_CAPACITY, both
-            // buffers are valid for `len` bytes and do not overlap. The
-            // sequence re-check below rejects a copy concurrent with a write.
+            // Copy into reserved-but-uninitialized capacity. Zeroing first
+            // (`resize(len, 0)`) would be a second full-frame write that the
+            // copy immediately overwrites — 8.29 MB per presented frame at
+            // 1080p, on the Shell's UI thread, that nothing ever reads.
+            //
+            // SAFETY: `pixels` has capacity for at least `len` bytes — the pool
+            // only hands back buffers of `capacity() >= len`, and otherwise the
+            // `try_reserve_exact` above succeeded or we already returned. `len`
+            // was validated against PIXEL_CAPACITY, so the source range lies
+            // inside the mapping; a heap buffer and the mapped view cannot
+            // overlap. The copy initializes every one of those `len` bytes
+            // before `set_len` publishes them, and it is the only thing between
+            // the two, so `pixels` leaves this function either untouched
+            // (`len == 0`, on the early returns above) or fully initialized —
+            // including on the sequence re-check below, which discards this
+            // copy and keeps the cached frame when the producer lapped us.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.mapping.pixels(slot).cast_const(),
                     pixels.as_mut_ptr(),
                     len,
                 );
+                pixels.set_len(len);
             }
             std::sync::atomic::fence(Ordering::Acquire);
             let second = self
