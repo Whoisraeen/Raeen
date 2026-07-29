@@ -125,6 +125,28 @@ use crate::{GuestCallError, HleContext};
 pub(crate) const UCONTEXT_SIZE: u64 = 0x500;
 /// Byte offset of `uc_mcontext` inside `ucontext_t`: a 16-byte `uc_sigmask`
 /// followed by 0x30 bytes of private fields.
+///
+/// # Measured against the alternatives
+///
+/// The references disagree: shadPS4 places `uc_mcontext` here at 0x40
+/// (`Sigset uc_sigmask; int field1_0x10[12]`), stock FreeBSD amd64 at 0x10, and
+/// KytyPS5 at 0x00. All three share the same WITHIN-mcontext offsets, so the
+/// choice decides which of our registers a guest finds where it expects
+/// `mc_rip`.
+///
+/// All three were measured against Blasphemous II, whose IL2CPP collector faults
+/// after its GC handshake:
+///
+/// | `UC_MCONTEXT` | where the collector dies |
+/// |---|---|
+/// | **0x40** (this) | `Il2CppUserAssemblies.prx+0x2b24ab`, reading `0x145b03c0` |
+/// | 0x10 | `libc.prx+0x48e0`, reading `0xffff_ffff_ffff_ffff` |
+/// | 0x00 | `libc.prx+0x48e0`, reading `0xffff_ffff_ffff_ffff` |
+///
+/// So the layout is **not** that fault's cause — no offset avoids it — and 0x40
+/// is the least bad: the other two move the failure into libc, 0x00 by
+/// overwriting `uc_sigmask` outright. Keep 0x40 until a third source settles the
+/// real Orbis layout; the collector fault is a separate defect.
 pub(crate) const UC_MCONTEXT: u64 = 0x40;
 /// `sizeof(mcontext_t)`, the value the ABI requires in `mc_len`.
 pub(crate) const MCONTEXT_LEN: u64 = 0x480;
@@ -378,6 +400,29 @@ fn write_ucontext(ctx: &HleContext, address: u64, rip: u64, rsp: u64) -> bool {
         (MC_FSBASE, regs.fsbase),
         (MC_GSBASE, 0),
     ];
+    // One-shot: what a guest reading `mc_rip` would get under each candidate
+    // `uc_mcontext` offset. Ours is 0x40 (shadPS4's RE'd layout); stock FreeBSD
+    // amd64 puts it at 0x10 and KytyPS5 at 0x00, and all three share the same
+    // WITHIN-mcontext offsets. So a guest compiled against a different one reads
+    // one of our other registers where it expects the instruction pointer — and
+    // Blasphemous II's IL2CPP collector dies dereferencing 0x145b03c0, a value
+    // with no guest-arena base. This line says whether that value is sitting in
+    // R12 or R14, which would identify the layout as the cause.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            uc = format_args!("{address:#x}"),
+            uc_mcontext_offset = format_args!("{UC_MCONTEXT:#x}"),
+            real_rip = format_args!("{rip:#x}"),
+            real_rsp = format_args!("{rsp:#x}"),
+            at_uc_plus_0xa0_is_r12 = format_args!("{:#x}", regs.r12),
+            at_uc_plus_0xb0_is_r14 = format_args!("{:#x}", regs.r14),
+            rbp = format_args!("{:#x}", regs.rbp),
+            rbx = format_args!("{:#x}", regs.rbx),
+            "ucontext layout probe: what a guest expecting mcontext at 0x00 or 0x10 \
+             would read where it wants mc_rip"
+        );
+    }
     fields
         .iter()
         .all(|(offset, value)| ctx.mem.write(mc + offset, &value.to_le_bytes()))
