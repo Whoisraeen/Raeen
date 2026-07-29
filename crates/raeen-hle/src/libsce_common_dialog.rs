@@ -58,6 +58,20 @@ pub fn register(registry: &HleRegistry) {
         "sceMsgDialogTerminate",
         hle_msg_terminate,
     );
+    // Progress-bar controls. Measured unresolved on Blasphemous II (PPSA13580),
+    // which imports all three from `libSceMsgDialog.native`. There is nothing on
+    // screen to advance, and a progress dialog here is already FINISHED the
+    // moment it opens, so acknowledging is the correct behavior — a title driving
+    // a progress bar must not see an error and abandon the operation the bar was
+    // reporting on. KytyPS5 registers the same three against its shared
+    // `Dialog::MsgDialog` implementation (`src/libs/libDialog.cpp:114-116`).
+    for name in [
+        "sceMsgDialogProgressBarInc",
+        "sceMsgDialogProgressBarSetMsg",
+        "sceMsgDialogProgressBarSetValue",
+    ] {
+        registry.register("libSceMsgDialog", name, hle_msg_progress_bar);
+    }
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
@@ -113,6 +127,16 @@ fn hle_msg_close(_ctx: &HleContext, _args: &[u64]) -> u64 {
 
 fn hle_msg_terminate(_ctx: &HleContext, _args: &[u64]) -> u64 {
     MSG_STATUS.store(STATUS_NONE, Ordering::Relaxed);
+    SCE_OK
+}
+
+/// `sceMsgDialogProgressBarInc/SetMsg/SetValue(target, ...)`: acknowledge.
+///
+/// There is no visible bar to move — an opened dialog is already `FINISHED`
+/// here — and none of these calls returns data to the guest, so there is
+/// nothing to fabricate. Refusing instead would make a title treat the
+/// operation the bar reports on as failed.
+fn hle_msg_progress_bar(_ctx: &HleContext, _args: &[u64]) -> u64 {
     SCE_OK
 }
 

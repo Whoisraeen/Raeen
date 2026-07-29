@@ -340,6 +340,32 @@ fn font_fallback_sibling(missing: &std::path::Path) -> Option<String> {
     candidates.into_iter().next()
 }
 
+/// Guest roots that exist only on a **development** console and are absent on
+/// retail hardware, so resolving them to nothing is correct behavior.
+///
+/// A retail title compiled with its debug logging left in still opens
+/// `/devlog/...`; on a retail unit that open fails and the title continues.
+/// Mounting one of these would be inventing a device the guest cannot
+/// distinguish from a real devkit — it would start believing its log writes
+/// land somewhere a support bundle can read. Measured on Blasphemous II
+/// (PPSA13580), which opens `/devlog/app/debug.log` during boot and proceeds.
+///
+/// Deliberately just the one entry. `/hostapp` looks similar but is **not** in
+/// this class — both KytyPS5 (`src/emulator.cpp:202`) and shadPS4
+/// (`src/core/file_sys/fs.cpp:104`) treat it as a second name for the app root,
+/// so an unresolved `/hostapp` open is a genuine missing mount and must keep
+/// warning.
+const DEVKIT_ONLY_ROOTS: &[&str] = &["/devlog"];
+
+fn is_devkit_only_root(path: &str) -> bool {
+    DEVKIT_ONLY_ROOTS.iter().any(|root| {
+        path == *root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Real `open(path, flags, mode)` / `sceKernelOpen` (VFS-backed): resolves
 /// the guest path through the kernel VFS (`/app0/…` → the game directory,
 /// etc.), opens it, and returns a file descriptor (>= 3). A path that
@@ -507,7 +533,20 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
                 } else {
                     debug!("open: '{path}' does not exist — ENOENT");
                     if e.to_string().contains("path is not mounted") {
-                        warn!("open: '{path}' matches no VFS mount — ENOENT");
+                        if is_devkit_only_root(&path) {
+                            // Not a gap: these roots do not exist on a retail
+                            // console either, so ENOENT is the *correct*
+                            // answer and the title must already handle it.
+                            // Warning about it sent one debugging session
+                            // looking for a missing mount that should stay
+                            // missing (Blasphemous II, `/devlog/app/debug.log`).
+                            debug!(
+                                "open: '{path}' is under a devkit-only root that retail hardware \
+                                 does not have either — ENOENT (expected, not a missing mount)"
+                            );
+                        } else {
+                            warn!("open: '{path}' matches no VFS mount — ENOENT");
+                        }
                     }
                 }
                 return FILE_ENOENT;
@@ -2425,7 +2464,7 @@ pub fn register(registry: &HleRegistry) {
     );
     // Filesystem metadata. Path-based operations resolve through the same VFS
     // mounts as open/read/write; no title-specific path handling lives here.
-    registry.register("libkernel", "sceKernelMkdir", hle_mkdir);
+    registry.register("libkernel", "sceKernelMkdir", hle_sce_mkdir);
     registry.register("libkernel", "sceKernelUnlink", hle_sce_unlink);
     registry.register("libkernel", "sceKernelRmdir", hle_sce_rmdir);
     registry.register("libkernel", "unlink", hle_posix_unlink);
@@ -2435,17 +2474,34 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "sceKernelSync", hle_sce_sync);
     registry.register("libkernel", "sceKernelChmod", hle_path_metadata_accept);
     registry.register("libkernel", "sceKernelUtimes", hle_path_metadata_accept);
+    registry.register("libkernel", "sceKernelFchmod", hle_sce_fd_metadata_accept);
     registry.register("libkernel", "sceKernelStat", hle_stat);
     registry.register("libkernel", "sceKernelFstat", hle_sce_fstat);
-    // Plain POSIX spellings of the same two metadata calls — different NIDs
-    // from the sce* forms, registered under both providers (the measured
-    // imports name `libScePosix`; `unlink`/`rmdir` above show libkernel
-    // exports the plain spellings too). `-1` + `errno` convention, like
-    // `hle_posix_unlink`.
+    // Plain POSIX spellings of the same metadata calls — different NIDs from
+    // the sce* forms, registered under both providers (the measured imports
+    // name `libScePosix`; `unlink`/`rmdir` above show libkernel exports the
+    // plain spellings too). `-1` + `errno` convention, like `hle_posix_unlink`.
     registry.register("libkernel", "rename", hle_posix_rename);
     registry.register("libScePosix", "rename", hle_posix_rename);
     registry.register("libkernel", "stat", hle_posix_stat);
     registry.register("libScePosix", "stat", hle_posix_stat);
+    // The POSIX filesystem spellings Blasphemous II (PPSA13580) imports from
+    // `libScePosix` and that resolved to nothing: `mkdir`, `rmdir`, `unlink`,
+    // `chmod`, `fchmod`, `utimes`, `futimes`. Every one of these already had a
+    // working implementation reachable under a *different* provider or a
+    // *different* name, so the title was calling a null stub for directory
+    // creation while `sceKernelMkdir` worked — measured as 9 unresolved
+    // `libScePosix` imports (`cargo xtask nids coverage`).
+    registry.register("libkernel", "mkdir", hle_posix_mkdir);
+    registry.register("libScePosix", "mkdir", hle_posix_mkdir);
+    registry.register("libScePosix", "rmdir", hle_posix_rmdir);
+    registry.register("libScePosix", "unlink", hle_posix_unlink);
+    for library in ["libkernel", "libScePosix"] {
+        registry.register(library, "chmod", hle_posix_path_metadata_accept);
+        registry.register(library, "utimes", hle_posix_path_metadata_accept);
+        registry.register(library, "fchmod", hle_posix_fd_metadata_accept);
+        registry.register(library, "futimes", hle_posix_fd_metadata_accept);
+    }
     // pthread surface libc/fmod touch during init — attr/priority/affinity
     // bookkeeping has no scheduler to talk to yet, so recording nothing and
     // returning success is faithful enough for a single-thread world.
@@ -4679,21 +4735,29 @@ fn hle_debug_write_cpp_exception_info(_ctx: &HleContext, args: &[u64]) -> u64 {
     SCE_OK
 }
 
-/// `sceKernelMkdir(path, mode)`: create the directory beneath a registered
-/// VFS mount. The VFS rejects unmounted and traversing paths.
-fn hle_mkdir(ctx: &HleContext, args: &[u64]) -> u64 {
-    let path_ptr = args.first().copied().unwrap_or(0);
-    let Some(path_bytes) = crate::fmt::read_cstr(ctx.mem, path_ptr) else {
-        return SCE_KERNEL_ERROR_EFAULT;
+/// `mkdir(path, mode)` / `sceKernelMkdir`: create the directory beneath a
+/// registered VFS mount (internal negative-errno convention; see the wrappers
+/// below). The VFS rejects unmounted paths and clamps traversal at the mount
+/// root.
+fn hle_mkdir_core(ctx: &HleContext, args: &[u64]) -> u64 {
+    let Some(path) = read_guest_path(ctx, args, 0) else {
+        return FILE_EFAULT;
     };
-    let path = String::from_utf8_lossy(&path_bytes);
     match ctx.kernel.filesystem.create_dir_all(&path) {
         Ok(()) => SCE_OK,
         Err(error) => {
-            warn!("sceKernelMkdir('{path}') failed: {error}");
-            SCE_KERNEL_ERROR_ENOENT
+            warn!("mkdir('{path}') failed: {error}");
+            io_error_to_file_result(&error)
         }
     }
+}
+
+fn hle_sce_mkdir(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_mkdir_core(ctx, args))
+}
+
+fn hle_posix_mkdir(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_mkdir_core(ctx, args))
 }
 
 const ORBIS_STAT_SIZE: usize = 120;
@@ -4917,8 +4981,14 @@ fn hle_sce_sync(_ctx: &HleContext, _args: &[u64]) -> u64 {
 /// authoritative), so a resolvable existing path is accepted with a debug log
 /// and an unresolvable one is a real `ENOENT`.
 fn hle_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_path_metadata_core(ctx, args))
+}
+
+/// Internal negative-errno core of [`hle_path_metadata_accept`], so the POSIX
+/// spellings can return `-1` + `errno` from the same check.
+fn hle_path_metadata_core(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(path) = read_guest_path(ctx, args, 0) else {
-        return SCE_KERNEL_ERROR_EFAULT;
+        return FILE_EFAULT;
     };
     match ctx.kernel.filesystem.resolve_path(&path) {
         Some(host) if host.exists() => {
@@ -4927,9 +4997,47 @@ fn hle_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         _ => {
             warn!("chmod/utimes('{path}'): not a mounted existing path — ENOENT");
-            SCE_KERNEL_ERROR_ENOENT
+            FILE_ENOENT
         }
     }
+}
+
+/// POSIX `chmod(path, mode)` / `utimes(path, times)`: `-1` + `errno`.
+fn hle_posix_path_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_path_metadata_core(ctx, args))
+}
+
+/// `fchmod(fd, mode)` / `futimes(fd, times)` / `sceKernelFchmod`: the
+/// descriptor twin of [`hle_path_metadata_core`].
+///
+/// The VFS models no guest permission bits or timestamps (host metadata is
+/// authoritative), so this validates the descriptor and accepts. A bad fd is a
+/// real `EBADF` — a title that silently "succeeded" on a closed descriptor
+/// would keep using it.
+fn hle_fd_metadata_core(ctx: &HleContext, args: &[u64]) -> u64 {
+    let fd = args.first().copied().unwrap_or(0);
+    // Console descriptors and the random devices are valid fds with no backing
+    // file entry; everything else must be a live VFS descriptor.
+    let known = fd <= 2
+        || ctx.kernel.filesystem.is_random_device(fd as i32)
+        || ctx.kernel.filesystem.is_directory(fd as i32)
+        || ctx.kernel.filesystem.file_size(fd as i32).is_some();
+    if !known {
+        warn!("fchmod/futimes(fd={fd}): no file table backing — EBADF");
+        return WRITE_EBADF;
+    }
+    debug!("fchmod/futimes(fd={fd}) accepted (no guest metadata modeled)");
+    SCE_OK
+}
+
+/// `sceKernelFchmod(fd, mode)`: a negative `SCE_KERNEL_ERROR_*` code.
+fn hle_sce_fd_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_sce(hle_fd_metadata_core(ctx, args))
+}
+
+/// POSIX `fchmod` / `futimes`: `-1` + `errno`.
+fn hle_posix_fd_metadata_accept(ctx: &HleContext, args: &[u64]) -> u64 {
+    file_result_posix(ctx, hle_fd_metadata_core(ctx, args))
 }
 
 /// `fstat`/`sceKernelFstat(fd, stat_out)`: report regular-file size for VFS
@@ -7791,7 +7899,7 @@ mod tests {
         kernel.filesystem.set_temp_directory(&tmp);
 
         assert!(mem.write(0x100, b"/temp0/cache\0"));
-        assert_eq!(hle_mkdir(&ctx, &[0x100, 0o755]), SCE_OK);
+        assert_eq!(hle_sce_mkdir(&ctx, &[0x100, 0o755]), SCE_OK);
         assert!(tmp.join("cache").is_dir());
 
         assert_eq!(hle_stat(&ctx, &[0x100, 0x200]), SCE_OK);

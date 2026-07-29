@@ -36,12 +36,14 @@ pub(crate) mod libsce_agc_reg_defaults;
 pub(crate) mod libsce_agc_reg_defaults_v10;
 pub mod libsce_ampr;
 pub mod libsce_app_content;
+pub mod libsce_audio_in;
 pub mod libsce_audio_out;
 pub mod libsce_audio_out2;
 pub mod libsce_audio_propagation;
 pub mod libsce_common_dialog;
 pub mod libsce_content_export;
 pub mod libsce_coredump;
+pub mod libsce_dialog_misc;
 pub mod libsce_disc_map;
 pub mod libsce_fiber;
 pub mod libsce_font;
@@ -850,6 +852,13 @@ impl HleRegistry {
         // libSceSigninDialog.prx as NEEDED.
         libsce_signin_dialog::register(&registry);
         libsce_audio_out::register(&registry);
+        // Capture (microphone): a real port that yields silence and reports
+        // DEVICE_NONE. Blasphemous II (PPSA13580) imports 5 `libSceAudioIn`
+        // functions that resolved to nothing before this module existed.
+        libsce_audio_in::register(&registry);
+        // Error / VR-setup common dialogs — the last two dialog libraries the
+        // measured title imports and that had no registrations at all.
+        libsce_dialog_misc::register(&registry);
         libsce_save_data::register(&registry);
         libsce_save_data_dialog::register(&registry);
         libsce_common_dialog::register(&registry);

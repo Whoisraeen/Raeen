@@ -62,6 +62,12 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "clock_gettime", posix_clock_gettime);
     registry.register("libkernel", "gettimeofday", posix_gettimeofday);
     registry.register("libkernel", "usleep", posix_usleep);
+
+    // `sceKernelSleep(seconds)` — the Sony spelling of `sleep`, a DIFFERENT NID
+    // from the plain name above and therefore its own registration. Blasphemous
+    // II (PPSA13580) imports it and it resolved to nothing, so a guest that
+    // meant to block for whole seconds was calling a null stub.
+    registry.register("libkernel", "sceKernelSleep", posix_sleep);
 }
 
 /// Turn an SCE return (`0` on success, negative error code on failure) into the

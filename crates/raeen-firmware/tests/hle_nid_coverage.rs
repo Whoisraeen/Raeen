@@ -432,3 +432,143 @@ fn the_gettimeofday_nid_resolves_through_the_module_registry() {
         ),
     }
 }
+
+/// The four `.native` `DT_NEEDED` names Blasphemous II (PPSA13580) carries must
+/// reach the HLE libraries that already implement them.
+///
+/// Measured warnings from that title's launch — all four libraries exist in
+/// tree, and all four were reported missing purely because the loader compared
+/// a `DT_NEEDED` *file name* against bare HLE *library* names:
+///
+/// ```text
+/// NEEDED libSceAjm.native.prx: no HLE library named 'libSceAjm.native'
+/// NEEDED libSceAvPlayer.native.prx: no HLE library named 'libSceAvPlayer.native'
+/// NEEDED libSceMsgDialog.native.prx: no HLE library named 'libSceMsgDialog.native'
+/// NEEDED libSceSaveDataDialog.native.prx: no HLE library named 'libSceSaveDataDialog.native'
+/// ```
+///
+/// This asserts the property behind that fix: the canonical identity of the
+/// `.native` file name is a library the live `HleRegistry` actually registers,
+/// and a real import naming the `.native` provider resolves to a real function.
+#[test]
+fn native_suffixed_needed_names_reach_the_libraries_that_implement_them() {
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+    let registered: std::collections::HashSet<String> = hle
+        .registered_names()
+        .into_iter()
+        .map(|(library, _)| raeen_firmware::canonical_module_name(&library))
+        .collect();
+
+    // (NEEDED file name, one function the title imports from it.)
+    const MEASURED: &[(&str, &str)] = &[
+        ("libSceAjm.native.prx", "sceAjmInitialize"),
+        ("libSceAvPlayer.native.prx", "sceAvPlayerInit"),
+        ("libSceMsgDialog.native.prx", "sceMsgDialogInitialize"),
+        (
+            "libSceSaveDataDialog.native.prx",
+            "sceSaveDataDialogInitialize",
+        ),
+    ];
+
+    for (needed, function) in MEASURED {
+        let canonical = raeen_firmware::canonical_module_name(needed);
+        assert!(
+            registered.contains(&canonical),
+            "NEEDED {needed} canonicalizes to {canonical:?}, which no HLE library matches — the \
+             loader would warn 'no HLE library named ...' for a library that exists"
+        );
+        // And the provider spelling in the import table resolves for real.
+        let provider = needed.trim_end_matches(".prx");
+        match registry.resolve(&hle, provider, nid_of(function)) {
+            Resolver::Hle {
+                function: got_fn, ..
+            } => assert_eq!(&got_fn, function),
+            other => panic!(
+                "{function} imported from provider {provider:?} must resolve to HLE; got {other:?}"
+            ),
+        }
+    }
+}
+
+/// The POSIX filesystem spellings Blasphemous II imports from `libScePosix` and
+/// that resolved to nothing.
+///
+/// Measured with `cargo xtask nids coverage` against the retail title: 9
+/// unresolved `libScePosix` imports, of which these seven are the filesystem
+/// family. `sceKernelMkdir` worked the whole time — the title was calling
+/// `libScePosix::mkdir`, a different NID under a provider nothing registered.
+/// `sendmsg`/`recvmsg` are the other two and remain unimplemented (socket
+/// message-vector semantics, not a naming gap).
+#[test]
+fn posix_filesystem_spellings_the_title_imports_resolve() {
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    for name in [
+        "mkdir", "rmdir", "unlink", "chmod", "fchmod", "utimes", "futimes",
+    ] {
+        match registry.resolve(&hle, "libScePosix", nid_of(name)) {
+            Resolver::Hle { function, library } => {
+                assert_eq!(function, name);
+                assert_eq!(library, "libScePosix");
+            }
+            other => panic!("libScePosix::{name} must resolve to HLE; got {other:?}"),
+        }
+    }
+
+    // `sceKernelSleep` is the Sony spelling of `sleep` and a distinct NID; the
+    // title imports it from `libkernel` and it resolved to nothing.
+    for name in ["sceKernelSleep", "sceKernelFchmod"] {
+        match registry.resolve(&hle, "libkernel", nid_of(name)) {
+            Resolver::Hle { function, .. } => assert_eq!(function, name),
+            other => panic!("libkernel::{name} must resolve to HLE; got {other:?}"),
+        }
+    }
+}
+
+/// The libraries Blasphemous II imports that had **zero** registrations before.
+///
+/// Names and counts from `cargo xtask nids coverage` against the retail title:
+/// 5 unresolved `libSceAudioIn`, 6 unresolved `libSceVrSetupDialog`, 4
+/// unresolved `libSceErrorDialog`, plus the three `libSceMsgDialog.native`
+/// progress-bar controls. Each must now resolve **from the provider the title
+/// names**, which is what a provider-blind check would miss.
+#[test]
+fn newly_added_libraries_resolve_from_the_providers_the_title_names() {
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    const MEASURED: &[(&str, &str)] = &[
+        ("libSceAudioIn", "sceAudioInOpen"),
+        ("libSceAudioIn", "sceAudioInAsyncOpen"),
+        ("libSceAudioIn", "sceAudioInClose"),
+        ("libSceAudioIn", "sceAudioInInput"),
+        ("libSceAudioIn", "sceAudioInGetSilentState"),
+        ("libSceVrSetupDialog", "sceVrSetupDialogInitialize"),
+        ("libSceVrSetupDialog", "sceVrSetupDialogOpen"),
+        ("libSceVrSetupDialog", "sceVrSetupDialogUpdateStatus"),
+        ("libSceVrSetupDialog", "sceVrSetupDialogGetResult"),
+        ("libSceVrSetupDialog", "sceVrSetupDialogClose"),
+        ("libSceVrSetupDialog", "sceVrSetupDialogTerminate"),
+        ("libSceErrorDialog", "sceErrorDialogInitialize"),
+        ("libSceErrorDialog", "sceErrorDialogOpen"),
+        ("libSceErrorDialog", "sceErrorDialogUpdateStatus"),
+        ("libSceErrorDialog", "sceErrorDialogTerminate"),
+        // Imported under the `.native` spelling; must reach the bare library.
+        ("libSceMsgDialog.native", "sceMsgDialogProgressBarInc"),
+        ("libSceMsgDialog.native", "sceMsgDialogProgressBarSetMsg"),
+        ("libSceMsgDialog.native", "sceMsgDialogProgressBarSetValue"),
+    ];
+
+    for (provider, function) in MEASURED {
+        match registry.resolve(&hle, provider, nid_of(function)) {
+            Resolver::Hle {
+                function: got_fn, ..
+            } => assert_eq!(&got_fn, function),
+            other => panic!(
+                "{function} imported from provider {provider:?} must resolve to HLE; got {other:?}"
+            ),
+        }
+    }
+}

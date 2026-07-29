@@ -163,7 +163,28 @@ SOFTWARE.
   (`Qhv5ARAoOEc`/`WkwEd3N7w0Y`/`il03nluKfMk` = Remove/Install/RaiseException),
   all three already registered by Raeen. Raeen's load-ordered module sweep, the
   trampoline-reservation mechanism, the miss diagnostics, and all tests are its
-  own. No C++ is vendored or compiled into Raeen.
+  own. The **`.native` library-name canonicalization** batch
+  (`crates/raeen-firmware/src/registry.rs`, 2026-07-28) uses `src/libs/libs.h`'s
+  `LIB_VERSION(library, lv, module, mv1, mv2)` macro (L24) and its `.native`
+  registrations as **naming-rule evidence**: `libDialog.cpp:87`
+  (`"SaveDataDialog.native"` → module `"SaveDataDialog"`), `libDialog.cpp:108`
+  (`"MsgDialog.native"` → module `"MsgDialog"`), and `dialog.cpp:497`
+  (`LIB_NAME("MsgDialog.native", "MsgDialog")`) together establish that
+  `.native` is a spelling of one library whose module identity is the bare
+  name, and that both spellings dispatch to the same implementation
+  (`Dialog::SaveDataDialog::*`). The **guest working directory** used when
+  anchoring relative guest paths (`crates/raeen-kernel/src/filesystem/mod.rs`,
+  2026-07-28) is likewise taken from `src/main.cpp:138` /
+  `src/emulator.cpp:201-202` (executable loaded as `/app0/eboot.bin`, app
+  directory mounted at `/app0` and `/hostapp`);
+  `src/kernel/fileSystem.cpp:226-245`'s `MountPoints::GetRealFilename`
+  fall-through — returning an unmatched guest path verbatim as a host path — is
+  documented as deliberately **not** adopted. `src/libs/audio.cpp:564-582`'s
+  `Audio::AudioInInput` simulated grain delay is behavioral evidence for the
+  capture-port pacing in `crates/raeen-hle/src/libsce_audio_in.rs`, and
+  `libDialog.cpp:114-116` for the `sceMsgDialogProgressBar*` trio. Raeen's
+  canonicalization function, the sandboxed path normalization, the port table,
+  and all tests are its own. No C++ is vendored or compiled into Raeen.
 
 ---
 
@@ -487,6 +508,22 @@ re-implementations are license-compatible; this notice preserves attribution.
   `PCONTEXT`; Raeen instead queues the raise and delivers at the target thread's
   next HLE safe point through its own `call_guest` re-entry, so no C++ and no
   delivery mechanism is copied.
+
+  The 2026-07-28 `libSceAudioIn` capture library
+  (`crates/raeen-hle/src/libsce_audio_in.rs`) re-implements the **values and
+  contract** of `src/core/libraries/audio/audioin.cpp` / `audioin_error.h` /
+  `audioin.h` in Rust: the `ORBIS_AUDIO_IN_ERROR_*` codes, the
+  `ORBIS_AUDIO_IN_SILENT_STATE_DEVICE_NONE` bit reported when no microphone is
+  available (`audioin.cpp:250-252`), the `(type << 16) | port_id | 0x30000000`
+  handle encoding (`audioin.cpp:141`), the S16 mono/stereo `param` decode, and
+  `HqOpen` routing to the same `Open` path. Raeen's port table, silence
+  zero-fill, grain pacing, and tests are its own. The same date's guest-path
+  normalization in `crates/raeen-kernel/src/filesystem/mod.rs` follows
+  `src/core/file_sys/fs.cpp:46`'s doubled-slash correction (as a *consequence*
+  of dropping empty components, not as a special case), and
+  `fs.cpp:104`'s treatment of `/hostapp` as a second name for the app root is
+  the reason `/hostapp` is excluded from Raeen's devkit-only root list. No C++
+  is copied.
 
   **Data incorporated in-tree:** `crates/raeen-firmware/src/dynlib/nid_names.txt`
   is derived from shadPS4's `src/core/aerolib/aerolib.inl` — a generated table

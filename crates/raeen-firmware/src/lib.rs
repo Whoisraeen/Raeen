@@ -28,7 +28,7 @@ pub use dynlib::linker::{
     UNRESOLVED_STUB_BASE, UnresolvedImport, UnresolvedStub, link_module, link_module_into,
 };
 pub use pup::Firmware;
-pub use registry::{ModulePolicy, ModuleRegistry, Resolver};
+pub use registry::{ModulePolicy, ModuleRegistry, Resolver, canonical_module_name};
 pub use report::summarize;
 pub use slb2::{Slb2Entry, parse_slb2};
 pub use sprx::{
@@ -81,6 +81,28 @@ pub fn inspect_module(
     Ok(InspectedModule { module, dynlib })
 }
 
+/// Every HLE library keyed by its **canonical** module identity, mapped back to
+/// the registered display spelling.
+///
+/// A `DT_NEEDED` name is a file name (`libSceAjm.native.prx`) while the HLE
+/// registers bare library names (`libSceAjm`). Comparing the two raw made four
+/// fully-implemented libraries — `libSceAjm`, `libSceAvPlayer`,
+/// `libSceMsgDialog`, `libSceSaveDataDialog` — report "no HLE library named
+/// ..." on every Blasphemous II (PPSA13580) launch, because the title names the
+/// `.native` spelling. Canonicalizing both sides through
+/// [`registry::canonical_module_name`] is the same normalization the import
+/// resolver already applies, so the diagnostic now agrees with what the linker
+/// actually did.
+fn hle_library_index(hle: &raeen_hle::HleRegistry) -> std::collections::HashMap<String, String> {
+    let mut index = std::collections::HashMap::new();
+    for (library, _) in hle.registered_names() {
+        index
+            .entry(registry::canonical_module_name(&library))
+            .or_insert(library);
+    }
+    index
+}
+
 /// End-to-end LM1 pipeline: [`inspect_module`] (SELF decrypt-or-passthrough ->
 /// `.sprx` parse -> `PT_SCE_DYNLIBDATA` decode) -> export registration -> link.
 ///
@@ -107,20 +129,17 @@ pub fn load_module(
     // entry is informational; one with no matching HLE library is the first
     // sign a title needs a real file-backed `.prx` load (future work).
     if !dynlib_data.needed_modules.is_empty() {
-        let hle_libs: std::collections::HashSet<String> = hle
-            .registered_names()
-            .into_iter()
-            .map(|(lib, _)| lib)
-            .collect();
+        let hle_libs = hle_library_index(hle);
         for needed in &dynlib_data.needed_modules {
-            let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
-            if hle_libs.contains(stem) {
-                tracing::info!("NEEDED {needed}: covered by HLE library '{stem}'");
-            } else {
-                tracing::warn!(
-                    "NEEDED {needed}: no HLE library named '{stem}' — its imports resolve only if \
-                     their NIDs are registered elsewhere (file-backed .prx loading not implemented)"
-                );
+            match hle_libs.get(&registry::canonical_module_name(needed)) {
+                Some(library) => {
+                    tracing::info!("NEEDED {needed}: covered by HLE library '{library}'");
+                }
+                None => tracing::warn!(
+                    "NEEDED {needed}: no HLE library named '{}' — its imports resolve only if \
+                     their NIDs are registered elsewhere (file-backed .prx loading not implemented)",
+                    registry::canonical_module_name(needed)
+                ),
             }
         }
     }
@@ -1095,11 +1114,7 @@ pub fn load_process(
         None => dynlib::parse_dynlibdata(module.dynlib_data.as_deref().unwrap_or(&[]), &dyn_tags)?,
     };
 
-    let hle_libs: std::collections::HashSet<String> = hle
-        .registered_names()
-        .into_iter()
-        .map(|(lib, _)| lib)
-        .collect();
+    let hle_libs = hle_library_index(hle);
 
     let mut next_offset = align_up_16k(dynlib::linker::image_size(&module)? as u64);
     let mut dependencies = Vec::new();
@@ -1196,14 +1211,20 @@ pub fn load_process(
     // still all registered here, before ANY module links in pass 2 below.
     while let Some(request) = queue.pop_front() {
         let needed = request.name.as_str();
-        let stem = needed.trim_end_matches(".sprx").trim_end_matches(".prx");
+        // Canonical identity, not a raw file stem: `libSceAjm.native.prx` and
+        // `libSceAjm` are one library (see `registry::canonical_module_name`),
+        // and the HLE registers the bare spelling.
+        let stem = registry::canonical_module_name(needed);
+        let hle_library = hle_libs.get(&stem);
         let resolved = match &request.path {
             Some(path) => Some(path.clone()),
             None => find_dependency_file(dir, needed, &module_index),
         };
         let Some(path) = resolved else {
-            if hle_libs.contains(stem) {
-                tracing::info!("NEEDED {needed}: no file shipped; covered by HLE library '{stem}'");
+            if let Some(library) = hle_library {
+                tracing::info!(
+                    "NEEDED {needed}: no file shipped; covered by HLE library '{library}'"
+                );
             } else {
                 tracing::warn!(
                     "NEEDED {needed} (required by {}): no HLE library named '{stem}' and no file \
@@ -1227,10 +1248,10 @@ pub fn load_process(
         // actually calls — including the one it dies on today. Refusing to load
         // it because "libc is HLE-covered" left all of that unresolved while our
         // libc HLE supplied only ~31 relocations' worth.
-        if hle_libs.contains(stem) {
+        if let Some(library) = hle_library {
             tracing::info!(
-                "NEEDED {needed}: HLE library '{stem}' exists AND the title ships the real module \
-                 — loading it as the preferred provider for its own imports"
+                "NEEDED {needed}: HLE library '{library}' exists AND the title ships the real \
+                 module — loading it as the preferred provider for its own imports"
             );
         }
 

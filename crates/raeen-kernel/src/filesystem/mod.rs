@@ -425,14 +425,17 @@ impl VirtualFileSystem {
     /// that matches no mount, or that would escape its mount root, resolves to
     /// `None` (default-deny / fail-closed) — see [`combine_within_mount`].
     pub fn resolve_path(&self, ps5_path: &str) -> Option<PathBuf> {
+        // Mount matching is a literal prefix compare, so it must run on a
+        // normalized spelling — see [`normalize_guest_path`].
+        let normalized = normalize_guest_path(ps5_path);
         let mounts = self.mounts.read();
         for mount in mounts.iter() {
-            let exact_root = ps5_path == mount.ps5_prefix;
-            let under_root = ps5_path
+            let exact_root = normalized == mount.ps5_prefix;
+            let under_root = normalized
                 .strip_prefix(&mount.ps5_prefix)
                 .is_some_and(|suffix| suffix.starts_with('/'));
             if exact_root || under_root {
-                let relative = ps5_path[mount.ps5_prefix.len()..].trim_start_matches('/');
+                let relative = normalized[mount.ps5_prefix.len()..].trim_start_matches('/');
                 return combine_within_mount(
                     &mount.host_path,
                     mount.canonical_root.as_deref(),
@@ -1319,6 +1322,72 @@ fn positional_read_into(
         filled += n;
     }
     Ok(filled)
+}
+
+/// The guest directory a **relative** guest path is resolved against.
+///
+/// Orbis titles run with their app root as the process working directory
+/// (KytyPS5 loads the executable as `/app0/eboot.bin` and mounts the app
+/// directory at both `/app0` and `/hostapp` — `reference/kytyps5`,
+/// `src/main.cpp:138` / `src/emulator.cpp:201`). Raeen has no `chdir`/`getcwd`
+/// HLE, so this is fixed rather than per-process; when one is added, this
+/// becomes its default.
+pub const GUEST_WORKING_DIRECTORY: &str = "/app0";
+
+/// Normalize a guest path into the absolute, `.`-free spelling that mount
+/// prefix matching can compare literally.
+///
+/// Mount matching is a literal string prefix compare, so any spelling the
+/// guest is entitled to use but that does not *look* like `/<mount>/...` was
+/// reported as "path is not mounted". Measured on Blasphemous II (PPSA13580):
+/// `sceKernelMkdir('././')` failed that way immediately before the title
+/// stalled. `'././'` is a legal spelling of the current directory and must
+/// resolve to it.
+///
+/// Three normalizations, all of which only ever *shorten* the path:
+///
+/// 1. `.` and empty components are dropped, which also collapses the `//`
+///    double slashes shadPS4 corrects for the same reason (`reference/shadps4`,
+///    `src/core/file_sys/fs.cpp:46`: *"Evil games like Turok2 pass double
+///    slashes"*).
+/// 2. A relative path is anchored at [`GUEST_WORKING_DIRECTORY`]. Without this
+///    a relative guest path matched no mount at all. This is the *sandboxed*
+///    form of what KytyPS5 does — its `MountPoints::GetRealFilename`
+///    (`src/kernel/fileSystem.cpp:226-245`) returns an unmatched guest path
+///    verbatim, which on the host resolves against the emulator's own working
+///    directory. Deliberately **not** copied: a raw guest string used as a host
+///    path is the escape `combine_within_mount` exists to close.
+/// 3. Trailing slashes disappear with the empty components, so `/app0/` and
+///    `/app0` are the same path.
+///
+/// `..` is deliberately left **in place**. Resolving it here would change which
+/// mount a path matches; it belongs to [`combine_within_mount`], which pops it
+/// with a clamp at the mount root so no amount of `..` escapes (and which a
+/// UE title's `../../../Content/...` depends on). An empty input stays empty so
+/// `open("")` keeps failing rather than silently becoming the app root.
+fn normalize_guest_path(ps5_path: &str) -> String {
+    if ps5_path.is_empty() {
+        return String::new();
+    }
+    let absolute = ps5_path.starts_with('/');
+    let mut normalized = if absolute {
+        String::new()
+    } else {
+        normalize_mount_root(GUEST_WORKING_DIRECTORY)
+    };
+    for segment in ps5_path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        normalized.push('/');
+        normalized.push_str(segment);
+    }
+    if normalized.is_empty() {
+        // Every component was `.` or empty on an absolute path: the root.
+        "/".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn normalize_mount_root(prefix: &str) -> String {
@@ -2292,6 +2361,104 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(nested);
+    }
+
+    /// `'././'` is a legal spelling of the current directory and must resolve
+    /// to it, not fail as "path is not mounted".
+    ///
+    /// Measured on Blasphemous II (PPSA13580): `sceKernelMkdir('././')` failed
+    /// that way in the last seconds before the title stalled, because mount
+    /// matching is a literal prefix compare and `'././'` neither starts with a
+    /// mount prefix nor is absolute at all.
+    #[test]
+    fn dot_relative_guest_paths_resolve_against_the_app_root() {
+        let app = temp_dir("dot-relative-app");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&app);
+
+        // The exact measured call, plus the other spellings of the same idea.
+        for spelling in ["././", ".", "./", "./.", "././."] {
+            assert_eq!(
+                vfs.resolve_path(spelling),
+                Some(app.clone()),
+                "guest path {spelling:?} must resolve to the app root"
+            );
+        }
+        // A relative *name* lands inside the app root, not outside any mount.
+        assert_eq!(
+            vfs.resolve_path("./cache/state.bin"),
+            Some(app.join("cache").join("state.bin"))
+        );
+        assert_eq!(
+            vfs.resolve_path("cache/state.bin"),
+            Some(app.join("cache").join("state.bin"))
+        );
+        // `mkdir` of the current directory is a no-op that must succeed.
+        assert!(vfs.create_dir_all("././").is_ok());
+
+        let _ = std::fs::remove_dir_all(app);
+    }
+
+    /// Interior `.` components and doubled slashes collapse before mount
+    /// matching; `..` does **not**, because resolving it here would change
+    /// which mount a path matches (see `normalize_guest_path`).
+    #[test]
+    fn dot_and_double_slash_components_collapse_but_dotdot_survives() {
+        assert_eq!(
+            normalize_guest_path("/app0/./sce_sys/./param.json"),
+            "/app0/sce_sys/param.json"
+        );
+        assert_eq!(
+            normalize_guest_path("/app0//Media//level0"),
+            "/app0/Media/level0"
+        );
+        assert_eq!(normalize_guest_path("/app0/"), "/app0");
+        assert_eq!(normalize_guest_path("/"), "/");
+        assert_eq!(normalize_guest_path("/./"), "/");
+        // `..` is preserved verbatim for `combine_within_mount` to clamp.
+        assert_eq!(
+            normalize_guest_path("/app0/../../escape.bin"),
+            "/app0/../../escape.bin"
+        );
+        // An empty path stays empty so `open("")` keeps failing.
+        assert_eq!(normalize_guest_path(""), "");
+    }
+
+    /// Normalization must not open an escape: a relative path is anchored at
+    /// the app root and then clamped there, so `..` still cannot walk out.
+    #[test]
+    fn normalizing_relative_paths_does_not_weaken_the_dotdot_clamp() {
+        let app = temp_dir("dot-relative-clamp");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&app);
+
+        for escape in ["../escape.bin", "./../../escape.bin", "../../../escape.bin"] {
+            assert_eq!(
+                vfs.resolve_path(escape),
+                Some(app.join("escape.bin")),
+                "{escape:?} must clamp INTO the app root"
+            );
+        }
+        // A drive qualifier is still refused, relative spelling included.
+        assert_eq!(
+            vfs.resolve_path("./C:/Windows/System32/drivers/etc/hosts"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(app);
+    }
+
+    /// An unbacked mount stays unbacked: anchoring relative paths must not make
+    /// a stubbed mount resolvable, and an empty path must not become a mount.
+    #[test]
+    fn normalization_does_not_resolve_unbacked_or_unknown_roots() {
+        let vfs = VirtualFileSystem::new();
+        assert_eq!(vfs.resolve_path("/dev/./null"), None);
+        assert_eq!(vfs.resolve_path(""), None);
+        // `/devlog` is devkit-only and absent on retail hardware: it must keep
+        // resolving to nothing rather than gain an invented mount.
+        assert_eq!(vfs.resolve_path("/devlog/app/debug.log"), None);
+        assert_eq!(vfs.resolve_path("/devlog/./app/./debug.log"), None);
     }
 
     #[test]

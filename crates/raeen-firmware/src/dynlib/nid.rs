@@ -253,27 +253,17 @@ impl NidDatabase {
     }
 }
 
+/// One provider identity for the whole crate.
+///
+/// This used to be a private second copy of the rule in
+/// [`crate::registry::canonical_module_name`], and the copies drifted: this one
+/// stripped `.native`, the registry's did not. An import from
+/// `libSceAjm.native` therefore reached the HLE (whose lookup normalizes
+/// through here) but resolved LLE exports and module policy under a *different*
+/// key than the loader had registered them with. Delegating keeps the two
+/// halves of a provider identity from disagreeing again.
 fn canonical_provider_name(provider: &str) -> String {
-    let lower = provider.to_ascii_lowercase();
-    let lower = lower
-        .strip_suffix(".sprx")
-        .or_else(|| lower.strip_suffix(".prx"))
-        .unwrap_or(&lower);
-    // `.native` / `_native` is a SPELLING of the same library, not a different
-    // one. Retail import tables ask for `libSceMsgDialog.native` and
-    // `libSceSaveDataDialog.native` while the HLE registers the bare names, so
-    // without this every such import resolved to `Unresolved` even though the
-    // function was fully implemented — measured on Minecraft (PPSA17221), which
-    // imports 7 `libSceMsgDialog.native` + 7 `libSceSaveDataDialog.native`
-    // symbols that all exist in-tree. Stripping here fixes the whole class at
-    // the one point that already normalizes provider spelling, instead of
-    // making each module hand-maintain an alias list (the idiom
-    // `libsce_save_data.rs` had to use).
-    lower
-        .strip_suffix(".native")
-        .or_else(|| lower.strip_suffix("_native"))
-        .unwrap_or(lower)
-        .to_string()
+    crate::registry::canonical_module_name(provider)
 }
 
 #[cfg(test)]

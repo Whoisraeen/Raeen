@@ -237,15 +237,55 @@ impl ModuleRegistry {
 }
 
 /// The identity a module has for policy, LLE exports, and the process
-/// loader's visit-set alike: lowercased, `.sprx`/`.prx` suffix stripped.
-/// `pub(crate)` so `load_process`'s dependency walk dedupes by exactly the
-/// identity the registry resolves providers by.
-pub(crate) fn canonical_module_name(module: &str) -> String {
+/// loader's visit-set alike: lowercased, `.sprx`/`.prx` suffix stripped, then
+/// a `.native`/`_native` variant suffix stripped.
+///
+/// `pub` so the loader's dependency walk, its HLE-coverage diagnostics, and
+/// the NID database's provider lookup all key on exactly the identity the
+/// registry resolves providers by. Three copies of this rule that disagreed by
+/// one suffix is precisely the class of bug it exists to prevent.
+///
+/// # Why `.native` collapses to the bare name
+///
+/// Orbis ships several libraries under two spellings —
+/// `libSceMsgDialog.native.prx` alongside `libSceMsgDialog` — and a PS5 title
+/// may name either in `DT_NEEDED` or in an import's provider field. They are
+/// **one library**, not two ABIs.
+///
+/// Established from KytyPS5 (`reference/kytyps5`, MIT © InoriRus / Nmzik),
+/// which boots Blasphemous II (PPSA13580) in-game and is the only reference
+/// with a PS5 `.native` model at all (shadPS4 is PS4-only and has no `.native`
+/// spelling anywhere). Its `LIB_VERSION(library, …, module, …)` macro
+/// (`src/libs/libs.h:24`) declares the library and the *module* it belongs to
+/// separately, and every `.native` library there names the **bare** module:
+///
+/// * `src/libs/libDialog.cpp:87` — `LIB_VERSION("SaveDataDialog.native", 1, "SaveDataDialog", 1, 1)`
+/// * `src/libs/libDialog.cpp:108` — `LIB_VERSION("MsgDialog.native", 1, "MsgDialog", 1, 1)`
+/// * `src/libs/dialog.cpp:497` — `LIB_NAME("MsgDialog.native", "MsgDialog")`
+///
+/// The two spellings there are also backed by the **same** C++ functions
+/// (`Dialog::SaveDataDialog::*` serves both `"SaveDataDialog"` and
+/// `"SaveDataDialog.native"`; the `.native` set is a superset of NIDs, not a
+/// different implementation). So `.native` is a spelling of the same library,
+/// and its module identity is the bare name. No library in either reference
+/// gives `.native` a distinct ABI.
+///
+/// This deliberately does **not** generalize to other suffix families. Kyty
+/// aliases `AudioOut2 -> AudioOut` and `LibcInternalExt -> LibcInternal`
+/// per-library because those are genuinely different libraries sharing a
+/// module; `.native` is the only pure spelling variant, so it is the only one
+/// stripped here.
+#[must_use]
+pub fn canonical_module_name(module: &str) -> String {
     let lower = module.to_ascii_lowercase();
-    lower
+    let lower = lower
         .strip_suffix(".sprx")
         .or_else(|| lower.strip_suffix(".prx"))
-        .unwrap_or(&lower)
+        .unwrap_or(&lower);
+    lower
+        .strip_suffix(".native")
+        .or_else(|| lower.strip_suffix("_native"))
+        .unwrap_or(lower)
         .to_string()
 }
 
@@ -469,6 +509,82 @@ mod tests {
             registry.resolve(&hle, "libGamma", nid),
             Resolver::Unresolved
         );
+    }
+
+    /// `.native` is a spelling, not a second library: every spelling Orbis
+    /// uses for one of these modules must canonicalize to the same identity.
+    ///
+    /// The four names are the exact `DT_NEEDED` entries Blasphemous II
+    /// (PPSA13580) carries and that reported "no HLE library named
+    /// 'libSceAjm.native'" and friends on every launch. Established from
+    /// KytyPS5's `LIB_VERSION("MsgDialog.native", 1, "MsgDialog", 1, 1)` model
+    /// — see the doc comment on [`canonical_module_name`].
+    #[test]
+    fn native_spellings_canonicalize_to_the_bare_library_identity() {
+        for bare in [
+            "libSceAjm",
+            "libSceAvPlayer",
+            "libSceMsgDialog",
+            "libSceSaveDataDialog",
+        ] {
+            let expected = bare.to_ascii_lowercase();
+            for spelling in [
+                bare.to_string(),
+                format!("{bare}.prx"),
+                format!("{bare}.sprx"),
+                format!("{bare}.native"),
+                format!("{bare}.native.prx"),
+                format!("{bare}_native"),
+                format!("{bare}_native.prx"),
+            ] {
+                assert_eq!(
+                    canonical_module_name(&spelling),
+                    expected,
+                    "{spelling:?} must be the same library as {bare:?}"
+                );
+            }
+        }
+        // Not a blanket suffix strip: only `.native`/`_native` collapses.
+        assert_eq!(canonical_module_name("libSceAudioOut2"), "libsceaudioout2");
+        assert_eq!(
+            canonical_module_name("libSceNativeThing"),
+            "libscenativething"
+        );
+    }
+
+    /// A `.native` import must find an LLE export the loader registered under
+    /// the bare module name.
+    ///
+    /// This is the drift the canonicalization unification closes. The NID
+    /// database's provider lookup already stripped `.native`, so a `.native`
+    /// import reached HLE — but module policy and the LLE export table used a
+    /// second copy of the rule that did *not* strip it, so the same import
+    /// resolved against a different key and missed a real export entirely.
+    #[test]
+    fn native_import_resolves_the_bare_modules_lle_export_and_policy() {
+        let (hle, db) = build_hle_and_db();
+        let mut registry = ModuleRegistry::new(db);
+        let nid = nid_of("someNativeOnlyExport");
+        registry.register_module_exports("libSceAjm.prx", &[SymbolExport { nid, value: 0xC0DE }]);
+        registry.set_policy("libSceAjm.prx", ModulePolicy::LleOnly);
+
+        for importer_spelling in [
+            "libSceAjm",
+            "libSceAjm.native",
+            "libSceAjm.native.prx",
+            "libSceAjm_native",
+        ] {
+            assert_eq!(
+                registry.policy_for(importer_spelling),
+                ModulePolicy::LleOnly,
+                "policy must follow {importer_spelling:?} to the same module"
+            );
+            assert_eq!(
+                registry.resolve(&hle, importer_spelling, nid),
+                Resolver::Lle { addr: 0xC0DE },
+                "{importer_spelling:?} must resolve the bare module's export"
+            );
+        }
     }
 
     #[test]
