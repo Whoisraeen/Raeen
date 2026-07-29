@@ -2444,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "kyty-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "flate2",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "kyty-graphics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kyty-core",
  "naga",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "kyty-math"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam",
  "rand 0.8.7",
@@ -3717,7 +3717,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raeen-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -3743,7 +3743,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-firmware"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "cbc",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -3793,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crash-handler",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-hle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gilrs",
@@ -3870,7 +3870,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "lz4_flex",
@@ -3881,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -3915,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "raeen-core",
@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "raeen-upscale"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "raeen-gpu",
  "tracing",
@@ -6206,7 +6206,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "raeen-firmware",
