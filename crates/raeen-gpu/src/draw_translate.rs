@@ -492,7 +492,21 @@ fn vulkan_format(
     channel_order: u32,
 ) -> Result<vk::Format, DrawError> {
     match (format, channel_type, channel_order) {
+        // 8 UNORM (CB format 1). GTA V uses this single-channel intermediate
+        // after its 128-bit float pass; Vulkan supports it as a colour
+        // attachment and the readback path preserves its one-byte texels.
+        // Component-swap only selects which exported component feeds the
+        // single stored channel; it cannot change the memory layout.
+        (0x1, 0, 0..=3) => Ok(vk::Format::R8_UNORM),
+        // 16 UINT (CB format 2, number type 4). Guest colour exports are
+        // float-valued and AMD's CB performs the numeric conversion. Vulkan
+        // requires integer attachment outputs to be integer-typed in SPIR-V,
+        // which this translator cannot express per target yet, so preserve
+        // the two-byte layout and degrade through R16_UNORM instead of
+        // rejecting the draw or creating an invalid float→UINT pipeline.
+        (0x2, 4, 0..=3) => Ok(vk::Format::R16_UNORM),
         (0xa, 0, 0) => Ok(vk::Format::R8G8B8A8_UNORM),
+        (0xa, 1, 0) => Ok(vk::Format::R8G8B8A8_SNORM),
         (0xa, 6, 0) => Ok(vk::Format::R8G8B8A8_SRGB),
         (0xa, 0, 1) => Ok(vk::Format::B8G8R8A8_UNORM),
         (0xa, 6, 1) => Ok(vk::Format::B8G8R8A8_SRGB),
@@ -517,6 +531,11 @@ fn vulkan_format(
         // scene target ASTRO.BOT renders into before tone-mapping. The offscreen
         // readback is bpp-aware (8 bytes/pixel for this one).
         (0xc, 7, 0) => Ok(vk::Format::R16G16B16A16_SFLOAT),
+        // 32_32_32_32 FLOAT (CB format 0xe, channel_type 7). GTA V emits this
+        // exact 128-bit intermediate after the legal 1x1 target. It is the
+        // colour-buffer form of unified format 77, already supported by the
+        // vertex, texture, and storage-image paths.
+        (0xe, 7, 0) => Ok(vk::Format::R32G32B32A32_SFLOAT),
         // CB format 0x3 (8_8 UNORM). MEASURED: mapping it to the exact
         // R8G8_UNORM (a 2-channel attachment) device-loses on vkQueueSubmit —
         // the recompiled PS exports 4 components (mrt0 = vec4) and the pipeline
@@ -557,9 +576,9 @@ pub(crate) mod cb_mode {
 /// clear to the packed words — a raw byte splat, no per-format unpack needed,
 /// because the framebuffer map holds raw target-format bytes.
 ///
-/// Returns `Ok(None)` when there is nothing to clear (no bound target, fast
-/// clear not enabled on it, or a degenerate extent — the register state does
-/// not describe a real FCE). `resolution_scale` mirrors
+/// Returns `Ok(None)` when there is nothing to clear (no bound target or fast
+/// clear not enabled on it). Zero encoded width/height is a valid 1×1 surface.
+/// `resolution_scale` mirrors
 /// [`DrawState::scale_resolution`] so the cleared image matches the extent
 /// later draws render at.
 pub(crate) fn fast_clear_image(
@@ -567,9 +586,6 @@ pub(crate) fn fast_clear_image(
     resolution_scale: f32,
 ) -> Result<Option<RenderedImage>, DrawError> {
     if rt.base.addr == 0 || !rt.info.cmask_fast_clear_enable {
-        return Ok(None);
-    }
-    if rt.attrib2.width == 0 || rt.attrib2.height == 0 {
         return Ok(None);
     }
     let format = vulkan_format(rt.info.format, rt.info.channel_type, rt.info.channel_order)?;
@@ -4353,12 +4369,6 @@ pub fn draw_state_from_regs<'a>(
         // one.
         let width = rt.attrib2.width + 1;
         let height = rt.attrib2.height + 1;
-        if rt.attrib2.width == 0 || rt.attrib2.height == 0 {
-            return Err(err(format!(
-                "CB_COLOR0_ATTRIB2 gives a degenerate extent {width}x{height} — \
-                 the render target extent was never programmed"
-            )));
-        }
         (
             width,
             height,
@@ -4373,11 +4383,6 @@ pub fn draw_state_from_regs<'a>(
         let size = ctx.depth_render_target.size;
         let width = u32::from(size.x_max) + 1;
         let height = u32::from(size.y_max) + 1;
-        if size.x_max == 0 || size.y_max == 0 {
-            return Err(err(format!(
-                "depth-only draw has degenerate DB_DEPTH_SIZE_XY {width}x{height}"
-            )));
-        }
         (
             width,
             height,
@@ -5459,6 +5464,37 @@ impl OffscreenDrawSink<'_> {
     }
 }
 
+const COMPUTE_DISPATCH_USE_THREAD_DIMENSIONS: u32 = 1 << 5;
+
+/// Convert `DISPATCH_DIRECT` packet dimensions into Vulkan workgroup counts.
+///
+/// AMD's `COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS` changes the packet
+/// fields from workgroup counts to total thread counts. Vulkan always accepts
+/// workgroup counts, so divide each thread dimension by its corresponding
+/// `COMPUTE_NUM_THREAD_*` register, rounding up for the final partial group.
+fn vulkan_dispatch_groups(
+    packet_dimensions: [u32; 3],
+    workgroup_size: [u32; 3],
+    initiator: u32,
+) -> Result<[u32; 3], DrawError> {
+    if initiator & COMPUTE_DISPATCH_USE_THREAD_DIMENSIONS == 0 {
+        return Ok(packet_dimensions);
+    }
+
+    let mut groups = [0; 3];
+    for axis in 0..3 {
+        let local = workgroup_size[axis];
+        if local == 0 {
+            return Err(err(format!(
+                "USE_THREAD_DIMENSIONS with zero COMPUTE_NUM_THREAD_{}",
+                ['X', 'Y', 'Z'][axis]
+            )));
+        }
+        groups[axis] = packet_dimensions[axis].div_ceil(local);
+    }
+    Ok(groups)
+}
+
 impl DrawSink for OffscreenDrawSink<'_> {
     /// Invalidate exactly what a PM4 guest write can have changed.
     ///
@@ -5540,7 +5576,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
         ctx: &Context,
         _ucfg: &UserConfig,
         sh: &Shader,
-        groups: [u32; 3],
+        packet_dimensions: [u32; 3],
         mode: u32,
     ) -> Result<(), DrawError> {
         let _dispatch_timer = crate::vulkan::offscreen::StageTimer::start(
@@ -5550,11 +5586,10 @@ impl DrawSink for OffscreenDrawSink<'_> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The legacy Kyty AGC wrapper emits 0. Retail RDNA2 command streams
         // also carry COMPUTE_SHADER_EN (bit 0) and CS_W32_EN (bit 6), yielding
-        // the measured 0x41; ASTRO.BOT additionally sets USE_THREAD_DIMENSIONS
-        // (bit 5, 0x20) for 0x61. All three describe execution already
-        // represented by the translated Vulkan compute stage — the group counts
-        // carry the thread dimensions bit 5 selects — so accept them; other
-        // initiator bits need explicit semantics before they can be accepted.
+        // the measured 0x41; GTA V and ASTRO.BOT additionally set
+        // USE_THREAD_DIMENSIONS (bit 5, 0x20) for 0x61. That changes the packet
+        // fields from workgroups to total threads and is normalized below.
+        // Other initiator bits need explicit semantics before acceptance.
         if mode & !0x61 != 0 {
             return Err(err(format!(
                 "unsupported compute dispatch initiator {mode:#x}"
@@ -5565,6 +5600,15 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // dispatch-only ACB buffers translate against the shader the title bound
         // on the DCB instead of skipping on a null address.
         let cs = Self::seed_compute(&sh.cs, &mut self.current_compute);
+        let groups = vulkan_dispatch_groups(
+            packet_dimensions,
+            [
+                cs.cs_regs.num_thread_x,
+                cs.cs_regs.num_thread_y,
+                cs.cs_regs.num_thread_z,
+            ],
+            mode,
+        )?;
         let translate_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_CS_TRANSLATE_NS,
         );
@@ -5579,6 +5623,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     reason = %error,
                     queue = if self.queue_is_compute { "ACB" } else { "DCB" },
                     cs_addr = format_args!("{:#x}", r.data_addr),
+                    packet_dimensions = ?packet_dimensions,
                     groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
                     threads = format_args!("{}x{}x{}", r.num_thread_x, r.num_thread_y, r.num_thread_z),
                     user_sgpr = r.user_sgpr,
@@ -5614,7 +5659,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
             }
         }
         if let Some(quarantine_reason) =
-            known_device_loss_compute_reason(cs.cs_regs.data_addr, groups)
+            known_device_loss_compute_reason(cs.cs_regs.data_addr, packet_dimensions)
             && !crate::diagnostics::gpu_env().allow_known_device_loss_cs
         {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -5623,7 +5668,11 @@ impl DrawSink for OffscreenDrawSink<'_> {
             let reason = format!(
                 "known-device-loss compute quarantined at {:#x} ({}x{}x{}): {}; \
                  RAEEN_ALLOW_KNOWN_DEVICE_LOSS_CS=1 restores it for diagnostics",
-                cs.cs_regs.data_addr, groups[0], groups[1], groups[2], quarantine_reason,
+                cs.cs_regs.data_addr,
+                packet_dimensions[0],
+                packet_dimensions[1],
+                packet_dimensions[2],
+                quarantine_reason,
             );
             self.dispatch_skips += 1;
             self.last_dispatch_skip_reason = Some(reason.clone());
@@ -5631,7 +5680,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 tracing::warn!(
                     occurrence,
                     cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
-                    groups = ?groups,
+                    packet_dimensions = ?packet_dimensions,
                     reason,
                     "compute dispatch safely refused before the known Windows driver reset"
                 );
@@ -5687,6 +5736,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     .unwrap_or_default();
                 tracing::warn!(
                     cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                    mode = format_args!("{mode:#x}"),
+                    packet_dimensions = ?packet_dimensions,
                     groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
                     threads = format_args!(
                         "{}x{}x{}",
@@ -5810,6 +5861,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
             if trace {
                 tracing::warn!(
                     cs_addr,
+                    mode = format_args!("{mode:#x}"),
+                    packet_dimensions = ?packet_dimensions,
                     groups,
                     storage_num,
                     null_vsharps,
@@ -5822,6 +5875,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
             } else {
                 debug!(
                     cs_addr,
+                    mode = format_args!("{mode:#x}"),
+                    packet_dimensions = ?packet_dimensions,
                     groups,
                     storage_num,
                     null_vsharps,
@@ -5888,6 +5943,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     tracing::warn!(
                         slow_dispatch = n,
                         cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                        packet_dimensions = ?packet_dimensions,
                         groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
                         elapsed_us = elapsed.as_micros(),
                         guest_outputs = ?guest_outputs,
@@ -6071,6 +6127,42 @@ impl DrawSink for OffscreenDrawSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GTA V's measured constant-buffer fill asks AGC for `0x1fe000`
+    /// **threads** with `USE_THREAD_DIMENSIONS` set. The bound shader has a
+    /// 64x1x1 workgroup, so Vulkan must receive 32,640 groups, not 2,088,960
+    /// groups (which over-dispatches the fill by exactly 64x).
+    #[test]
+    fn thread_dimension_dispatch_converts_threads_to_vulkan_groups() {
+        assert_eq!(
+            vulkan_dispatch_groups([0x1fe000, 1, 1], [64, 1, 1], 0x61)
+                .expect("valid thread dimensions"),
+            [32_640, 1, 1]
+        );
+    }
+
+    #[test]
+    fn group_dimension_dispatch_remains_unscaled() {
+        assert_eq!(
+            vulkan_dispatch_groups([7, 8, 9], [64, 4, 2], 0x41).expect("valid group dimensions"),
+            [7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn thread_dimension_dispatch_rounds_up_partial_workgroups() {
+        assert_eq!(
+            vulkan_dispatch_groups([65, 3, 1], [64, 2, 1], 0x61).expect("valid partial dimensions"),
+            [2, 2, 1]
+        );
+    }
+
+    #[test]
+    fn thread_dimension_dispatch_refuses_zero_workgroup_size() {
+        let error = vulkan_dispatch_groups([64, 1, 1], [0, 1, 1], 0x61)
+            .expect_err("zero COMPUTE_NUM_THREAD_X must be named");
+        assert!(error.0.contains("COMPUTE_NUM_THREAD"), "got {error}");
+    }
     use kyty_graphics::hw_regs::{ColorAttrib2, ComputeShaderInfo};
 
     #[test]
@@ -6386,9 +6478,9 @@ mod tests {
         assert_eq!((scaled.width, scaled.height), (8, 4));
     }
 
-    /// FCE with nothing to eliminate (no base / fast clear unarmed /
-    /// degenerate extent) is a quiet no-op; an unmapped format is a named
-    /// error, never a wrong-coloured clear.
+    /// FCE with nothing to eliminate (no base / fast clear unarmed) is a quiet
+    /// no-op; an unmapped format is a named error, never a wrong-coloured
+    /// clear. Zero encoded width/height is a valid 1×1 target.
     #[test]
     fn fast_clear_image_refuses_unarmed_or_unmapped_state() {
         let mut rt = kyty_graphics::hw_regs::RenderTarget::default();
@@ -6403,12 +6495,13 @@ mod tests {
             matches!(fast_clear_image(&rt, 1.0), Ok(None)),
             "fast clear not armed"
         );
+        rt.info.format = 0xa; // RGBA8 UNORM
         rt.info.cmask_fast_clear_enable = true;
-        rt.attrib2.width = 0;
-        assert!(
-            matches!(fast_clear_image(&rt, 1.0), Ok(None)),
-            "degenerate extent"
-        );
+        rt.attrib2 = ColorAttrib2::default();
+        let one = fast_clear_image(&rt, 1.0)
+            .expect("mapped 1x1")
+            .expect("armed 1x1");
+        assert_eq!((one.width, one.height), (1, 1));
         rt.attrib2.width = 3;
         rt.info.format = 0x1F; // unmapped CB format
         assert!(fast_clear_image(&rt, 1.0).is_err(), "unmapped format");
@@ -6636,17 +6729,18 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_extent_is_a_named_error() {
+    fn zero_encoded_attrib2_is_a_legal_one_by_one_target() {
         let mut ctx = ctx_96x48();
         ctx.render_targets[0].attrib2 = ColorAttrib2::default();
-        let e = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).expect_err("no extent");
-        assert!(e.0.contains("ATTRIB2"), "got {e}");
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV)
+            .expect("ATTRIB2 stores width/height minus one");
+        assert_eq!((state.width, state.height), (1, 1));
     }
 
     #[test]
     fn unsupported_format_is_a_named_error() {
         let mut ctx = ctx_96x48();
-        ctx.render_targets[0].info.format = 0x1;
+        ctx.render_targets[0].info.format = 0xF;
         let e = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).expect_err("bad format");
         assert!(e.0.contains("format"), "got {e}");
     }
@@ -8218,12 +8312,17 @@ mod tests {
     #[test]
     fn cb_colour_formats_map_and_have_readback_sizes() {
         for (fmt, ty, order, want, bpp) in [
+            (0x1, 0, 0, vk::Format::R8_UNORM, 1u32),
+            (0x1, 0, 3, vk::Format::R8_UNORM, 1u32),
+            (0x2, 4, 0, vk::Format::R16_UNORM, 2u32),
             (0xa, 0, 0, vk::Format::R8G8B8A8_UNORM, 4u32),
+            (0xa, 1, 0, vk::Format::R8G8B8A8_SNORM, 4u32),
             (0x4, 7, 0, vk::Format::R32_SFLOAT, 4),
             (0x5, 7, 0, vk::Format::R16G16_SFLOAT, 4),
             (0x6, 7, 0, vk::Format::B10G11R11_UFLOAT_PACK32, 4),
             (0x9, 0, 0, vk::Format::A2B10G10R10_UNORM_PACK32, 4),
             (0xc, 7, 0, vk::Format::R16G16B16A16_SFLOAT, 8),
+            (0xe, 7, 0, vk::Format::R32G32B32A32_SFLOAT, 16),
         ] {
             let got = vulkan_format(fmt, ty, order)
                 .unwrap_or_else(|e| panic!("CB format {fmt:#x}/{ty}/{order}: {e}"));

@@ -639,10 +639,10 @@ pub fn scalar_load_target_address(load: &ScalarLoadRef, user_sgpr: &UserSgprInfo
 /// of which used to be an unresolvable case and therefore a skipped dispatch.
 ///
 /// Anything the evaluator cannot prove (a value read out of guest memory, a
-/// lane-dependent value, `m0`, `vcc`, an undecidable branch, a loop) still
-/// returns `None`, so the caller keeps its named refusal instead of recording a
-/// wrong address. That asymmetry is deliberate: see the module docs on
-/// [`crate::shader::scalar_eval`].
+/// lane-dependent value, an undefined named scalar register, an undecidable
+/// branch, or a loop) still returns `None`, so the caller keeps its named
+/// refusal instead of recording a wrong address. That asymmetry is deliberate:
+/// see the module docs on [`crate::shader::scalar_eval`].
 fn resolve_scalar_soffset_bytes(
     instructions: &[ShaderInstruction],
     at: usize,
@@ -653,14 +653,10 @@ fn resolve_scalar_soffset_bytes(
     let Some(soffset) = crate::shader::types::smem_register_soffset(inst) else {
         return Some(0);
     };
-    if soffset.type_ != ShaderOperandType::Sgpr {
-        return None;
-    }
-
-    match crate::shader::scalar_eval::resolve_sgpr_before(
+    match crate::shader::scalar_eval::resolve_scalar_operand_before(
         instructions,
         at,
-        soffset.register_id,
+        &soffset,
         user_sgpr,
         shift,
     ) {
@@ -668,7 +664,8 @@ fn resolve_scalar_soffset_bytes(
             if value.known().is_none() {
                 tracing::debug!(
                     pc = inst.pc,
-                    soffset = soffset.register_id,
+                    soffset = ?soffset.type_,
+                    soffset_register = soffset.register_id,
                     "scalar evaluator ran but the soffset register is not a dispatch-time constant"
                 );
             }
@@ -677,7 +674,8 @@ fn resolve_scalar_soffset_bytes(
         Err(refusal) => {
             tracing::debug!(
                 pc = inst.pc,
-                soffset = soffset.register_id,
+                soffset = ?soffset.type_,
+                soffset_register = soffset.register_id,
                 ?refusal,
                 "scalar evaluator refused to fold the soffset register"
             );
@@ -729,6 +727,20 @@ pub fn shader_capture_runtime_scalar_loads(
     shader_capture_runtime_scalar_loads_shifted(code, mem, user_sgpr, 0, bind);
 }
 
+fn trace_shader_env_matches(name: &str, shader_address: u64) -> bool {
+    let Ok(filter) = std::env::var(name) else {
+        return false;
+    };
+    filter.split(',').any(|raw| {
+        let raw = raw.trim();
+        let raw = raw
+            .strip_prefix("0x")
+            .or_else(|| raw.strip_prefix("0X"))
+            .unwrap_or(raw);
+        u64::from_str_radix(raw, 16).ok() == Some(shader_address)
+    })
+}
+
 /// [`shader_capture_runtime_scalar_loads`] with the NGG scalar-register rebase.
 ///
 /// A gs-prolog (next-gen) vertex stage addresses its user data eight SGPRs up:
@@ -778,20 +790,18 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
 
     let instructions = code.get_instructions();
     let mut texture_changed = false;
+    let trace = trace_shader_env_matches("RAEEN_TRACE_VSHARP", code.get_base_address());
 
     for (at, load) in instructions.iter().enumerate() {
         let Some(dwords) = width(load.type_) else {
             continue;
         };
-        let offset_operand = crate::shader::types::smem_offset_operand(load);
+        let Some(immediate_bytes) = crate::shader::types::smem_immediate_offset_bytes(load) else {
+            continue;
+        };
         if load.src[0].type_ != ShaderOperandType::Sgpr
             || load.src[0].size != 2
             || load.dst.type_ != ShaderOperandType::Sgpr
-            || !matches!(
-                offset_operand.type_,
-                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
-            )
-            || offset_operand.constant.i() < 0
         {
             continue;
         }
@@ -840,16 +850,45 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
         // (KytyPS5 `EmitRelativeAddress` `align_components`; SharpEmu
         // `Gen5ShaderScalarEvaluator.cs:1898` `& ~3UL`).
         let address = pointer
-            .wrapping_add(u64::from(offset_operand.constant.u))
+            .wrapping_add(u64::from(immediate_bytes))
             .wrapping_add(u64::from(soffset_bytes))
             & !3u64;
         if pointer == 0 {
+            if trace {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    base_register = base_reg,
+                    "TRACE_VSHARP scalar producer has a null live-in pointer"
+                );
+            }
             continue;
         }
         let Some(source) = mem.dwords_at(address) else {
+            if trace {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    base_register = base_reg,
+                    pointer = format_args!("{pointer:#x}"),
+                    address = format_args!("{address:#x}"),
+                    dwords,
+                    "TRACE_VSHARP scalar producer address is unreadable"
+                );
+            }
             continue;
         };
         if source.len() < dwords {
+            if trace {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    address = format_args!("{address:#x}"),
+                    available_dwords = source.len(),
+                    dwords,
+                    "TRACE_VSHARP scalar producer read is truncated"
+                );
+            }
             continue;
         }
 
@@ -866,6 +905,15 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
             capture.dwords_num = dwords as u32;
             capture.values[..dwords].copy_from_slice(&source[..dwords]);
             bind.embedded_constant_loads.loads_num += 1;
+            if trace {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    address = format_args!("{address:#x}"),
+                    values = ?&source[..dwords],
+                    "TRACE_VSHARP captured scalar producer"
+                );
+            }
         }
 
         if dwords != 8 {
@@ -1221,22 +1269,30 @@ pub fn shader_capture_vsharp_buffer_loads(
     }
 
     let instructions = code.get_instructions();
+    let trace = trace_shader_env_matches("RAEEN_TRACE_VSHARP", code.get_base_address());
 
     for (at, load) in instructions.iter().enumerate() {
         let Some(dwords) = width(load.type_) else {
             continue;
         };
-        // src[0] is the V# quad; the offset operand is src[1] (two-operand
-        // form) or src[2] (combined soffset+immediate form).
-        let offset_operand = crate::shader::types::smem_offset_operand(load);
+        // src[0] is the V# quad. Register-only forms have an implicit zero
+        // immediate; combined and NULL-soffset forms carry an explicit term.
+        let Some(immediate_bytes) = crate::shader::types::smem_immediate_offset_bytes(load) else {
+            continue;
+        };
+        let supported_destination = load.dst.type_ == ShaderOperandType::Sgpr
+            || (dwords == 1
+                && matches!(
+                    load.dst.type_,
+                    ShaderOperandType::VccLo
+                        | ShaderOperandType::VccHi
+                        | ShaderOperandType::ExecLo
+                        | ShaderOperandType::ExecHi
+                        | ShaderOperandType::M0
+                ));
         if load.src[0].type_ != ShaderOperandType::Sgpr
             || load.src[0].size != 4
-            || load.dst.type_ != ShaderOperandType::Sgpr
-            || !matches!(
-                offset_operand.type_,
-                ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
-            )
-            || offset_operand.constant.i() < 0
+            || !supported_destination
         {
             continue;
         }
@@ -1278,12 +1334,33 @@ pub fn shader_capture_vsharp_buffer_loads(
             shift,
             &bind.embedded_constant_loads,
         ) else {
+            if trace {
+                let writers: Vec<_> = instructions[..at]
+                    .iter()
+                    .filter(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)))
+                    .map(|prior| {
+                        (
+                            prior.pc,
+                            prior.type_,
+                            prior.dst.register_id,
+                            prior.dst.size,
+                            bind.embedded_constant_loads.find(prior.pc).is_some(),
+                        )
+                    })
+                    .collect();
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    base_register = base_reg,
+                    ?writers,
+                    "TRACE_VSHARP could not prove the buffer descriptor quad"
+                );
+            }
             continue;
         };
         let size_bytes = vsharp_size_bytes(&resource);
         let base_address = resource.base48();
-        let byte_offset =
-            u64::from(offset_operand.constant.u).wrapping_add(u64::from(soffset_bytes));
+        let byte_offset = u64::from(immediate_bytes).wrapping_add(u64::from(soffset_bytes));
         // Refuse a read the descriptor itself says is out of range rather than
         // snapshotting whatever happens to follow the buffer in guest memory.
         let read_bytes = (dwords as u64) * 4;
@@ -1303,9 +1380,28 @@ pub fn shader_capture_vsharp_buffer_loads(
         // `Gen5ShaderScalarEvaluator.cs:1898` `& ~3UL`).
         let address = base_address.wrapping_add(byte_offset) & !3u64;
         let Some(source) = mem.dwords_at(address) else {
+            if trace {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    base_register = base_reg,
+                    address = format_args!("{address:#x}"),
+                    "TRACE_VSHARP V# target address is unreadable"
+                );
+            }
             continue;
         };
         if source.len() < dwords {
+            if trace {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    pc = load.pc,
+                    address = format_args!("{address:#x}"),
+                    available_dwords = source.len(),
+                    dwords,
+                    "TRACE_VSHARP V# target read is truncated"
+                );
+            }
             continue;
         }
 
@@ -1325,6 +1421,15 @@ pub fn shader_capture_vsharp_buffer_loads(
         capture.dwords_num = dwords as u32;
         capture.values[..dwords].copy_from_slice(&source[..dwords]);
         bind.embedded_constant_loads.loads_num += 1;
+        if trace {
+            tracing::warn!(
+                shader = format_args!("{:#x}", code.get_base_address()),
+                pc = load.pc,
+                address = format_args!("{address:#x}"),
+                values = ?&source[..dwords],
+                "TRACE_VSHARP captured scalar-buffer load"
+            );
+        }
         tracing::debug!(
             pc = load.pc,
             base_register = base_reg,
@@ -1563,15 +1668,9 @@ pub fn shader_detect_embedded_constant_loads(
         if load.src[0].type_ != ShaderOperandType::Sgpr || load.src[0].size != 2 {
             continue;
         }
-        let offset_operand = crate::shader::types::smem_offset_operand(load);
-        let load_off = match offset_operand.type_ {
-            ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant => {
-                if offset_operand.constant.i() < 0 {
-                    continue;
-                }
-                u64::from(offset_operand.constant.u)
-            }
-            _ => continue,
+        let Some(load_off) = crate::shader::types::smem_immediate_offset_bytes(load).map(u64::from)
+        else {
+            continue;
         };
         // A register soffset adds a runtime term. There is no user-data file
         // here (the base is PC-relative), so only in-shader arithmetic rooted
@@ -5130,6 +5229,16 @@ pub fn shader_get_input_info_cs_decoded(
             data,
             base_dw: *base_dw,
         });
+        // GTA V's measured Gen5 metadata declares `direct[t1]=s0` for an
+        // eight-dword type-9 UAV consumed by `image_store`. Other titles use
+        // the same direct type for a four-dword IMM_SAMPLER, so the metadata
+        // tag alone is insufficient. The decoded instruction is decisive:
+        // when an image store reads that exact SGPR range, route it through
+        // the established read-write sharp-table path instead of consuming
+        // only s0..s3 as a sampler.
+        let normalized_user_data =
+            decoded_code.and_then(|code| normalize_direct_type1_storage_image(user_data, code));
+        let user_data = normalized_user_data.as_ref().unwrap_or(user_data);
         shader_parse_usage2(
             user_data,
             &mut usage,
@@ -5210,6 +5319,43 @@ pub fn shader_get_input_info_cs_decoded(
     shader_calc_binding_indices(&mut info.bind);
 
     Ok(())
+}
+
+/// Reinterpret a Gen5 direct type-1 entry as a read-write image only when the
+/// decoded shader proves that the same register is an `image_store` T#.
+///
+/// Direct type 1 is otherwise retained as IMM_SAMPLER (ASTRO.BOT). This
+/// instruction-driven split avoids guessing from sampler descriptor bits while
+/// preserving GTA V's measured eight-dword UAV at s0.
+fn normalize_direct_type1_storage_image(
+    user_data: &ShaderUserData,
+    code: &ShaderCode,
+) -> Option<ShaderUserData> {
+    let &start = user_data.direct_resource_offset.get(1)?;
+    if start == 0xffff {
+        return None;
+    }
+    let start = i32::from(start);
+    let used_as_storage_image = code.get_instructions().iter().any(|inst| {
+        matches!(
+            inst.type_,
+            ShaderInstructionType::ImageStore | ShaderInstructionType::ImageStoreMip
+        ) && inst.src[1].type_ == ShaderOperandType::Sgpr
+            && inst.src[1].register_id == start
+    });
+    if !used_as_storage_image {
+        return None;
+    }
+
+    let mut normalized = user_data.clone();
+    normalized.direct_resource_offset[1] = 0xffff;
+    if !normalized.sharp_resource_offset[1]
+        .iter()
+        .any(|sharp| i32::from(sharp.offset_dw()) == start)
+    {
+        normalized.sharp_resource_offset[1].push(ShaderSharp::new(start as u16, 0));
+    }
+    Some(normalized)
 }
 
 /// Refine conservative Gen5 storage-buffer usage with the compute shader's
@@ -7385,7 +7531,7 @@ mod tests {
             code.get_instructions().len()
         );
         for (i, inst) in code.get_instructions().iter().enumerate() {
-            eprintln!("  [{i:3}] {:?}", inst.type_);
+            eprintln!("  [{i:3}] {}", ShaderCode::dbg_instruction_to_str(inst));
         }
         eprintln!("scalar-load bases: {:?}", find_scalar_load_bases(&code));
     }
@@ -7693,6 +7839,169 @@ mod tests {
                 .values[..4],
             payload,
             "the evaluator must fold `s_lshl_b32 s4, s5, 2` into the address"
+        );
+    }
+
+    #[test]
+    fn vcc_soffset_captures_the_measured_gta_scalar_buffer_shape() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+
+        // Measured GTA pixel shader:
+        //   s_lshl_b32 vcc_lo, s6, 4
+        //   s_buffer_load_dwordx4 ..., s[12:15], vcc_lo
+        let mut scale = ShaderInstruction {
+            pc: 0x08,
+            type_: T::SLshlB32,
+            ..Default::default()
+        };
+        scale.dst = ShaderOperand {
+            type_: ShaderOperandType::VccLo,
+            size: 1,
+            ..Default::default()
+        };
+        scale.src[0] = sgpr_op(6, 1);
+        scale.src[1] = imm_op(4);
+        scale.src_num = 2;
+
+        let mut load = ShaderInstruction {
+            pc: 0x88,
+            type_: T::SBufferLoadDwordx4,
+            format: F::Sdst4SvSoffset,
+            ..Default::default()
+        };
+        load.dst = sgpr_op(20, 4);
+        load.src[0] = sgpr_op(12, 4);
+        load.src[1] = ShaderOperand {
+            type_: ShaderOperandType::VccLo,
+            size: 1,
+            ..Default::default()
+        };
+        load.src_num = 2;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().extend([scale, load]);
+
+        let base = 0x0080_0000u64;
+        let payload = [0x4754_4100, 0x4754_4101, 0x4754_4102, 0x4754_4103];
+        let mem = TestMem {
+            // s6=1 => vcc_lo=0x10; the register-only form has immediate 0.
+            regions: vec![(base + 0x10, payload.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        user_sgpr.set(6, 1, UserSgprType::Unknown);
+        for (slot, value) in vsharp(base, 0, 0x200).fields.into_iter().enumerate() {
+            user_sgpr.set(12 + slot as u32, value, UserSgprType::Unknown);
+        }
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_vsharp_buffer_loads(&code, &mem, &user_sgpr, 0, &mut bind);
+        assert_eq!(
+            bind.embedded_constant_loads
+                .find(0x88)
+                .expect("the defined vcc_lo soffset must reach V# capture")
+                .values[..4],
+            payload
+        );
+
+        // The named register is not a PM4 user-data live-in. Without the
+        // in-shader definition the same load must remain unresolved.
+        let mut undefined = ShaderCode::new();
+        undefined
+            .get_instructions_mut()
+            .push(code.get_instructions()[1]);
+        let mut refused = ShaderBindResources::default();
+        shader_capture_vsharp_buffer_loads(&undefined, &mem, &user_sgpr, 0, &mut refused);
+        assert!(refused.embedded_constant_loads.find(0x88).is_none());
+    }
+
+    #[test]
+    fn one_dword_vsharp_capture_accepts_the_measured_vcc_destination() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+
+        // GTA also writes a scalar-buffer dword directly to vcc_lo. The
+        // recompiler declares and addresses that named scalar destination;
+        // analysis must not discard an otherwise proved per-PC capture.
+        let mut load = ShaderInstruction {
+            pc: 0x90,
+            type_: T::SBufferLoadDword,
+            format: F::SdstSvSoffset,
+            ..Default::default()
+        };
+        load.dst = ShaderOperand {
+            type_: ShaderOperandType::VccLo,
+            size: 1,
+            ..Default::default()
+        };
+        load.src[0] = sgpr_op(12, 4);
+        load.src[1] = imm_op(0x90);
+        load.src_num = 2;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().push(load);
+
+        let base = 0x0081_0000u64;
+        let payload = [0x3f80_0000];
+        let mem = TestMem {
+            regions: vec![(base + 0x90, payload.to_vec())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        for (slot, value) in vsharp(base, 0, 0x200).fields.into_iter().enumerate() {
+            user_sgpr.set(12 + slot as u32, value, UserSgprType::Unknown);
+        }
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_vsharp_buffer_loads(&code, &mem, &user_sgpr, 0, &mut bind);
+        assert_eq!(
+            bind.embedded_constant_loads
+                .find(0x90)
+                .expect("a proved one-dword capture may target vcc_lo")
+                .values[0],
+            payload[0]
+        );
+    }
+
+    #[test]
+    fn vsharp_capture_table_retains_the_measured_ninth_gta_load() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format as F;
+
+        let base = 0x0082_0000u64;
+        let mut code = ShaderCode::new();
+        for index in 0..9u32 {
+            let mut load = ShaderInstruction {
+                pc: index * 8,
+                type_: T::SBufferLoadDword,
+                format: F::SdstSvSoffset,
+                ..Default::default()
+            };
+            load.dst = sgpr_op(20 + index as i32, 1);
+            load.src[0] = sgpr_op(12, 4);
+            load.src[1] = imm_op(index * 4);
+            load.src_num = 2;
+            code.get_instructions_mut().push(load);
+        }
+
+        let payload: Vec<u32> = (0..9).map(|index| 0x4754_4100 + index).collect();
+        let mem = TestMem {
+            regions: vec![(base, payload.clone())],
+        };
+        let mut user_sgpr = UserSgprInfo::default();
+        for (slot, value) in vsharp(base, 0, 0x200).fields.into_iter().enumerate() {
+            user_sgpr.set(12 + slot as u32, value, UserSgprType::Unknown);
+        }
+
+        let mut bind = ShaderBindResources::default();
+        shader_capture_vsharp_buffer_loads(&code, &mem, &user_sgpr, 0, &mut bind);
+
+        assert_eq!(bind.embedded_constant_loads.loads_num, 9);
+        assert_eq!(
+            bind.embedded_constant_loads
+                .find(0x40)
+                .expect("the measured ninth scalar-buffer load must be retained")
+                .values[0],
+            payload[8]
         );
     }
 
@@ -8697,6 +9006,86 @@ mod tests {
         shader_get_input_info_cs(&regs, &sh, &mem, &map, true, &mut info)
             .expect("next-gen CS with an IMM_SAMPLER must analyse");
         assert_eq!(info.bind.samplers.samplers_num, 1);
+    }
+
+    /// GTA V compute 0x148d47200 declares `direct[t1]=s0`, but the decoded
+    /// instruction consumes s[0:7] as an image-store T#. Instruction evidence
+    /// must route the eight dwords as a read-write image without changing the
+    /// ordinary direct-type-1 sampler behavior above.
+    #[test]
+    fn cs_direct_type1_image_store_binds_readwrite_texture() {
+        let mut value = [0u32; UserSgprInfo::SGPRS_MAX];
+        value[..8].copy_from_slice(&[
+            0x0161_4730,
+            0xc050_0000,
+            0x03ff_c1ff,
+            0x9000_0204,
+            0,
+            0x0070_0000,
+            0,
+            0,
+        ]);
+        let mut type_ = [UserSgprType::Unknown; UserSgprInfo::SGPRS_MAX];
+        type_[..8].fill(UserSgprType::Vsharp);
+        let regs = ComputeShaderInfo {
+            cs_regs: crate::shader::hw_regs::CsStageRegisters {
+                data_addr: 0x7000,
+                num_thread_x: 8,
+                num_thread_y: 8,
+                num_thread_z: 1,
+                user_sgpr: 14,
+                ..Default::default()
+            },
+            cs_user_sgpr: UserSgprInfo {
+                value,
+                type_,
+                count: 14,
+            },
+        };
+        let raw = vec![
+            0xF020_3F08, // image_store dmask:f glc unrm, DIM_2D
+            0x0000_0004, // vdata=v0, vaddr=v4, T#=s0
+            S_ENDPGM,
+        ];
+        let mem = TestMem {
+            regions: vec![(0x7000, raw.clone())],
+        };
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &raw, &mut code, true).expect("parse GTA image store");
+
+        let mut direct = vec![0xffff_u16; 8];
+        direct[1] = 0;
+        let mut map = ShaderMap::new();
+        map.map_user_data(
+            0x7000,
+            ShaderMappedData {
+                user_data: Some(ShaderUserData {
+                    direct_resource_offset: direct,
+                    sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+                    eud_size_dw: 0,
+                    srt_size_dw: 14,
+                }),
+                input_semantics: vec![],
+            },
+        );
+        let mut info = ShaderComputeInputInfo::default();
+        shader_get_input_info_cs_decoded(
+            &regs,
+            &ShaderRegisters::default(),
+            &mem,
+            &map,
+            true,
+            Some(&code),
+            &mut info,
+        )
+        .expect("image-store evidence must bind direct type 1 as a UAV");
+
+        assert_eq!(info.bind.samplers.samplers_num, 0);
+        assert_eq!(info.bind.textures2d.textures2d_storage_num, 1);
+        assert_eq!(info.bind.textures2d.desc[0].start_register, 0);
+        assert!(info.bind.textures2d.desc[0].textures2d_without_sampler);
+        assert_eq!(info.bind.textures2d.desc[0].texture.fields, value[..8]);
     }
 
     /// Gen5 vertex stages use the same stage-agnostic sampler binding as PS

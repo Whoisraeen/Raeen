@@ -4184,6 +4184,78 @@ fn alloc_command_dwords(ctx: &HleContext, cb_addr: u64, size_dwords: u64) -> Opt
     if size_dwords == 0 {
         return None;
     }
+    let (mut cursor_up, mut cursor_down, mut reserved_dw) =
+        read_command_buffer_window(ctx, cb_addr)?;
+    let mut remaining = remaining_command_dwords(cursor_up, cursor_down, reserved_dw);
+    if size_dwords > remaining {
+        let mut callback_bytes = [0u8; 8];
+        let mut user_data_bytes = [0u8; 8];
+        if !ctx.mem.read(cb_addr + CB_CALLBACK, &mut callback_bytes)
+            || !ctx.mem.read(cb_addr + CB_USER_DATA, &mut user_data_bytes)
+        {
+            return None;
+        }
+        let callback = u64::from_le_bytes(callback_bytes);
+        let user_data = u64::from_le_bytes(user_data_bytes);
+        let requested = size_dwords.checked_add(reserved_dw)?;
+        if callback == 0 || requested > u64::from(u32::MAX) {
+            debug!(
+                "agc: command buffer {cb_addr:#x} full (need {size_dwords}, have {remaining}, \
+                 callback={callback:#x})"
+            );
+            return None;
+        }
+
+        // KytyPS5 `CommandBuffer::ReserveDW` and SharpEmu's
+        // `TryAllocateCommandDwords` both call:
+        //   bool callback(CommandBuffer*, requested + reserved, user_data)
+        // A single callback attempt is deliberate: a callback that succeeds
+        // without replenishing the cursors must fail closed, not spin forever.
+        let callback_result = match ctx
+            .guest_calls
+            .call_guest(callback, [cb_addr, requested, user_data, 0, 0, 0])
+        {
+            Ok(result) if result != 0 => result,
+            Ok(_) => {
+                debug!(
+                    "agc: command buffer {cb_addr:#x} grow callback {callback:#x} returned false"
+                );
+                return None;
+            }
+            Err(error) => {
+                debug!(
+                    "agc: command buffer {cb_addr:#x} grow callback {callback:#x} unavailable: \
+                     {error:?}"
+                );
+                return None;
+            }
+        };
+        debug!(
+            "agc: command buffer {cb_addr:#x} grow callback {callback:#x} returned \
+             {callback_result:#x}"
+        );
+
+        (cursor_up, cursor_down, reserved_dw) = read_command_buffer_window(ctx, cb_addr)?;
+        remaining = remaining_command_dwords(cursor_up, cursor_down, reserved_dw);
+        if size_dwords > remaining {
+            debug!(
+                "agc: command buffer {cb_addr:#x} grow callback left insufficient space \
+                 (need {size_dwords}, have {remaining})"
+            );
+            return None;
+        }
+    }
+    let next = cursor_up.checked_add(size_dwords.checked_mul(4)?)?;
+    if !ctx.mem.write(cb_addr + CB_CURSOR_UP, &next.to_le_bytes()) {
+        return None;
+    }
+    // KytyPS5 `CommandBuffer::AllocateDW` (agc.cpp L358-364): every builder
+    // allocation may extend the pending post-submit graphics segment.
+    track_pending_graphics_allocation(ctx, cursor_up, size_dwords);
+    Some(cursor_up)
+}
+
+fn read_command_buffer_window(ctx: &HleContext, cb_addr: u64) -> Option<(u64, u64, u64)> {
     let mut up = [0u8; 8];
     let mut down = [0u8; 8];
     let mut reserved = [0u8; 4];
@@ -4193,29 +4265,19 @@ fn alloc_command_dwords(ctx: &HleContext, cb_addr: u64, size_dwords: u64) -> Opt
     {
         return None;
     }
-    let cursor_up = u64::from_le_bytes(up);
-    let cursor_down = u64::from_le_bytes(down);
-    let reserved_dw = u64::from(u32::from_le_bytes(reserved));
+    Some((
+        u64::from_le_bytes(up),
+        u64::from_le_bytes(down),
+        u64::from(u32::from_le_bytes(reserved)),
+    ))
+}
 
-    let available = if cursor_down >= cursor_up {
-        (cursor_down - cursor_up) / 4
-    } else {
-        0
-    };
-    // remaining = max(available, reserved) - reserved  (== available - reserved, else 0)
-    let remaining = available.max(reserved_dw) - reserved_dw;
-    if size_dwords > remaining {
-        debug!("agc: command buffer {cb_addr:#x} full (need {size_dwords}, have {remaining})");
-        return None;
-    }
-    let next = cursor_up + size_dwords * 4;
-    if !ctx.mem.write(cb_addr + CB_CURSOR_UP, &next.to_le_bytes()) {
-        return None;
-    }
-    // KytyPS5 `CommandBuffer::AllocateDW` (agc.cpp L358-364): every builder
-    // allocation may extend the pending post-submit graphics segment.
-    track_pending_graphics_allocation(ctx, cursor_up, size_dwords);
-    Some(cursor_up)
+fn remaining_command_dwords(cursor_up: u64, cursor_down: u64, reserved_dw: u64) -> u64 {
+    let available = cursor_down
+        .checked_sub(cursor_up)
+        .map(|bytes| bytes / 4)
+        .unwrap_or(0);
+    available.saturating_sub(reserved_dw)
 }
 
 /// `sceAgcDcbSetIndexSize(dcb, indexSize, cachePolicy)`: emit an INDEX_TYPE
@@ -6044,7 +6106,43 @@ fn hle_get_semaphore_label_unavailable(_ctx: &HleContext, args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GuestMemory, test_ctx};
+    use crate::{
+        GuestCallError, GuestCallRequest, GuestCallScheduler, GuestMemory, test_ctx,
+        test_ctx_with_guest_calls,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RefillingGuestCalls<'a> {
+        mem: &'a crate::TestMemory,
+        entry: u64,
+        cb: u64,
+        user_data: u64,
+        refill_start: u64,
+        refill_end: u64,
+        result: u64,
+        calls: AtomicUsize,
+    }
+
+    impl GuestCallScheduler for RefillingGuestCalls<'_> {
+        fn request(&self, _request: GuestCallRequest) -> bool {
+            false
+        }
+
+        fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, GuestCallError> {
+            assert_eq!(entry, self.entry);
+            assert_eq!(args, [self.cb, 11, self.user_data, 0, 0, 0]);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                self.mem
+                    .write(self.cb + CB_CURSOR_UP, &self.refill_start.to_le_bytes())
+            );
+            assert!(
+                self.mem
+                    .write(self.cb + CB_CURSOR_DOWN, &self.refill_end.to_le_bytes())
+            );
+            Ok(self.result)
+        }
+    }
 
     fn ctx_env() -> (
         raeen_kernel::OrbisKernel,
@@ -6755,6 +6853,65 @@ mod tests {
         assert_eq!(read_u32(&ctx, ret3 + 4), 0);
         assert_eq!(read_u32(&ctx, ret3 + 8), 1);
         assert_eq!(read_u32(&ctx, ret3 + 16), (base >> 8) as u32);
+    }
+
+    #[test]
+    fn dcb_acquire_mem_calls_guest_grow_callback_before_allocating() {
+        let (kernel, mem, alloc) = ctx_env();
+        let cb = 0x40;
+        let callback = 0x1234_5678u64;
+        let user_data = 0x160u64;
+        assert!(mem.write(cb + CB_CURSOR_UP, &0u64.to_le_bytes()));
+        assert!(mem.write(cb + CB_CURSOR_DOWN, &0u64.to_le_bytes()));
+        assert!(mem.write(cb + CB_CALLBACK, &callback.to_le_bytes()));
+        assert!(mem.write(cb + CB_USER_DATA, &user_data.to_le_bytes()));
+        assert!(mem.write(cb + CB_RESERVED_DW, &3u32.to_le_bytes()));
+        let guest_calls = RefillingGuestCalls {
+            mem: &mem,
+            entry: callback,
+            cb,
+            user_data,
+            refill_start: 0x400,
+            refill_end: 0x440,
+            result: 1,
+            calls: AtomicUsize::new(0),
+        };
+        let ctx = test_ctx_with_guest_calls(&kernel, &mem, &alloc, &guest_calls);
+
+        let ret = hle_dcb_acquire_mem(&ctx, &[cb, 1, 0xF, 0x7, 0x1234_0000, 0x100, 80]);
+
+        assert_eq!(ret, 0x400);
+        assert_eq!(guest_calls.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x420);
+        assert_eq!(read_u32(&ctx, ret), pm4(8, IT_NOP, R_ACQUIRE_MEM));
+    }
+
+    #[test]
+    fn command_buffer_grow_callback_without_space_fails_after_one_attempt() {
+        let (kernel, mem, alloc) = ctx_env();
+        let cb = 0x40;
+        let callback = 0x1234_5678u64;
+        let user_data = 0x160u64;
+        assert!(mem.write(cb + CB_CURSOR_UP, &0u64.to_le_bytes()));
+        assert!(mem.write(cb + CB_CURSOR_DOWN, &0u64.to_le_bytes()));
+        assert!(mem.write(cb + CB_CALLBACK, &callback.to_le_bytes()));
+        assert!(mem.write(cb + CB_USER_DATA, &user_data.to_le_bytes()));
+        assert!(mem.write(cb + CB_RESERVED_DW, &3u32.to_le_bytes()));
+        let guest_calls = RefillingGuestCalls {
+            mem: &mem,
+            entry: callback,
+            cb,
+            user_data,
+            refill_start: 0x400,
+            refill_end: 0x400,
+            result: 1,
+            calls: AtomicUsize::new(0),
+        };
+        let ctx = test_ctx_with_guest_calls(&kernel, &mem, &alloc, &guest_calls);
+
+        assert_eq!(alloc_command_dwords(&ctx, cb, 8), None);
+        assert_eq!(guest_calls.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400);
     }
 
     #[test]

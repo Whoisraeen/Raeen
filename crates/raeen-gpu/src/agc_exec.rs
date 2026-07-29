@@ -1352,9 +1352,14 @@ impl AgcGpuSession {
         // fade-out, a night scene) instead of mistaking it for a never-drawn
         // buffer and presenting a stale target in its place.
         let mut flip_target_drawn = false;
+        // With no Vulkan backend, every framebuffer is already CPU-visible and
+        // a routing census is cheap/authoritative (fixtures and 2D paths). A
+        // real backend sets this only after the periodic all-target flush.
+        let mut route_census_ready = true;
         {
             let guard = self.backend.lock();
             if let Some(device) = guard.as_ref().and_then(|b| b.device()) {
+                route_census_ready = false;
                 let mut framebuffers = self.framebuffers.lock();
                 let mut gpu_overrides = self.gpu_present_overrides.lock();
                 let insert_all =
@@ -1436,19 +1441,20 @@ impl AgcGpuSession {
                 // different target without turning solid fades into a
                 // full-readback-every-frame performance regression.
                 if let Some(addr) = address {
-                    let scanout_missing = !framebuffers.contains_key(&addr);
-                    let uniform_without_detail =
-                        framebuffers.get(&addr).is_some_and(|image| {
-                            has_visible_content(image) && is_visually_uniform(image)
-                        }) && elect_detailed_target(&framebuffers, Some(addr)).is_none();
-                    if scanout_missing || uniform_without_detail {
+                    let scanout = framebuffers.get(&addr);
+                    let scanout_missing_or_empty = scanout
+                        .is_none_or(|image| !flip_target_drawn && !has_visible_content(image));
+                    let uniform_scanout = scanout.is_some_and(|image| {
+                        has_visible_content(image) && is_visually_uniform(image)
+                    });
+                    if scanout_missing_or_empty || uniform_scanout {
                         let misses = self.flip_miss_count.fetch_add(1, Ordering::Relaxed);
                         let remembered_has_detail = remembered.is_some_and(|r| {
                             framebuffers.get(&r).is_some_and(|image| {
                                 has_visible_content(image) && !is_visually_uniform(image)
                             })
                         });
-                        let needs_full_census = if scanout_missing {
+                        let needs_full_census = if scanout_missing_or_empty {
                             !remembered_has_detail
                                 || misses.is_multiple_of(FALLBACK_REELECT_INTERVAL)
                         } else {
@@ -1479,13 +1485,14 @@ impl AgcGpuSession {
                             // the freshly-landed pixels instead of trusting the
                             // remembered winner.
                             *self.fallback_present_base.lock() = None;
+                            route_census_ready = true;
                         }
                     }
                 }
             }
         }
         if let Some(address) = address {
-            self.present_flipped(address, flip_target_drawn);
+            self.present_flipped(address, flip_target_drawn, route_census_ready);
         }
     }
 
@@ -1535,7 +1542,7 @@ impl AgcGpuSession {
         Some(encoded)
     }
 
-    fn present_flipped(&self, address: u64, flip_target_drawn: bool) {
+    fn present_flipped(&self, address: u64, flip_target_drawn: bool, route_census_ready: bool) {
         let remembered = *self.fallback_present_base.lock();
         let (image, fallback, fallback_base, keys, flip_target_known) = {
             let fb = self.framebuffers.lock();
@@ -1552,7 +1559,21 @@ impl AgcGpuSession {
             let detailed_over_uniform = scanout_image
                 .as_ref()
                 .filter(|image| has_visible_content(image) && is_visually_uniform(image))
-                .and_then(|_| elect_detailed_target(&fb, Some(address)));
+                .and_then(|_| {
+                    remembered
+                        .and_then(|base| {
+                            fb.get(&base)
+                                .filter(|image| {
+                                    has_visible_content(image) && !is_visually_uniform(image)
+                                })
+                                .map(|image| (base, Arc::clone(image)))
+                        })
+                        .or_else(|| {
+                            route_census_ready
+                                .then(|| elect_detailed_target(&fb, Some(address)))
+                                .flatten()
+                        })
+                });
             let image = if detailed_over_uniform.is_some() {
                 None
             } else {
@@ -1577,7 +1598,9 @@ impl AgcGpuSession {
                         // exact counts cost a full scan of every 8 MB target
                         // per flip. Which target has the MOST content
                         // survives sub-sampling.
-                        let elected = elect_detailed_target(&fb, Some(address));
+                        let elected = route_census_ready
+                            .then(|| elect_detailed_target(&fb, Some(address)))
+                            .flatten();
                         match elected {
                             Some((base, img)) => (Some(img), Some(base)),
                             None => (None, None),
@@ -2048,11 +2071,26 @@ impl AgcGpuSession {
                 None => Arc::new(self.read_scanout_bytes(address, desc)?),
             }
         };
+        let output_len = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        // GTA V's Gen5 scanouts are already tightly packed RGBA8
+        // (`2R8G8B8A8`, pitch == width). Walking an 8.3-million-pixel 4K
+        // image and issuing one four-byte slice copy per texel cost roughly
+        // 400 ms per flip in a measured release run. Preserve the general
+        // swizzle/unpack path below, but make the identity conversion one
+        // bounded bulk copy.
+        if matches!(conv, ScanoutConv::Rgba8) && pitch == width {
+            return Some(RenderedImage {
+                width,
+                height,
+                pixels: src.get(..output_len)?.to_vec(),
+                bytes_per_pixel: 4,
+            });
+        }
         let mut pixels = Vec::<u8>::new();
-        pixels
-            .try_reserve_exact(width as usize * height as usize * 4)
-            .ok()?;
-        pixels.resize(width as usize * height as usize * 4, 0);
+        pixels.try_reserve_exact(output_len).ok()?;
+        pixels.resize(output_len, 0);
         // 10-bit UNORM -> 8-bit UNORM, round-to-nearest preserving both
         // endpoints (SharpEmu `ReduceUnorm10To8`; a plain >>2 biases low
         // because the 10-bit max is 1023, not 1020).
@@ -4269,7 +4307,7 @@ mod tests {
             .lock()
             .insert(0x2000, Arc::new(detailed_ui.clone()));
 
-        session.present_flipped(0x1000, true);
+        session.present_flipped(0x1000, true, true);
 
         assert_eq!(
             session.last_image().expect("detailed frame").pixels,
@@ -4295,13 +4333,53 @@ mod tests {
             .lock()
             .insert(0x1000, Arc::new(solid.clone()));
 
-        session.present_flipped(0x1000, true);
+        session.present_flipped(0x1000, true, true);
 
         assert_eq!(
             session.last_image().expect("solid frame").pixels,
             solid.pixels
         );
         assert_eq!(*session.fallback_present_base.lock(), None);
+    }
+
+    #[test]
+    fn uniform_scanout_uses_only_a_ready_or_remembered_routing_census() {
+        let session = AgcGpuSession::new(deny_memory());
+        let solid = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: [12, 24, 36, 255].repeat(2),
+            bytes_per_pixel: 4,
+        };
+        let detailed = RenderedImage {
+            width: 2,
+            height: 1,
+            pixels: vec![1, 2, 3, 255, 90, 80, 70, 255],
+            bytes_per_pixel: 4,
+        };
+        session
+            .framebuffers
+            .lock()
+            .insert(0x1000, Arc::new(solid.clone()));
+        session
+            .framebuffers
+            .lock()
+            .insert(0x2000, Arc::new(detailed.clone()));
+
+        session.present_flipped(0x1000, true, false);
+        assert_eq!(
+            session.last_image().expect("solid frame").pixels,
+            solid.pixels,
+            "a filtered flush must not rescan every stale CPU-side target"
+        );
+
+        *session.fallback_present_base.lock() = Some(0x2000);
+        session.present_flipped(0x1000, true, false);
+        assert_eq!(
+            session.last_image().expect("remembered detail").pixels,
+            detailed.pixels,
+            "a validated remembered route remains available without a new census"
+        );
     }
 
     /// An HDR (RGBA16F) texel spends TWO bytes per channel, so its colour span
@@ -4410,7 +4488,7 @@ mod tests {
 
         // `true` = this flush read the flipped target back, i.e. the GPU
         // rendered into the very buffer the title is presenting.
-        session.present_flipped(0x1000, true);
+        session.present_flipped(0x1000, true, false);
 
         assert_eq!(
             session.last_image().expect("presented frame").pixels,

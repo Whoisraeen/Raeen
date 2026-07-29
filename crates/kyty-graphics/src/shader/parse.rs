@@ -1448,7 +1448,17 @@ fn shader_parse_vop1(
     match opcode {
         0x00 => return Err(ni(dst, S, "v_nop", opcode, pc, b0)),
         0x01 => inst.type_ = T::VMovB32,
-        0x02 => return Err(ni(dst, S, "v_readfirstlane_b32", opcode, pc, b0)),
+        0x02 => {
+            // Unlike ordinary VOP1 instructions, VDST is a scalar-destination
+            // code for v_readfirstlane_b32. Re-decode it without the VGPR
+            // bias; this also preserves VCC/EXEC aliases such as the measured
+            // GTA destination 107 = VCC_HI.
+            if sdwa || dpp {
+                return Err(feature(S, "v_readfirstlane_b32 SDWA/DPP", pc));
+            }
+            inst.type_ = T::VReadfirstlaneB32;
+            inst.dst = operand_parse(vdst)?;
+        }
         0x03 => return Err(ni(dst, S, "v_cvt_i32_f64", opcode, pc, b0)),
         0x04 => return Err(ni(dst, S, "v_cvt_f64_i32", opcode, pc, b0)),
         0x05 => inst.type_ = T::VCvtF32I32,
@@ -2512,9 +2522,16 @@ fn shader_parse_vop3(
         }
         0x30f => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // RDNA2 VOP3B v_add_co_u32: two-source add with carry-out in
+                // SDST. The measured GTA word uses v1, VCC, s12, v6.
+                inst.type_ = T::VAddI32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1;
+                inst.src_num = 2;
+                inst.dst2 = operand_parse(sdst)?;
+                inst.dst2.size = 2;
+            } else {
+                return Err(ni(dst, S, "v_add_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_add_u32", opcode, pc, b0));
         }
         0x310 => {
             if next_gen {
@@ -4077,13 +4094,23 @@ fn shader_parse_mimg(
     if lwe == 1 {
         return Err(feature(S, "lwe == 1", pc));
     }
-    if glc == 1 {
+    // GLC is a cache-coherency policy, not a value/addressing modifier. For
+    // direct image load/store operations Vulkan synchronization owns the
+    // visibility contract, so accepting it preserves the operation's
+    // semantics. Sampled operations keep the named refusal until their cache
+    // policy is modelled and measured.
+    let direct_image_memory = matches!(opcode, 0x00 | 0x08 | 0x09);
+    if glc == 1 && !direct_image_memory {
         return Err(feature(S, "glc == 1", pc));
     }
     if slc == 1 {
         return Err(feature(S, "slc == 1", pc));
     }
-    if unrm == 1 {
+    // UNRM only changes sampled-coordinate interpretation. Direct image
+    // loads/stores already use integer texel coordinates, so the bit has no
+    // additional semantic effect there. GTA's measured image_store sets it
+    // together with GLC.
+    if unrm == 1 && !direct_image_memory {
         return Err(feature(S, "unrm == 1", pc));
     }
 
@@ -5373,6 +5400,38 @@ mod tests {
     }
 
     #[test]
+    fn gta_vop1_v_readfirstlane_b32_decodes_scalar_destination() {
+        // Measured GTA V compute shader 0x148d47200, pc 0x24:
+        // v_readfirstlane_b32 vcc_hi, v0.
+        let (code, result) = parse(&[0x7ED6_0500, S_ENDPGM], ShaderType::Compute, true);
+        assert_eq!(result.unwrap(), 2);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VReadfirstlaneB32);
+        assert_eq!(inst.format, F::SVdstSVsrc0);
+        assert_eq!(inst.dst.type_, O::VccHi);
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 0));
+    }
+
+    #[test]
+    fn gta_vop3_v_add_co_u32_decodes_carry_destination() {
+        // Measured GTA V compute shader 0x148d47200, pc 0x7c:
+        // v_add_co_u32 v1, vcc, s12, v6.
+        let (code, result) = parse(
+            &[0xD70F_6A01, 0x0002_0C0C, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        assert_eq!(result.unwrap(), 3);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VAddI32);
+        assert_eq!(inst.format, F::VdstSdst2Vsrc0Vsrc1);
+        assert_eq!((inst.dst.type_, inst.dst.register_id), (O::Vgpr, 1));
+        assert_eq!(inst.dst2.type_, O::VccLo);
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Sgpr, 12));
+        assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Vgpr, 6));
+    }
+
+    #[test]
     fn vopc_v_cmp_eq_f32() {
         // VOP2 opcode6=0x3e -> VOPC; implicit VCC destination.
         let (code, _) = parse_vs(&[0x7C04_0300, S_ENDPGM]);
@@ -5670,6 +5729,11 @@ mod tests {
         assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Sgpr, 4));
         // Still a runtime soffset, and the offset operand is src[1] here.
         assert!(crate::shader::types::smem_register_soffset(inst).is_some());
+        assert_eq!(
+            crate::shader::types::smem_immediate_offset_bytes(inst),
+            Some(0),
+            "a register-only encoding has an implicit zero immediate"
+        );
     }
 
     /// The immediate keeps its 21-bit signed interpretation in the combined
@@ -5719,6 +5783,10 @@ mod tests {
             crate::shader::types::smem_offset_operand(inst).constant.i(),
             64
         );
+        assert_eq!(
+            crate::shader::types::smem_immediate_offset_bytes(inst),
+            Some(64)
+        );
     }
 
     /// Every `s_buffer_load` width carries the combined V# addressing mode.
@@ -5756,6 +5824,10 @@ mod tests {
         assert_eq!(inst.format, F::Sdst4SvSoffset);
         assert_eq!(inst.src_num, 2);
         assert!(!crate::shader::types::smem_has_combined_offset(inst));
+        assert_eq!(
+            crate::shader::types::smem_immediate_offset_bytes(inst),
+            Some(0)
+        );
     }
 
     #[test]
@@ -6181,6 +6253,40 @@ mod tests {
             3,
             "DIM_2D_ARRAY consumes x/y/layer"
         );
+    }
+
+    #[test]
+    fn gta_direct_image_store_accepts_glc_and_unrm_only_where_semantics_match() {
+        // Exact GTA V compute shader 0x148d47200 store at pc 0xcc:
+        // image_store v[0:3], v[4:5], s[0:7] dmask:f glc unrm, DIM_2D.
+        let (code, result) = parse(
+            &[0xF020_3F08, 0x0000_0004, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("GLC/UNRM do not alter direct image-store values");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageStore);
+        assert_eq!(inst.format, F::Vdata4Vaddr3StDmaskF);
+        assert_eq!((inst.dst.register_id, inst.dst.size), (0, 4));
+        assert_eq!((inst.src[0].register_id, inst.src[0].size), (4, 2));
+        assert_eq!((inst.src[1].register_id, inst.src[1].size), (0, 8));
+
+        // The same policy bits on a sampled operation can change coordinate
+        // and cache semantics, so that path must keep refusing by name.
+        let (_, sampled) = parse(
+            &[0xF080_3108, 0x0061_0800, S_ENDPGM],
+            ShaderType::Pixel,
+            true,
+        );
+        assert!(matches!(
+            sampled,
+            Err(ShaderParseError::NotImplementedFeature {
+                family: "mimg",
+                feature: "glc == 1",
+                ..
+            })
+        ));
     }
 
     #[test]

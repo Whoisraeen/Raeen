@@ -481,6 +481,10 @@ pub enum ShaderInstructionType {
     /// Measured in ASTRO.BOT scene-composite compute shader 0x555f4f500.
     VMinU32,
     VMovB32,
+    /// VOP1 0x02: copy the value from the first active lane of a VGPR into a
+    /// scalar destination. Lowered with SPIR-V subgroup broadcast-first; GTA V
+    /// first reaches it in compute shader 0x148d47200.
+    VReadfirstlaneB32,
     VMulF32,
     VMulHiU32,
     VMulLoI32,
@@ -1403,6 +1407,30 @@ pub fn smem_register_soffset(inst: &ShaderInstruction) -> Option<ShaderOperand> 
         | ShaderOperandType::Null
         | ShaderOperandType::Unknown => None,
         _ => Some(inst.src[1]),
+    }
+}
+
+/// The non-negative immediate byte term of an SMEM address.
+///
+/// In a register-only two-operand form, [`smem_offset_operand`] necessarily
+/// returns the register in `src[1]`; that means the absent immediate is zero,
+/// not that the instruction lacks a provable constant term. Combined forms
+/// carry the immediate in `src[2]`, while NULL-soffset forms carry it in
+/// `src[1]`.
+#[must_use]
+pub fn smem_immediate_offset_bytes(inst: &ShaderInstruction) -> Option<u32> {
+    if smem_register_soffset(inst).is_some() && !smem_has_combined_offset(inst) {
+        return Some(0);
+    }
+    let offset = smem_offset_operand(inst);
+    if matches!(
+        offset.type_,
+        ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
+    ) && offset.constant.i() >= 0
+    {
+        Some(offset.constant.u)
+    } else {
+        None
     }
 }
 

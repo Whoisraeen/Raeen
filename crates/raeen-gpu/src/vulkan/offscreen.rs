@@ -97,7 +97,10 @@ impl RenderedImage {
 /// is 8.
 pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
     match format {
+        vk::Format::R8_UNORM => Ok(1),
+        vk::Format::R16_UNORM => Ok(2),
         vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_UNORM
         | vk::Format::B8G8R8A8_SRGB
@@ -106,6 +109,7 @@ pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
         | vk::Format::B10G11R11_UFLOAT_PACK32
         | vk::Format::A2B10G10R10_UNORM_PACK32 => Ok(4),
         vk::Format::R16G16B16A16_SFLOAT => Ok(8),
+        vk::Format::R32G32B32A32_SFLOAT => Ok(16),
         other => Err(GpuError::VulkanInitFailed(format!(
             "render target format {other:?} has no readback byte size mapping"
         ))),
@@ -391,6 +395,7 @@ fn texture_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
         vk::Format::R16_UNORM | vk::Format::R8G8_UNORM => Ok(2),
         vk::Format::B10G11R11_UFLOAT_PACK32
         | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SNORM
         | vk::Format::R32_SFLOAT
         | vk::Format::R16G16_SFLOAT => Ok(4),
         vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => Ok(8),

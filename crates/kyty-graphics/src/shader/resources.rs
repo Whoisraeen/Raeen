@@ -915,7 +915,12 @@ pub struct ShaderEmbeddedConstantLoads {
 }
 
 impl ShaderEmbeddedConstantLoads {
-    pub const LOADS_MAX: usize = 8;
+    // GTA V's measured pixel shaders perform more than eight independently
+    // addressed scalar constant-buffer loads before their final color
+    // calculation (shader 0x148d83c00 reaches a ninth capture at pc=0xc0).
+    // This is an analysis-side snapshot table, not a hardware resource-slot
+    // limit, so retaining 32 per-PC captures is both bounded and faithful.
+    pub const LOADS_MAX: usize = 32;
 
     /// The captured dwords for the `s_load` at `pc`, if any.
     #[must_use]

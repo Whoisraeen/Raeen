@@ -44,7 +44,7 @@ use crate::shader::resources::{
 };
 use crate::shader::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderLabel, ShaderOperandType,
-    shader_instruction_format::Format,
+    ShaderType, shader_instruction_format::Format,
 };
 
 /// Kyty: ShaderSpirv.cpp `SccCheck` (L1434).
@@ -3482,6 +3482,56 @@ fn recompile_vmov_b32(
     Ok(true)
 }
 
+/// Beyond Kyty: `v_readfirstlane_b32`.
+///
+/// GCN/RDNA copies the source value from the first active lane of the wave
+/// into a scalar destination. A plain per-invocation move is only correct for
+/// uniform sources, so use the SPIR-V subgroup primitive instead. The measured
+/// GTA V shader runs on a 64-lane compute subgroup and writes VCC_HI.
+fn recompile_vreadfirstlane_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VReadfirstlaneB32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+
+    if code.get_type() != ShaderType::Compute {
+        return Err(not_supported(
+            FUNC,
+            "subgroup broadcast is currently guaranteed only for compute shaders",
+        ));
+    }
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let index_str = format!("{index}");
+    let mut load0 = String::new();
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+    <load0>
+    %t_<index> = OpGroupNonUniformBroadcastFirst %uint %uint_3 %t0_<index>
+    OpStore %<dst> %t_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<dst>", &dst_value.value)
+        .replace("<load0>", &load0)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
 /// Kyty: `Recompile_V_XXX_F32_SVdstSVsrc0SVsrc1` (ShaderSpirv.cpp L5615).
 /// XXX: Mac, Max, Min, Mul, Sub, Subrev, Add.
 fn recompile_v_xxx_f32_svdst_svsrc01(
@@ -4554,6 +4604,7 @@ fn flat_mem(
     func: &'static str,
     dwords: i32,
     is_store: bool,
+    load_ubyte: bool,
 ) -> Result<bool, ShaderRecompileError> {
     let inst = inst_at(code, index, func)?;
 
@@ -4647,8 +4698,28 @@ fn flat_mem(
         } else {
             text += &format!(
                 "        %flat_lv_{i}_{k} = OpLoad %uint %flat_ptr_{i}_{k}
-        %flat_res_{i}_{k} = OpSelect %uint %flat_inb_{i}_{k} %flat_lv_{i}_{k} %uint_0
-        %flat_fv_{i}_{k} = OpBitcast %float %flat_res_{i}_{k}
+        %flat_raw_{i}_{k} = OpSelect %uint %flat_inb_{i}_{k} %flat_lv_{i}_{k} %uint_0
+"
+            );
+            if load_ubyte {
+                // The global window is dword-backed. Select the addressed byte
+                // from that dword and zero-extend it exactly as
+                // flat_load_ubyte requires.
+                text += &format!(
+                    "        %flat_lane_{i}_{k} = OpBitwiseAnd %uint %flat_bo_{i} %uint_3
+        %flat_shift_{i}_{k} = OpShiftLeftLogical %uint %flat_lane_{i}_{k} %uint_3
+        %flat_shr_{i}_{k} = OpShiftRightLogical %uint %flat_raw_{i}_{k} %flat_shift_{i}_{k}
+        %flat_res_{i}_{k} = OpBitwiseAnd %uint %flat_shr_{i}_{k} %uint_255
+"
+                );
+            } else {
+                text += &format!(
+                    "        %flat_res_{i}_{k} = OpIAdd %uint %flat_raw_{i}_{k} %uint_0
+"
+                );
+            }
+            text += &format!(
+                "        %flat_fv_{i}_{k} = OpBitcast %float %flat_res_{i}_{k}
                OpStore %{dv} %flat_fv_{i}_{k}
 ",
                 dv = dv.value
@@ -4670,9 +4741,31 @@ macro_rules! flat_mem_recompiler {
             _param: &Params,
             _scc_check: SccCheck,
         ) -> Result<bool, ShaderRecompileError> {
-            flat_mem(index, code, dst_source, spirv, $func, $dwords, $is_store)
+            flat_mem(
+                index, code, dst_source, spirv, $func, $dwords, $is_store, false,
+            )
         }
     };
+}
+
+fn recompile_flat_load_ubyte(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    flat_mem(
+        index,
+        code,
+        dst_source,
+        spirv,
+        "Recompile_FlatLoadUbyte",
+        1,
+        false,
+        true,
+    )
 }
 
 flat_mem_recompiler!(
@@ -10924,7 +11017,7 @@ fn recompile_v_xxx_u32_vdst_vsrc012(
 
 /// Kyty: `Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1` (ShaderSpirv.cpp L6005).
 /// XXX: Add, Sub, Subrev (via `param`; carry-out goes to `dst2`).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
+#[allow(dead_code)] // Sub/Subrev remain staged; Add uses the validator-clean body below.
 fn recompile_v_xxx_u32_vdst_sdst2_vsrc01(
     index: u32,
     code: &ShaderCode,
@@ -10992,6 +11085,74 @@ fn recompile_v_xxx_u32_vdst_sdst2_vsrc01(
         .replace("<load0>", &load0)
         .replace("<load1>", &load1)
         .replace("<param>", param[0].unwrap_or(""))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// Validator-clean RDNA2 `v_add_co_u32`: add two dwords, write the sum to the
+/// VGPR and the unsigned overflow bit to the scalar carry mask.
+///
+/// Kyty's staged body uses `OpIAddCarry`; naga cannot validate that opcode, so
+/// use the equivalent `sum < src0` overflow test already used by the working
+/// carry-in sibling. This also keeps the generated module consumable by both
+/// Vulkan and the repository's independent validator.
+fn recompile_v_add_co_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VAddCoU32_VdstSdst2Vsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) || !operand_is_variable(inst.dst2) {
+        return Err(not_supported(FUNC, "destination is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    let carry_out0 = operand_variable_to_str_shift(inst.dst2, 0);
+    let carry_out1 = operand_variable_to_str_shift(inst.dst2, 1);
+    if dst_value.type_ != SpirvType::Float || carry_out0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "unexpected destination type"));
+    }
+    if operand_is_exec(inst.dst2) {
+        return Err(not_supported(FUNC, "exec carry-out"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(spirv, inst.src[1], "t1_<index>", &index_str, &mut load1, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %tsum_<index> = OpIAdd %uint %t0_<index> %t1_<index>
+        %tcarry_<index> = OpULessThan %bool %tsum_<index> %t0_<index>
+        %tcarry_u_<index> = OpSelect %uint %tcarry_<index> %uint_1 %uint_0
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tcarry_mask_<index> = OpSelect %uint %exec_lo_b_<index> %tcarry_u_<index> %uint_0
+               OpStore %<carryout0> %tcarry_mask_<index>
+               OpStore %<carryout1> %uint_0
+        %tsumf_<index> = OpBitcast %float %tsum_<index>
+        %tdst_<index> = OpLoad %float %<dst>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> %tsumf_<index> %tdst_<index>
+               OpStore %<dst> %tval_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<carryout0>", &carry_out0.value)
+        .replace("<carryout1>", &carry_out1.value)
+        .replace("<dst>", &dst_value.value)
         .replace("<index>", &index_str);
 
     Ok(true)
@@ -11184,6 +11345,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // Beyond Kyty (SharpEmu PR #587): FLAT-class direct guest-memory access via
     // the `%global_mem` window. One row per width; FLAT vs GLOBAL addressing is
     // selected inside the body by `ShaderInstruction::uses_flat_address`.
+    f(recompile_flat_load_ubyte,   T::FlatLoadUbyte,    F::FlatAddr, p1("")),
     f(recompile_flat_load_dword,   T::FlatLoadDword,    F::FlatAddr, p1("")),
     f(recompile_flat_load_dwordx2, T::FlatLoadDwordX2,  F::FlatAddr, p1("")),
     f(recompile_flat_load_dwordx3, T::FlatLoadDwordX3,  F::FlatAddr, p1("")),
@@ -11566,6 +11728,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcvt_f32_xxx, T::VCvtF32Ubyte2, F::SVdstSVsrc0, p2("%tb_<index> = OpBitFieldUExtract %uint %t0_<index> %uint_16 %uint_8", "%t_<index> = OpConvertUToF %float %tb_<index>")),
     f(recompile_vcvt_f32_xxx, T::VCvtF32Ubyte3, F::SVdstSVsrc0, p2("%tb_<index> = OpBitFieldUExtract %uint %t0_<index> %uint_24 %uint_8", "%t_<index> = OpConvertUToF %float %tb_<index>")),
     f(recompile_vmov_b32, T::VMovB32, F::SVdstSVsrc0, p1("")),
+    f(recompile_vreadfirstlane_b32, T::VReadfirstlaneB32, F::SVdstSVsrc0, p1("")),
 
     fs(recompile_s_and_saveexec_b64, T::SAndSaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     fs(recompile_s_orn2_saveexec_b64, T::SOrn2SaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
@@ -11599,7 +11762,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_tbuffer_load_format_xy_float2, T::TBufferLoadFormatXy, F::Vdata2VaddrSvSoffsIdxenFloat2, p1("")),
     ni("Recompile_TBufferLoadFormatXy_Vdata2Vaddr2SvSoffsOffenIdxenFloat2 (no Kyty upstream; the float2 body has no voffset term)", 0, T::TBufferLoadFormatXy, F::Vdata2Vaddr2SvSoffsOffenIdxenFloat2, p1("")),
 
-    ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VAddI32,    F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>")),
+    f(recompile_v_add_co_u32, T::VAddI32, F::VdstSdst2Vsrc0Vsrc1, p1("")),
     ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VSubI32,    F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpISubBorrow %ResTypeU %t0_<index> %t1_<index>")),
     ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VSubrevI32, F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpISubBorrow %ResTypeU %t1_<index> %t0_<index>")),
 
@@ -12103,7 +12266,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            398,
+            400,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -12148,7 +12311,7 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 389,
+            implemented, 392,
             "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
@@ -12185,7 +12348,7 @@ mod tests {
               and the exp-null row: EXP target 9 accepted and dropped, \n              and the Blasphemous II decoder-gap batch: 27 exp param5..param31 \n              rows, TBufferLoadFormatXy, ImageSample dmask 0xb, and ImageSampleLz \n              dmask 0x8)"
         );
         assert_eq!(
-            ni, 9,
+            ni, 8,
             "C2 remainder (BufferStoreFormatX/Xy wired out; BufferStoreFormatXyz staged in; \
              the mbcnt pair wired for the RDNA2 VOP3 lane-index idiom; VBfeU32 wired out \
              of the staged VdstVsrc0Vsrc1Vsrc2 U32 set; plus TBufferLoadFormatXy's offen variant, \n             refused because the float2 body has no voffset term)"
@@ -12441,6 +12604,69 @@ mod tests {
 
         // Unknown (type, format) pair -> None.
         assert!(recomp_func(T::VMovB32, F::Label).is_none());
+    }
+
+    #[test]
+    fn gta_readfirstlane_uses_a_real_subgroup_broadcast() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x7ED6_0500, // v_readfirstlane_b32 vcc_hi, v0
+                0xBF80_0000, // s_nop 0
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured GTA readfirstlane");
+
+        let input_info = ShaderComputeInputInfo {
+            threads_num: [64, 1, 1],
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured GTA readfirstlane");
+        assert!(source.contains("OpCapability GroupNonUniformBallot"));
+        assert!(source.contains("OpGroupNonUniformBroadcastFirst %uint %uint_3 %t0_0"));
+        assert!(source.contains("OpStore %vcc_hi %t_0"));
+
+        let words = spirv_run(&source).expect("assemble measured GTA readfirstlane");
+        naga_parse_and_validate(&words, "gta_readfirstlane");
+    }
+
+    #[test]
+    fn gta_add_co_u32_emits_sum_and_carry() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xD70F_6A01, // v_add_co_u32 v1, vcc, s12, v6
+                0x0002_0C0C,
+                0xBF80_0000, // s_nop 0
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured GTA carry add");
+
+        let input_info = ShaderComputeInputInfo {
+            threads_num: [64, 1, 1],
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured GTA carry add");
+        assert!(source.contains("OpIAdd %uint"));
+        assert!(source.contains("OpULessThan %bool"));
+        assert!(source.contains("OpStore %v1"));
+        assert!(source.contains("OpStore %vcc_lo"));
+        assert!(source.contains("OpStore %vcc_hi %uint_0"));
+
+        let words = spirv_run(&source).expect("assemble measured GTA carry add");
+        naga_parse_and_validate(&words, "gta_add_co_u32");
     }
 
     #[test]
@@ -17982,6 +18208,40 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble flat load module");
         spirv_val_ok(&words, "flat_load_dword_global_window");
+    }
+
+    #[test]
+    fn gta_flat_load_ubyte_selects_and_zero_extends_the_addressed_byte() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xDC20_0000,
+                0x007D_0001, // flat_load_ubyte v0, v[1:2]
+                0x7E02_0280,
+                0x7E02_0280,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured GTA flat byte load");
+        assert_eq!(code.get_instructions()[0].type_, T::FlatLoadUbyte);
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [64, 1, 1];
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+
+        let source =
+            spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile flat byte load");
+        assert!(source.contains("OpBitwiseAnd %uint %flat_bo_0 %uint_3"));
+        assert!(source.contains("OpShiftLeftLogical %uint %flat_lane_0_0 %uint_3"));
+        assert!(source.contains("OpShiftRightLogical %uint %flat_raw_0_0"));
+        assert!(source.contains("OpBitwiseAnd %uint %flat_shr_0_0 %uint_255"));
+
+        let words = spirv_run(&source).expect("assemble GTA flat byte load");
+        spirv_val_ok(&words, "gta_flat_load_ubyte");
     }
 
     /// A GLOBAL-segment `global_load_dword v5, v2, s[8:9]` adds the SGPR base

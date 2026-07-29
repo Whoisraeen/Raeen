@@ -228,6 +228,8 @@ fn enum_value(kind: EKind, tok: &str) -> Option<u32> {
         // (ShaderSpirv.cpp WriteHeader, L6689 region).
         (E::Capability, "Shader") => 1,
         (E::Capability, "ImageQuery") => 50,
+        (E::Capability, "GroupNonUniform") => 61,
+        (E::Capability, "GroupNonUniformBallot") => 64,
         // `OpEntryPoint <Type>` where <Type> ∈ Fragment/Vertex/GLCompute.
         (E::ExecutionModel, "Vertex") => 0,
         (E::ExecutionModel, "Fragment") => 4,
@@ -470,6 +472,7 @@ fn op_info(name: &str) -> Option<OpInfo> {
         ),
         "OpExecutionMode" => op(16, false, false, &[Id, Enum(E::ExecutionMode), LitRest]),
         "OpCapability" => op(17, false, false, &[Enum(E::Capability)]),
+        "OpGroupNonUniformBroadcastFirst" => op(338, true, true, &[Id, Id]),
         // --- Types ---------------------------------------------------------
         "OpTypeVoid" => op(19, false, true, &[]),
         "OpTypeBool" => op(20, false, true, &[]),

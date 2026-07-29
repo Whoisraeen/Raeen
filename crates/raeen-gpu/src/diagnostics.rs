@@ -17,6 +17,7 @@ pub(crate) struct GpuEnv {
     pub no_cull: bool,
     pub no_defer: bool,
     pub no_defer_compute: bool,
+    pub relax_simple_compute_tdr: bool,
     pub no_depth: bool,
     pub no_mip_chain: bool,
     pub no_stencil: bool,
@@ -50,6 +51,11 @@ impl GpuEnv {
             no_cull: on("RAEEN_NO_CULL"),
             no_defer: on("RAEEN_NO_DEFER"),
             no_defer_compute: on("RAEEN_NO_DEFER_COMPUTE"),
+            // The default one-billion weighted-instruction TDR budget remains
+            // deliberately conservative. This opt-in raises the budget only
+            // for small compute modules so retail A/B runs can validate
+            // whether batching them is safe before changing the default.
+            relax_simple_compute_tdr: on("RAEEN_RELAX_SIMPLE_COMPUTE_TDR"),
             no_depth: on("RAEEN_NO_DEPTH"),
             // A GFX10 mip chain is stored smallest-first, so mip 0 sits at the
             // END of the allocation; `decode_texture` relocates its tiled read

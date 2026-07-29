@@ -37,6 +37,8 @@ struct DispatchSlice {
 /// stays preemptible. The estimate intentionally includes declaration words;
 /// overestimating creates a few extra commands but preserves guest work.
 const DISPATCH_TDR_BUDGET: u128 = 1_000_000_000;
+const SIMPLE_DISPATCH_TDR_BUDGET: u128 = 5_000_000_000;
+const SIMPLE_DISPATCH_MAX_WORDS: usize = 2_048;
 
 fn compute_local_size(spirv: &[u32]) -> [u32; 3] {
     // SPIR-V: five-word header, OpExecutionMode = 16, LocalSize = 17.
@@ -56,6 +58,20 @@ fn compute_local_size(spirv: &[u32]) -> [u32; 3] {
 }
 
 fn dispatch_slices(state: &ComputeState<'_>) -> Vec<DispatchSlice> {
+    let budget = if crate::diagnostics::gpu_env().relax_simple_compute_tdr
+        && state.spirv.len() <= SIMPLE_DISPATCH_MAX_WORDS
+    {
+        SIMPLE_DISPATCH_TDR_BUDGET
+    } else {
+        DISPATCH_TDR_BUDGET
+    };
+    dispatch_slices_with_budget(state, budget)
+}
+
+fn dispatch_slices_with_budget(
+    state: &ComputeState<'_>,
+    dispatch_tdr_budget: u128,
+) -> Vec<DispatchSlice> {
     let local = compute_local_size(state.spirv);
     let words = state.spirv.len().max(1) as u128;
     let local_invocations = local.into_iter().map(u128::from).product::<u128>().max(1);
@@ -63,7 +79,7 @@ fn dispatch_slices(state: &ComputeState<'_>) -> Vec<DispatchSlice> {
     let total_work = words
         .saturating_mul(local_invocations)
         .saturating_mul(total_groups);
-    if total_work <= DISPATCH_TDR_BUDGET || total_groups == 0 {
+    if total_work <= dispatch_tdr_budget || total_groups == 0 {
         return vec![DispatchSlice {
             base: [0; 3],
             groups: state.groups,
@@ -94,7 +110,7 @@ fn dispatch_slices(state: &ComputeState<'_>) -> Vec<DispatchSlice> {
         .saturating_mul(local_invocations)
         .saturating_mul(other_groups)
         .max(1);
-    let groups_per_slice = u32::try_from((DISPATCH_TDR_BUDGET / work_per_axis_group).max(1))
+    let groups_per_slice = u32::try_from((dispatch_tdr_budget / work_per_axis_group).max(1))
         .unwrap_or(u32::MAX)
         .min(axis_groups);
 
@@ -2182,8 +2198,8 @@ impl Drop for ComputeResources<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeState, compute_local_size, compute_requires_slicing, dispatch_slices,
-        inline_push_constant_range,
+        ComputeState, SIMPLE_DISPATCH_TDR_BUDGET, compute_local_size, compute_requires_slicing,
+        dispatch_slices, dispatch_slices_with_budget, inline_push_constant_range,
     };
 
     fn compute_module(local: [u32; 3], words: usize) -> Vec<u32> {
@@ -2278,5 +2294,27 @@ mod tests {
         assert_eq!(slices[0].base, [0; 3]);
         assert_eq!(slices[0].groups, state.groups);
         assert!(!compute_requires_slicing(&state));
+    }
+
+    #[test]
+    fn relaxed_simple_budget_batches_gta_fill_without_exempting_astro() {
+        let gta_spirv = compute_module([64, 1, 1], 1_954);
+        let gta = ComputeState {
+            groups: [32_640, 1, 1],
+            spirv: &gta_spirv,
+            binding: None,
+        };
+        assert_eq!(
+            dispatch_slices_with_budget(&gta, SIMPLE_DISPATCH_TDR_BUDGET).len(),
+            1
+        );
+
+        let astro_spirv = compute_module([16, 16, 1], 8_700);
+        let astro = ComputeState {
+            groups: [64, 64, 1],
+            spirv: &astro_spirv,
+            binding: None,
+        };
+        assert!(dispatch_slices_with_budget(&astro, SIMPLE_DISPATCH_TDR_BUDGET).len() > 1);
     }
 }

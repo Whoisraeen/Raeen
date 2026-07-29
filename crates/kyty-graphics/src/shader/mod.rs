@@ -72,6 +72,6 @@ pub use spirv::{
 pub use types::{
     DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf,
     ShaderInstruction, ShaderInstructionType, ShaderInstructionTypeFormat, ShaderLabel,
-    ShaderOperand, ShaderOperandType, ShaderType, shader_instruction_format, smem_offset_operand,
-    smem_register_soffset,
+    ShaderOperand, ShaderOperandType, ShaderType, shader_instruction_format,
+    smem_immediate_offset_bytes, smem_offset_operand, smem_register_soffset,
 };

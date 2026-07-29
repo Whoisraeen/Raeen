@@ -1115,6 +1115,13 @@ impl ShaderTranslateCache {
                     &code,
                     &mut cs_info.bind,
                 );
+                // FLAT/GLOBAL ops use a final catch-all guest-memory window.
+                // Its binding index must be assigned after every ordinary
+                // descriptor group and the raw-EUD fallback above. The pass
+                // existed but was never called by the production CS path,
+                // leaving GTA's otherwise supported flat_load_ubyte to fail
+                // with "global_mem window not declared".
+                kyty_graphics::shader::shader_detect_flat_global_window(&code, &mut cs_info.bind);
                 Ok(PreparedShader::Cs {
                     code,
                     info: Arc::new(cs_info),
@@ -1912,6 +1919,98 @@ mod tests {
                     .expect("fixture CS must translate");
                 assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
                 assert_eq!(t.cs_info.threads_num, [8, 4, 1]);
+            },
+        );
+    }
+
+    #[test]
+    fn guest_cs_declares_global_window_for_flat_byte_load() {
+        let mut shader = vec![
+            0xDC20_0000,
+            0x007D_0001, // flat_load_ubyte v0, v[1:2]
+            0x7E02_0280,
+            0x7E02_0280,
+            S_ENDPGM,
+        ];
+        shader.resize(CHUNK_DWORDS, 0);
+        let addr = shader.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        cache.map_shader_metadata(
+            addr,
+            ShaderMappedData {
+                user_data: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(shader.as_slice()))],
+            || {
+                let translated = cache
+                    .translate_cs(&cs_regs_at(addr), &ShaderRegisters::default())
+                    .expect("production CS path must declare the FLAT window");
+                assert!(translated.cs_info.bind.global_mem.used);
+                assert_eq!(translated.spirv[0], 0x0723_0203);
+            },
+        );
+    }
+
+    #[test]
+    fn guest_cs_routes_direct_type1_image_store_and_flat_window_to_spirv() {
+        let mut shader = vec![
+            0xDC20_0000,
+            0x007D_0001, // flat_load_ubyte v0, v[1:2]
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0x7E04_0300, // v_mov_b32 v2, v0
+            0x7E06_0300, // v_mov_b32 v3, v0
+            0xF020_3F08, // image_store dmask:f glc unrm, DIM_2D
+            0x0000_0004, // vdata=v0, vaddr=v4, T#=s0
+            S_ENDPGM,
+        ];
+        shader.resize(CHUNK_DWORDS, 0);
+        let addr = shader.as_ptr() as u64;
+
+        let mut direct = vec![0xffff_u16; 8];
+        direct[1] = 0;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        cache.map_shader_metadata(
+            addr,
+            ShaderMappedData {
+                user_data: Some(kyty_graphics::shader::resources::ShaderUserData {
+                    direct_resource_offset: direct,
+                    sharp_resource_offset: [vec![], vec![], vec![], vec![]],
+                    eud_size_dw: 0,
+                    srt_size_dw: 8,
+                }),
+                ..Default::default()
+            },
+        );
+
+        let mut regs = cs_regs_at(addr);
+        regs.cs_regs.user_sgpr = 8;
+        regs.cs_user_sgpr.count = 8;
+        regs.cs_user_sgpr.value[..8].copy_from_slice(&[
+            0x0161_4730,
+            0xc050_0000,
+            0x03ff_c1ff,
+            0x9000_0204,
+            0,
+            0x0070_0000,
+            0,
+            0,
+        ]);
+        regs.cs_user_sgpr.type_[..8].fill(kyty_graphics::hw_regs::UserSgprType::Vsharp);
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(shader.as_slice()))],
+            || {
+                let translated = cache
+                    .translate_cs(&regs, &ShaderRegisters::default())
+                    .expect("GTA direct UAV + FLAT shape must translate end to end");
+                assert!(translated.cs_info.bind.global_mem.used);
+                assert_eq!(translated.cs_info.bind.samplers.samplers_num, 0);
+                assert_eq!(translated.cs_info.bind.textures2d.textures2d_storage_num, 1);
+                assert_eq!(translated.spirv[0], 0x0723_0203);
             },
         );
     }

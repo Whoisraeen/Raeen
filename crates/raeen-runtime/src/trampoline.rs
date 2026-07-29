@@ -250,6 +250,9 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
     if std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
         return false;
     }
+    if callback_capable_agc_builder(trampoline) {
+        return false;
+    }
     if std::env::var_os("RAEEN_DIRECT_BLOCKING_WAITS").is_some() && blocking_wait_import(trampoline)
     {
         return true;
@@ -309,39 +312,21 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
             | "sceAudioOut2ContextAdvance"
             | "sceAudioOut2PortSetAttributes"
             | "sceAjmBatchInitialize"
-            // AGC packet emitters: guest-memory writes only; actual GPU work
-            // remains asynchronous in the command submission subsystem.
+            // AGC helpers that cannot grow a command buffer. Packet builders
+            // are filtered by `callback_capable_agc_builder` above because an
+            // exhausted buffer synchronously re-enters the guest callback.
             | "sceAgcSetCxRegIndirectPatchAddRegisters"
             | "sceAgcGetDataPacketPayloadAddress"
-            | "sceAgcCbSetShRegisterRangeDirect"
-            | "sceAgcDcbEventWrite"
             | "sceAgcSetShRegIndirectPatchAddRegisters"
-            | "sceAgcDcbAcquireMem"
-            | "sceAgcDcbDrawIndexOffset"
             | "sceAgcSetCxRegIndirectPatchSetAddress"
             | "sceAgcSetShRegIndirectPatchSetAddress"
             | "sceAgcSetUcRegIndirectPatchAddRegisters"
             | "sceAgcSetUcRegIndirectPatchSetAddress"
-            | "sceAgcDcbSetCxRegistersIndirect"
-            | "sceAgcDcbSetShRegistersIndirect"
-            | "sceAgcDcbSetUcRegistersIndirect"
             | "sceAgcCreatePrimState"
             | "sceAgcCreateInterpolantMapping"
-            | "sceAgcCbReleaseMem"
-            | "sceAgcDcbWriteData"
-            | "sceAgcAcbWriteData"
-            | "sceAgcDcbWaitRegMem"
             | "sceAgcWaitRegMemPatchAddress"
             | "sceAgcQueueEndOfPipeActionPatchAddress"
             | "sceAgcWriteDataPatchAddress"
-            | "sceAgcCbNop"
-            | "sceAgcCbDispatch"
-            | "sceAgcDcbDrawIndexAuto"
-            | "sceAgcDcbSetIndexBuffer"
-            | "sceAgcDcbSetIndexCount"
-            | "sceAgcDcbWaitUntilSafeForRendering"
-            | "sceAgcDcbSetFlip"
-            | "sceAgcUnknownKRzWekV120"
             // These three are ordinary blocking/submission boundaries. They
             // neither invoke guest callbacks nor replace the live context;
             // the gateway already owns a host stack and permits blocking.
@@ -388,6 +373,37 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
             | "tanf"
             | "tanhf"
     )
+}
+
+/// Every AGC packet builder ultimately calls `alloc_command_dwords`. When its
+/// guest-owned cursor window is full, that helper synchronously invokes the
+/// command-buffer grow callback. The direct leaf gateway cannot safely
+/// re-enter guest code, so these imports must use the VEH path even though
+/// their non-growth fast path only writes guest memory.
+fn callback_capable_agc_builder(trampoline: &HleTrampoline) -> bool {
+    trampoline.library == "libSceAgc"
+        && matches!(
+            trampoline.function.as_str(),
+            "sceAgcCbSetShRegisterRangeDirect"
+                | "sceAgcDcbEventWrite"
+                | "sceAgcDcbAcquireMem"
+                | "sceAgcDcbDrawIndexOffset"
+                | "sceAgcDcbSetCxRegistersIndirect"
+                | "sceAgcDcbSetShRegistersIndirect"
+                | "sceAgcDcbSetUcRegistersIndirect"
+                | "sceAgcCbReleaseMem"
+                | "sceAgcDcbWriteData"
+                | "sceAgcAcbWriteData"
+                | "sceAgcDcbWaitRegMem"
+                | "sceAgcCbNop"
+                | "sceAgcCbDispatch"
+                | "sceAgcDcbDrawIndexAuto"
+                | "sceAgcDcbSetIndexBuffer"
+                | "sceAgcDcbSetIndexCount"
+                | "sceAgcDcbWaitUntilSafeForRendering"
+                | "sceAgcDcbSetFlip"
+                | "sceAgcUnknownKRzWekV120"
+        )
 }
 
 fn write_call_slot(slot: u64, target: u64) {
@@ -516,10 +532,7 @@ mod tests {
             ("libScePosix", "pthread_mutex_lock"),
             ("libScePosix", "pthread_mutex_unlock"),
             ("libScePosix", "recvfrom"),
-            ("libSceAgc", "sceAgcDcbAcquireMem"),
             ("libSceAgc", "sceAgcCreatePrimState"),
-            ("libSceAgc", "sceAgcDcbWriteData"),
-            ("libSceAgc", "sceAgcDcbSetFlip"),
             ("libSceAgcDriver", "sceAgcDriverSubmitDcb"),
         ] {
             assert!(
@@ -538,10 +551,41 @@ mod tests {
             ("libSceFiber", "sceFiberSwitch"),
             ("libc", "__cxa_throw"),
             ("libkernel", "sceKernelDebugRaiseException"),
+            ("libSceAgc", "sceAgcDcbAcquireMem"),
         ] {
             assert!(
                 !direct_dispatchable(&trampoline(library, function)),
                 "{library}::{function}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_capable_agc_builders_stay_on_veh() {
+        for function in [
+            "sceAgcCbSetShRegisterRangeDirect",
+            "sceAgcDcbEventWrite",
+            "sceAgcDcbAcquireMem",
+            "sceAgcDcbDrawIndexOffset",
+            "sceAgcDcbSetCxRegistersIndirect",
+            "sceAgcDcbSetShRegistersIndirect",
+            "sceAgcDcbSetUcRegistersIndirect",
+            "sceAgcCbReleaseMem",
+            "sceAgcDcbWriteData",
+            "sceAgcAcbWriteData",
+            "sceAgcDcbWaitRegMem",
+            "sceAgcCbNop",
+            "sceAgcCbDispatch",
+            "sceAgcDcbDrawIndexAuto",
+            "sceAgcDcbSetIndexBuffer",
+            "sceAgcDcbSetIndexCount",
+            "sceAgcDcbWaitUntilSafeForRendering",
+            "sceAgcDcbSetFlip",
+            "sceAgcUnknownKRzWekV120",
+        ] {
+            assert!(
+                !direct_dispatchable(&trampoline("libSceAgc", function)),
+                "libSceAgc::{function} may synchronously call the guest grow callback"
             );
         }
     }

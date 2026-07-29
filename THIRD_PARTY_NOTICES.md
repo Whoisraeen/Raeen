@@ -104,6 +104,10 @@ SOFTWARE.
   `track_pending_graphics_allocation` in `CommandBuffer::AllocateDW`), and
   `flush_pending_graphics_segment_before_acb` (ACB wait-address collection,
   RELEASE_MEM producer matching, packet-boundary trimming, flush-as-DCB).
+  The command-buffer grow path (2026-07-29) follows KytyPS5's
+  `CommandBuffer::ReserveDW` callback ABI and one-shot post-callback capacity
+  check, independently cross-checked against SharpEmu's
+  `TryAllocateCommandDwords`.
   `crates/kyty-graphics/src/run.rs` additionally re-implements
   `CpOpDispatchIndirect` (both the base+offset and absolute-address argument
   forms, `pm4Handlers.cpp`/`graphicsRun.cpp`) and `CpOpSetBase`'s shader-type
@@ -676,7 +680,10 @@ attribution as that license requires.
   `crates/kyty-graphics/src/pm4.rs`, and records the *negative* finding that
   `ac_gather_context_rolls.c` only classifies that opcode as context-busy
   without decoding a body — no layout was transcribed, because none exists to
-  transcribe.
+  transcribe. The thread-dimension dispatch fix (2026-07-29) additionally uses
+  `src/amd/registers/gfx940.json` as the register fact that bit 5 of
+  `COMPUTE_DISPATCH_INITIATOR` is `USE_THREAD_DIMENSIONS`; Raeen's Rust
+  conversion and tests are original, and no Mesa code or table is copied.
 
 ---
 

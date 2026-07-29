@@ -91,6 +91,36 @@ Claude `/goal` (≤200 chars):
 - **Mesa delta — NO AMD CHANGE.** `3e2d851..780727e` contains no files under
   `src/amd`; AddrLib/register/PM4 source used by Raeen is unchanged.
 
+### AGC command-buffer grow callback 2026-07-29 (KytyPS5 `src/libs/agc.cpp` + SharpEmu `AgcExports.cs`)
+
+- **Behavioral port — DONE in working tree.** `alloc_command_dwords` now
+  invokes the guest command-buffer callback as
+  `callback(cb, requested_dwords + reserved_dwords, user_data)` when the
+  cursor window is exhausted, requires a true return, rereads the guest-owned
+  cursors, and fails closed after one attempt if the callback did not provide
+  enough space. Every direct-listed packet builder that can reach this helper
+  stays on the VEH HLE path because the direct gateway cannot safely re-enter
+  guest code. Regressions pin the ABI, refill, cursor advance, emitted packet,
+  one-shot failure, and gateway classification. This closes the missing
+  owner/grow interaction measured in GTA V without embedding title-specific
+  state or data.
+
+### PM4 thread-dimension dispatch normalization 2026-07-29 (Mesa AMD register facts)
+
+- **Hardware-semantic fix — DONE in working tree.** GTA V calls
+  `sceAgcCbDispatch` with modifier `0x21`, which HLE encodes as dispatch
+  initiator `0x61`: `USE_THREAD_DIMENSIONS` is set. Mesa's MIT-licensed
+  `src/amd/registers/gfx940.json` identifies bit 5 of
+  `COMPUTE_DISPATCH_INITIATOR` by that name. Raeen previously accepted the bit
+  but passed the packet's total thread dimensions straight to Vulkan as
+  workgroup counts. The measured `0x1fe000`-thread, 64x1x1 constant-buffer fill
+  therefore launched 2,088,960 workgroups instead of 32,640 and performed 64x
+  excess, mostly out-of-bounds work. `vulkan_dispatch_groups` now divides only
+  thread-dimension packets by `COMPUTE_NUM_THREAD_{X,Y,Z}` (rounding up);
+  ordinary group-dimension packets are unchanged, zero local sizes fail by
+  name, and the existing ASTRO device-loss quarantine remains keyed to the
+  original packet shape. No title-specific branch or game data is incorporated.
+
 ### GTA V AGC Phase A batch 2026-07-27 (KytyPS5 `src/libs/agc.cpp` + Mesa PM4 facts)
 
 - **The full measured 83-NID `libSceAgc` gap (docs/gta5-blocker-analysis-2026-07-27.md)

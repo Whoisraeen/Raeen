@@ -976,6 +976,25 @@ pub fn resolve_sgpr_before(
     Ok(evaluate_before(instructions, at, user_sgpr, shift)?.sgpr(reg))
 }
 
+/// Prove a 32-bit scalar operand as read by `instructions[at]`.
+///
+/// Unlike [`resolve_sgpr_before`], this also serves the named scalar registers
+/// (`vcc`, `exec`, `m0`, and `scc`) that RDNA2 permits in an SMEM `soffset`
+/// field. They are never treated as live-in constants: the deterministic walk
+/// must prove their value through an instruction this evaluator models.
+pub fn resolve_scalar_operand_before(
+    instructions: &[ShaderInstruction],
+    at: usize,
+    operand: &ShaderOperand,
+    user_sgpr: Option<&UserSgprInfo>,
+    shift: i32,
+) -> Result<ScalarValue, ScalarEvalRefusal> {
+    if operand.type_ == O::Sgpr {
+        return resolve_sgpr_before(instructions, at, operand.register_id, user_sgpr, shift);
+    }
+    Ok(evaluate_before(instructions, at, user_sgpr, shift)?.read32(operand))
+}
+
 /// The PM4-latched live-in value of shader scalar register `reg`, or `Unknown`
 /// when `reg` is not a captured user-data slot.
 #[must_use]
@@ -1015,6 +1034,14 @@ mod tests {
             type_: O::Sgpr,
             register_id: reg,
             size,
+            ..Default::default()
+        }
+    }
+
+    fn named(type_: O) -> ShaderOperand {
+        ShaderOperand {
+            type_,
+            size: 1,
             ..Default::default()
         }
     }
@@ -2007,5 +2034,28 @@ mod tests {
             endpgm(16),
         ];
         assert_eq!(resolve(&program, 6, &user), ScalarValue::Known(0xa0));
+    }
+
+    #[test]
+    fn a_named_scalar_soffset_is_proven_only_after_a_modelled_definition() {
+        // GTA's measured pixel shader computes an S_BUFFER_LOAD offset as
+        // `vcc_lo = s6 << 4`. Named scalar registers are not user-data live-ins,
+        // but a deterministic definition before the load is safe to fold.
+        let user = user_data(&[(6, 3)]);
+        let mut scale = alu2(0, T::SLshlB32, 0, sgpr(6, 1), imm(4));
+        scale.dst = named(O::VccLo);
+        let program = [scale, endpgm(4)];
+        let vcc_lo = named(O::VccLo);
+
+        assert_eq!(
+            resolve_scalar_operand_before(&program, 1, &vcc_lo, Some(&user), 0),
+            Ok(ScalarValue::Known(48))
+        );
+
+        let no_definition = [endpgm(0)];
+        assert_eq!(
+            resolve_scalar_operand_before(&no_definition, 0, &vcc_lo, Some(&user), 0),
+            Ok(ScalarValue::Unknown)
+        );
     }
 }

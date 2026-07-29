@@ -3963,6 +3963,16 @@ impl<'a> Spirv<'a> {
 
         imports.push("%GLSL_std_450 = OpExtInstImport \"GLSL.std.450\"".to_string());
 
+        if self
+            .code
+            .has_any_of(&[ShaderInstructionType::VReadfirstlaneB32])
+        {
+            // OpGroupNonUniformBroadcastFirst requires this SPIR-V 1.3
+            // capability. Vulkan exposes it as subgroup ballot support.
+            extensions.push("OpCapability GroupNonUniform".to_string());
+            extensions.push("OpCapability GroupNonUniformBallot".to_string());
+        }
+
         if self.debug_printf_enabled {
             extensions.push("OpExtension \"SPV_KHR_non_semantic_info\"".to_string());
             imports.push(
@@ -5889,6 +5899,12 @@ impl<'a> Spirv<'a> {
             // OpControlBarrier memory semantics: AcquireRelease (0x8) |
             // WorkgroupMemory (0x100).
             self.add_constant_uint(0x108);
+        }
+        if self
+            .code
+            .has_any_of(&[ShaderInstructionType::FlatLoadUbyte])
+        {
+            self.add_constant_uint(0xff);
         }
         if self.uses_lds() {
             // The LDS index clamp bound (see recompile_ds_write/read_b32).
