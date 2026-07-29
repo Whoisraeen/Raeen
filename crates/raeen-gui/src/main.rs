@@ -1802,12 +1802,18 @@ fn main() -> anyhow::Result<()> {
         // load problem, not a rendering one.
         raeen_core::frame_path::record_phase(raeen_core::frame_path::Phase::EntryReached);
         info!("entering guest _start via execute_process ...");
+        // The guest is entered with the *guest* spelling of its own eboot —
+        // `/app0/eboot.bin`, the path the VFS mount installed above resolves
+        // back to this very file — not the host path this runner was given.
+        // Same argv/envp the Shell's in-process launcher passes, so both launch
+        // paths put a title in the same process environment.
+        let guest_argv0 = raeen_kernel::filesystem::guest_argv0(Path::new(path.as_str()));
         let outcome = raeen_runtime::execute_process_shared(
             std::sync::Arc::clone(&linked),
             std::sync::Arc::clone(&hle),
             std::sync::Arc::clone(&kernel),
-            &[path.as_str()],
-            &[],
+            &[guest_argv0.as_str()],
+            raeen_kernel::filesystem::GUEST_ENVP,
         );
         match &outcome {
             Ok(o) => info!("RESULT: {o:?}"),

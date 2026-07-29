@@ -1334,6 +1334,80 @@ fn positional_read_into(
 /// becomes its default.
 pub const GUEST_WORKING_DIRECTORY: &str = "/app0";
 
+/// The eboot name [`guest_argv0`] falls back to when the host file's own name
+/// cannot be spelled as a guest path component.
+const DEFAULT_EBOOT_NAME: &str = "eboot.bin";
+
+/// The environment a title is entered with (`envp`, laid out by the runtime's
+/// `build_process_stack` between `argv`'s terminator and the auxv).
+///
+/// An Orbis process has a real, FreeBSD-derived environment — the PS5 SDK's own
+/// rtld resolves shared libraries by reading `LD_LIBRARY_PATH` out of it
+/// (`reference/ps5-payload-sdk`, `crt/rtld.c:223`) — so an empty `envp` is a
+/// shape no process has on hardware.
+///
+/// This is a *description*, not a control knob: Raeen resolves `DT_NEEDED`
+/// itself and never reads this back. The value it states is true anyway —
+/// `sce_module/` under the app root is exactly where the loader looks for a
+/// title's shipped system modules (`raeen-firmware`'s `DEPENDENCY_SUBDIRS`) —
+/// so a title that parses `envp` for its own reasons is told the truth. Kept
+/// deliberately minimal for the same reason: every entry here is a string a
+/// guest may act on, and inventing variables no hardware sets would be a lie
+/// with a larger blast radius than an empty environment.
+///
+/// The path is spelled out because [`GUEST_WORKING_DIRECTORY`] cannot be
+/// concatenated in a `const`; `guest_envp_paths_live_under_the_app_mount`
+/// pins the two together.
+pub const GUEST_ENVP: &[&str] = &["LD_LIBRARY_PATH=/app0/sce_module"];
+
+/// The `argv[0]` a title is entered with, for the eboot at `host_eboot`.
+///
+/// `argv[0]` is the one string a crt0 hands straight to the title, and titles
+/// print it, parse it, and open it — so it must name a path the guest can
+/// actually reach. Measured on Blasphemous II (PPSA13580): while the runner
+/// passed the raw host path, the title's own launcher banner printed
+/// `Arg 0 = E:\PS5\PPSA13580-app\eboot.bin` — a spelling no guest API can open,
+/// since the file is mounted at [`GUEST_WORKING_DIRECTORY`].
+///
+/// So: the eboot's *basename* under `/app0`, which is the path the app mount
+/// resolves back to that same file. shadPS4 builds `argv[0]` identically
+/// (`reference/shadps4`, `src/emulator.cpp:285`: `"/app0/" + eboot_name`);
+/// KytyPS5 passes a bare `"KytyEmu"` (`src/loader/runtimeLinker.cpp:1359`),
+/// which keeps the host out of guest memory but names nothing openable.
+///
+/// A basename that cannot serve as a guest path component (absent, non-UTF-8,
+/// empty, or carrying host path syntax of its own) falls back to `eboot.bin`
+/// rather than passing the odd spelling through.
+pub fn guest_argv0(host_eboot: &Path) -> String {
+    let name = host_eboot
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !looks_like_host_path(name))
+        .unwrap_or(DEFAULT_EBOOT_NAME);
+    format!("{GUEST_WORKING_DIRECTORY}/{name}")
+}
+
+/// Whether `s` carries *host* path syntax — a Windows drive letter (`E:\…`,
+/// `E:/…`) or any backslash separator. Guest paths are `/`-rooted and contain
+/// neither.
+///
+/// This is a syntactic check, and on a POSIX host it cannot be more than that:
+/// `/home/user/Games/x/eboot.bin` is shaped exactly like a guest path. What
+/// closes that gap is rooting every guest-visible path at
+/// [`GUEST_WORKING_DIRECTORY`] (see [`guest_argv0`]) rather than detecting the
+/// host spelling after the fact. Used to keep host paths out of `argv`/`envp`,
+/// and to make the leak loud if one ever gets that far.
+pub fn looks_like_host_path(s: &str) -> bool {
+    if s.contains('\\') {
+        return true;
+    }
+    let mut chars = s.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic()
+    )
+}
+
 /// Normalize a guest path into the absolute, `.`-free spelling that mount
 /// prefix matching can compare literally.
 ///
@@ -2397,6 +2471,100 @@ mod tests {
         assert!(vfs.create_dir_all("././").is_ok());
 
         let _ = std::fs::remove_dir_all(app);
+    }
+
+    /// `guest_argv0` maps a host eboot path to the guest spelling of the same
+    /// file: rooted at the app mount, carrying the eboot's own basename, and
+    /// free of every trace of the host layout it came from. The Windows path
+    /// here is the exact one Blasphemous II's launcher banner echoed back as
+    /// `Arg 0 = E:\PS5\PPSA13580-app\eboot.bin`.
+    #[test]
+    fn guest_argv0_is_the_app_mount_spelling_never_the_host_path() {
+        for host in [
+            r"E:\PS5\PPSA13580-app\eboot.bin",
+            r"C:\Users\someone\Documents\Raeen\Games\Title\eboot.bin",
+            "/home/someone/Games/Title/eboot.bin",
+            "eboot.bin",
+        ] {
+            let argv0 = guest_argv0(Path::new(host));
+            assert_eq!(argv0, "/app0/eboot.bin", "host path {host:?}");
+        }
+
+        // A differently-named main module keeps its own name — argv[0] must
+        // still resolve through the mount to the file that was launched.
+        // Forward slashes so the basename is the basename on either host:
+        // Windows accepts `/` as a separator, POSIX does not accept `\`.
+        assert_eq!(
+            guest_argv0(Path::new("E:/PS5/Homebrew/hello.elf")),
+            "/app0/hello.elf"
+        );
+
+        // Nothing usable as a guest path component falls back rather than
+        // passing an odd spelling through.
+        assert_eq!(guest_argv0(Path::new("")), "/app0/eboot.bin");
+        assert_eq!(guest_argv0(Path::new("/")), "/app0/eboot.bin");
+    }
+
+    /// No `argv[0]` this produces carries host path syntax, whatever the host
+    /// layout — the property the guest side depends on, asserted directly.
+    #[test]
+    fn guest_argv0_never_carries_a_drive_letter_or_backslash() {
+        for host in [
+            r"E:\PS5\PPSA13580-app\eboot.bin",
+            r"\\server\share\Title\eboot.bin",
+            r"C:eboot.bin",
+            "/mnt/games/Title/eboot.bin",
+        ] {
+            let argv0 = guest_argv0(Path::new(host));
+            assert!(
+                !looks_like_host_path(&argv0),
+                "argv[0] {argv0:?} from host path {host:?} still reads as a host path"
+            );
+            assert!(
+                argv0.starts_with(&format!("{GUEST_WORKING_DIRECTORY}/")),
+                "argv[0] {argv0:?} must be rooted at the app mount"
+            );
+        }
+    }
+
+    /// The environment describes guest paths only, and every path in it lives
+    /// under the app mount — so `GUEST_ENVP`'s spelled-out `/app0` cannot drift
+    /// away from [`GUEST_WORKING_DIRECTORY`].
+    #[test]
+    fn guest_envp_paths_live_under_the_app_mount() {
+        for entry in GUEST_ENVP {
+            let (name, value) = entry
+                .split_once('=')
+                .unwrap_or_else(|| panic!("envp entry {entry:?} must be NAME=VALUE"));
+            assert!(!name.is_empty(), "envp entry {entry:?} has an empty name");
+            assert!(
+                !looks_like_host_path(value),
+                "envp entry {entry:?} leaks host path syntax"
+            );
+            assert!(
+                value.starts_with(&format!("{GUEST_WORKING_DIRECTORY}/")),
+                "envp entry {entry:?} must name a path under the app mount"
+            );
+        }
+    }
+
+    /// The host-path predicate the argv/envp checks rest on: drive letters and
+    /// backslashes are host syntax; `/`-rooted guest paths are not.
+    #[test]
+    fn looks_like_host_path_flags_drive_letters_and_backslashes() {
+        assert!(looks_like_host_path(r"E:\PS5\PPSA13580-app\eboot.bin"));
+        assert!(looks_like_host_path("E:/PS5/eboot.bin"));
+        assert!(looks_like_host_path(r"C:eboot.bin"));
+        assert!(looks_like_host_path(r"\\server\share\eboot.bin"));
+        assert!(looks_like_host_path(r"Games\Title\eboot.bin"));
+
+        assert!(!looks_like_host_path("/app0/eboot.bin"));
+        assert!(!looks_like_host_path("LD_LIBRARY_PATH=/app0/sce_module"));
+        assert!(!looks_like_host_path("eboot.bin"));
+        assert!(!looks_like_host_path(""));
+        // A lone colon is not a drive letter: only `<alpha>:` at the front is.
+        assert!(!looks_like_host_path("/app0/odd:name.bin"));
+        assert!(!looks_like_host_path(":8080"));
     }
 
     /// Interior `.` components and doubled slashes collapse before mount

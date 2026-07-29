@@ -3470,6 +3470,120 @@ fn start_stub_observes_argv0_first_byte_via_the_process_stack() {
     }
 }
 
+/// Writes `mov rdi, [rsp+disp8]` (`48 8B 7C 24 <disp8>`) followed by `call
+/// qword ptr [rip+disp32]` (`FF 15 <disp32>`) at `off`, returning the offset
+/// just past it: passes one process-stack slot to the HLE function behind
+/// `slot_off` as its SysV first argument. `rsp` is unchanged across the call
+/// (the VEH pops the return address it pushed), so successive uses address the
+/// same stack the guest was entered on.
+fn write_puts_of_stack_slot(buf: &mut [u8], off: usize, stack_disp: u8, slot_off: usize) -> usize {
+    buf[off..off + 4].copy_from_slice(&[0x48, 0x8B, 0x7C, 0x24]); // mov rdi, [rsp+disp8]
+    buf[off + 4] = stack_disp;
+
+    let call_off = off + 5;
+    let call_disp32 = (slot_off as i64 - (call_off as i64 + 6)) as i32;
+    buf[call_off] = 0xFF;
+    buf[call_off + 1] = 0x15;
+    buf[call_off + 2..call_off + 6].copy_from_slice(&call_disp32.to_le_bytes());
+    call_off + 6
+}
+
+/// The process environment a real launch builds, observed from inside the
+/// guest: a `_start` that reads `argv[0]` and `envp[0]` off its own process
+/// stack, hands each to the real HLE `puts`, and exits — so the assertions
+/// below are made against the exact bytes the guest dereferenced, not against
+/// the strings the test passed in.
+///
+/// `argv[0]` is built by the production helper from the very host path
+/// Blasphemous II (PPSA13580) was launched from, whose own launcher banner used
+/// to echo back `Arg 0 = E:\PS5\PPSA13580-app\eboot.bin`. Nothing of that host
+/// path may reach guest memory: the guest must see `/app0/eboot.bin`, the
+/// spelling its own `/app0` mount resolves back to the same file.
+#[test]
+fn process_argv_and_envp_carry_guest_paths_never_the_host_path() {
+    const ENTRY_OFF: usize = 0x0;
+    const PUTS_SLOT_OFF: usize = 0x80;
+    const EXIT_SLOT_OFF: usize = 0x88;
+    // The process stack `_start` is entered on: argc, argv[0], argv NULL,
+    // envp[0] — one argv entry, so envp[0] is four slots in.
+    const ARGV0_DISP: u8 = 0x08;
+    const ENVP0_DISP: u8 = 0x18;
+
+    const HOST_EBOOT: &str = r"E:\PS5\PPSA13580-app\eboot.bin";
+
+    let hle = HleRegistry::new();
+    let mut image = vec![0u8; 0x100];
+    let mut off = write_puts_of_stack_slot(&mut image, ENTRY_OFF, ARGV0_DISP, PUTS_SLOT_OFF);
+    off = write_puts_of_stack_slot(&mut image, off, ENVP0_DISP, PUTS_SLOT_OFF);
+    write_start_exit_stub(&mut image, off, EXIT_SLOT_OFF, 0);
+    image[PUTS_SLOT_OFF..PUTS_SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+    image[EXIT_SLOT_OFF..EXIT_SLOT_OFF + 8]
+        .copy_from_slice(&(HLE_TRAMPOLINE_BASE + 8).to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libc".to_string(),
+                function: "puts".to_string(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libc".to_string(),
+                function: "exit".to_string(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+        ],
+        entry: ENTRY_OFF as u64,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+
+    // Exactly what a launch passes (`raeen-gui`'s runner and the Shell's
+    // in-process launcher both call these).
+    let argv0 = raeen_kernel::filesystem::guest_argv0(std::path::Path::new(HOST_EBOOT));
+    let envp = raeen_kernel::filesystem::GUEST_ENVP;
+
+    let kernel = OrbisKernel::new();
+    let outcome = execute_process(&linked, &hle, &kernel, &[argv0.as_str()], envp)
+        .expect("the stub reads its process stack and exits cleanly");
+    assert_eq!(outcome, RunOutcome::Exited(0));
+
+    let console = kernel.console.contents();
+    let seen: Vec<&str> = console.lines().collect();
+    assert_eq!(
+        seen,
+        vec!["/app0/eboot.bin", GUEST_ENVP_LD_LIBRARY_PATH],
+        "the guest must read its own argv[0]/envp[0] as guest paths"
+    );
+
+    // The property, asserted on what the guest actually dereferenced: no drive
+    // letter, no backslash, and no fragment of the host layout at all.
+    for line in &seen {
+        assert!(
+            !raeen_kernel::filesystem::looks_like_host_path(line),
+            "guest read a host path off its process stack: {line:?}"
+        );
+    }
+    for host_fragment in ["E:", "\\", "PPSA13580-app", HOST_EBOOT] {
+        assert!(
+            !console.contains(host_fragment),
+            "{host_fragment:?} from the host path {HOST_EBOOT:?} reached guest memory: {console:?}"
+        );
+    }
+}
+
+/// The one `envp` entry a launch passes, spelled out so the test above fails
+/// loudly (rather than tautologically passing) if `GUEST_ENVP` changes.
+const GUEST_ENVP_LD_LIBRARY_PATH: &str = "LD_LIBRARY_PATH=/app0/sce_module";
+
 /// Writes `mov edi, code` (`BF <imm32>`) followed by `call qword ptr
 /// [rip+disp32]` (`FF 15 <disp32>`) into `buf` at `entry_off`, targeting the
 /// 8-byte trampoline slot at `slot_off`: sets up `exit(code)`'s SysV first

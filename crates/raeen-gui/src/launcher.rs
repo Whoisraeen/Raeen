@@ -260,16 +260,6 @@ impl GameLauncher for StubLauncher {
 #[cfg_attr(not(test), allow(dead_code))]
 const DEFAULT_LOAD_BASE: u64 = raeen_runtime::GUEST_ARENA_BASE;
 
-/// `argv[0]` every launched module sees (M1-A, crt0/process environment):
-/// the PS4/PS5 convention mounts a title's content at `/app0`, so its main
-/// module is `/app0/eboot.bin` regardless of where the file lives on the
-/// host. The host path is deliberately *not* leaked into the guest — a real
-/// filesystem mapping layer (host dir ↔ `/app0`) comes with save-data/file
-/// I/O work, but the argv convention is stable now.
-#[cfg(target_os = "windows")]
-#[cfg_attr(not(test), allow(dead_code))]
-const GUEST_ARGV0: &str = "/app0/eboot.bin";
-
 /// What came of trying to load+link (and, on Windows, run) one module for a
 /// launch.
 #[derive(Debug, Clone)]
@@ -791,12 +781,17 @@ impl FirmwareLauncher {
             // bare 6-register function call. A well-formed run ends via an
             // exit-family call (`Exited`); a `_start` that returns anyway is
             // reported as `Ran` (malformed but tolerated).
+            //
+            // `argv[0]` is the guest spelling of this eboot (`/app0/…`, what
+            // the app mount resolves back to it), never the host path it was
+            // loaded from; `envp` describes the guest's own module search path.
+            let guest_argv0 = raeen_kernel::filesystem::guest_argv0(path);
             match raeen_runtime::execute_process_shared_with_control(
                 std::sync::Arc::clone(&linked),
                 std::sync::Arc::clone(hle),
                 std::sync::Arc::clone(kernel),
-                &[GUEST_ARGV0],
-                &[],
+                &[guest_argv0.as_str()],
+                raeen_kernel::filesystem::GUEST_ENVP,
                 {
                     let process = std::sync::Arc::clone(&process);
                     move |handle| {

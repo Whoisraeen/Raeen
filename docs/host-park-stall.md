@@ -267,8 +267,10 @@ below the log's threshold in these runs:
 
 ## Also worth fixing, unrelated to the park
 
-`argv[0]` is still a raw host path (`crates/raeen-gui/src/main.rs` passes
-`&[path.as_str()]`), which is why the title's own banner prints
-`Arg 0 = E:\PS5\PPSA13580-app\eboot.bin`. Recorded in
-`docs/blasphemous-next-blockers.md`; not touched here, and not a plausible cause of
-this stall (KytyPS5 passes the bare string `"KytyEmu"` and the title runs).
+`argv[0]` was a raw host path (`crates/raeen-gui/src/main.rs` passed
+`&[path.as_str()]`), which is why the title's own banner printed
+`Arg 0 = E:\PS5\PPSA13580-app\eboot.bin`. Fixed separately — both launch paths now
+build `argv[0]` with `raeen_kernel::filesystem::guest_argv0` (`/app0/eboot.bin`) and
+pass `GUEST_ENVP`; see §4 of `docs/blasphemous-next-blockers.md`. It was never a
+plausible cause of this stall (KytyPS5 passes the bare string `"KytyEmu"` and the title
+runs), and the fix is not claimed to change any title's boot outcome.

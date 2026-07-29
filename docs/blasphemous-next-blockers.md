@@ -239,6 +239,61 @@ measured title calls. They stay unimplemented and the NEEDED warning stays hones
 
 ---
 
+## 4. `argv[0]` was the raw host path (side finding — fixed, no boot-outcome claim)
+
+Observed on hardware from the title's own launcher banner:
+
+```
+Arg 0 = E:\PS5\PPSA13580-app\eboot.bin
+```
+
+The isolated runner (`crates/raeen-gui/src/main.rs`) passed `&[path.as_str()]` — the
+**host** path it was invoked with — and an empty `envp`. That is a string no guest API
+can open: the title's content is mounted at `/app0`, so a title that opens or parses
+`argv[0]` looks up a path that does not exist in its own address space. It also leaks the
+host filesystem layout into guest memory for no reason.
+
+The Shell's in-process launcher already passed `/app0/eboot.bin`; only the runner (the
+path every real launch takes) did not — so the two launch paths disagreed about the
+process environment a title is entered with.
+
+### Fix
+
+`raeen_kernel::filesystem::guest_argv0(host_eboot)` builds `argv[0]` as the eboot's
+basename under `GUEST_WORKING_DIRECTORY` (`/app0/eboot.bin`), which is the spelling the
+app mount resolves back to that same file — both launch paths already bind that mount to
+the eboot's own directory before entering the guest (`launcher.rs:696`, `main.rs:1331`),
+so `argv[0]` names a file the guest can actually open. Both now call it, and both pass
+`GUEST_ENVP` (`LD_LIBRARY_PATH=/app0/sce_module`) instead of an empty environment — an
+Orbis process has a real environment, and the PS5 SDK's own rtld reads exactly that
+variable out of it (`reference/ps5-payload-sdk`, `crt/rtld.c:223`).
+
+References: shadPS4 builds `argv[0]` the same way (`src/emulator.cpp:285`,
+`"/app0/" + eboot_name`); KytyPS5 passes a bare `"KytyEmu"`
+(`src/loader/runtimeLinker.cpp:1359`) — guest-visible, but not openable.
+
+`build_process_stack` now also logs a `WARN` for any `argv`/`envp` entry carrying host
+path syntax, so a future call site that regresses this says so instead of silently
+handing the guest a host string.
+
+### Tests
+
+* `raeen-runtime`, `tests/execute.rs`:
+  `process_argv_and_envp_carry_guest_paths_never_the_host_path` — a `_start` stub reads
+  `argv[0]` and `envp[0]` off its own process stack and hands each to the real HLE
+  `puts`, so the assertions are made against the bytes the **guest dereferenced**, from
+  an `argv[0]` built by the production helper out of the exact host path above. No drive
+  letter, no backslash, and no fragment of `E:\PS5\PPSA13580-app\…` reaches guest memory.
+* `raeen-kernel`, `filesystem`: `guest_argv0` maps Windows, UNC and POSIX host paths to
+  the app-mount spelling; `GUEST_ENVP`'s paths are pinned under
+  `GUEST_WORKING_DIRECTORY`; `looks_like_host_path` covers drive letters and
+  backslashes without flagging legitimate guest paths.
+
+**Explicitly not a stage claim.** This is a correctness fix. Nothing measured suggests
+Blasphemous II — or any other title — boots differently because of it; the title read the
+wrong string and carried on. Its value is that a title which *does* act on `argv[0]` no
+longer gets a lie.
+
 ## Not verified
 
 * **This does not claim the title boots.** 27 imports link that did not; whether any of

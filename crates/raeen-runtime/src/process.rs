@@ -4,6 +4,7 @@
 //! [`build_process_stack`].
 
 use raeen_hle::GuestMemory;
+use raeen_kernel::filesystem::looks_like_host_path;
 
 use crate::RuntimeError;
 
@@ -39,6 +40,24 @@ pub(crate) fn build_process_stack(
     envp: &[&str],
     mem: &dyn GuestMemory,
 ) -> Result<u64, RuntimeError> {
+    // `argv`/`envp` are the only strings the host hands the guest verbatim, and
+    // this is the single place they cross the boundary. A host path here is not
+    // cosmetic: it names a file no guest API can open — measured on Blasphemous
+    // II (PPSA13580), whose own launcher banner printed
+    // `Arg 0 = E:\PS5\PPSA13580-app\eboot.bin` back at us. Callers build these
+    // with `raeen_kernel::filesystem::guest_argv0`/`GUEST_ENVP`; if one ever
+    // stops, that gets said out loud rather than silently reaching guest memory.
+    for (label, values) in [("argv", argv), ("envp", envp)] {
+        for (index, value) in values.iter().enumerate() {
+            if looks_like_host_path(value) {
+                tracing::warn!(
+                    "{label}[{index}] leaks a host path into guest memory: {value:?} — \
+                     the guest cannot open it; build it with guest_argv0/GUEST_ENVP"
+                );
+            }
+        }
+    }
+
     // 1. Strings first, highest addresses, in argv-then-envp order — each
     // write moves `cursor` further down, recording where that string ended
     // up so the pointer table below can reference it.
