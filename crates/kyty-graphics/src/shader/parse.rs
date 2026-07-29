@@ -14,7 +14,7 @@
 use super::types::{
     DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType as T,
     ShaderLabel, ShaderOperand, ShaderOperandType as O, ShaderType,
-    shader_instruction_format::Format as F,
+    shader_instruction_format as sif, shader_instruction_format::Format as F,
 };
 
 /// GFX10 `VCMPX` instructions write EXEC only. Older generations also exposed
@@ -84,6 +84,13 @@ pub enum ShaderParseError {
     UnknownMimgFormat { opcode: u32, dmask: u32, pc: u32 },
     /// `shader_parse_mtbuf` (L3244): unsupported dfmt/nfmt combination.
     UnknownMtbufFormat { dfmt: u32, nfmt: u32, pc: u32 },
+    /// Beyond Kyty: a GFX10/RDNA2 MTBUF whose 7-bit unified FORMAT field is
+    /// not in the ISA's format table (doc 70648 table 47), i.e. a reserved
+    /// encoding. Named separately from [`Self::UnknownMtbufFormat`] because
+    /// the number reported is the field that actually exists on this
+    /// generation — reporting a split `dfmt`/`nfmt` for it would name two
+    /// fields the instruction does not have.
+    UnknownMtbufUnifiedFormat { unified: u32, pc: u32 },
 }
 
 impl std::fmt::Display for ShaderParseError {
@@ -131,6 +138,11 @@ impl std::fmt::Display for ShaderParseError {
             Self::UnknownMtbufFormat { dfmt, nfmt, pc } => write!(
                 f,
                 "unknown format: dfmt = {dfmt}, nfmt = {nfmt} at addr 0x{pc:08x}"
+            ),
+            Self::UnknownMtbufUnifiedFormat { unified, pc } => write!(
+                f,
+                "unknown mtbuf unified format: {unified} at addr 0x{pc:08x} \
+                 (reserved in RDNA2 ISA table 47)"
             ),
         }
     }
@@ -2835,14 +2847,16 @@ fn shader_parse_exp(
     // recorded in `export_enable` and the recompiler writes 0 to the disabled
     // channels, so any `en` is accepted here — the earlier `en == 0xf` gate
     // rejected every partial param export and failed the whole vertex shader.
+    //
+    // Beyond Kyty in range: upstream stops at 0x24 (param4) and EXITs on the
+    // rest. Per the AMD RDNA 2 ISA reference (doc 70648) EXP targets
+    // **32..63 are PARAM0..PARAM31**, so the whole range is ordinary vertex
+    // parameter exports with one operand shape. Measured on Blasphemous II:
+    // targets 0x25/0x26 (param5/param6) accounted for six of thirteen
+    // "guest shader analysis failed" refusals in one run.
     if inst.format == F::Unknown && done == 0 && compr == 0 && vm == 0 && en != 0 {
-        match target {
-            0x20 => inst.format = F::Param0Vsrc0Vsrc1Vsrc2Vsrc3,
-            0x21 => inst.format = F::Param1Vsrc0Vsrc1Vsrc2Vsrc3,
-            0x22 => inst.format = F::Param2Vsrc0Vsrc1Vsrc2Vsrc3,
-            0x23 => inst.format = F::Param3Vsrc0Vsrc1Vsrc2Vsrc3,
-            0x24 => inst.format = F::Param4Vsrc0Vsrc1Vsrc2Vsrc3,
-            _ => {}
+        if let Some(format) = sif::exp_param_format(target.wrapping_sub(0x20)) {
+            inst.format = format;
         }
     }
 
@@ -4234,6 +4248,18 @@ fn shader_parse_mimg(
                     inst.format = F::Vdata2Vaddr3StSsDmask9;
                     inst.dst.size = 2;
                 }
+                // Beyond Kyty: three-channel XYW. Per the RDNA 2 ISA (doc
+                // 70648) DMASK names which texel components are RETURNED and
+                // they land in consecutive VGPRs in ascending component order,
+                // so a gapped mask is an ordinary destination-subset — the
+                // 0x5 (XZ) and 0x9 (XW) rows above are the two-channel
+                // precedent. Measured on one Blasphemous II pixel shader,
+                // which previously failed whole with "unknown mimg format for
+                // opcode: 0x20 ... dmask: 0xb".
+                0xb => {
+                    inst.format = F::Vdata3Vaddr3StSsDmaskB;
+                    inst.dst.size = 3;
+                }
                 0xf => {
                     inst.format = F::Vdata4Vaddr3StSsDmaskF;
                     inst.dst.size = 4;
@@ -4278,6 +4304,15 @@ fn shader_parse_mimg(
                 0x3 => {
                     inst.format = F::Vdata2Vaddr3StSsDmask3;
                     inst.dst.size = 2;
+                }
+                // Beyond Kyty: single-channel W at LOD zero. Measured on one
+                // Blasphemous II vertex shader, which only became reachable
+                // once the MTBUF immediate-offset refusal ahead of it was
+                // lifted — the ordinary `image_sample` path has served dmask
+                // 0x8 since the ASTRO.BOT batch, LZ had not.
+                0x8 => {
+                    inst.format = F::Vdata1Vaddr3StSsDmask8;
+                    inst.dst.size = 1;
                 }
                 0x7 => {
                     inst.format = F::Vdata3Vaddr3StSsDmask7;
@@ -4470,15 +4505,13 @@ fn shader_parse_mtbuf(
     pc: u32,
     buffer: &[u32],
     dst: &mut ShaderCode,
-    _next_gen: bool,
+    next_gen: bool,
 ) -> Result<u32, ShaderParseError> {
     const S: &str = "mtbuf";
     let b0 = buffer[0];
     let b1 = dw(buffer, 1, pc)?;
 
     let opcode = (b0 >> 16) & 0x7;
-    let dfmt = (b0 >> 19) & 0xf;
-    let nfmt = (b0 >> 23) & 0x7;
     let glc = (b0 >> 14) & 0x1;
     let idxen = (b0 >> 13) & 0x1;
     let offen = (b0 >> 12) & 0x1;
@@ -4491,12 +4524,52 @@ fn shader_parse_mtbuf(
     let vdata = (b1 >> 8) & 0xff;
     let vaddr = b1 & 0xff;
 
+    // The element format.
+    //
+    // GCN (Kyty's target) splits it into DATA_FORMAT `[22:19]` and NUM_FORMAT
+    // `[25:23]`. **GFX10/RDNA2 replaces both with one 7-bit unified FORMAT at
+    // `[25:19]`** — the same numbering a V# descriptor carries, which is why
+    // `gfx10_unified_to_dfmt_nfmt` (RDNA2 ISA doc 70648 table 47) already
+    // exists in this tree for the MUBUF path. Contiguous `[25:19]` and
+    // "low nibble at [22:19], high 3 bits at [25:23]" are the same number;
+    // the contiguous form is what the ISA states.
+    //
+    // Reading a GFX10 instruction with the legacy split is what produced
+    // Blasphemous II's `unknown format: dfmt = 6, nfmt = 1` (4 pixel shaders)
+    // and `dfmt = 13, nfmt = 4` (1 vertex shader) — five of thirteen refusals
+    // in one measured run. Both decode cleanly as unified: 6 | (1 << 4) = 22 =
+    // `32_FLOAT` and 13 | (4 << 4) = 77 = `32_32_32_32_FLOAT`, which are
+    // exactly the formats their opcodes (`tbuffer_load_format_x` /
+    // `_xyzw`) require. That agreement between two independently encoded
+    // fields — the opcode's channel count and the format's channel count — is
+    // what establishes the reading, in both samples at once.
+    //
+    // Gated on `next_gen`: the legacy split is still correct for GCN, and the
+    // runtime tries next-gen first and falls back to legacy
+    // (`attempt_generations`), so a stream that genuinely spells a legacy pair
+    // still decodes through the second attempt exactly as before.
+    let (dfmt, nfmt) = if next_gen {
+        let unified = (b0 >> 19) & 0x7f;
+        match crate::shader::spirv::gfx10_unified_to_dfmt_nfmt(unified) {
+            Some(pair) => pair,
+            None => {
+                tracing::error!(
+                    "unknown mtbuf unified format: {unified} at addr 0x{pc:08x} \
+                     (reserved in RDNA2 ISA table 47) \
+                     (hash0 = 0x{:08x}, crc32 = 0x{:08x})",
+                    dst.get_hash0(),
+                    dst.get_crc32()
+                );
+                return Err(ShaderParseError::UnknownMtbufUnifiedFormat { unified, pc });
+            }
+        }
+    } else {
+        ((b0 >> 19) & 0xf, (b0 >> 23) & 0x7)
+    };
+
     // Kyty L3233-3238: EXIT_NOT_IMPLEMENTED checks (offen is allowed here).
     if idxen == 0 {
         return Err(feature(S, "idxen == 0", pc));
-    }
-    if offset != 0 {
-        return Err(feature(S, "offset != 0", pc));
     }
     if glc == 1 {
         return Err(feature(S, "glc == 1", pc));
@@ -4508,7 +4581,17 @@ fn shader_parse_mtbuf(
         return Err(feature(S, "tfe == 1", pc));
     }
 
-    if (dfmt != 14 && dfmt != 4) || nfmt != 7 {
+    // GFX10 keeps OP{2:0} at `[18:16]` but moves OP{3} to word1 bit 21, so the
+    // 3-bit mask above cannot tell `tbuffer_load_format_x` from its D16
+    // sibling `tbuffer_load_format_d16_x` (opcodes 8..15). Those transfer half
+    // the bytes per channel: decoding one as its full-width twin would read
+    // the wrong element stride and silently return wrong vertex data. Refuse
+    // by name instead. Every measured Blasphemous II MTBUF has this bit clear.
+    if next_gen && (b1 >> 21) & 0x1 != 0 {
+        return Err(feature(S, "d16 opcode (op{3} set)", pc));
+    }
+
+    if (dfmt != 14 && dfmt != 4 && dfmt != 11) || nfmt != 7 {
         // Kyty L3242-3246: dump-free EXIT on unsupported buffer format.
         tracing::error!(
             "unknown format: dfmt = {dfmt}, nfmt = {nfmt} at addr 0x{pc:08x} \
@@ -4536,6 +4619,32 @@ fn shader_parse_mtbuf(
         size += 1;
     }
 
+    // Fold the 12-bit immediate offset into the constant soffset operand.
+    //
+    // Kyty EXITs on `offset != 0` (L3234). Per the RDNA2 buffer address model
+    // (doc 70648, "Buffer Addressing"), the instruction offset and SOFFSET are
+    // both plain BYTE addends of the same term:
+    //
+    //   addr = base + soffset + inst_offset + (idxen ? index * stride : 0)
+    //                                       + (offen ? voffset : 0)
+    //
+    // and every `tbuffer_*` recompile body already routes `src[2]` into
+    // `%temp_int_2`, the slot `buffer_load_float*` adds before dividing by 4.
+    // This is the same fold `shader_parse_mubuf` already performs, for the same
+    // reason — see the note above its `glc` gate. A REGISTER soffset would need
+    // a runtime add no body models, so that combination stays a named refusal
+    // rather than a silently dropped offset. Measured on Blasphemous II: one
+    // vertex shader per run refused with `not implemented mtbuf feature:
+    // offset != 0` (offset 4, `tbuffer_load_format_xy`).
+    if offset != 0 {
+        match inst.src[2].type_ {
+            O::LiteralConstant | O::IntegerInlineConstant => {
+                inst.src[2].constant.u = inst.src[2].constant.u.wrapping_add(offset);
+            }
+            _ => return Err(feature(S, "offset != 0 with register soffset", pc)),
+        }
+    }
+
     inst.src[1].size = 4;
 
     match opcode {
@@ -4549,7 +4658,28 @@ fn shader_parse_mtbuf(
                 return Err(feature(S, "tbuffer_load_format_x needs dfmt=4 nfmt=7", pc));
             }
         }
-        0x01 => return Err(ni(dst, S, "tbuffer_load_format_xy", opcode, pc, b0)),
+        // Beyond Kyty (`tbuffer_load_format_xy` is KYTY_NI upstream): the
+        // two-channel typed fetch. dfmt 11 = `32_32`, nfmt 7 = float, i.e.
+        // legacy packed 95 — the same guard constant Kyty's own
+        // `tbuffer_store_format_xy` helper already tests. Measured on
+        // Blasphemous II (unified FORMAT 64, opcode 1, immediate offset 4).
+        0x01 => {
+            inst.type_ = T::TBufferLoadFormatXy;
+            inst.format = if offen == 1 {
+                F::Vdata2Vaddr2SvSoffsOffenIdxenFloat2
+            } else {
+                F::Vdata2VaddrSvSoffsIdxenFloat2
+            };
+            inst.src[0].size += offen as i32;
+            inst.dst.size = 2;
+            if !(dfmt == 11 && nfmt == 7) {
+                return Err(feature(
+                    S,
+                    "tbuffer_load_format_xy needs dfmt=11 nfmt=7",
+                    pc,
+                ));
+            }
+        }
         0x02 => return Err(ni(dst, S, "tbuffer_load_format_xyz", opcode, pc, b0)),
         0x03 => {
             inst.type_ = T::TBufferLoadFormatXyzw;

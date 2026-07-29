@@ -702,6 +702,101 @@ pub(crate) const BUFFER_LOAD_FLOAT1: &str = r#"
                OpFunctionEnd
 "#;
 
+/// Beyond Kyty (upstream has `buffer_store_float2` but no load twin, because
+/// `buffer_load_format_xy` / `tbuffer_load_format_xy` are `KYTY_NI`): two
+/// consecutive dword loads. Same address model and signature as
+/// [`BUFFER_STORE_FLOAT2`], so it reuses
+/// `%function_buffer_load_store_float2`.
+pub(crate) const BUFFER_LOAD_FLOAT2: &str = r#"
+             ; void buffer_load_float2(out float p1, out float p2, in int index, in int offset, in int stride, in int buffer_index)
+             ; {
+             ; 	int addr = (offset + index * stride)/4;
+             ; 	p1 = buf[buffer_index].data[addr+0];
+             ; 	p2 = buf[buffer_index].data[addr+1];
+             ; }
+%buffer_load_float2 = OpFunction %void None %function_buffer_load_store_float2
+         %buf_l_f2_11 = OpFunctionParameter %_ptr_Function_float
+         %buf_l_f2_12 = OpFunctionParameter %_ptr_Function_float
+         %buf_l_f2_13 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_f2_14 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_f2_15 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_f2_16 = OpFunctionParameter %_ptr_Function_int
+         %buf_l_f2_18 = OpLabel
+         %buf_l_f2_43 = OpLoad %int %buf_l_f2_14
+         %buf_l_f2_44 = OpLoad %int %buf_l_f2_13
+         %buf_l_f2_45 = OpLoad %int %buf_l_f2_15
+         %buf_l_f2_46 = OpIMul %int %buf_l_f2_44 %buf_l_f2_45
+         %buf_l_f2_47 = OpIAdd %int %buf_l_f2_43 %buf_l_f2_46
+         %buf_l_f2_49 = OpSDiv %int %buf_l_f2_47 %int_4
+         %buf_l_f2_57 = OpLoad %int %buf_l_f2_16
+         %buf_l_f2_62 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_f2_57 %int_0 %buf_l_f2_49
+         %buf_l_f2_63 = OpLoad %float %buf_l_f2_62
+               OpStore %buf_l_f2_11 %buf_l_f2_63
+         %buf_l_f2_64 = OpIAdd %int %buf_l_f2_49 %int_1
+         %buf_l_f2_65 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_f2_57 %int_0 %buf_l_f2_64
+         %buf_l_f2_66 = OpLoad %float %buf_l_f2_65
+               OpStore %buf_l_f2_12 %buf_l_f2_66
+               OpReturn
+               OpFunctionEnd
+"#;
+
+/// Beyond Kyty: the load twin of [`TBUFFER_STORE_FORMAT_XY`], for
+/// `tbuffer_load_format_xy` (`KYTY_NI` upstream).
+///
+/// Same guard as the store — legacy packed **92** (dfmt 11, nfmt 4,
+/// `32_32_UINT`) or **95** (nfmt 7, `32_32_FLOAT`). At 32 bits per channel the
+/// RDNA 2 ISA (doc 70648) defines no numeric conversion for either nfmt, so one
+/// body serves both, exactly as the x1 (36/39) and xyzw (116/119) helpers
+/// already do. Signature matches `%function_tbuffer_load_store_format_xy`.
+pub(crate) const TBUFFER_LOAD_FORMAT_XY: &str = r#"
+             ; void tbuffer_load_format_xy(out float p1, out float p2, in int index, in int offset, in int stride, in int buffer_index, in int dfmt_nfmt)
+             ; {
+             ; 	if (dfmt_nfmt == 92 || dfmt_nfmt == 95) // dfmt = 11, nfmt = 4 or 7
+             ; 	{
+             ; 		buffer_load_float2(p1, p2, index, offset, stride, buffer_index);
+             ; 	}
+             ; }
+%tbuffer_load_format_xy = OpFunction %void None %function_tbuffer_load_store_format_xy
+        %tbuf_l_f_xy_60 = OpFunctionParameter %_ptr_Function_float
+        %tbuf_l_f_xy_61 = OpFunctionParameter %_ptr_Function_float
+        %tbuf_l_f_xy_62 = OpFunctionParameter %_ptr_Function_int
+        %tbuf_l_f_xy_63 = OpFunctionParameter %_ptr_Function_int
+        %tbuf_l_f_xy_64 = OpFunctionParameter %_ptr_Function_int
+        %tbuf_l_f_xy_65 = OpFunctionParameter %_ptr_Function_int
+        %tbuf_l_f_xy_66 = OpFunctionParameter %_ptr_Function_int
+        %tbuf_l_f_xy_68 = OpLabel
+       %tbuf_l_f_xy_170 = OpVariable %_ptr_Function_float Function
+       %tbuf_l_f_xy_172 = OpVariable %_ptr_Function_float Function
+       %tbuf_l_f_xy_174 = OpVariable %_ptr_Function_int Function
+       %tbuf_l_f_xy_176 = OpVariable %_ptr_Function_int Function
+       %tbuf_l_f_xy_178 = OpVariable %_ptr_Function_int Function
+       %tbuf_l_f_xy_180 = OpVariable %_ptr_Function_int Function
+       %tbuf_l_f_xy_161 = OpLoad %int %tbuf_l_f_xy_66
+       %tbuf_l_f_xy_163 = OpIEqual %bool %tbuf_l_f_xy_161 %int_92
+       %tbuf_l_f_xy_166 = OpIEqual %bool %tbuf_l_f_xy_161 %int_95
+       %tbuf_l_f_xy_167 = OpLogicalOr %bool %tbuf_l_f_xy_163 %tbuf_l_f_xy_166
+               OpSelectionMerge %tbuf_l_f_xy_169 None
+               OpBranchConditional %tbuf_l_f_xy_167 %tbuf_l_f_xy_168 %tbuf_l_f_xy_169
+       %tbuf_l_f_xy_168 = OpLabel
+       %tbuf_l_f_xy_175 = OpLoad %int %tbuf_l_f_xy_62
+               OpStore %tbuf_l_f_xy_174 %tbuf_l_f_xy_175
+       %tbuf_l_f_xy_177 = OpLoad %int %tbuf_l_f_xy_63
+               OpStore %tbuf_l_f_xy_176 %tbuf_l_f_xy_177
+       %tbuf_l_f_xy_179 = OpLoad %int %tbuf_l_f_xy_64
+               OpStore %tbuf_l_f_xy_178 %tbuf_l_f_xy_179
+       %tbuf_l_f_xy_181 = OpLoad %int %tbuf_l_f_xy_65
+               OpStore %tbuf_l_f_xy_180 %tbuf_l_f_xy_181
+       %tbuf_l_f_xy_182 = OpFunctionCall %void %buffer_load_float2 %tbuf_l_f_xy_170 %tbuf_l_f_xy_172 %tbuf_l_f_xy_174 %tbuf_l_f_xy_176 %tbuf_l_f_xy_178 %tbuf_l_f_xy_180
+       %tbuf_l_f_xy_183 = OpLoad %float %tbuf_l_f_xy_170
+               OpStore %tbuf_l_f_xy_60 %tbuf_l_f_xy_183
+       %tbuf_l_f_xy_184 = OpLoad %float %tbuf_l_f_xy_172
+               OpStore %tbuf_l_f_xy_61 %tbuf_l_f_xy_184
+               OpBranch %tbuf_l_f_xy_169
+       %tbuf_l_f_xy_169 = OpLabel
+               OpReturn
+               OpFunctionEnd
+"#;
+
 /// Beyond Kyty (`buffer_load_ubyte` is `KYTY_NI` upstream): single byte
 /// load, zero-extended. The address model is the same BYTE address the
 /// float1 helper computes (`offset + index * stride`) — it is NOT
@@ -3288,23 +3383,18 @@ pub(crate) fn operand_load_uint(
 }
 
 /// Kyty: ShaderSpirv.cpp `operand_load_float` (L1791).
-/// Highest exp param index the shader body writes, from the Param0..4 format
+/// Highest exp param index the shader body writes, from the Param0..31 format
 /// of its Exp instructions. The register-derived `export_count` can under-read
 /// the body (measured: a menu VS writes `%param1` while `spi_vs_out_config`
 /// says 1 export) — the declarations must cover the body's ground truth or
 /// the assembler dies with "id %paramN is used but never defined".
 fn max_exp_param(code: &ShaderCode) -> i32 {
-    use super::shader_instruction_format::Format as F;
     code.get_instructions()
         .iter()
         .filter(|inst| inst.type_ == ShaderInstructionType::Exp)
-        .map(|inst| match inst.format {
-            F::Param0Vsrc0Vsrc1Vsrc2Vsrc3 => 0,
-            F::Param1Vsrc0Vsrc1Vsrc2Vsrc3 => 1,
-            F::Param2Vsrc0Vsrc1Vsrc2Vsrc3 => 2,
-            F::Param3Vsrc0Vsrc1Vsrc2Vsrc3 => 3,
-            F::Param4Vsrc0Vsrc1Vsrc2Vsrc3 => 4,
-            _ => -1,
+        .map(|inst| {
+            super::shader_instruction_format::exp_param_index(inst.format)
+                .map_or(-1, |n| i32::try_from(n).unwrap_or(-1))
         })
         .max()
         .unwrap_or(-1)
@@ -5615,6 +5705,15 @@ impl<'a> Spirv<'a> {
             self.source += BUFFER_LOAD_FLOAT4;
             self.source += TBUFFER_LOAD_FORMAT_X;
             self.source += TBUFFER_LOAD_FORMAT_XYZW;
+        }
+
+        // Beyond Kyty: the two-channel typed fetch. Emitted on its own opcode
+        // so the pair is absent from every shader that does not use it (an
+        // unreferenced function is legal, but this keeps the module minimal and
+        // matches how the ubyte / unorm8 helpers are gated).
+        if has_buffers && self.code.has_any_of(&[T::TBufferLoadFormatXy]) {
+            self.source += BUFFER_LOAD_FLOAT2;
+            self.source += TBUFFER_LOAD_FORMAT_XY;
         }
 
         // The four-channel MUBUF fetch picks its unpack at translate time from
