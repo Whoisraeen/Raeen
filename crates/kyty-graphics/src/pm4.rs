@@ -68,7 +68,24 @@ pub const IT_INDEX_TYPE: ItOp = ItOp(0x2A);
 pub const IT_DRAW_INDIRECT_MULTI: ItOp = ItOp(0x2C);
 pub const IT_DRAW_INDEX_AUTO: ItOp = ItOp(0x2D);
 pub const IT_NUM_INSTANCES: ItOp = ItOp(0x2F);
+/// AMD `PKT3_DRAW_INDEX_MULTI_AUTO` (Mesa `src/amd/common/sid.h` L70; shadPS4
+/// `pm4_opcodes.h` L33). **Not in Kyty's Pm4.h** — added here so the command
+/// processor can NAME it rather than dropping it in the anonymous
+/// unknown-opcode arm: `raeen-gpu`'s `agc::decode_submission` counts this
+/// opcode as a draw, so a packet the walker silently skipped inflated the
+/// submission's draw count with no matching `draws`, `draw_skips`, or
+/// `refused_draws`. See [`crate::run::CommandProcessor::dispatch`]'s
+/// unimplemented-draw arm.
+pub const IT_DRAW_INDEX_MULTI_AUTO: ItOp = ItOp(0x30);
 pub const IT_INDIRECT_BUFFER_CNST: ItOp = ItOp(0x33);
+/// KytyPS5 `pm4.h` L44 (`IT_DISPATCH_DRAW_PREAMBLE`). **Not in Kyty's Pm4.h.**
+///
+/// The AGC multi-instanced indexed draw, and the one opcode in this file that
+/// Raeen's own HLE *emits*: `sceAgcDcbDrawIndexMultiInstanced`
+/// (`raeen-hle::hle_dcb_draw_index_multi_instanced`) writes the 9-dword
+/// `0xC0073A00` packet KytyPS5's `CpOpDrawIndex` decodes. See
+/// [`crate::run::CommandProcessor::cp_op_draw_index_multi_instanced`].
+pub const IT_DISPATCH_DRAW_PREAMBLE: ItOp = ItOp(0x3A);
 pub const IT_DRAW_INDEX_OFFSET_2: ItOp = ItOp(0x35);
 pub const IT_WRITE_DATA: ItOp = ItOp(0x37);
 pub const IT_DRAW_INDEX_INDIRECT_MULTI: ItOp = ItOp(0x38);
@@ -98,6 +115,12 @@ pub const IT_INCREMENT_CE_COUNTER: ItOp = ItOp(0x84);
 pub const IT_INCREMENT_DE_COUNTER: ItOp = ItOp(0x85);
 pub const IT_WAIT_ON_CE_COUNTER: ItOp = ItOp(0x86);
 pub const IT_WAIT_ON_DE_COUNTER_DIFF: ItOp = ItOp(0x88);
+/// KytyPS5 `pm4.h` L71 (`IT_DISPATCH_DRAW`). Named but never dispatched there —
+/// KytyPS5's `MakeOpcodeDispatchTable` (pm4Dispatch.cpp L212) wires only the
+/// *preamble* opcode `0x3A`. Present here for the same reason as
+/// [`IT_DRAW_INDEX_MULTI_AUTO`]: `agc::decode_submission` counts it as a draw,
+/// so the walker must account for it by name.
+pub const IT_DISPATCH_DRAW: ItOp = ItOp(0x8D);
 
 // ---- R_* custom-op ids (Pm4.h L75-99) — the AGC/Gen5 dialect ------------
 

@@ -1158,6 +1158,11 @@ impl CommandProcessor {
             pm4::IT_DRAW_INDEX_OFFSET_2 => {
                 self.cp_op_draw_index_offset_2(cmd_id, body, offset, sink)
             }
+            // The AGC multi-instanced indexed draw Raeen's own HLE emits. See
+            // cp_op_draw_index_multi_instanced.
+            pm4::IT_DISPATCH_DRAW_PREAMBLE => {
+                self.cp_op_draw_index_multi_instanced(cmd_id, body, offset, sink)
+            }
             pm4::IT_NUM_INSTANCES => {
                 // Kyty: SetNumInstances (L1036) — 0 means 1.
                 let n = Self::body_at(body, 0, offset)?;
@@ -1252,6 +1257,56 @@ impl CommandProcessor {
                 }
                 Ok(pm4::body_dw(cmd_id))
             }
+            // Draw opcodes `raeen-gpu`'s `agc::decode_submission` COUNTS
+            // (`draw_packets`) that this processor cannot translate. Falling to
+            // the default arm below made them the worst kind of drop: the
+            // submission reported a draw, the walk reported neither a draw nor a
+            // skip nor a refusal, and the only trace was one rate-limited
+            // "unknown PM4 opcode" line — the same shape as the Dead Cells
+            // `draws=0` blocker. A NAMED, COUNTED refusal instead, so the drop
+            // lands in `refused_draws` / `last_refusal` like every other
+            // untranslatable draw.
+            //
+            // Refused rather than implemented deliberately: no reference walks
+            // either body. KytyPS5's opcode table (pm4Dispatch.cpp L212) wires
+            // only `IT_DISPATCH_DRAW_PREAMBLE` (0x3A), not `IT_DISPATCH_DRAW`
+            // (0x8D); shadPS4 names `DrawIndexMultiAuto` (0x30) in
+            // `pm4_opcodes.h` but its liverpool `switch` has no case for it; and
+            // Mesa's `ac_gather_context_rolls` only classifies 0x30 as
+            // context-busy without decoding a body. Guessing a body layout would
+            // issue a WRONG draw that looks like a working one — strictly worse
+            // than an honest counted refusal. Replace this arm with a real
+            // handler the moment a title in evidence emits either opcode; the
+            // refusal count and reason are what will show that it does.
+            pm4::IT_DRAW_INDEX_MULTI_AUTO | pm4::IT_DISPATCH_DRAW => {
+                let name = if op == pm4::IT_DRAW_INDEX_MULTI_AUTO {
+                    "IT_DRAW_INDEX_MULTI_AUTO"
+                } else {
+                    "IT_DISPATCH_DRAW"
+                };
+                // Once per distinct opcode per processor, like the unknown-op
+                // arm — the refusal warn in `run_resumable` is rate-limited
+                // across ALL refusals, so without this a processor that already
+                // refused something would never log this opcode's name.
+                if self.first(SkipKey::Op(op.0)) {
+                    warn!(
+                        cmd_id = format_args!("{cmd_id:#010x}"),
+                        op = format_args!("{:#04x}", op.0),
+                        name,
+                        offset,
+                        "draw opcode counted by the AGC decoder has no command-processor \
+                         handler — refused and counted (refused_draws), not silently skipped"
+                    );
+                }
+                Err(CpError::Draw {
+                    offset,
+                    source: DrawError(format!(
+                        "{name} ({:#04x}) is counted as a draw by the AGC decoder but has no \
+                         command-processor handler — packet skipped by its encoded length",
+                        op.0
+                    )),
+                })
+            }
             _ => {
                 // Resilience policy: skip by encoded length, warn once.
                 if self.first(SkipKey::Op(op.0)) {
@@ -1310,7 +1365,15 @@ impl CommandProcessor {
             | pm4::IT_DRAW_INDIRECT
             | pm4::IT_DRAW_INDIRECT_MULTI
             | pm4::IT_DRAW_INDEX_INDIRECT
-            | pm4::IT_DRAW_INDEX_INDIRECT_MULTI => PacketClass::Draw,
+            | pm4::IT_DRAW_INDEX_INDIRECT_MULTI
+            // The AGC multi-instanced indexed draw — translated, not refused.
+            | pm4::IT_DISPATCH_DRAW_PREAMBLE
+            // Refused, not translated (see the unimplemented-draw arm in
+            // `dispatch`) — but still draw PACKETS, and `decode_submission`
+            // counts both in `draw_packets`. Classing them Inert would make the
+            // census disagree with the submission count all over again.
+            | pm4::IT_DRAW_INDEX_MULTI_AUTO
+            | pm4::IT_DISPATCH_DRAW => PacketClass::Draw,
             pm4::IT_DISPATCH_DIRECT | pm4::IT_DISPATCH_INDIRECT => PacketClass::Dispatch,
             pm4::IT_WRITE_DATA | pm4::IT_RELEASE_MEM | pm4::IT_DMA_DATA => PacketClass::Write,
             pm4::IT_WAIT_REG_MEM => PacketClass::Wait,
@@ -2303,6 +2366,101 @@ impl CommandProcessor {
             .map_err(|source| CpError::Draw { offset, source })?;
 
         Ok(pm4::body_dw(cmd_id))
+    }
+
+    /// Body dwords in the only modeled `IT_DISPATCH_DRAW_PREAMBLE` layout —
+    /// KytyPS5's `0xC0073A00`, i.e. a 9-dword total packet.
+    const DISPATCH_DRAW_PREAMBLE_BODY_DW: u32 = 8;
+
+    /// `IT_DISPATCH_DRAW_PREAMBLE` (0x3A) — the AGC multi-instanced indexed
+    /// draw.
+    ///
+    /// KytyPS5 routes this opcode to the *same* handler as `IT_DRAW_INDEX_2`
+    /// (`MakeOpcodeDispatchTable`, pm4Dispatch.cpp L212) and discriminates the
+    /// two layouts on the exact `cmd_id`: `CpOpDrawIndex` (pm4Handlers.cpp
+    /// L2276-2297) decodes `0xC0073A00` as
+    ///
+    /// ```text
+    /// [index_count, addr_lo, addr_hi, max_instance_count,
+    ///  obj_lo, obj_hi, instance_count, flags]
+    /// ```
+    ///
+    /// and returns 8 body dwords.
+    ///
+    /// Unlike every other opcode here this is not a speculative decode of some
+    /// title's stream: Raeen's own `sceAgcDcbDrawIndexMultiInstanced`
+    /// (`raeen-hle::hle_dcb_draw_index_multi_instanced`) emits exactly this
+    /// packet, so the emitter and this handler are the two ends of one in-tree
+    /// contract —
+    /// `multi_instanced_draw_emission_reaches_the_command_processor` pins it
+    /// from the emitter's side. Before this handler existed the opcode fell to
+    /// the anonymous unknown-opcode arm and every such draw vanished with no
+    /// counter and no named reason anywhere.
+    ///
+    /// **Degradation (named, deliberate):** `instance_count` and the
+    /// `object_ids` buffer are not forwarded — [`IndexedDraw`] carries neither
+    /// and no sink implements instanced draws — so instances `2..N` are not
+    /// rendered. The first instance still lands, which is a visual glitch
+    /// rather than a dropped draw.
+    fn cp_op_draw_index_multi_instanced(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        sink: &mut dyn DrawSink,
+    ) -> Result<u32, CpError> {
+        let consumed = pm4::body_dw(cmd_id);
+        // KytyPS5 `EXIT`s on any cmd_id but 0xC0073A00. The resilience policy
+        // REFUSES instead — a short packet is still a draw being dropped, so it
+        // must land in `refused_draws` / `last_refusal` rather than be skipped
+        // anonymously. The guard is also load-bearing for memory safety of the
+        // reads below: `body_at` bounds-checks against the rest of the BUFFER,
+        // not against this packet, so without it a truncated 0x3A would silently
+        // read the following packets' dwords as its own draw fields.
+        if consumed < Self::DISPATCH_DRAW_PREAMBLE_BODY_DW {
+            return Err(CpError::Draw {
+                offset,
+                source: DrawError(format!(
+                    "IT_DISPATCH_DRAW_PREAMBLE with a {consumed}-dword body — the only \
+                     modeled layout is KytyPS5's {}-dword 0xC0073A00 form, so the draw \
+                     fields cannot be located",
+                    Self::DISPATCH_DRAW_PREAMBLE_BODY_DW
+                )),
+            });
+        }
+
+        let index_count = Self::body_at(body, 0, offset)?;
+        let lo = Self::body_at(body, 1, offset)?;
+        let hi = Self::body_at(body, 2, offset)?;
+        let index_addr = u64::from(lo) | (u64::from(hi) << 32);
+        let instance_count = Self::body_at(body, 6, offset)?;
+        let flags = Self::body_at(body, 7, offset)?;
+
+        if instance_count > 1 && self.first(SkipKey::Note("multi_instanced_draw_degradation")) {
+            warn!(
+                instance_count,
+                index_count,
+                offset,
+                "multi-instanced indexed draw degraded to ONE instance — IndexedDraw carries \
+                 no instance count and no sink implements instanced draws, so instances 2..N \
+                 and the object-id buffer are dropped (the draw itself still lands)"
+            );
+        }
+
+        let draw = IndexedDraw {
+            index_type_and_size: self.index_type_and_size,
+            index_count,
+            index_addr,
+            flags,
+            // KytyPS5 passes the same `type` argument here as for the raw
+            // IT_DRAW_INDEX_2 form: `cp.DrawIndex(.., 0, 1, ..)`
+            // (pm4Handlers.cpp L2296 vs L2311).
+            index_type: 1,
+        };
+        sink.draw_index(&self.ctx, &self.ucfg, &self.sh_ctx, &draw)
+            .map_err(|source| CpError::Draw { offset, source })?;
+
+        Ok(consumed)
     }
 
     /// Bytes per index for a latched `IT_INDEX_TYPE` dword.
@@ -4148,6 +4306,227 @@ mod tests {
             cp.last_refusal(),
             Some("indexed draw with no index buffer: addr=0x0 count=6"),
             "reset must not erase the reason"
+        );
+    }
+
+    /// A sink that only accepts indexed draws, so a silent degrade to
+    /// `draw_index_auto` (which would lose the index buffer) cannot pass as a
+    /// success.
+    #[derive(Default)]
+    struct IndexOnlySink {
+        indexed: Vec<IndexedDraw>,
+    }
+
+    impl DrawSink for IndexOnlySink {
+        fn draw_index_auto(
+            &mut self,
+            _ctx: &Context,
+            _ucfg: &UserConfig,
+            _sh: &Shader,
+            _index_count: u32,
+            _flags: u32,
+        ) -> Result<(), DrawError> {
+            Err(DrawError("expected an indexed draw".to_owned()))
+        }
+
+        fn draw_index(
+            &mut self,
+            _ctx: &Context,
+            _ucfg: &UserConfig,
+            _sh: &Shader,
+            draw: &IndexedDraw,
+        ) -> Result<(), DrawError> {
+            self.indexed.push(*draw);
+            Ok(())
+        }
+    }
+
+    /// `IT_DISPATCH_DRAW_PREAMBLE` (0x3A) decodes KytyPS5's `0xC0073A00` layout.
+    ///
+    /// This opcode is the one Raeen's own HLE emits
+    /// (`sceAgcDcbDrawIndexMultiInstanced`), and it had no arm at all: the
+    /// packet fell to the anonymous unknown-opcode skip, so every such draw
+    /// disappeared with no counter and no named reason — the same drift class as
+    /// 0x30/0x8d, but pointing the other way (`decode_submission` did not count
+    /// it either, so the submission UNDER-reported its draws).
+    ///
+    /// Field order is pinned against KytyPS5 `CpOpDrawIndex`
+    /// (pm4Handlers.cpp L2281-2297): a transposition here is exactly the
+    /// zero-index-base failure that produced Dead Cells' `draws=0`.
+    #[test]
+    fn dispatch_draw_preamble_decodes_the_kytyps5_multi_instanced_layout() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexOnlySink::default();
+        let index_addr = 0x00AB_CDEF_1234_5678u64;
+        let object_ids = 0x0000_7777_8888_9999u64;
+
+        let dcb = vec![
+            header(2, pm4::IT_INDEX_TYPE, pm4::R_ZERO),
+            1, // 32-bit indices
+            header(9, pm4::IT_DISPATCH_DRAW_PREAMBLE, pm4::R_ZERO),
+            6,                         // index_count
+            index_addr as u32,         // addr_lo
+            (index_addr >> 32) as u32, // addr_hi
+            4,                         // max_instance_count
+            object_ids as u32,         // obj_lo
+            (object_ids >> 32) as u32, // obj_hi
+            4,                         // instance_count
+            0xA0,                      // flags (KytyPS5 asserts flags & ~0xa0 == 0)
+            header(2, pm4::IT_NUM_INSTANCES, pm4::R_ZERO),
+            5,
+        ];
+        cp.run(&dcb, &mut sink)
+            .expect("the emitted layout must walk cleanly");
+
+        assert_eq!(cp.refused_draws(), 0, "the draw must not be refused");
+        assert_eq!(sink.indexed.len(), 1, "exactly one indexed draw must land");
+        let draw = sink.indexed[0];
+        assert_eq!(draw.index_count, 6, "body[0] is the index count");
+        assert_eq!(
+            draw.index_addr, index_addr,
+            "body[1..2] is the index buffer — a zero here is the Dead Cells failure"
+        );
+        assert_eq!(draw.flags, 0xA0, "body[7] is the flags dword");
+        assert_eq!(draw.index_type_and_size, 1, "the latched IT_INDEX_TYPE");
+        assert_eq!(
+            cp.num_instances(),
+            5,
+            "the packet after the draw must still execute"
+        );
+    }
+
+    /// The packet's own declared length is what bounds the field reads.
+    ///
+    /// `body_at` bounds-checks against the rest of the BUFFER, not against the
+    /// current packet, so a short `IT_DISPATCH_DRAW_PREAMBLE` would happily read
+    /// the FOLLOWING packets' dwords as its index buffer and instance count.
+    /// That must be a counted refusal instead — and the walk must resume at the
+    /// right boundary.
+    #[test]
+    fn a_short_dispatch_draw_preamble_is_refused_not_read_past_its_own_length() {
+        let mut cp = CommandProcessor::new();
+        // Records auto draws rather than refusing them, so the packet AFTER the
+        // short one is observable as a draw and not just as a second refusal.
+        let mut sink = RecordingSink::default();
+        // A 4-dword 0x3A (body 3) followed by a real auto draw. If the handler
+        // read its 8 modeled body dwords it would swallow the auto draw's header
+        // and count, and the walk would desync.
+        let dcb = vec![
+            header(4, pm4::IT_DISPATCH_DRAW_PREAMBLE, pm4::R_ZERO),
+            6,
+            0x1234,
+            0,
+            header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO),
+            9, // index_count
+            0, // flags
+        ];
+        cp.run(&dcb, &mut sink)
+            .expect("a short packet is a refusal, not a stream fault");
+
+        assert_eq!(
+            cp.refused_draws(),
+            1,
+            "the malformed draw must be COUNTED — and it is the ONLY refusal, so the \
+             handler did not also mangle the packet behind it"
+        );
+        let reason = cp.last_refusal().expect("and NAMED");
+        assert!(
+            reason.contains("IT_DISPATCH_DRAW_PREAMBLE") && reason.contains("3-dword"),
+            "the reason must name the opcode and the length it got, got {reason:?}"
+        );
+        // The auto draw after it must be parsed as a packet, which only holds if
+        // the refusal advanced by the short packet's own encoded length.
+        assert_eq!(
+            sink.draws.iter().map(|d| d.0).collect::<Vec<_>>(),
+            vec![9],
+            "the walk must resume at the next packet boundary and reach the auto draw"
+        );
+    }
+
+    /// A draw opcode the AGC decoder counts but this processor cannot translate
+    /// must be REFUSED (named + counted), never dropped in the anonymous
+    /// unknown-opcode arm.
+    ///
+    /// `IT_DRAW_INDEX_MULTI_AUTO` (0x30) and `IT_DISPATCH_DRAW` (0x8D) are both
+    /// counted in `agc::decode_submission`'s `draw_packets` and neither had a
+    /// constant here, so both fell through to the default arm: the packet
+    /// inflated the submission's draw count while the walk incremented NEITHER
+    /// `sink.draws`, NOR `sink.draw_skips`, NOR `refused_draws` — one
+    /// rate-limited "unknown PM4 opcode" line was the entire trace. That is the
+    /// Dead Cells `draws=0` failure shape, and this is the assertion that keeps
+    /// the drop accountable.
+    #[test]
+    fn unimplemented_draw_opcodes_are_refused_by_name_not_anonymously_skipped() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // [MULTI_AUTO][DISPATCH_DRAW][NUM_INSTANCES = 5]. The trailing register
+        // write proves the walk continued past both refusals.
+        let dcb = vec![
+            header(5, pm4::IT_DRAW_INDEX_MULTI_AUTO, pm4::R_ZERO),
+            0x100, // MAX_SIZE
+            0,     // INDEX_OFFSET
+            3,     // INDEX_COUNT
+            0,     // DRAW_INITIATOR
+            header(3, pm4::IT_DISPATCH_DRAW, pm4::R_ZERO),
+            0,
+            0,
+            header(2, pm4::IT_NUM_INSTANCES, pm4::R_ZERO),
+            5,
+        ];
+        cp.run(&dcb, &mut sink)
+            .expect("an unimplemented draw opcode is a refusal, not a stream fault");
+
+        assert_eq!(
+            cp.refused_draws(),
+            2,
+            "both unimplemented draw opcodes must be COUNTED, not silently skipped"
+        );
+        let reason = cp.last_refusal().expect("a counted refusal must be named");
+        assert!(
+            reason.contains("IT_DISPATCH_DRAW") && reason.contains("0x8d"),
+            "the refusal must name the opcode that was dropped, got {reason:?}"
+        );
+        assert!(
+            sink.draws.is_empty(),
+            "a refused draw must not reach the sink"
+        );
+        assert_eq!(
+            cp.num_instances(),
+            5,
+            "the packet after a refusal must still execute (completion invariant)"
+        );
+    }
+
+    /// The refusal is skipped by the packet's own encoded length — a wrong
+    /// advance would desync the walk and turn a missing handler into a stream
+    /// fault (or, worse, misparse the following packet's body as headers).
+    #[test]
+    fn a_refused_unimplemented_draw_advances_by_its_encoded_length() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // A deliberately long MULTI_AUTO body whose dwords would each decode as
+        // a valid-looking type-3 header if the walk advanced by anything less.
+        let mut dcb = vec![header(8, pm4::IT_DRAW_INDEX_MULTI_AUTO, pm4::R_ZERO)];
+        dcb.extend(std::iter::repeat_n(
+            header(2, pm4::IT_NUM_INSTANCES, pm4::R_ZERO),
+            7,
+        ));
+        dcb.push(header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO));
+        dcb.push(9); // index_count
+        dcb.push(0); // flags
+
+        cp.run(&dcb, &mut sink).expect("the walk must stay in sync");
+        assert_eq!(cp.refused_draws(), 1);
+        assert_eq!(
+            sink.draws.first().map(|d| d.0),
+            Some(9),
+            "the packet AFTER the refused one must be parsed as a packet, which \
+             only holds if the refusal advanced by its full encoded length"
+        );
+        assert_eq!(
+            cp.num_instances(),
+            1,
+            "the swallowed body dwords must NOT have executed as NUM_INSTANCES packets"
         );
     }
 
