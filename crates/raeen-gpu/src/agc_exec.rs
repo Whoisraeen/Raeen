@@ -2405,6 +2405,12 @@ impl AgcGpuSession {
                 // with no other blocker. The `Spirv::WriteGlobalVariables`
                 // error line names the exact pair.
                 vertex_input_pair_skips = kyty_graphics::shader::vertex_input_pair_skips(),
+                // MUBUF `buffer_load_format_*` sites whose BOUND V# carries a
+                // unified format the typed helper does not serve (only 119
+                // today). Refusing is deliberate: the helper's alternative is
+                // to leave the destination VGPRs untouched.
+                unsupported_buffer_format_skips =
+                    kyty_graphics::shader::unsupported_buffer_format_skips(),
                 vs_addr = format_args!("{:#x}", shader_state.vs.vs_regs.data_addr),
                 es_addr = format_args!("{:#x}", shader_state.vs.es_regs.data_addr),
                 gs_addr = format_args!("{:#x}", shader_state.vs.gs_regs.data_addr),

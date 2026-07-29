@@ -504,6 +504,15 @@ fn fold_sop2(
 ) -> Option<Folded32> {
     use ScalarValue as V;
 
+    /// `s_lshlN_add_u32`: the low 32 bits of `(left << n) + right`, plus the
+    /// 33-bit carry-out that lands in SCC. SharpEmu
+    /// `Gen5ShaderScalarEvaluator.cs` L1525-1552 uses this one body for all
+    /// four shifts.
+    fn lshl_add(a: u32, b: u32, n: u32) -> (u32, bool) {
+        let wide = (u64::from(a) << n) + u64::from(b);
+        (wide as u32, wide > u64::from(u32::MAX))
+    }
+
     // Carry/borrow/overflow flags need both operands, so they are derived from
     // the same `zip` guard as the value.
     let both = |f: fn(u32, u32) -> (u32, bool)| -> Folded32 {
@@ -572,10 +581,13 @@ fn fold_sop2(
         T::SMulHiU32 => {
             Folded32::plain(left.zip(right, |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32))
         }
-        T::SLshl4AddU32 => both(|a, b| {
-            let wide = (u64::from(a) << 4) + u64::from(b);
-            (wide as u32, wide > u64::from(u32::MAX))
-        }),
+        // SharpEmu `Gen5ShaderScalarEvaluator.cs` L1525-1552 folds all four
+        // shifts through one body: `wide = (left << N) + right`, result is the
+        // low 32 bits and SCC the 33-bit carry-out.
+        T::SLshl1AddU32 => both(|a, b| lshl_add(a, b, 1)),
+        T::SLshl2AddU32 => both(|a, b| lshl_add(a, b, 2)),
+        T::SLshl3AddU32 => both(|a, b| lshl_add(a, b, 3)),
+        T::SLshl4AddU32 => both(|a, b| lshl_add(a, b, 4)),
         T::SPackLlB32B16 => Folded32::plain(left.zip(right, |a, b| (a & 0xffff) | (b << 16))),
         _ => return None,
     })
@@ -1249,6 +1261,24 @@ mod tests {
     #[test]
     fn s_lshl4_add_u32_folds() {
         fold_case(T::SLshl4AddU32, 3, 1, 0x31);
+    }
+
+    /// The whole `s_lshlN_add_u32` family folds, so a byte offset computed with
+    /// any of the four shifts resolves for the V#/pointer capture passes rather
+    /// than leaving them on a named refusal. Semantics from SharpEmu
+    /// `Gen5ShaderScalarEvaluator.cs` L1525-1552.
+    #[test]
+    fn every_s_lshl_n_add_u32_shift_folds() {
+        // (left << N) + right, for left = 3, right = 1.
+        fold_case(T::SLshl1AddU32, 3, 1, 7);
+        fold_case(T::SLshl2AddU32, 3, 1, 0xd);
+        fold_case(T::SLshl3AddU32, 3, 1, 0x19);
+        fold_case(T::SLshl4AddU32, 3, 1, 0x31);
+        // The measured ASTRO.BOT shape: a dword index scaled to a byte offset
+        // (index 5, element size 8) plus a base.
+        fold_case(T::SLshl3AddU32, 5, 0x100, 0x128);
+        // The result is the LOW 32 bits; the overflow goes to SCC, not the dst.
+        fold_case(T::SLshl3AddU32, 0x2000_0000, 0, 0);
     }
 
     #[test]

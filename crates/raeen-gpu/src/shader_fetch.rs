@@ -1039,6 +1039,15 @@ impl ShaderTranslateCache {
                     0,
                     &mut cs_info.bind,
                 );
+                // Same reason, same stage gap: bind a MUBUF V# this analysis
+                // can prove when the usage-table walk bound nothing for it.
+                // VS/PS reach this through the chained entry point above.
+                kyty_graphics::shader::shader_bind_vsharp_storage_buffers(
+                    &code,
+                    &cs.cs_user_sgpr,
+                    0,
+                    &mut cs_info.bind,
+                );
                 kyty_graphics::shader::shader_measure_constant_buffer_accesses(
                     &code,
                     &mut cs_info.bind,

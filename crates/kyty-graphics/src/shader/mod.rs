@@ -34,9 +34,9 @@ pub use crate::hw_regs::{
 pub use analysis::{
     EudView, ShaderAnalysisError, ShaderBinaryInfo, ShaderMap, ShaderMemory, ShaderParsedUsage,
     ShaderUsageInfo, ShaderUsageSlot, get_binary_info, get_usage_slots,
-    shader_calc_binding_indices, shader_capture_runtime_scalar_loads,
-    shader_capture_runtime_scalar_loads_shifted, shader_capture_vsharp_buffer_loads,
-    shader_detect_buffers, shader_detect_embedded_buffer_fetch,
+    shader_bind_vsharp_storage_buffers, shader_calc_binding_indices,
+    shader_capture_runtime_scalar_loads, shader_capture_runtime_scalar_loads_shifted,
+    shader_capture_vsharp_buffer_loads, shader_detect_buffers, shader_detect_embedded_buffer_fetch,
     shader_detect_embedded_constant_loads, shader_get_id_cs, shader_get_id_ps, shader_get_id_vs,
     shader_get_input_info_cs, shader_get_input_info_ps, shader_get_input_info_vs,
     shader_get_input_info_vs_decoded, shader_measure_constant_buffer_accesses,
@@ -66,7 +66,8 @@ pub use spirv::{
     PUSH_CONSTANT_SPILL_THRESHOLD, SampledClass, SampledDim, ShaderRecompileError, Spirv,
     SpirvType, SpirvValue, StorageFormat, sampled_key_ordinal, shader_detect_eud_raw_window,
     shader_detect_flat_global_window, shader_push_constant_spill_binding, spirv_generate_source,
-    spirv_get_embedded_ps, spirv_get_embedded_vs, storage_key_ordinal, vertex_input_pair_skips,
+    spirv_get_embedded_ps, spirv_get_embedded_vs, storage_key_ordinal,
+    unsupported_buffer_format_skips, vertex_input_pair_skips,
 };
 pub use types::{
     DppCtrl, DppMode, ShaderCode, ShaderConstant, ShaderControlFlowBlock, ShaderDebugPrintf,

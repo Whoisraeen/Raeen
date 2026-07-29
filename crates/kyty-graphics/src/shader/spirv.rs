@@ -2311,6 +2311,135 @@ pub fn vertex_input_pair_skips() -> u64 {
     VERTEX_INPUT_PAIR_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide count of MUBUF `buffer_load_format_*` sites refused because the
+/// BOUND descriptor's unified format is one the typed helper does not serve
+/// (only 119 = `32_32_32_32_FLOAT` today). The helper's upstream behavior for
+/// any other format is to leave the destination VGPRs untouched — silent
+/// garbage — so the refusal is deliberate and this counter is how much a real
+/// format unpack would recover.
+pub(crate) static UNSUPPORTED_BUFFER_FORMAT_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total MUBUF format-fetch sites refused for a non-119 descriptor format.
+#[must_use]
+pub fn unsupported_buffer_format_skips() -> u64 {
+    UNSUPPORTED_BUFFER_FORMAT_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The legacy `(DATA_FORMAT, NUM_FORMAT)` pair an RDNA2 **unified** FORMAT field
+/// denotes, for the encodings that have a legacy equivalent. `None` for the
+/// reserved holes and for the image-only encodings above 130, which have no
+/// legacy DATA_FORMAT at all.
+///
+/// Ported from SharpEmu `src/SharpEmu.ShaderCompiler/Gfx10UnifiedFormat.cs`
+/// (GPL-2.0-or-later), itself transcribed from RDNA2 ISA table 47. The table is
+/// intentionally **sparse**: the integer/normalized spellings some assemblers
+/// expose for 10_11_11 / 11_11_10, and 10_10_10_2 USCALED/SSCALED, are reserved
+/// by the hardware, so this is an exact match rather than a derived range —
+/// deriving would make reserved encodings look valid.
+#[must_use]
+pub const fn gfx10_unified_to_dfmt_nfmt(unified: u32) -> Option<(u32, u32)> {
+    Some(match unified {
+        0 => (0, 0),
+        1 => (1, 0),
+        2 => (1, 1),
+        3 => (1, 2),
+        4 => (1, 3),
+        5 => (1, 4),
+        6 => (1, 5),
+        7 => (2, 0),
+        8 => (2, 1),
+        9 => (2, 2),
+        10 => (2, 3),
+        11 => (2, 4),
+        12 => (2, 5),
+        13 => (2, 7),
+        14 => (3, 0),
+        15 => (3, 1),
+        16 => (3, 2),
+        17 => (3, 3),
+        18 => (3, 4),
+        19 => (3, 5),
+        20 => (4, 4),
+        21 => (4, 5),
+        22 => (4, 7),
+        23 => (5, 0),
+        24 => (5, 1),
+        25 => (5, 2),
+        26 => (5, 3),
+        27 => (5, 4),
+        28 => (5, 5),
+        29 => (5, 7),
+        36 => (6, 7),
+        43 => (7, 7),
+        44 => (8, 0),
+        45 => (8, 1),
+        48 => (8, 4),
+        49 => (8, 5),
+        50 => (9, 0),
+        51 => (9, 1),
+        52 => (9, 2),
+        53 => (9, 3),
+        54 => (9, 4),
+        55 => (9, 5),
+        56 => (10, 0),
+        57 => (10, 1),
+        58 => (10, 2),
+        59 => (10, 3),
+        60 => (10, 4),
+        61 => (10, 5),
+        62 => (11, 4),
+        63 => (11, 5),
+        64 => (11, 7),
+        65 => (12, 0),
+        66 => (12, 1),
+        67 => (12, 2),
+        68 => (12, 3),
+        69 => (12, 4),
+        70 => (12, 5),
+        71 => (12, 7),
+        72 => (13, 4),
+        73 => (13, 5),
+        74 => (13, 7),
+        75 => (14, 4),
+        76 => (14, 5),
+        // 32_32_32_32_FLOAT — the one format the four-channel typed helper
+        // serves. Measured on every Avatar: Frontiers of Pandora vertex stream.
+        77 => (14, 7),
+        128 => (1, 9),
+        129 => (3, 9),
+        130 => (10, 9),
+        _ => return None,
+    })
+}
+
+/// The RDNA2 unified FORMAT field re-expressed in the **legacy MTBUF packing**
+/// `dfmt * 8 + nfmt` that Kyty's `tbuffer_*_format_*` SPIR-V helpers compare
+/// against. `None` when the encoding has no legacy equivalent.
+///
+/// This conversion is the whole reason MUBUF `buffer_load_format_*` never
+/// fetched anything: MTBUF carries `dfmt`/`nfmt` in the *instruction*, so the
+/// Kyty rows hardcode the packed number (36, 39, 92, 95, 119); MUBUF takes the
+/// format from the *descriptor*, where RDNA2 stores the **unified** number. The
+/// MUBUF row passed the unified value straight into a helper that only ever
+/// accepts the packed one, so the comparison could never succeed and the helper
+/// silently left the destination VGPRs untouched. `32_32_32_32_FLOAT` is
+/// unified **77** and packed **119** — and 119 is not even a valid unified
+/// encoding (RDNA2 table 47 has no entry there).
+///
+/// The packing is confirmed by all five constants Kyty's own helpers document:
+/// 36 = (4,4), 39 = (4,7), 92 = (11,4), 95 = (11,7), 119 = (14,7).
+#[must_use]
+pub const fn gfx10_unified_to_packed_dfmt_nfmt(unified: u32) -> Option<u32> {
+    match gfx10_unified_to_dfmt_nfmt(unified) {
+        // Only real legacy DATA_FORMATs (0..=14) pack; the `nfmt 9` rows
+        // (128..130, SRGB) have a legacy dfmt but no packed spelling in Kyty's
+        // helpers, and fall out below as an honest `None`.
+        Some((dfmt, nfmt)) if dfmt <= 14 && nfmt <= 7 => Some(dfmt * 8 + nfmt),
+        _ => None,
+    }
+}
+
 /// The SPIR-V spellings one Gen5 vertex attribute is declared and consumed
 /// with: `registers_num` components (the semantic's `size_in_elements`, i.e.
 /// how many VGPRs the fetch writes) of the V#'s numeric class.
@@ -5150,7 +5279,12 @@ impl<'a> Spirv<'a> {
             self.source += FUNC_ADDC;
         }
 
-        if self.code.has_any_of(&[T::SLshl4AddU32]) {
+        if self.code.has_any_of(&[
+            T::SLshl1AddU32,
+            T::SLshl2AddU32,
+            T::SLshl3AddU32,
+            T::SLshl4AddU32,
+        ]) {
             self.source += FUNC_LSHL_ADD;
         }
 

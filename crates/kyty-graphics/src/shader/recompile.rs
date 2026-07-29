@@ -847,7 +847,95 @@ fn recompile_buffer_load_format_xyzw_vdata4(
     let inst = inst_at(code, index, FUNC)?;
 
     if let Some(bind_info) = spirv.get_bind_info() {
-        if bind_info.storage_buffers.buffers_num > 0 {
+        if bind_info.storage_buffers.buffers_num == 0 {
+            // Kyty's bare `return false` here printed only
+            // `can't recompile: <disassembly>`, which is why Avatar: Frontiers
+            // of Pandora's 829-per-run blocker read as "no table entry" when
+            // the row and its recompiler both exist. Name the precondition.
+            return Err(not_supported(
+                FUNC,
+                format!(
+                    "no storage buffer bound for the V#: {:?} [{:?}] V#=s[{base}:{base_end}], \
+                     pc={:#x} — the descriptor could not be proved by \
+                     shader_bind_vsharp_storage_buffers",
+                    inst.type_,
+                    inst.format,
+                    inst.pc,
+                    base = inst.src[1].register_id,
+                    base_end = inst.src[1].register_id + 3,
+                ),
+            ));
+        }
+        // The MUBUF form takes its element format from the DESCRIPTOR
+        // (`(V#.dword3 >> 12) & 0x7f`), which on RDNA2 is the **unified**
+        // FORMAT number. Kyty's `tbuffer_load_format_xyzw` helper compares
+        // against the **legacy MTBUF packing** `dfmt * 8 + nfmt` — MTBUF
+        // carries dfmt/nfmt in the instruction, so its rows hardcode 36/39/
+        // 92/95/119. Feeding the unified number straight in (what the row did)
+        // could therefore NEVER match: 32_32_32_32_FLOAT is unified **77** and
+        // packed **119**, and 119 is not even a valid unified encoding. Every
+        // MUBUF four-channel fetch silently left its destination VGPRs
+        // untouched. Convert here, at translate time, from the bound
+        // descriptor.
+        let packed_format = {
+            let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
+                8
+            } else {
+                0
+            };
+            let count = usize::try_from(bind_info.storage_buffers.buffers_num.max(0))
+                .unwrap_or(0)
+                .min(bind_info.storage_buffers.buffers.len());
+            let Some(i) = (0..count).find(|&i| {
+                bind_info.storage_buffers.start_register[i] + shift_regs == inst.src[1].register_id
+            }) else {
+                return Err(not_supported(
+                    FUNC,
+                    format!(
+                        "the V# is not one of this shader's bound descriptors, so its element \
+                         format is unknown: {:?} [{:?}] V#=s[{base}:{base_end}], pc={:#x}",
+                        inst.type_,
+                        inst.format,
+                        inst.pc,
+                        base = inst.src[1].register_id,
+                        base_end = inst.src[1].register_id + 3,
+                    ),
+                ));
+            };
+            let unified = bind_info.storage_buffers.buffers[i].format();
+            let packed =
+                crate::shader::spirv::gfx10_unified_to_packed_dfmt_nfmt(u32::from(unified));
+            // Silent garbage is worse than a refusal and invisible in a log, so
+            // a format the helper does not serve is named and counted.
+            if packed != Some(119) {
+                crate::shader::spirv::UNSUPPORTED_BUFFER_FORMAT_SKIPS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let decoded = crate::shader::spirv::gfx10_unified_to_dfmt_nfmt(u32::from(unified));
+                return Err(not_supported(
+                    FUNC,
+                    format!(
+                        "V# unified format {unified} ({}) is not 32_32_32_32_FLOAT \
+                         (unified 77 / packed 119): {:?} [{:?}] V#=s[{base}:{base_end}], \
+                         stride={}, pc={:#x} — the typed helper would leave \
+                         v[{d}:{d_end}] untouched",
+                        match decoded {
+                            Some((dfmt, nfmt)) => format!("dfmt {dfmt}, nfmt {nfmt}"),
+                            None => "no legacy dfmt/nfmt equivalent".to_owned(),
+                        },
+                        inst.type_,
+                        inst.format,
+                        bind_info.storage_buffers.buffers[i].stride(),
+                        inst.pc,
+                        base = inst.src[1].register_id,
+                        base_end = inst.src[1].register_id + 3,
+                        d = inst.dst.register_id,
+                        d_end = inst.dst.register_id + 3,
+                    ),
+                ));
+            }
+            119
+        };
+        {
             if !operand_is_constant(inst.src[2]) {
                 return Err(not_supported(FUNC, "src2 is not a constant"));
             }
@@ -883,11 +971,7 @@ fn recompile_buffer_load_format_xyzw_vdata4(
         %t156_<index> = OpBitcast %int %t155_<index>
                OpStore %temp_int_4 %t156_<index>
                OpStore %temp_int_2 %<offset>
-        %t206_<index> = OpLoad %uint %<src1_value3>
-        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
-        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
-        %t211_<index> = OpBitcast %int %t210_<index>
-               OpStore %temp_int_5 %t211_<index>
+               OpStore %temp_int_5 %int_<packed_format>
         %t110_<index> = OpFunctionCall %void %tbuffer_load_format_xyzw %<p0> %<p1> %<p2> %<p3> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
 "#;
             *dst_source += &TEXT
@@ -896,7 +980,7 @@ fn recompile_buffer_load_format_xyzw_vdata4(
                 .replace("<offset>", &offset)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src1_value1>", &src1_value1.value)
-                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<packed_format>", &format!("{packed_format}"))
                 .replace("<p0>", &dst_value[0].value)
                 .replace("<p1>", &dst_value[1].value)
                 .replace("<p2>", &dst_value[2].value)
@@ -1502,6 +1586,11 @@ fn sbuffer_load_dwords(
     if let Some(load) = bind_info.embedded_constant_loads.find(inst.pc) {
         let count = (load.dwords_num as usize).min(n);
         for i in 0..count {
+            // Never overwrite a descriptor-array index a bound storage buffer
+            // seeded into this register — see `descriptor_seeded_register`.
+            if descriptor_seeded_register(spirv, bind_info, inst.dst, i as i32) {
+                continue;
+            }
             let dst_value = operand_variable_to_str_shift(inst.dst, i as i32);
             if dst_value.type_ != SpirvType::Uint {
                 return Err(not_supported(func, "unexpected embedded-load dst type"));
@@ -1929,6 +2018,38 @@ fn recompile_sload_dwordx2(
 
 /// Common extended (EUD) V#-from-push-constants path of
 /// `Recompile_SLoadDwordx4/x8` (ShaderSpirv.cpp L4325-4369 / L4388-4432).
+/// Whether dword `i` of a captured scalar load lands in an SGPR that a
+/// **non-extended storage binding** already owns.
+///
+/// `Spirv::WriteLocalVariables` seeds those four registers from the
+/// push-constant window, in which dword 0 has been REWRITTEN from the guest
+/// base address to the compact descriptor-array index (`prepare_stage_binding`),
+/// and every buffer body indexes `%buf` with the value of that register.
+/// Materializing the captured RAW guest dwords over that seed replaces a small
+/// array index with a guest address and indexes the descriptor array out of
+/// bounds — the shape that produced a measured `VK_ERROR_DEVICE_LOST` on
+/// ASTRO.BOT (see [`mimg_descriptor_guard`] for the image-side twin).
+///
+/// The seed is the value the shader must observe, so skipping the store is the
+/// CORRECT lowering, not a workaround: the descriptor content still reaches the
+/// draw, live, through the bound descriptor.
+fn descriptor_seeded_register(
+    spirv: &Spirv<'_>,
+    bind: &ShaderBindResources,
+    dst: crate::shader::types::ShaderOperand,
+    i: i32,
+) -> bool {
+    if dst.type_ != ShaderOperandType::Sgpr {
+        return false;
+    }
+    let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
+        8
+    } else {
+        0
+    };
+    crate::shader::analysis::storage_binding_owns_register(bind, dst.register_id + i, shift_regs)
+}
+
 fn sload_dword_extended(
     index: u32,
     code: &ShaderCode,
@@ -1951,6 +2072,9 @@ fn sload_dword_extended(
     if let Some(load) = bind_info.embedded_constant_loads.find(inst.pc) {
         let count = (load.dwords_num as i32).min(n);
         for i in 0..count {
+            if descriptor_seeded_register(spirv, bind_info, inst.dst, i) {
+                continue;
+            }
             let dst_value = operand_variable_to_str_shift(inst.dst, i);
             if dst_value.type_ != SpirvType::Uint {
                 return Err(not_supported(func, "unexpected embedded-load dst type"));
@@ -10954,6 +11078,9 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SSubU32, F::SVdstSVsrc0SVsrc1, p4("%t_<index> = OpISub %uint %t0_<index> %t1_<index>", "%nb_<index> = OpUGreaterThanEqual %bool %t0_<index> %t1_<index>", "%carry_<index> = OpSelect %uint %nb_<index> %uint_1 %uint_0", ""), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SBfeU32, F::SVdstSVsrc0SVsrc1, p3("%to_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_0  %uint_5", "%ts_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_16 %uint_7", "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>"), S::NonZero),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl1AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_1", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl2AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_2", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl3AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_3", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl4AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_4", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SMulHiU32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>"), S::None),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SPackLlB32B16, F::SVdstSVsrc0SVsrc1, p3("%tlo_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x0000ffff", "%thi_<index> = OpShiftLeftLogical %uint %t1_<index> %uint_16", "%t_<index> = OpBitwiseOr %uint %tlo_<index> %thi_<index>"), S::None),
@@ -11579,8 +11706,10 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            364,
-            "the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
+            367,
+            "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
+             0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
+             the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
              VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
              the beyond-Kyty exp-null row (EXP target 9, ASTRO.BOT),            the seven beyond-Kyty FLAT-class rows (SharpEmu PR #587: \
              FlatLoadDword/X2/X3/X4 + FlatStoreDword/X2/X4), and \
@@ -11622,8 +11751,9 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 356,
-            "the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
+            implemented, 359,
+            "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
+             the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
              VCmpxNgeF32, SVersion, the S_XXX_I32 \
@@ -15741,6 +15871,93 @@ mod tests {
         // `lshl_add` helper. naga 24 does not parse it, so assembly plus the
         // real Vulkan title run is the appropriate gate for this row.
         assert_eq!(words.first().copied(), Some(0x0723_0203));
+    }
+
+    /// SOP2 `0x2e`/`0x2f`/`0x30` = `s_lshl{1,2,3}_add_u32`.
+    ///
+    /// Identity from two independent references that agree row-for-row:
+    /// KytyPS5 `src/graphics/shader/recompiler/ScalarAluOps.cpp` L26-28 and
+    /// SharpEmu `src/SharpEmu.ShaderCompiler/Gen5ShaderTranslator.cs` L804-807.
+    /// `0x30` is ASTRO.BOT's measured `parse: unknown sop2 opcode: 0x30`
+    /// (92 occurrences, baseline `1acd114`, stage `rendering`, 36 flips).
+    ///
+    /// Encoding (SOP2): `10` | opcode[29:23] | sdst[22:16] | ssrc1[15:8] |
+    /// ssrc0[7:0]; `ssrc1 == 0xff` selects the following literal dword. The
+    /// words below are hand-encoded from that layout, cross-checked against the
+    /// already-wired `0x31` word `0x98eb_ff6a` measured in Minecraft.
+    #[test]
+    fn s_lshl_n_add_u32_decodes_every_shift_and_lowers_through_lshl_add() {
+        for (opcode, expect, shift_id) in [
+            (0x2eu32, T::SLshl1AddU32, "%uint_1"),
+            (0x2fu32, T::SLshl2AddU32, "%uint_2"),
+            (0x30u32, T::SLshl3AddU32, "%uint_3"),
+            (0x31u32, T::SLshl4AddU32, "%uint_4"),
+        ] {
+            // s_lshl<N>_add_u32 s8, s4, 0x00000040
+            let word = 0x8000_0000 | (opcode << 23) | (8 << 16) | (0xff << 8) | 4;
+
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Vertex);
+            shader_parse(
+                0,
+                &[
+                    word,
+                    0x0000_0040,
+                    0x7E00_02FF,
+                    0x3F80_0000,
+                    0x7E02_0280,
+                    0x1004_0300,
+                    0xF800_08CF,
+                    0x0302_0100,
+                    0xF800_020F,
+                    0x0302_0100,
+                    S_ENDPGM,
+                ],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("parse sop2 {opcode:#04x}: {e:?}"));
+
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, expect, "sop2 {opcode:#04x}");
+            assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1, "sop2 {opcode:#04x}");
+            assert_eq!(inst.dst.type_, ShaderOperandType::Sgpr);
+            assert_eq!(inst.dst.register_id, 8);
+            assert_eq!(inst.src[0].type_, ShaderOperandType::Sgpr);
+            assert_eq!(inst.src[0].register_id, 4);
+            assert_eq!(inst.src[1].constant.u, 0x40);
+
+            // The row exists, carries the 33-bit carry-out SCC rule, and is
+            // implemented (not a `NotImplemented` placeholder).
+            let entry = recomp_func(expect, F::SVdstSVsrc0SVsrc1)
+                .unwrap_or_else(|| panic!("{expect:?} row"));
+            assert!(matches!(entry.func, RecompileFn::Func(_)), "{expect:?}");
+            assert_eq!(entry.scc_check, SccCheck::CarryOut, "{expect:?}");
+
+            let source = spirv_generate_source(
+                &code,
+                Some(&ShaderVertexInputInfo {
+                    export_count: 1,
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("recompile sop2 {opcode:#04x}: {e:?}"));
+            // The shared helper is emitted, called with THIS shift, and the
+            // carry reaches SCC.
+            assert!(
+                source.contains(&format!(
+                    "OpFunctionCall %v2uint %lshl_add %t0_0 %t1_0 {shift_id}"
+                )),
+                "sop2 {opcode:#04x} must lower through %lshl_add with {shift_id}"
+            );
+            assert!(source.contains("OpStore %scc %carry_0"));
+
+            let words =
+                spirv_run(&source).unwrap_or_else(|e| panic!("assemble sop2 {opcode:#04x}: {e:?}"));
+            spirv_val_ok(&words, "s_lshl_n_add_u32");
+        }
     }
 
     #[test]
@@ -20497,11 +20714,16 @@ mod tests {
             "BufferLoadFormatXyzw/Vdata4VaddrSvSoffsIdxen needs a table row"
         );
 
-        // The typed helpers index %buf, so one storage buffer must be bound.
+        // The typed helpers index %buf, so one storage buffer must be bound —
+        // and MUBUF reads its element format from that descriptor, so the
+        // binding has to be the instruction's own V# (s[4:7]) carrying unified
+        // 77 = (dfmt 14, nfmt 7) = 32_32_32_32_FLOAT.
         let mut input_info = ShaderPixelInputInfo::default();
         input_info.target_output_mode[0] = 4;
         input_info.bind.push_constant_size = 48;
         input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 4;
+        input_info.bind.storage_buffers.buffers[0].fields = [0, 16 << 16, 256, 77 << 12];
 
         let source = spirv_generate_source(&code, None, Some(&input_info), None)
             .expect("full chain recompiles");
@@ -20509,8 +20731,416 @@ mod tests {
             source.contains("%tbuffer_load_format_xyzw"),
             "the four-channel typed helper must be called: {source}"
         );
+        assert!(
+            source.contains("OpStore %temp_int_5 %int_119"),
+            "unified 77 must reach the helper as the packed 119 it tests: {source}"
+        );
         let module = spirv_run(&source).expect("assemble");
         spirv_val_ok(&module, "full_chain_buffer_load_format_xyzw_idxen");
+    }
+
+    /// A V# that sits at a **nonzero offset inside** the descriptor table a
+    /// single wide `s_load` fetched.
+    ///
+    /// One `s_load_dwordx8 s[16:23]` delivers TWO V#s; one
+    /// `s_load_dwordx16 s[12:27]` delivers four. The provenance proof used to
+    /// require `producer.dst.register_id == base_reg`, so only the FIRST quad
+    /// of such a table was ever provable and every later one kept the named
+    /// refusal — even though its dwords sit in the same already-captured
+    /// snapshot at a known index. Measured shapes: Avatar: Frontiers of
+    /// Pandora's vertex stage (`s_load_dwordx16 s[12:27], s[8:9], 0` feeding
+    /// five `buffer_load_format_xyzw` through s[12:15], s[16:19], s[20:23],
+    /// s[24:27]) and GTA V's `s_load_dwordx8 s[8:15], s[0:1], 0`.
+    ///
+    /// Nothing is guessed: the same proved bytes, indexed at the right dword.
+    #[test]
+    fn full_chain_vsharp_at_an_offset_inside_a_loaded_table() {
+        // s_load_dwordx8 s[16:23], s[12:13], 0  — a table of two V#s.
+        //   b0 = 0x3d << 26 | opcode 0x03 << 18 | sdst 16 << 6 | sbase 6
+        //   b1 = soffset NULL (0x7d) << 25 | offset 0
+        const SLOAD: [u32; 2] = [0xF40C_0406, 0xFA00_0000];
+        // s_buffer_load_dwordx4 s[28:31], s[20:23], 0 — the SECOND quad.
+        //   b0 = 0x3d << 26 | opcode 0x0a << 18 | sdst 28 << 6 | sbase 10
+        const SBUFFER: [u32; 2] = [0xF428_070A, 0xFA00_0000];
+        let mut words = Vec::new();
+        words.extend_from_slice(&SLOAD);
+        words.extend_from_slice(&SBUFFER);
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true).expect("parse");
+        assert_eq!(code.get_instructions()[0].type_, T::SLoadDwordx8);
+        assert_eq!(code.get_instructions()[0].dst.register_id, 16);
+        assert_eq!(code.get_instructions()[0].dst.size, 8);
+        let use_ = code.get_instructions()[1];
+        assert_eq!(use_.type_, T::SBufferLoadDwordx4);
+        assert_eq!(
+            (use_.src[0].register_id, use_.src[0].size),
+            (20, 4),
+            "the V# is the SECOND quad of the loaded table"
+        );
+
+        const TABLE: u64 = 0x0070_0000;
+        const DATA: u64 = 0x0090_0000;
+        // Two V#s back to back; only the second one is used.
+        let mut table = Vec::new();
+        table.extend_from_slice(&vsharp(0x0060_0000, 0, 64));
+        table.extend_from_slice(&vsharp(DATA, 0, 1024));
+        let payload: Vec<u32> = (0..4).map(|i| 0xfeed_0000 + i).collect();
+
+        struct TwoRegion(u64, Vec<u32>, u64, Vec<u32>);
+        impl crate::shader::analysis::ShaderMemory for TwoRegion {
+            fn dwords_at(&self, addr: u64) -> Option<std::borrow::Cow<'_, [u32]>> {
+                for (base, data) in [(self.0, &self.1), (self.2, &self.3)] {
+                    if addr >= base && (addr - base) % 4 == 0 {
+                        let start = ((addr - base) / 4) as usize;
+                        if start < data.len() {
+                            return Some(std::borrow::Cow::Borrowed(&data[start..]));
+                        }
+                    }
+                }
+                None
+            }
+        }
+        let mem = TwoRegion(TABLE, table, DATA, payload.clone());
+
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(
+            12,
+            TABLE as u32,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user_sgpr.set(13, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        assert_eq!(input_info.bind.storage_buffers.buffers_num, 0);
+
+        // The production entry point: the pointer-load capture runs first and
+        // the V# pass reads its snapshot at dword offset 4.
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            &mut input_info.bind,
+        );
+        assert_eq!(
+            input_info
+                .bind
+                .embedded_constant_loads
+                .find(0x08)
+                .expect("the offset quad's V# resolves and its dwords are captured")
+                .values[..4],
+            payload[..]
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("full chain recompiles from the offset quad");
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "vsharp_at_an_offset_inside_a_loaded_table");
+    }
+
+    /// Avatar: Frontiers of Pandora's real, dumped vertex-fetch shape, and the
+    /// three separate defects it exposed.
+    ///
+    /// Measured VS `0x4020024d00` (dumped 2026-07-29 from the retail title):
+    ///
+    /// ```text
+    /// s_load_dwordx16         s[12:27], s[8:9], 0        ; a table of FOUR V#s
+    /// buffer_load_format_xyzw v[0:3],  v5, s[12:15], 0 idxen
+    /// buffer_load_format_xyzw v[10:13], v5, s[24:27], 0 idxen
+    /// ...
+    /// ```
+    ///
+    /// 1. Every MUBUF body is gated on `storage_buffers.buffers_num > 0`, and
+    ///    the usage-table walk binds nothing for an SRT-delivered V#, so
+    ///    `recompile_buffer_load_format_xyzw_vdata4` returned `Ok(false)` —
+    ///    printed as the bare `can't recompile: BufferLoadFormatXyzw
+    ///    [Vdata4VaddrSvSoffsIdxen] v[0:3], v5, s[12:15], 0, idxen`, 853
+    ///    occurrences in a 180 s run. The descriptor-format branch the previous
+    ///    note suspected is INSIDE `buffers_num > 0` and was never reached.
+    /// 2. Three of the four V#s sit at nonzero offsets inside one captured
+    ///    `s_load_dwordx16`.
+    /// 3. Binding the descriptor makes `WriteLocalVariables` seed the quad's
+    ///    SGPRs with the rewritten push-constant index — which the captured
+    ///    `s_load` would then overwrite with the raw guest base address,
+    ///    indexing the descriptor array out of bounds (the ASTRO.BOT
+    ///    `VK_ERROR_DEVICE_LOST` class). The seed must survive.
+    #[test]
+    fn avatar_srt_vsharp_binds_and_its_descriptor_seed_survives() {
+        // s_load_dwordx16 s[12:27], s[8:9], 0
+        //   b0 = 0x3d << 26 | opcode 0x04 << 18 | sdst 12 << 6 | sbase 4
+        const SLOAD: [u32; 2] = [0xF410_0304, 0xFA00_0000];
+        // buffer_load_format_xyzw v[0:3], v5, s[16:19], 0 idxen — the SECOND
+        // quad of the table (srsrc field = 16 / 4 = 4).
+        const MUBUF: [u32; 2] = [0xE00C_2000, 0x8004_0005];
+        let words = [
+            SLOAD[0], SLOAD[1], MUBUF[0], MUBUF[1], MUBUF[0], MUBUF[1], S_ENDPGM,
+        ];
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true).expect("parse");
+        let fetch = code.get_instructions()[1];
+        assert_eq!(fetch.type_, T::BufferLoadFormatXyzw);
+        assert_eq!(fetch.format, F::Vdata4VaddrSvSoffsIdxen);
+        assert_eq!(
+            (fetch.src[1].register_id, fetch.src[1].size),
+            (16, 4),
+            "the V# is the second quad of the s_load_dwordx16 table"
+        );
+
+        const TABLE: u64 = 0x0050_0000;
+        const VERTS: u64 = 0x0080_0000;
+        let mut table = Vec::new();
+        table.extend_from_slice(&vsharp(0x0040_0000, 16, 8)); // s[12:15]
+        let mut used = vsharp(VERTS, 16, 256); // s[16:19]
+        // Unified format **77** = (dfmt 14, nfmt 7) = 32_32_32_32_FLOAT, in
+        // bits 12..18 of dword 3. Kyty's helper compares against the LEGACY
+        // packing `dfmt * 8 + nfmt` = 119, which is what the row must convert
+        // to — 119 is not a valid unified encoding at all.
+        used[3] = 77 << 12;
+        table.extend_from_slice(&used);
+        table.extend_from_slice(&vsharp(0x0041_0000, 16, 8)); // s[20:23]
+        table.extend_from_slice(&vsharp(0x0042_0000, 16, 8)); // s[24:27]
+
+        struct Mem(u64, Vec<u32>);
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, addr: u64) -> Option<std::borrow::Cow<'_, [u32]>> {
+                (addr >= self.0 && (addr - self.0) % 4 == 0)
+                    .then(|| ((addr - self.0) / 4) as usize)
+                    .filter(|start| *start < self.1.len())
+                    .map(|start| std::borrow::Cow::Borrowed(&self.1[start..]))
+            }
+        }
+        let mem = Mem(TABLE, table);
+
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(
+            8,
+            TABLE as u32,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user_sgpr.set(9, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code,
+            &mem,
+            &user_sgpr,
+            &mut input_info.bind,
+        );
+
+        // (1) + (2): the offset quad is proved and BOUND as a real descriptor.
+        assert_eq!(
+            input_info.bind.storage_buffers.buffers_num, 1,
+            "the proved MUBUF V# must be bound as a storage buffer"
+        );
+        assert_eq!(input_info.bind.storage_buffers.start_register[0], 16);
+        assert!(!input_info.bind.storage_buffers.extended[0]);
+        assert_eq!(input_info.bind.storage_buffers.buffers[0].base48(), VERTS);
+        assert_eq!(input_info.bind.storage_buffers.buffers[0].format(), 77);
+
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("Avatar's measured fetch must recompile once its V# is bound");
+        assert!(
+            source.contains("%tbuffer_load_format_xyzw"),
+            "the four-channel typed helper must be called: {source}"
+        );
+        // The unified 77 in the descriptor must reach the helper as the LEGACY
+        // packed 119 it actually tests. Passing the unified number straight
+        // through — what the row used to do — could never match, so the fetch
+        // silently did nothing for every descriptor.
+        assert!(
+            source.contains("OpStore %temp_int_5 %int_119"),
+            "unified 77 must be converted to the packed 119 the helper tests: {source}"
+        );
+        assert!(
+            !source.contains("OpBitwiseAnd %uint %t208_1"),
+            "the broken runtime unified-format extraction must be gone: {source}"
+        );
+
+        // (3) The push-constant seed of the bound quad must be the ONLY writer
+        // of s16..s19 before the fetch: the captured `s_load_dwordx16` must not
+        // materialize the raw guest dwords over the descriptor-array index.
+        for reg in 16..20 {
+            let stores = source
+                .lines()
+                .filter(|line| line.trim_start().starts_with(&format!("OpStore %s{reg} ")))
+                .count();
+            assert_eq!(
+                stores, 1,
+                "s{reg} must keep its descriptor seed (found {stores} stores):\n{source}"
+            );
+        }
+        // The dwords the binding does NOT own are still materialized.
+        assert!(
+            source.contains("OpStore %s12 "),
+            "unowned table dwords keep the snapshot: {source}"
+        );
+
+        let module = spirv_run(&source).expect("assemble");
+        spirv_val_ok(&module, "avatar_srt_vsharp_binds");
+    }
+
+    /// The unified → legacy-packed conversion, checked against the five packed
+    /// constants Kyty's own SPIR-V helpers document in their comments. Those
+    /// comments are the ground truth for the packing (`dfmt * 8 + nfmt`) and
+    /// SharpEmu's `Gfx10UnifiedFormat.cs` (RDNA2 ISA table 47) for the unified
+    /// numbering; agreement across the two is what makes the conversion safe.
+    #[test]
+    fn unified_format_converts_to_the_packed_number_kyty_helpers_test() {
+        use crate::shader::spirv::{gfx10_unified_to_dfmt_nfmt, gfx10_unified_to_packed_dfmt_nfmt};
+
+        // (unified, dfmt, nfmt, the packed constant a Kyty helper compares to)
+        for (unified, dfmt, nfmt, packed) in [
+            // `tbuffer_load_format_x`: "dfmt = 4, nfmt = 4 or 7" -> 36 / 39.
+            (20u32, 4u32, 4u32, 36u32),
+            (22, 4, 7, 39),
+            // `tbuffer_store_format_xy`: "dfmt = 11, nfmt = 4 or 7" -> 92 / 95.
+            (62, 11, 4, 92),
+            (64, 11, 7, 95),
+            // `tbuffer_load_format_xyzw`: "dfmt = 14, nfmt = 7" -> 119.
+            (77, 14, 7, 119),
+        ] {
+            assert_eq!(
+                gfx10_unified_to_dfmt_nfmt(unified),
+                Some((dfmt, nfmt)),
+                "unified {unified}"
+            );
+            assert_eq!(
+                gfx10_unified_to_packed_dfmt_nfmt(unified),
+                Some(packed),
+                "unified {unified} must pack to {packed}"
+            );
+            assert_eq!(dfmt * 8 + nfmt, packed, "the packing rule itself");
+        }
+
+        // 119 is a PACKED number, not a unified one — RDNA2 table 47 has no
+        // entry there. Feeding the descriptor's unified field straight into the
+        // helper (what the MUBUF row used to do) could therefore never match.
+        assert_eq!(gfx10_unified_to_dfmt_nfmt(119), None);
+        // Reserved holes stay refused rather than being derived into existence.
+        for reserved in [30u32, 35, 46, 47, 127] {
+            assert_eq!(
+                gfx10_unified_to_dfmt_nfmt(reserved),
+                None,
+                "unified {reserved} is reserved"
+            );
+        }
+        // Image-only encodings have no legacy dfmt and must not pack.
+        assert_eq!(gfx10_unified_to_packed_dfmt_nfmt(131), None);
+    }
+
+    /// A shader must never end up PARTIALLY bound.
+    ///
+    /// `mubuf_flexible` has two lowerings: with no storage buffer bound
+    /// anywhere it treats every MUBUF as a null V# (loads return 0, stores
+    /// drop) and the shader still compiles; with at least one bound it
+    /// switches every site to the descriptor path, which indexes `%buf` with
+    /// the VALUE of that site's V# dword-0 register. A site whose V# was not
+    /// proved has no seeded register, so it would index the descriptor array
+    /// with raw guest data — the ASTRO.BOT `VK_ERROR_DEVICE_LOST` class.
+    /// Binding some-but-not-all would therefore turn a compiling shader into a
+    /// device-loss risk, so the pass binds all or none.
+    #[test]
+    fn a_shader_with_one_unprovable_mubuf_vsharp_binds_none_of_them() {
+        // s_load_dwordx8 s[16:23], s[12:13], 0 — proves s[16:19] and s[20:23].
+        const SLOAD: [u32; 2] = [0xF40C_0406, 0xFA00_0000];
+        // buffer_load_format_xyzw v[0:3], v5, s[16:19], 0 idxen  (provable)
+        const PROVABLE: [u32; 2] = [0xE00C_2000, 0x8004_0005];
+        // buffer_load_format_xyzw v[0:3], v5, s[4:7], 0 idxen
+        // s[4:7] is neither live-in user data nor written by any load here.
+        const UNPROVABLE: [u32; 2] = [0xE00C_2000, 0x8001_0005];
+        let words = [
+            SLOAD[0],
+            SLOAD[1],
+            PROVABLE[0],
+            PROVABLE[1],
+            UNPROVABLE[0],
+            UNPROVABLE[1],
+            S_ENDPGM,
+        ];
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true).expect("parse");
+
+        const TABLE: u64 = 0x0050_0000;
+        let mut table = Vec::new();
+        table.extend_from_slice(&vsharp(0x0080_0000, 16, 256));
+        table.extend_from_slice(&vsharp(0x0081_0000, 16, 256));
+
+        struct Mem(u64, Vec<u32>);
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, addr: u64) -> Option<std::borrow::Cow<'_, [u32]>> {
+                (addr >= self.0 && (addr - self.0) % 4 == 0)
+                    .then(|| ((addr - self.0) / 4) as usize)
+                    .filter(|start| *start < self.1.len())
+                    .map(|start| std::borrow::Cow::Borrowed(&self.1[start..]))
+            }
+        }
+        let mem = Mem(TABLE, table);
+
+        let mut user_sgpr = crate::shader::hw_regs::UserSgprInfo::default();
+        user_sgpr.set(
+            12,
+            TABLE as u32,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user_sgpr.set(13, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+
+        let mut bind = crate::shader::resources::ShaderBindResources::default();
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code, &mem, &user_sgpr, &mut bind,
+        );
+        assert_eq!(
+            bind.storage_buffers.buffers_num, 0,
+            "one unprovable MUBUF V# must suppress ALL new bindings"
+        );
+    }
+
+    /// The second Avatar-class defect, now that its V# binds: the MUBUF form
+    /// takes its element format from the DESCRIPTOR, and Kyty's
+    /// `tbuffer_load_format_xyzw` helper serves only unified 119 — for any
+    /// other format it silently leaves the destination VGPRs untouched. Silent
+    /// garbage is invisible in a log, so a known non-119 descriptor is refused
+    /// by name and counted.
+    #[test]
+    fn non_119_buffer_format_is_refused_by_name_not_silently_dropped() {
+        const MUBUF: [u32; 2] = [0xE00C_2000, 0x8001_0400];
+        let words = [MUBUF[0], MUBUF[1], MUBUF[0], MUBUF[1], S_ENDPGM];
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        crate::shader::parse::shader_parse(0, &words, &mut code, true).expect("parse");
+
+        let mut input_info = ShaderPixelInputInfo::default();
+        input_info.target_output_mode[0] = 4;
+        input_info.bind.push_constant_size = 48;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 4;
+        // Unified 13 = (dfmt 2, nfmt 7) — a real format, but not the
+        // 32_32_32_32_FLOAT the four-channel helper serves.
+        input_info.bind.storage_buffers.buffers[0].fields = [0, 16 << 16, 256, 13 << 12];
+
+        let before = crate::shader::spirv::unsupported_buffer_format_skips();
+        let err = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect_err("a format the typed helper cannot serve must not translate silently");
+        let text = err.to_string();
+        for want in [
+            "unified format 13",
+            "dfmt 2, nfmt 7",
+            "unified 77 / packed 119",
+            "s[4:7]",
+        ] {
+            assert!(text.contains(want), "refusal must name {want}, got: {text}");
+        }
+        assert!(
+            crate::shader::spirv::unsupported_buffer_format_skips() > before,
+            "the refusal must be counted"
+        );
     }
 
     /// The scalar-evaluator acceptance case: real GCN bytes whose scalar load

@@ -920,6 +920,234 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
     }
 
     shader_capture_vsharp_buffer_loads(code, mem, user_sgpr, shift, bind);
+    shader_bind_vsharp_storage_buffers(code, user_sgpr, shift, bind);
+}
+
+/// The SGPR quad an instruction uses as its buffer resource (V#), and whether
+/// it WRITES through it. `None` for anything that is not a buffer op.
+///
+/// MUBUF/MTBUF carry the V# in `src[1]`; SMEM `s_buffer_load*` in `src[0]` —
+/// the same operand split `shader_capture_eud_storage_buffers` uses, with the
+/// additional requirement that the operand really is a four-register quad.
+fn buffer_resource_operand(inst: &ShaderInstruction) -> Option<(i32, bool)> {
+    use crate::shader::types::ShaderInstructionType as T;
+    let (operand, writes) = match inst.type_ {
+        T::BufferLoadDword
+        | T::BufferLoadDwordX2
+        | T::BufferLoadDwordX3
+        | T::BufferLoadDwordX4
+        | T::BufferLoadUbyte
+        | T::BufferLoadFormatX
+        | T::BufferLoadFormatXy
+        | T::BufferLoadFormatXyz
+        | T::BufferLoadFormatXyzw
+        | T::TBufferLoadFormatX
+        | T::TBufferLoadFormatXyzw => (inst.src[1], false),
+        T::BufferStoreDword
+        | T::BufferStoreDwordX2
+        | T::BufferStoreDwordX4
+        | T::BufferStoreFormatX
+        | T::BufferStoreFormatXy
+        | T::BufferStoreFormatXyz
+        | T::BufferStoreFormatXyzw => (inst.src[1], true),
+        T::SBufferLoadDword
+        | T::SBufferLoadDwordx2
+        | T::SBufferLoadDwordx4
+        | T::SBufferLoadDwordx8
+        | T::SBufferLoadDwordx16 => (inst.src[0], false),
+        _ => return None,
+    };
+    (operand.type_ == ShaderOperandType::Sgpr && operand.size == 4)
+        .then_some((operand.register_id, writes))
+}
+
+/// Beyond Kyty: bind a **MUBUF/MTBUF** buffer resource whose V# this analysis
+/// can prove, when the static usage-table walk bound nothing for it.
+///
+/// The measured case is Avatar: Frontiers of Pandora, whose whole shader
+/// pipeline dies on
+///
+/// ```text
+/// can't recompile: BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen] v[0:3], v5, s[12:15], 0, idxen
+/// ```
+///
+/// (829 occurrences in the 2026-07-28 baseline, stage `timed_out`). The
+/// dispatch row for that pair **exists** and its recompiler **is** implemented;
+/// it returns `Ok(false)` — which the caller prints as the bare
+/// `can't recompile:` above — for exactly one reason: every MUBUF body is
+/// gated on `bind.storage_buffers.buffers_num > 0`, and the title delivers its
+/// V#s through an SRT descriptor table the usage-table walk never turns into
+/// bound slots. Dumped VS `0x4020024d00` (2026-07-29) is the whole shape:
+/// `s_load_dwordx16 s[12:27], s[8:9], 0` fetches FOUR V#s and the next five
+/// instructions fetch five vertex streams through them. The descriptor-format
+/// path (`(V#.dword3 >> 12) & 0x7f`, the 119-only `tbuffer_load_format_xyzw`
+/// helper) sits INSIDE that branch and is therefore never reached — it is not
+/// what Avatar hits.
+///
+/// A MUBUF `idxen` fetch cannot be snapshotted the way
+/// [`shader_capture_vsharp_buffer_loads`] snapshots a scalar load: its address
+/// depends on a per-invocation VGPR index. The correct lowering is the one the
+/// recompiler already has — bind the descriptor and let it read live guest
+/// memory at draw time. So this pass supplies the binding rather than a value.
+///
+/// Only [`proved_vsharp_quad`] provenances are bound; anything else keeps the
+/// named refusal. A V# the usage table already bound is never shadowed.
+///
+/// # The clobber the binding creates, and its guard
+///
+/// `Spirv::WriteLocalVariables` seeds a non-extended binding's four SGPRs from
+/// the push-constant window, where dword 0 has been REWRITTEN from the guest
+/// base address to the compact descriptor-array index, and every MUBUF body
+/// indexes `%buf` with the value of that register. When the V# arrives via a
+/// captured `s_load`, the recompiled load would then materialize the RAW guest
+/// dwords over the seed — turning a small array index into a guest address and
+/// indexing the descriptor array out of bounds. That exact shape produced a
+/// measured `VK_ERROR_DEVICE_LOST` on ASTRO.BOT (see `mimg_descriptor_guard`),
+/// so `sload_dword_extended` and `sbuffer_load_dwords` now skip any captured
+/// dword whose destination register a non-extended storage binding owns.
+pub fn shader_bind_vsharp_storage_buffers(
+    code: &ShaderCode,
+    user_sgpr: &UserSgprInfo,
+    shift: i32,
+    bind: &mut ShaderBindResources,
+) {
+    let instructions = code.get_instructions();
+
+    // Only MUBUF/MTBUF. SMEM `s_buffer_load*` keeps the snapshot path, which is
+    // already proved and does not need a descriptor slot.
+    let mubuf_sites: Vec<(usize, i32, bool)> = instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| {
+            !matches!(
+                inst.type_,
+                ShaderInstructionType::SBufferLoadDword
+                    | ShaderInstructionType::SBufferLoadDwordx2
+                    | ShaderInstructionType::SBufferLoadDwordx4
+                    | ShaderInstructionType::SBufferLoadDwordx8
+                    | ShaderInstructionType::SBufferLoadDwordx16
+            )
+        })
+        .filter_map(|(at, inst)| buffer_resource_operand(inst).map(|(reg, w)| (at, reg, w)))
+        .collect();
+    if mubuf_sites.is_empty() {
+        return;
+    }
+
+    // ALL OR NOTHING. `mubuf_flexible` has two lowerings: with NO storage
+    // buffer bound anywhere it treats every MUBUF as a null V# (loads return
+    // 0, stores drop) and the shader still compiles; with at least one bound
+    // it switches every site to the descriptor path, which indexes `%buf`
+    // with the VALUE of that site's V# dword-0 register. A site whose V# this
+    // pass cannot prove has no seeded register, so it would index the
+    // descriptor array with raw guest data — the ASTRO.BOT
+    // `VK_ERROR_DEVICE_LOST` class. Binding SOME of a shader's V#s would
+    // therefore convert a compiling (if zero-valued) shader into a
+    // device-loss risk, so bind only when every MUBUF site in the program
+    // ends up covered.
+    let unprovable = mubuf_sites.iter().find(|&&(at, base_reg, _)| {
+        !storage_binding_owns_register(bind, base_reg, shift)
+            && proved_vsharp_quad(
+                instructions,
+                at,
+                base_reg,
+                user_sgpr,
+                shift,
+                &bind.embedded_constant_loads,
+            )
+            .is_none()
+    });
+    if let Some(&(_, base_reg, _)) = unprovable {
+        tracing::debug!(
+            base_register = base_reg,
+            sites = mubuf_sites.len(),
+            "a MUBUF V# in this shader is unprovable; binding none of them (a partially \
+             bound shader would index the descriptor array with raw guest data)"
+        );
+        return;
+    }
+
+    let mut added = false;
+    for (at, base_reg, writes) in mubuf_sites {
+        let inst = &instructions[at];
+        let bound_count = usize::try_from(bind.storage_buffers.buffers_num.max(0))
+            .unwrap_or(0)
+            .min(bind.storage_buffers.start_register.len());
+        // Already bound (by the usage table or by an earlier iteration of this
+        // loop): the live descriptor always wins.
+        if bind.storage_buffers.start_register[..bound_count]
+            .iter()
+            .any(|start| start.saturating_add(shift) == base_reg)
+        {
+            continue;
+        }
+        if bound_count >= ShaderStorageResources::BUFFERS_MAX {
+            tracing::warn!(
+                pc = inst.pc,
+                "more provable MUBUF V#s than BUFFERS_MAX; the rest keep their named refusal"
+            );
+            break;
+        }
+
+        let Some(resource) = proved_vsharp_quad(
+            instructions,
+            at,
+            base_reg,
+            user_sgpr,
+            shift,
+            &bind.embedded_constant_loads,
+        ) else {
+            continue;
+        };
+
+        bind.storage_buffers.buffers[bound_count] = resource;
+        bind.storage_buffers.usages[bound_count] = if writes {
+            ShaderStorageUsage::ReadWrite
+        } else {
+            ShaderStorageUsage::ReadOnly
+        };
+        // Zero = "no measured prefix", so the host uploads the descriptor's
+        // full extent. A MUBUF index is runtime data; no prefix is provable.
+        bind.storage_buffers.required_bytes[bound_count] = 0;
+        bind.storage_buffers.slots[bound_count] = -1;
+        bind.storage_buffers.start_register[bound_count] = base_reg - shift;
+        bind.storage_buffers.extended[bound_count] = false;
+        bind.storage_buffers.buffers_num += 1;
+        added = true;
+
+        tracing::debug!(
+            pc = inst.pc,
+            base_register = base_reg,
+            base_address = format_args!("{:#x}", resource.base48()),
+            stride = resource.stride(),
+            num_records = resource.num_records(),
+            unified_format = resource.format(),
+            writes,
+            "bound a proved MUBUF V# as a storage buffer"
+        );
+    }
+
+    if added {
+        shader_calc_binding_indices(bind);
+    }
+}
+
+/// Whether a **non-extended** storage binding owns `reg`, i.e.
+/// `Spirv::WriteLocalVariables` seeds it with a rewritten push-constant
+/// descriptor dword that no captured `s_load` may overwrite. See
+/// [`shader_bind_vsharp_storage_buffers`] for why overwriting it is a
+/// device-loss class bug and not merely wrong data.
+#[must_use]
+pub fn storage_binding_owns_register(bind: &ShaderBindResources, reg: i32, shift: i32) -> bool {
+    let count = usize::try_from(bind.storage_buffers.buffers_num.max(0))
+        .unwrap_or(0)
+        .min(bind.storage_buffers.start_register.len());
+    (0..count).any(|i| {
+        !bind.storage_buffers.extended[i] && {
+            let start = bind.storage_buffers.start_register[i] + shift;
+            reg >= start && reg < start + 4
+        }
+    })
 }
 
 /// Beyond Kyty: resolve `s_buffer_load*` whose base is a **buffer resource
@@ -1031,16 +1259,6 @@ pub fn shader_capture_vsharp_buffer_loads(
         {
             continue;
         }
-        // Where the V# comes from. Exactly one writer of the quad is tolerated;
-        // with two, which one reaches this load depends on control flow this
-        // pass does not model, so refuse.
-        let mut writers = instructions[..at]
-            .iter()
-            .filter(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)));
-        let producer = writers.next();
-        if writers.next().is_some() {
-            continue;
-        }
         // A register soffset adds a second runtime term. Prove it or skip —
         // folding the immediate alone would snapshot the wrong dwords.
         // Now backed by the scalar evaluator: a soffset computed by scalar
@@ -1051,80 +1269,18 @@ pub fn shader_capture_vsharp_buffer_loads(
         else {
             continue;
         };
-        // Two proved provenances for the descriptor, and nothing else:
-        //
-        //  * **live-in** — no writer, so the captured user-data snapshot IS what
-        //    the load will read;
-        //  * **loaded from an SRT table** — the single writer is a scalar load
-        //    whose OWN dwords were already captured from guest memory by the
-        //    pointer-load pass that runs before this one. GTA V's vertex shaders
-        //    use only this shape: `s_load_dwordx4 s[20:23], s[12:13], 64` and
-        //    then `s_buffer_load_dwordx8 s[24:31], s[20:23], 0`, so the live-in
-        //    guard alone refused every one of them (998 of the run's 999 shader
-        //    errors, measured 2026-07-28 on PPSA04264).
-        //
-        // The second shape adds no staleness the module does not already carry:
-        // the producing load is itself materialized from that snapshot, so the
-        // translated shader is pinned to those dwords either way, and the shader
-        // cache key hashes every captured value — changed data re-keys and
-        // retranslates rather than silently reusing a stale descriptor.
-        //
-        // A quad assembled by `s_mov`s, a partial overwrite, or a producer whose
-        // own dwords were never proved all keep the named refusal.
-        let fields = if let Some(producer) = producer {
-            // The writer must define the WHOLE quad at exactly `base_reg` —
-            // a partial or offset write leaves fields this pass cannot name.
-            if producer.dst.type_ != ShaderOperandType::Sgpr
-                || producer.dst.register_id != base_reg
-                || producer.dst.size < 4
-            {
-                continue;
-            }
-            let Some(captured) = bind
-                .embedded_constant_loads
-                .find(producer.pc)
-                .filter(|captured| captured.dwords_num >= 4)
-            else {
-                continue;
-            };
-            let mut fields = [0u32; 4];
-            fields.copy_from_slice(&captured.values[..4]);
-            fields
-        } else {
-            // Live-in: the quad must sit inside the captured user-data window.
-            let Ok(base) = usize::try_from(base_reg - shift) else {
-                continue;
-            };
-            if base + 3 >= UserSgprInfo::SGPRS_MAX || base + 3 >= user_sgpr.count as usize {
-                continue;
-            }
-            let mut fields = [0u32; 4];
-            fields.copy_from_slice(&user_sgpr.value[base..base + 4]);
-            fields
+        let Some(resource) = proved_vsharp_quad(
+            instructions,
+            at,
+            base_reg,
+            user_sgpr,
+            shift,
+            &bind.embedded_constant_loads,
+        ) else {
+            continue;
         };
-        if fields.iter().all(|field| *field == 0) {
-            continue;
-        }
-        // SharpEmu `TryDecodeBufferDescriptor`: `word3 >> 30 != 0` is not a
-        // buffer sharp (it is a T#/S#), and a zero-size descriptor is unbound.
-        if !sharp_dword3_is_buffer(fields[3]) {
-            continue;
-        }
-        let resource = super::resources::ShaderBufferResource { fields };
-        let stride = u64::from(resource.stride());
-        let records = u64::from(resource.num_records());
-        let size_bytes = if stride == 0 {
-            records
-        } else {
-            stride.saturating_mul(records)
-        };
-        if size_bytes == 0 {
-            continue;
-        }
+        let size_bytes = vsharp_size_bytes(&resource);
         let base_address = resource.base48();
-        if base_address == 0 {
-            continue;
-        }
         let byte_offset =
             u64::from(offset_operand.constant.u).wrapping_add(u64::from(soffset_bytes));
         // Refuse a read the descriptor itself says is out of range rather than
@@ -1176,6 +1332,111 @@ pub fn shader_capture_vsharp_buffer_loads(
             "captured V#-based s_buffer_load from user-data descriptor"
         );
     }
+}
+
+/// The BOUND a V# describes, in bytes. SharpEmu `TryDecodeBufferDescriptor`
+/// (L2163-2216): `stride == 0 ? num_records : stride * num_records`. This is a
+/// size, never an address term.
+fn vsharp_size_bytes(resource: &super::resources::ShaderBufferResource) -> u64 {
+    let stride = u64::from(resource.stride());
+    let records = u64::from(resource.num_records());
+    if stride == 0 {
+        records
+    } else {
+        stride.saturating_mul(records)
+    }
+}
+
+/// The buffer descriptor (V#) held in the SGPR quad at `base_reg` when — and
+/// only when — its provenance is one of exactly two proved shapes. `None`
+/// means "not proved"; the caller keeps its named refusal. This never guesses
+/// an address.
+///
+/// The two shapes, and why each is sound:
+///
+/// * **live-in** — no instruction before `at` writes any of the four
+///   registers, so the captured user-data snapshot IS what the shader will
+///   read;
+/// * **loaded from a descriptor table** — exactly one earlier instruction
+///   writes the quad, and that instruction's OWN dwords were already captured
+///   from guest memory by the pointer-load pass that runs before this one
+///   (`shader_capture_runtime_scalar_loads_shifted`). GTA V's vertex shaders
+///   use this shape: `s_load_dwordx4 s[20:23], s[12:13], 64` and then
+///   `s_buffer_load_dwordx8 s[24:31], s[20:23], 0`.
+///
+/// The quad need not start at the producer's own base register. One
+/// `s_load_dwordx8 s[12:19]` / `s_load_dwordx16 s[12:27]` delivers a
+/// descriptor **table** — two or four consecutive V#s — and a title picks any
+/// of them as a buffer base. Reading the snapshot at the right dword offset is
+/// the same proved data, indexed correctly; a partial overlap, or an offset
+/// past the dwords the capture actually proved, still returns `None`.
+///
+/// More than one writer returns `None`: which one reaches the use depends on
+/// control flow this pass does not model. A quad assembled by `s_mov`s, or a
+/// producer whose own dwords were never proved, also returns `None`.
+///
+/// Finally the dwords must actually BE a usable buffer descriptor: nonzero,
+/// buffer-typed (SharpEmu's `word3 >> 30 != 0` type check, here
+/// [`sharp_dword3_is_buffer`]), with a nonzero bound and a nonzero base.
+fn proved_vsharp_quad(
+    instructions: &[ShaderInstruction],
+    at: usize,
+    base_reg: i32,
+    user_sgpr: &UserSgprInfo,
+    shift: i32,
+    embedded: &ShaderEmbeddedConstantLoads,
+) -> Option<super::resources::ShaderBufferResource> {
+    let mut writers = instructions[..at.min(instructions.len())]
+        .iter()
+        .filter(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)));
+    let producer = writers.next();
+    if writers.next().is_some() {
+        return None;
+    }
+
+    let fields = if let Some(producer) = producer {
+        if producer.dst.type_ != ShaderOperandType::Sgpr {
+            return None;
+        }
+        let quad_offset = base_reg - producer.dst.register_id;
+        if quad_offset < 0 || quad_offset + 4 > producer.dst.size {
+            return None;
+        }
+        let captured = embedded.find(producer.pc)?;
+        let at_dword = usize::try_from(quad_offset).ok()?;
+        // Only dwords the capture actually PROVED (`dwords_num`) may be read;
+        // the rest of `values` is default-zero padding.
+        let end = at_dword + 4;
+        if end > captured.dwords_num as usize || end > captured.values.len() {
+            return None;
+        }
+        let mut fields = [0u32; 4];
+        fields.copy_from_slice(&captured.values[at_dword..end]);
+        fields
+    } else {
+        // Live-in: the quad must sit inside the captured user-data window.
+        let base = usize::try_from(base_reg - shift).ok()?;
+        if base + 3 >= UserSgprInfo::SGPRS_MAX || base + 3 >= user_sgpr.count as usize {
+            return None;
+        }
+        let mut fields = [0u32; 4];
+        fields.copy_from_slice(&user_sgpr.value[base..base + 4]);
+        fields
+    };
+
+    if fields.iter().all(|field| *field == 0) {
+        return None;
+    }
+    // SharpEmu `TryDecodeBufferDescriptor`: `word3 >> 30 != 0` is not a buffer
+    // sharp (it is a T#/S#), and a zero-size descriptor is unbound.
+    if !sharp_dword3_is_buffer(fields[3]) {
+        return None;
+    }
+    let resource = super::resources::ShaderBufferResource { fields };
+    if vsharp_size_bytes(&resource) == 0 || resource.base48() == 0 {
+        return None;
+    }
+    Some(resource)
 }
 
 /// For an `s_add_u32`, return `(constant_addend, other_sgpr)` when exactly one
