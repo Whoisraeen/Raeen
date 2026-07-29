@@ -111,10 +111,47 @@ pub(crate) fn sanitize_id(id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A scratch directory unique to this process **and** this call.
+    ///
+    /// This test used to reuse one fixed `raeen-ledger-test` path directly
+    /// under the shared system temp dir, delete it, and immediately recreate
+    /// it. Both halves of that are silent failure modes that only bite under
+    /// the I/O load of a full `cargo test --workspace` run, which is why it
+    /// passed every time it was run on its own:
+    ///
+    /// * the opening `remove_dir_all` was best-effort (`let _ = …`), so a
+    ///   ledger left behind by a killed run — or one a virus scanner still
+    ///   holds a handle on — survives it, and the "missing file → default"
+    ///   assertion reads the *previous* run's data instead of a default;
+    /// * on Windows a directory whose last handle has not closed lingers in
+    ///   delete-pending state, and recreating that exact path fails with
+    ///   access denied. [`store`] is best-effort by design — it reports that
+    ///   through `tracing::warn!` and returns normally — so the round-trip
+    ///   assertion below just sees an empty ledger, with nothing in the test
+    ///   output to explain why.
+    ///
+    /// A path that is never reused cannot hit either one. The pid follows the
+    /// convention every other temp-dir test in this crate uses; the counter
+    /// separates calls within one process, and the nanosecond stamp separates
+    /// runs that land on a recycled pid.
+    fn scratch_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "raeen-ledger-test-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("create ledger scratch dir");
+        dir
+    }
+
     #[test]
     fn round_trips_and_degrades_gracefully() {
-        let dir = std::env::temp_dir().join("raeen-ledger-test");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_dir();
         // Missing file → default.
         let fresh = load(&dir, "PPSA_TEST");
         assert_eq!(fresh.last_played, 0);
@@ -126,6 +163,18 @@ mod tests {
             last_faulted: true,
         };
         store(&dir, "PPSA_TEST", &ledger);
+        // `store` swallows I/O errors into a log line, and `load` turns *any*
+        // read failure into the default ledger — so between them a write that
+        // never happened surfaces as a bare `left: 0` value mismatch below,
+        // with nothing in the test output naming the real cause. Check the raw
+        // file here instead, so that failure reports itself. (Existence alone
+        // is not enough: a stale file at the path would satisfy it.)
+        let raw = std::fs::read_to_string(path_for(&dir, "PPSA_TEST"))
+            .expect("store left no readable ledger file (it logs why via tracing::warn!)");
+        assert!(
+            raw.contains("1234"),
+            "a ledger file exists but store did not write this ledger: {raw}"
+        );
         let back = load(&dir, "PPSA_TEST");
         assert_eq!(back.last_played, 1234);
         assert_eq!(back.play_time_text().as_deref(), Some("2h 15m played"));

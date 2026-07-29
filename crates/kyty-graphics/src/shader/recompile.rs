@@ -933,7 +933,7 @@ fn recompile_buffer_load_format_x_vdata1(
             // shader and handed the unified number straight to the guard, which
             // could never match, so this fetch was a silent no-op.
             let packed_format =
-                mubuf_descriptor_packed_format(inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_X)?;
+                mubuf_descriptor_packed_format(&inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_X)?;
 
             let dst_value = operand_variable_to_str(inst.dst);
             let src0_value = operand_variable_to_str(inst.src[0]);
@@ -1054,7 +1054,7 @@ fn recompile_buffer_load_format_xyzw_vdata4(
         // see [`mubuf_descriptor_packed_format`] for why extracting it in the
         // shader could never match.
         let packed_format =
-            mubuf_descriptor_packed_format(inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_XYZW)?;
+            mubuf_descriptor_packed_format(&inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_XYZW)?;
         {
             if !operand_is_constant(inst.src[2]) {
                 return Err(not_supported(FUNC, "src2 is not a constant"));
@@ -3852,8 +3852,13 @@ fn recompile_buffer_store_format_x_vdata1(
             // dword3 extraction handed `%tbuffer_store_format_x` a unified
             // number its guard can never equal, so the store wrote nothing.
             // See [`mubuf_descriptor_packed_format`].
-            let packed_format =
-                mubuf_descriptor_packed_format(inst, bind_info, spirv, FUNC, &TBUF_STORE_FORMAT_X)?;
+            let packed_format = mubuf_descriptor_packed_format(
+                &inst,
+                bind_info,
+                spirv,
+                FUNC,
+                &TBUF_STORE_FORMAT_X,
+            )?;
 
             let dst_value = operand_variable_to_str(inst.dst);
             let src0_value = operand_variable_to_str(inst.src[0]);
@@ -3938,7 +3943,7 @@ fn recompile_buffer_store_format_xy_vdata2(
             // [`mubuf_descriptor_packed_format`]. `%tbuffer_store_format_xy`
             // tests 92 / 95, which no unified FORMAT field ever holds.
             let packed_format = mubuf_descriptor_packed_format(
-                inst,
+                &inst,
                 bind_info,
                 spirv,
                 FUNC,
@@ -4112,7 +4117,7 @@ fn mubuf_flexible(
     );
     // The typed helper this op calls, for the ops that take a format argument.
     // `None` for the raw dword/byte ops, which have no format guard at all.
-    let helper = match op {
+    let format_helper = match op {
         MubufFlexOp::LoadFormatX => Some(&TBUF_LOAD_FORMAT_X),
         MubufFlexOp::StoreFormatX => Some(&TBUF_STORE_FORMAT_X),
         MubufFlexOp::StoreFormatXyzw => Some(&TBUF_STORE_FORMAT_XYZW),
@@ -4208,7 +4213,7 @@ fn mubuf_flexible(
     // that unified number in — a comparison that can never succeed, so every
     // flexible-addressing typed access was a silent no-op. See
     // [`mubuf_descriptor_packed_format`].
-    if let Some(helper) = helper {
+    if let Some(helper) = format_helper {
         // Type-check dword3 anyway: this row still reaches the same V# quad,
         // and a non-uint there means the operand model is wrong, not the
         // format.
@@ -4216,7 +4221,7 @@ fn mubuf_flexible(
         if src1_value3.type_ != SpirvType::Uint {
             return Err(not_supported(func, "unexpected V# dword3 type"));
         }
-        let packed_format = mubuf_descriptor_packed_format(inst, bind_info, spirv, func, helper)?;
+        let packed_format = mubuf_descriptor_packed_format(&inst, bind_info, spirv, func, helper)?;
         text += &format!("               OpStore %temp_int_5 %int_{packed_format}\n");
     }
 
@@ -4233,7 +4238,7 @@ fn mubuf_flexible(
         args += &format!("%{v} ");
     }
     args += "%temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4";
-    if helper.is_some() {
+    if format_helper.is_some() {
         args += " %temp_int_5";
     }
     text += &format!("        %mbf_c_{i} = OpFunctionCall %void {helper} {args}\n");
@@ -14681,10 +14686,26 @@ mod tests {
         input_info.threads_num = [1, 1, 1];
         input_info.bind.push_constant_size = 64;
         input_info.bind.storage_buffers.buffers_num = 1;
+        // The instruction's V# is s[4:7], and the store's element format now
+        // comes from that descriptor at translate time — so the fixture has to
+        // say which register the binding covers and what it holds. Unified 77 =
+        // (dfmt 14, nfmt 7) = 32_32_32_32_FLOAT, the one format
+        // `%tbuffer_store_format_xyzw` serves.
+        input_info.bind.storage_buffers.start_register[0] = 4;
+        input_info.bind.storage_buffers.buffers[0].fields = [0, 16 << 16, 256, 77 << 12];
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile buffer_store_format_xyzw");
         assert!(source.contains("%tbuffer_store_format_xyzw"), "{source}");
         assert!(source.contains("%buffer_store_float4"), "{source}");
+        assert!(
+            source.contains("OpStore %temp_int_5 %int_119"),
+            "the descriptor's unified 77 must reach the helper as PACKED 119, \
+             not as the raw field:\n{source}"
+        );
+        assert!(
+            !source.contains("%mbf_f0_"),
+            "the runtime `(dword3 >> 12) & 0x7f` extraction must be gone:\n{source}"
+        );
         // Stores are exec-guarded like the Kyty store bodies.
         assert!(source.contains("%exec_lo_u_0"), "{source}");
         let words = spirv_run(&source).expect("assemble buffer_store_format_xyzw");
@@ -21276,6 +21297,330 @@ mod tests {
             crate::shader::spirv::unsupported_buffer_format_skips() > before,
             "the refusal must be counted"
         );
+    }
+
+    /// One MUBUF fixture: a single typed access through a V# in `s[4:7]`,
+    /// against a descriptor whose unified FORMAT is `unified`.
+    ///
+    /// `word0` is the MUBUF first dword — `0xE000_0000 | (opcode << 18) |
+    /// (idxen << 13) | (offen << 12)`, the field layout `shader_parse_mubuf`
+    /// decodes. `word1 = 0x8001_0400` throughout: soffset `0x80` (inline zero),
+    /// srsrc 1 (= `s[4:7]`), vdata `v4`, vaddr `v0`.
+    fn mubuf_typed_source(
+        word0: u32,
+        unified: u32,
+    ) -> Result<(String, ShaderCode), ShaderRecompileError> {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &[word0, 0x8001_0400, S_ENDPGM], &mut code, true)
+            .unwrap_or_else(|e| panic!("parse MUBUF {word0:#010x}: {e}"));
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 4;
+        input_info.bind.storage_buffers.buffers[0].fields = [0, 16 << 16, 256, unified << 12];
+
+        spirv_generate_source(&code, None, None, Some(&input_info)).map(|s| (s, code))
+    }
+
+    /// EVERY MUBUF row that passes a format to a typed helper must pass the
+    /// **packed** `dfmt * 8 + nfmt` constant, not the descriptor's raw unified
+    /// field — through to spirv-val-clean SPIR-V.
+    ///
+    /// The `BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen]` row was converted
+    /// on `fix-aaa-shader-gaps`; the identical defect survived in the
+    /// `BufferLoadFormatX` / `BufferStoreFormatX` / `BufferStoreFormatXy`
+    /// bodies and in `mubuf_flexible`, which ten dispatch rows share. All of
+    /// them emitted
+    ///
+    /// ```text
+    /// OpShiftRightLogical %uint <dword3> %int_12
+    /// OpBitwiseAnd %uint <..> %uint_127
+    /// ```
+    ///
+    /// and handed the result to a guard that only ever accepts 36 / 39 / 92 /
+    /// 95 / 119 — so the guard could never pass and the access was a silent
+    /// no-op. Each row is checked separately because they share no code path
+    /// at all above `mubuf_flexible`, and the flexible rows differ by
+    /// addressing mode.
+    #[test]
+    fn every_mubuf_typed_row_passes_the_packed_format_not_the_unified_one() {
+        // (word0, what it decodes to, unified FORMAT of the descriptor, the
+        //  packed constant that must reach the helper, the helper called)
+        const ROWS: &[(u32, T, F, u32, u32, &str)] = &[
+            // --- the three standalone Kyty bodies (idxen, no offen) ---
+            // opcode 0x00 buffer_load_format_x
+            (
+                0xE000_2000,
+                T::BufferLoadFormatX,
+                F::Vdata1VaddrSvSoffsIdxen,
+                22,
+                39,
+                "%tbuffer_load_format_x",
+            ),
+            // opcode 0x04 buffer_store_format_x
+            (
+                0xE010_2000,
+                T::BufferStoreFormatX,
+                F::Vdata1VaddrSvSoffsIdxen,
+                20,
+                36,
+                "%tbuffer_store_format_x",
+            ),
+            // opcode 0x05 buffer_store_format_xy
+            (
+                0xE014_2000,
+                T::BufferStoreFormatXy,
+                F::Vdata2VaddrSvSoffsIdxen,
+                64,
+                95,
+                "%tbuffer_store_format_xy",
+            ),
+            // --- mubuf_flexible: buffer_load_format_x, all three modes ---
+            (
+                0xE000_0000,
+                T::BufferLoadFormatX,
+                F::Vdata1SvSoffs,
+                20,
+                36,
+                "%tbuffer_load_format_x",
+            ),
+            (
+                0xE000_1000,
+                T::BufferLoadFormatX,
+                F::Vdata1VaddrSvSoffsOffen,
+                22,
+                39,
+                "%tbuffer_load_format_x",
+            ),
+            (
+                0xE000_3000,
+                T::BufferLoadFormatX,
+                F::Vdata1Vaddr2SvSoffsOffenIdxen,
+                22,
+                39,
+                "%tbuffer_load_format_x",
+            ),
+            // --- mubuf_flexible: buffer_store_format_x, all three modes ---
+            (
+                0xE010_0000,
+                T::BufferStoreFormatX,
+                F::Vdata1SvSoffs,
+                20,
+                36,
+                "%tbuffer_store_format_x",
+            ),
+            (
+                0xE010_1000,
+                T::BufferStoreFormatX,
+                F::Vdata1VaddrSvSoffsOffen,
+                22,
+                39,
+                "%tbuffer_store_format_x",
+            ),
+            (
+                0xE010_3000,
+                T::BufferStoreFormatX,
+                F::Vdata1Vaddr2SvSoffsOffenIdxen,
+                20,
+                36,
+                "%tbuffer_store_format_x",
+            ),
+            // --- mubuf_flexible: buffer_store_format_xyzw, all four modes ---
+            (
+                0xE01C_2000,
+                T::BufferStoreFormatXyzw,
+                F::Vdata4VaddrSvSoffsIdxen,
+                77,
+                119,
+                "%tbuffer_store_format_xyzw",
+            ),
+            (
+                0xE01C_3000,
+                T::BufferStoreFormatXyzw,
+                F::Vdata4Vaddr2SvSoffsOffenIdxen,
+                77,
+                119,
+                "%tbuffer_store_format_xyzw",
+            ),
+            (
+                0xE01C_0000,
+                T::BufferStoreFormatXyzw,
+                F::Vdata4SvSoffs,
+                77,
+                119,
+                "%tbuffer_store_format_xyzw",
+            ),
+            (
+                0xE01C_1000,
+                T::BufferStoreFormatXyzw,
+                F::Vdata4VaddrSvSoffsOffen,
+                77,
+                119,
+                "%tbuffer_store_format_xyzw",
+            ),
+            // --- the four-channel load row fixed on fix-aaa-shader-gaps,
+            //     kept here so the whole set is one table ---
+            (
+                0xE00C_2000,
+                T::BufferLoadFormatXyzw,
+                F::Vdata4VaddrSvSoffsIdxen,
+                77,
+                119,
+                "%tbuffer_load_format_xyzw",
+            ),
+        ];
+
+        for &(word0, type_, format, unified, packed, helper) in ROWS {
+            let label = format!("{type_:?} [{format:?}] ({word0:#010x})");
+            let (source, code) = mubuf_typed_source(word0, unified)
+                .unwrap_or_else(|e| panic!("{label} must recompile: {e}"));
+
+            // The fixture really is the row under test.
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, type_, "{label}: decoded type");
+            assert_eq!(inst.format, format, "{label}: decoded format");
+
+            assert!(
+                source.contains(&format!("OpFunctionCall %void {helper} ")),
+                "{label} must call {helper}:\n{source}"
+            );
+            assert!(
+                source.contains(&format!("OpStore %temp_int_5 %int_{packed}")),
+                "{label}: unified {unified} must reach {helper} as PACKED {packed}:\n{source}"
+            );
+            // The runtime `(dword3 >> 12) & 0x7f` extraction is what could
+            // never match. Both spellings of it must be gone: `%mbf_f0_*` is
+            // `mubuf_flexible`'s, `%t206_*`/`%t208_*` the standalone bodies'.
+            for gone in ["%mbf_f0_", "%t206_0", "%t208_0"] {
+                assert!(
+                    !source.contains(gone),
+                    "{label}: runtime format extraction `{gone}` must be gone:\n{source}"
+                );
+            }
+
+            let words = spirv_run(&source).unwrap_or_else(|e| panic!("{label} assembles: {e}"));
+            spirv_val_ok(&words, &label);
+        }
+    }
+
+    /// The other half of the same gate, per row: a descriptor format the
+    /// helper's guard does not accept is refused **by name** and counted,
+    /// rather than translating into an access that quietly does nothing.
+    ///
+    /// The refusal names both numbering schemes, because the fix is a
+    /// descriptor-side fact: unified 56 is `(dfmt 10, nfmt 0)`, a real RDNA2
+    /// format with no raw-dword spelling any of these helpers implements.
+    #[test]
+    fn a_format_the_helper_cannot_serve_is_refused_per_row_and_counted() {
+        // (word0, the helper named in the refusal, what it does serve)
+        const ROWS: &[(u32, &str, &str)] = &[
+            (
+                0xE000_2000,
+                "tbuffer_load_format_x",
+                "unified 20 / packed 36",
+            ),
+            (
+                0xE010_2000,
+                "tbuffer_store_format_x",
+                "unified 20 / packed 36",
+            ),
+            (
+                0xE014_2000,
+                "tbuffer_store_format_xy",
+                "unified 62 / packed 92",
+            ),
+            (
+                0xE000_0000,
+                "tbuffer_load_format_x",
+                "unified 22 / packed 39",
+            ),
+            (
+                0xE010_1000,
+                "tbuffer_store_format_x",
+                "unified 22 / packed 39",
+            ),
+            (
+                0xE01C_3000,
+                "tbuffer_store_format_xyzw",
+                "unified 77 / packed 119",
+            ),
+            (
+                0xE00C_2000,
+                "tbuffer_load_format_xyzw",
+                "unified 77 / packed 119",
+            ),
+        ];
+
+        for &(word0, helper, served) in ROWS {
+            let before = crate::shader::spirv::unsupported_buffer_format_skips();
+            // Unified 56 = (dfmt 10, nfmt 0) — 8_8_8_8_UNORM, the format the
+            // retail measurement actually hits once unified-77 streams
+            // translate. No helper here serves it.
+            let err = mubuf_typed_source(word0, 56)
+                .expect_err("a format no helper serves must not translate silently");
+            let text = err.to_string();
+            for want in [
+                "unified format 56",
+                "dfmt 10, nfmt 0",
+                helper,
+                served,
+                "s[4:7]",
+            ] {
+                assert!(
+                    text.contains(want),
+                    "{word0:#010x}: refusal must name {want}, got: {text}"
+                );
+            }
+            assert!(
+                crate::shader::spirv::unsupported_buffer_format_skips() > before,
+                "{word0:#010x}: the refusal must be counted"
+            );
+        }
+    }
+
+    /// `mubuf_flexible` is shared with the RAW dword/byte rows, which have no
+    /// format guard at all. They must be untouched: no `temp_int_5` argument,
+    /// no descriptor-format lookup, and therefore no new refusal — a
+    /// `buffer_load_dword` through a descriptor whose format is meaningless
+    /// still has to compile.
+    #[test]
+    fn the_raw_mubuf_rows_keep_no_format_argument() {
+        // (word0, what it decodes to, the helper it calls)
+        const ROWS: &[(u32, T, &str)] = &[
+            (0xE030_2000, T::BufferLoadDword, "%buffer_load_float1"),
+            (0xE030_0000, T::BufferLoadDword, "%buffer_load_float1"),
+            (0xE030_3000, T::BufferLoadDword, "%buffer_load_float1"),
+            (0xE070_2000, T::BufferStoreDword, "%buffer_store_float1"),
+            (0xE070_1000, T::BufferStoreDword, "%buffer_store_float1"),
+            (0xE020_2000, T::BufferLoadUbyte, "%buffer_load_ubyte"),
+            (0xE020_3000, T::BufferLoadUbyte, "%buffer_load_ubyte"),
+        ];
+
+        for &(word0, type_, helper) in ROWS {
+            // Unified 56 is the format the typed rows refuse; a raw row must
+            // not even look at it.
+            let (source, code) = mubuf_typed_source(word0, 56)
+                .unwrap_or_else(|e| panic!("{type_:?} ({word0:#010x}) must recompile: {e}"));
+            let label = format!("{type_:?} ({word0:#010x})");
+            assert_eq!(code.get_instructions()[0].type_, type_, "{label}");
+            assert!(
+                source.contains(&format!("OpFunctionCall %void {helper} ")),
+                "{label} must call {helper}:\n{source}"
+            );
+            assert!(
+                !source.contains("OpFunctionCall %void %tbuffer_"),
+                "{label} must not reach a typed helper:\n{source}"
+            );
+            assert!(
+                !source.contains("%mbf_f0_"),
+                "{label} must not read the descriptor format at all:\n{source}"
+            );
+            let words = spirv_run(&source).unwrap_or_else(|e| panic!("{label} assembles: {e}"));
+            spirv_val_ok(&words, &label);
+        }
     }
 
     /// The scalar-evaluator acceptance case: real GCN bytes whose scalar load
