@@ -281,7 +281,22 @@ mod tests {
                 unresolved: Vec::new(),
                 unresolved_stubs: Vec::new(),
                 module_inits: Vec::new(),
-                hle_trampolines: Vec::new(),
+                hle_trampolines: vec![
+                    crate::dynlib::linker::HleTrampoline {
+                        library: "libkernel".to_string(),
+                        function: "sceKernelDlsym".to_string(),
+                        addr: crate::HLE_TRAMPOLINE_BASE,
+                    },
+                    // A dlsym-only reservation. A cache hit returns without
+                    // ever calling `load_process`, so the round-trip below is
+                    // what proves a restored process still carries the
+                    // reservation the guest's `dlsym` needs an address from.
+                    crate::dynlib::linker::HleTrampoline {
+                        library: "libkernel".to_string(),
+                        function: "scriptingGetMem".to_string(),
+                        addr: crate::HLE_TRAMPOLINE_BASE + 8,
+                    },
+                ],
                 entry: 1,
                 tls: None,
                 tls_layout: Vec::new(),
@@ -302,6 +317,13 @@ mod tests {
         let hit = load_from(&temp.0, &key).unwrap().expect("cache hit");
         assert_eq!(hit.hle_data_offset, 0x4000);
         assert_eq!(hit.process, expected);
+        // Named explicitly, not just covered by the whole-struct compare: a
+        // cache hit never runs `load_process`, so a restored process must
+        // already carry the dlsym-only reservation, and the import count must
+        // still exclude it.
+        assert_eq!(hit.process.linked.hle_trampolines.len(), 2);
+        assert_eq!(hit.process.linked.imported_hle_trampoline_count(), 1);
+        assert_eq!(hit.process.linked.reserved_hle_trampoline_count(), 1);
     }
 
     #[test]

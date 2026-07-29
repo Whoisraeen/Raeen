@@ -1896,14 +1896,14 @@ static MALLOC_SIZES: std::sync::LazyLock<dashmap::DashMap<(u64, u64), u64>> =
 
 /// Record a live allocation for `malloc_usable_size`. No-op on the null
 /// (failed) address.
-fn track_alloc(ctx: &HleContext, addr: u64, size: u64) {
+pub(crate) fn track_alloc(ctx: &HleContext, addr: u64, size: u64) {
     if addr != 0 {
         MALLOC_SIZES.insert((kernel_key(ctx), addr), size);
     }
 }
 
 /// Drop a released allocation from the `malloc_usable_size` table.
-fn track_free(ctx: &HleContext, addr: u64) {
+pub(crate) fn track_free(ctx: &HleContext, addr: u64) {
     if addr != 0 {
         MALLOC_SIZES.remove(&(kernel_key(ctx), addr));
     }

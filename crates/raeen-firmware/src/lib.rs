@@ -1464,6 +1464,15 @@ pub fn load_process(
         }
     }
 
+    // Reserve trampolines for the HLE functions the guest can only reach by
+    // NAME, through `sceKernelDlsym`. Nothing imports them, so no relocation
+    // ever mints their address — but `dlsym` has to hand back a callable one.
+    // Must happen before the tables are copied out below.
+    for (library, function) in raeen_hle::libkernel::DLSYM_RESERVED_EXPORTS {
+        let addr = tables.reserve_hle_export(library, function);
+        tracing::debug!("reserved dlsym-only HLE export {library}::{function} at {addr:#x}");
+    }
+
     // Install the process-wide marker tables: they cover every module, so the
     // runtime can invert a trampoline/stub address from ANY of them. Without
     // this the composed module would carry only the main module's entries and a
@@ -1522,11 +1531,13 @@ pub fn load_process(
     let dep_unresolved: usize = dependencies.iter().map(|d| d.unresolved).sum();
     tracing::info!(
         "process composed: {} dependenc(ies), {:#x}-byte image, {} HLE trampoline(s) \
-         (process-wide); unresolved relocations: {} in the main module + {} across its \
+         (process-wide, of which {} are dlsym-only reservations rather than imports); \
+         unresolved relocations: {} in the main module + {} across its \
          dependencies = {}, over {} distinct missing NID(s)",
         dependencies.len(),
         linked.image.len(),
         linked.hle_trampolines.len(),
+        linked.reserved_hle_trampoline_count(),
         linked.unresolved.len(),
         dep_unresolved,
         linked.unresolved.len() + dep_unresolved,

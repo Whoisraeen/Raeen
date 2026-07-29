@@ -1480,11 +1480,13 @@ fn main() -> anyhow::Result<()> {
         }
         let linked = std::sync::Arc::new(linked);
         info!(
-            "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={}",
+            "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={} \
+             (+{} dlsym-only reservation(s), not imports)",
             linked.entry,
             linked.image.len(),
-            linked.hle_trampolines.len(),
-            linked.unresolved.len()
+            linked.imported_hle_trampoline_count(),
+            linked.unresolved.len(),
+            linked.reserved_hle_trampoline_count()
         );
         // The module's thread-local template. `tdata` is the part that must be
         // *copied* into every thread's block; the rest is `.tbss` and is zero.

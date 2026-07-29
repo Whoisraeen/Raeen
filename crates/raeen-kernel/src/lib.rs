@@ -204,6 +204,15 @@ pub struct OrbisKernel {
     pub modules: DashMap<u32, ModuleInfo>,
     /// Handle-scoped NID -> absolute guest addresses for real LLE modules.
     lle_module_exports: DashMap<u32, HashMap<u64, u64>>,
+    /// Function name -> the guest-callable HLE trampoline address that stands
+    /// for it in *this* process, published by the runtime from the process-wide
+    /// trampoline table (`LinkedModule::hle_trampolines`).
+    ///
+    /// Only `sceKernelDlsym` reads this. Imports never do: the linker has
+    /// already written each import's trampoline address straight into its
+    /// relocation slot. `dlsym` is the one caller that has to turn a *name*
+    /// into a callable address at run time, with no relocation to consult.
+    hle_export_addrs: DashMap<String, u64>,
     /// Next module ID to assign.
     next_module_id: RwLock<u32>,
     /// Syscall statistics (for debugging).
@@ -1928,6 +1937,7 @@ impl OrbisKernel {
             started_at: std::time::Instant::now(),
             modules: DashMap::new(),
             lle_module_exports: DashMap::new(),
+            hle_export_addrs: DashMap::new(),
             next_module_id: RwLock::new(1),
             syscall_stats: DashMap::new(),
             thread_names: DashMap::new(),
@@ -2453,6 +2463,73 @@ impl OrbisKernel {
     /// different bugs that are indistinguishable from an `ENOENT` alone.
     pub fn lle_export_count(&self, handle: u32) -> Option<usize> {
         self.lle_module_exports.get(&handle).map(|e| e.len())
+    }
+
+    /// The handle of the **main program**.
+    ///
+    /// Module ids are handed out from 1 upward by [`Self::register_module`], in
+    /// load order, and the executable is registered first — so the lowest id
+    /// carrying an export table is the main program. `sceKernelDlsym(0, ...)`
+    /// resolves against it: handle 0 is the Orbis rtld's reserved id for the
+    /// executable, **not** a "search everything" scope (`RTLD_DEFAULT`) and not
+    /// an invalid handle.
+    #[must_use]
+    pub fn main_lle_module_handle(&self) -> Option<u32> {
+        self.lle_module_exports
+            .iter()
+            .map(|entry| *entry.key())
+            .min()
+    }
+
+    /// Resolve `nid` against **every** loaded module, in load order (ascending
+    /// handle), returning the first match as `(handle, address)`.
+    ///
+    /// The load-order walk is what makes this deterministic: `lle_module_exports`
+    /// is a `DashMap` whose iteration order is arbitrary, and two modules may
+    /// legally export the same NID, so an unordered "first hit" would resolve
+    /// the same symbol to different addresses on different runs.
+    #[must_use]
+    pub fn resolve_lle_export_anywhere(&self, nid: u64) -> Option<(u32, u64)> {
+        let mut handles: Vec<u32> = self
+            .lle_module_exports
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        handles.sort_unstable();
+        handles.into_iter().find_map(|handle| {
+            self.resolve_lle_export(handle, nid)
+                .map(|addr| (handle, addr))
+        })
+    }
+
+    /// Publish one process-wide HLE trampoline address under the function name
+    /// it stands for, so `sceKernelDlsym` can hand the guest a callable address
+    /// for an HLE-implemented function.
+    ///
+    /// First registration wins. Two libraries may export the same function name
+    /// under different NIDs (`libkernel::stat` and `libScePosix::stat`), and
+    /// both trampolines dispatch to the same implementation, so which one a
+    /// name-keyed lookup returns does not matter — but it must not *change*
+    /// between calls.
+    pub fn register_hle_export_addr(&self, function: &str, addr: u64) {
+        self.hle_export_addrs
+            .entry(function.to_string())
+            .or_insert(addr);
+    }
+
+    /// The guest-callable trampoline address for an HLE-implemented function
+    /// name, if this process reserved one.
+    #[must_use]
+    pub fn resolve_hle_export_addr(&self, function: &str) -> Option<u64> {
+        self.hle_export_addrs.get(function).map(|entry| *entry)
+    }
+
+    /// How many HLE trampolines this process published to `dlsym`. Diagnostic:
+    /// zero means the runtime never called [`Self::register_hle_export_addr`],
+    /// which is a wiring bug rather than a missing symbol.
+    #[must_use]
+    pub fn hle_export_addr_count(&self) -> usize {
+        self.hle_export_addrs.len()
     }
 
     /// Dispatch a syscall.
