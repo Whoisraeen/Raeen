@@ -12,6 +12,7 @@
 //! follow-up (behind `raeen-gpu`).
 
 use crate::{HleContext, HleRegistry};
+use raeen_core::frame_path::{self, Stage};
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -52,8 +53,16 @@ const DISPLAY_REFRESH_HZ: u64 = 60;
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceVideoOut", "sceVideoOutOpen", hle_open);
     registry.register("libSceVideoOut", "sceVideoOutClose", hle_close);
-    registry.register("libSceVideoOut", "sceVideoOutSetFlipRate", hle_ok);
-    registry.register("libSceVideoOut", "sceVideoOutRegisterBuffers", hle_ok);
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutSetFlipRate",
+        hle_set_flip_rate,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutRegisterBuffers",
+        hle_register_buffers,
+    );
     registry.register("libSceVideoOut", "sceVideoOutSubmitFlip", hle_submit_flip);
     registry.register(
         "libSceVideoOut",
@@ -171,6 +180,22 @@ fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {
     SCE_OK
 }
 
+/// `sceVideoOutSetFlipRate(handle, rate)`: accepted as-is. Recorded so a title
+/// that opens a handle and then stalls is distinguishable from one that never
+/// chose a presentation cadence at all.
+fn hle_set_flip_rate(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    frame_path::record(Stage::FlipRateSet);
+    SCE_OK
+}
+
+/// `sceVideoOutRegisterBuffers(...)`: the pre-Gen5 registration entry point.
+/// Accepted as-is; `sceVideoOutRegisterBuffers2` is the path that records
+/// layout. Both count toward the frame path's buffers-registered rung.
+fn hle_register_buffers(_ctx: &HleContext, _args: &[u64]) -> u64 {
+    frame_path::record(Stage::BuffersRegistered);
+    SCE_OK
+}
+
 fn hle_open(_ctx: &HleContext, args: &[u64]) -> u64 {
     debug!(
         "sceVideoOutOpen(userId={}, busType={}, index={})",
@@ -178,6 +203,7 @@ fn hle_open(_ctx: &HleContext, args: &[u64]) -> u64 {
         args.get(1).copied().unwrap_or(0),
         args.get(2).copied().unwrap_or(0)
     );
+    frame_path::record(Stage::VideoOutOpen);
     1 // video-out handle
 }
 
@@ -263,6 +289,7 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
     let buffer_index = args.get(1).copied().unwrap_or(0);
     let flip_arg = args.get(3).copied().unwrap_or(0) as i64;
     debug!("sceVideoOutSubmitFlip(bufferIndex={buffer_index}, flipArg={flip_arg})");
+    frame_path::record(Stage::FlipSubmitted);
     ctx.kernel
         .video_out_last_flip_arg
         .store(flip_arg, Ordering::Relaxed);
@@ -539,6 +566,7 @@ fn hle_register_buffers2(ctx: &HleContext, args: &[u64]) -> u64 {
         "sceVideoOutRegisterBuffers2(handle={handle}, set={set_index}, start={start_index}, count={buffer_count}, {}x{}, format={:#x})",
         attribute.width, attribute.height, attribute.pixel_format
     );
+    frame_path::record(Stage::BuffersRegistered);
     set_index as u64
 }
 

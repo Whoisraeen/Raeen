@@ -7,6 +7,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod error;
+pub mod frame_path;
 pub mod logging;
 pub mod subsystems;
 pub mod trophies;
