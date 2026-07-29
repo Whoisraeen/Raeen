@@ -113,27 +113,29 @@ mod tests {
 
     /// A scratch directory unique to this process **and** this call.
     ///
-    /// This test used to reuse one fixed `raeen-ledger-test` path directly
-    /// under the shared system temp dir, delete it, and immediately recreate
-    /// it. Both halves of that are silent failure modes that only bite under
-    /// the I/O load of a full `cargo test --workspace` run, which is why it
-    /// passed every time it was run on its own:
+    /// This test previously took one fixed `raeen-ledger-test` path directly
+    /// under the shared system temp dir, cleaned with a best-effort
+    /// `let _ = remove_dir_all(&dir)`. That made it flaky under
+    /// `cargo test --workspace` while passing every time it was run alone.
     ///
-    /// * the opening `remove_dir_all` was best-effort (`let _ = …`), so a
-    ///   ledger left behind by a killed run — or one a virus scanner still
-    ///   holds a handle on — survives it, and the "missing file → default"
-    ///   assertion reads the *previous* run's data instead of a default;
-    /// * on Windows a directory whose last handle has not closed lingers in
-    ///   delete-pending state, and recreating that exact path fails with
-    ///   access denied. [`store`] is best-effort by design — it reports that
-    ///   through `tracing::warn!` and returns normally — so the round-trip
-    ///   assertion below just sees an empty ledger, with nothing in the test
-    ///   output to explain why.
+    /// A fixed path there is reachable by every process on the machine, and
+    /// nothing about this test owns it: a ledger left behind by a killed run,
+    /// or any process holding the file open, survives the best-effort clean.
+    /// Both [`load`] and [`store`] are deliberately infallible — `load` turns
+    /// *any* read error into the default ledger, `store` logs write errors
+    /// through `tracing::warn!` and returns — so an inaccessible file does not
+    /// surface as an I/O failure. It surfaces as `assert_eq!(back.last_played,
+    /// 1234)` reporting a bare `left: 0`, with nothing in the test output
+    /// naming the cause. That failure was reproduced by holding an exclusive
+    /// handle on the file at the fixed path while the test ran.
     ///
-    /// A path that is never reused cannot hit either one. The pid follows the
-    /// convention every other temp-dir test in this crate uses; the counter
-    /// separates calls within one process, and the nanosecond stamp separates
-    /// runs that land on a recycled pid.
+    /// (A merely read-only leftover is *not* a trigger — `remove_dir_all`
+    /// clears the attribute and deletes it. It takes an open handle.)
+    ///
+    /// A path that is never reused cannot inherit any of it. The pid follows
+    /// the convention every other temp-dir test in this crate uses; the
+    /// counter separates calls within one process, and the nanosecond stamp
+    /// separates runs that land on a recycled pid.
     fn scratch_dir() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let nanos = std::time::SystemTime::now()
