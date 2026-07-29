@@ -1082,20 +1082,31 @@ mod platform {
 
         /// The status block must fit the header page and sit clear of the
         /// rumble word. Arithmetic in a comment is not a guarantee.
+        ///
+        /// Every operand is a `const`, so these are `const` blocks: the layout
+        /// is proven when the crate compiles rather than when the test runs,
+        /// which is the stronger guarantee and cannot be skipped by a filtered
+        /// test run. The test remains the named home for the invariant.
         #[test]
         fn the_status_block_fits_the_header_page_and_clears_the_rumble_word() {
-            assert!(
-                STATUS_SEQ_OFFSET >= RUMBLE_WORD_OFFSET + 8,
-                "status block overlaps the rumble word"
-            );
-            assert!(
-                STATUS_TEXT_OFFSET >= STATUS_TEXT_LEN_OFFSET + 8,
-                "status text overlaps its own length field"
-            );
-            assert!(
-                STATUS_TEXT_OFFSET + STATUS_TEXT_CAPACITY <= HEADER_BYTES,
-                "status text runs past the header into pixel slot 0"
-            );
+            const {
+                assert!(
+                    STATUS_SEQ_OFFSET >= RUMBLE_WORD_OFFSET + 8,
+                    "status block overlaps the rumble word"
+                );
+            }
+            const {
+                assert!(
+                    STATUS_TEXT_OFFSET >= STATUS_TEXT_LEN_OFFSET + 8,
+                    "status text overlaps its own length field"
+                );
+            }
+            const {
+                assert!(
+                    STATUS_TEXT_OFFSET + STATUS_TEXT_CAPACITY <= HEADER_BYTES,
+                    "status text runs past the header into pixel slot 0"
+                );
+            }
         }
 
         /// The whole point of the bridge: what the child knows must arrive in

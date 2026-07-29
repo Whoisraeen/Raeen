@@ -481,8 +481,10 @@ pub fn digest(max_entries: usize, max_bytes: usize) -> String {
 #[doc(hidden)]
 pub fn reset_for_tests() {
     let mut table = table();
-    for index in 0..table.meta.len() {
-        COUNTS[index].0.store(0, Ordering::Relaxed);
+    // `take` rather than indexing: the interned count is always <= the counter
+    // array's length, and this way an out-of-range table can never panic here.
+    for count in COUNTS.iter().take(table.meta.len()) {
+        count.0.store(0, Ordering::Relaxed);
     }
     *table = Table::default();
 }

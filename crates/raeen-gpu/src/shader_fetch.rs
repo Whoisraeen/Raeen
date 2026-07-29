@@ -2598,10 +2598,9 @@ mod tests {
         // title shaders are hundreds of instructions, and the decode copy this
         // change removes scales with that length.
         for pad in [0usize, 96, 480] {
-            let mut body: Vec<u32> = Vec::new();
-            for _ in 0..pad {
-                body.push(0x7E02_0280); // v_mov_b32 v1, 0
-            }
+            // `v_mov_b32 v1, 0` repeated: filler the parser decodes into real
+            // instructions without changing what the shader exports.
+            let mut body: Vec<u32> = vec![0x7E02_0280; pad];
             body.extend_from_slice(VS_BODY);
             let blob = build_blob(&body, 0xAAAA_5007, 0xBBBB_5007);
             let addr = blob.as_ptr() as u64;
