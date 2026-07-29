@@ -919,12 +919,19 @@ pub(crate) const BUFFER_STORE_FLOAT4: &str = r#"
 "#;
 
 /// Kyty: ShaderSpirv.cpp `TBUFFER_LOAD_FORMAT_XYZW` (L715).
+///
+/// Beyond Kyty in one respect: the guard also admits packed **116** (dfmt 14,
+/// nfmt 4 — `32_32_32_32_UINT`) next to Kyty's 119 (nfmt 7, float). Per the
+/// RDNA2 ISA (doc 70648), a 32-bit-per-channel element carries no numeric
+/// conversion in either direction — UINT and FLOAT alike move four raw dwords —
+/// so one body serves both, exactly as the x1 (36/39) and x2 (92/95) helpers
+/// already admit their UINT twin.
 pub(crate) const TBUFFER_LOAD_FORMAT_XYZW: &str = r#"
              ; Function tbuffer_load_format_xyzw
              ; void tbuffer_load_format_xyzw(out float p1, out float p2, out float p3, out float p4,
              ;                               in int index, in int offset, in int stride, in int buffer_index, in int dfmt_nfmt)
              ; {
-             ; 	if (dfmt_nfmt == 119) // dfmt = 14, nfmt = 7
+             ; 	if (dfmt_nfmt == 116 || dfmt_nfmt == 119) // dfmt = 14, nfmt = 4 or 7
              ; 	{
              ; 		buffer_load_float4(p1, p2, p3, p4, index, offset, stride, buffer_index);
              ; 	}
@@ -950,8 +957,11 @@ pub(crate) const TBUFFER_LOAD_FORMAT_XYZW: &str = r#"
 %tbuf_l_f_xyzw_176 = OpVariable %_ptr_Function_int Function
 %tbuf_l_f_xyzw_161 = OpLoad %int %tbuf_l_f_xyzw_62
 %tbuf_l_f_xyzw_163 = OpIEqual %bool %tbuf_l_f_xyzw_161 %int_119
+%tbuf_l_f_xyzw_200 = OpLoad %int %tbuf_l_f_xyzw_62
+%tbuf_l_f_xyzw_201 = OpIEqual %bool %tbuf_l_f_xyzw_200 %int_116
+%tbuf_l_f_xyzw_202 = OpLogicalOr %bool %tbuf_l_f_xyzw_163 %tbuf_l_f_xyzw_201
    OpSelectionMerge %tbuf_l_f_xyzw_165 None
-   OpBranchConditional %tbuf_l_f_xyzw_163 %tbuf_l_f_xyzw_164 %tbuf_l_f_xyzw_165
+   OpBranchConditional %tbuf_l_f_xyzw_202 %tbuf_l_f_xyzw_164 %tbuf_l_f_xyzw_165
 %tbuf_l_f_xyzw_164 = OpLabel
 %tbuf_l_f_xyzw_171 = OpLoad %int %tbuf_l_f_xyzw_58
    OpStore %tbuf_l_f_xyzw_170 %tbuf_l_f_xyzw_171
@@ -1244,15 +1254,25 @@ pub(crate) const TBUFFER_STORE_FORMAT_XY: &str = r#"
 "#;
 
 /// Beyond Kyty: the store twin of `TBUFFER_LOAD_FORMAT_XYZW` (L715), for
-/// `buffer_store_format_xyzw` (`KYTY_NI` upstream). dfmt_nfmt 119 = dfmt 14
-/// (32_32_32_32), nfmt 7 (float) — the only combination that stores as four
-/// raw dwords; every other format is left unwritten rather than corrupted.
+/// `buffer_store_format_xyzw` (`KYTY_NI` upstream). dfmt 14 (32_32_32_32) with
+/// nfmt 7 (float, packed 119) or nfmt 4 (uint, packed **116**) — the two
+/// combinations that store as four raw dwords; every other format is left
+/// unwritten rather than corrupted.
 /// Signature matches `%function_tbuffer_load_format_xyzw`.
+///
+/// The uint half is the measured first blocker of Dead Cells: its single
+/// compute shader stores through a `V#` whose format is unified 75 (dfmt 14,
+/// nfmt 4), and while the guard admitted only 119 that dispatch was skipped
+/// (`dispatch_skips=6`, `translate_failed: 1`) — the title reached 406
+/// published frames with nothing drawn into any of them. At 32 bits per
+/// channel the RDNA2 ISA (doc 70648) defines no conversion for either nfmt, so
+/// the float body is bit-exact for uint data; widening the guard is what the
+/// x1 (36/39) and x2 (92/95) helpers already do for their own UINT twin.
 pub(crate) const TBUFFER_STORE_FORMAT_XYZW: &str = r#"
              ; void tbuffer_store_format_xyzw(in float p1, in float p2, in float p3, in float p4,
              ;                                in int index, in int offset, in int stride, in int buffer_index, in int dfmt_nfmt)
              ; {
-             ; 	if (dfmt_nfmt == 119) // dfmt = 14, nfmt = 7
+             ; 	if (dfmt_nfmt == 116 || dfmt_nfmt == 119) // dfmt = 14, nfmt = 4 or 7
              ; 	{
              ; 		buffer_store_float4(p1, p2, p3, p4, index, offset, stride, buffer_index);
              ; 	}
@@ -1278,8 +1298,11 @@ pub(crate) const TBUFFER_STORE_FORMAT_XYZW: &str = r#"
 %tbuf_s_f_xyzw_176 = OpVariable %_ptr_Function_int Function
 %tbuf_s_f_xyzw_161 = OpLoad %int %tbuf_s_f_xyzw_62
 %tbuf_s_f_xyzw_163 = OpIEqual %bool %tbuf_s_f_xyzw_161 %int_119
+%tbuf_s_f_xyzw_200 = OpLoad %int %tbuf_s_f_xyzw_62
+%tbuf_s_f_xyzw_201 = OpIEqual %bool %tbuf_s_f_xyzw_200 %int_116
+%tbuf_s_f_xyzw_202 = OpLogicalOr %bool %tbuf_s_f_xyzw_163 %tbuf_s_f_xyzw_201
    OpSelectionMerge %tbuf_s_f_xyzw_165 None
-   OpBranchConditional %tbuf_s_f_xyzw_163 %tbuf_s_f_xyzw_164 %tbuf_s_f_xyzw_165
+   OpBranchConditional %tbuf_s_f_xyzw_202 %tbuf_s_f_xyzw_164 %tbuf_s_f_xyzw_165
 %tbuf_s_f_xyzw_164 = OpLabel
 %tbuf_s_f_xyzw_179 = OpLoad %float %tbuf_s_f_xyzw_54
    OpStore %tbuf_s_f_xyzw_166 %tbuf_s_f_xyzw_179
@@ -5606,6 +5629,10 @@ impl<'a> Spirv<'a> {
             self.add_constant_int(39);
             self.add_constant_int(92);
             self.add_constant_int(95);
+            // 116/119 are the uint/float halves of dfmt 14 (32_32_32_32), the
+            // pair the x4 typed helpers guard on — same relationship as 36/39
+            // (x1) and 92/95 (x2) above.
+            self.add_constant_int(116);
             self.add_constant_int(119);
             // The UNORM divisor of an 8-bit component, `(1 << 8) - 1`, used by
             // `BUFFER_LOAD_FORMAT_XYZW_UNORM8`.

@@ -2050,10 +2050,11 @@ impl AgcGpuSession {
         is_compute: bool,
     ) -> Result<Option<RenderedImage>, AgcExecError> {
         puffin::profile_function!();
-        // Frame path: this is where a guest GPU submission actually reaches the
-        // command processor. A title with buffers registered but zero DCBs here
-        // never asked the GPU for anything.
-        frame_path::record(Stage::DcbSubmitted);
+        // Frame path is recorded in `execute_dcb_cp_routed`, NOT here: this
+        // entry is only the synchronous/inline one, and the GPU worker — every
+        // real title's path — calls `_routed` directly from
+        // `run_worker_buffer`. Recording here reported `dcb_submitted=0` for
+        // titles that were submitting thousands of draw packets.
         // RenderDoc capture bracket (RAEEN_RENDERDOC_CAPTURE + running under
         // RenderDoc): each remaining budgeted DCB execution becomes one
         // capture, swapchain or not.
@@ -2092,6 +2093,17 @@ impl AgcGpuSession {
         is_compute: bool,
         deferred_present: bool,
     ) -> Result<(Option<RenderedImage>, Option<SuspendedWait>), AgcExecError> {
+        // Frame path: this is where a guest GPU submission actually reaches the
+        // command processor, on both the inline entry and the GPU worker's. A
+        // title with buffers registered but zero DCBs here never asked the GPU
+        // for anything.
+        //
+        // Only a submission's first segment counts. `execute_dcb_cp` re-enters
+        // with `start_dword` past an unmet wait to resume one buffer, and
+        // counting those resumes would inflate one submission into several.
+        if start_dword == 0 {
+            frame_path::record(Stage::DcbSubmitted);
+        }
         let memory = self
             .guest_memory
             .lock()
@@ -2187,6 +2199,10 @@ impl AgcGpuSession {
         let shader_state = cp.get_sh_ctx().clone();
 
         let drawn = sink.draws;
+        // Compute dispatches this submission actually ran. `Stage::Dispatch`
+        // had no recording site at all, so `dispatches=0` was reported for
+        // every title including ones whose whole frame is compute.
+        let dispatched = sink.dispatches;
         let shader_skips = sink.shader_skips;
         let draw_skips = sink.draw_skips;
         let dispatch_skips = sink.dispatch_skips;
@@ -2217,6 +2233,7 @@ impl AgcGpuSession {
                 *self.draw_count.lock() += drawn;
                 frame_path::record_n(Stage::Draw, drawn);
             }
+            frame_path::record_n(Stage::Dispatch, dispatched);
             debug!(
                 drawn,
                 last_target = format_args!("{:#x}", last_target.unwrap_or(0)),
@@ -2332,6 +2349,7 @@ impl AgcGpuSession {
                 *draws += drawn;
             }
             frame_path::record_n(Stage::Draw, drawn);
+            frame_path::record_n(Stage::Dispatch, dispatched);
             // Gate the dump on how many frames have been PRESENTED, not on the
             // cumulative draw count. A submission contributes its whole draw
             // total at once (`*draws += drawn`), so the draw counter jumps

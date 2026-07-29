@@ -789,21 +789,27 @@ const TBUF_STORE_FORMAT_XY: TypedBufferHelper = TypedBufferHelper {
     takes_format_arg: true,
 };
 
-/// `%tbuffer_load_format_xyzw`: "dfmt = 14, nfmt = 7"
+/// `%tbuffer_load_format_xyzw`: "dfmt = 14, nfmt = 4 or 7"
 /// (`TBUFFER_LOAD_FORMAT_XYZW`).
 const TBUF_LOAD_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
     name: "tbuffer_load_format_xyzw",
-    accepted: &[(119, "32_32_32_32_FLOAT")],
+    accepted: &[(116, "32_32_32_32_UINT"), (119, "32_32_32_32_FLOAT")],
     channels: 4,
     is_store: false,
     takes_format_arg: true,
 };
 
-/// `%tbuffer_store_format_xyzw`: the beyond-Kyty store twin, same 119-only
+/// `%tbuffer_store_format_xyzw`: the beyond-Kyty store twin, same 116/119
 /// guard (`TBUFFER_STORE_FORMAT_XYZW`).
+///
+/// The uint half must stay in step with that guard in both directions: the
+/// emitting row passes the *resolved* descriptor format (`OpStore %temp_int_5
+/// %int_{packed_format}`), so admitting a format here that the SPIR-V body
+/// rejects would translate cleanly and then store nothing at all — a silent
+/// version of the refusal this table exists to make loud.
 const TBUF_STORE_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
     name: "tbuffer_store_format_xyzw",
-    accepted: &[(119, "32_32_32_32_FLOAT")],
+    accepted: &[(116, "32_32_32_32_UINT"), (119, "32_32_32_32_FLOAT")],
     channels: 4,
     is_store: true,
     takes_format_arg: true,
@@ -21610,6 +21616,137 @@ mod tests {
 
             let words = spirv_run(&source).unwrap_or_else(|e| panic!("{label} assembles: {e}"));
             spirv_val_ok(&words, &label);
+        }
+    }
+
+    /// Dead Cells' only shader is a compute dispatch that stores through a `V#`
+    /// whose format is unified **75** — `dfmt 14, nfmt 4`, `32_32_32_32_UINT`.
+    /// While the x4 guard admitted packed 119 (nfmt 7, float) alone, that
+    /// dispatch was refused every frame (`dispatch_skips=6`,
+    /// `translate_failed: 1`) and the title published 406 frames with nothing
+    /// drawn into any of them.
+    ///
+    /// At 32 bits per channel the RDNA2 ISA (doc 70648) defines no numeric
+    /// conversion for either nfmt — both move four raw dwords — so the float
+    /// body is bit-exact for uint data. This is the same reason the x1 (36/39)
+    /// and x2 (92/95) helpers have always admitted their UINT twin; only x4 was
+    /// left narrow.
+    #[test]
+    fn a_32_32_32_32_uint_descriptor_reaches_both_x4_helpers() {
+        // (word0, the row it decodes to, the helper it must reach)
+        const ROWS: &[(u32, T, F, &str)] = &[
+            // Dead Cells' measured row, verbatim from the refusal it produced.
+            (
+                0xE01C_2000,
+                T::BufferStoreFormatXyzw,
+                F::Vdata4VaddrSvSoffsIdxen,
+                "%tbuffer_store_format_xyzw",
+            ),
+            // The load twin, widened by the same argument.
+            (
+                0xE00C_2000,
+                T::BufferLoadFormatXyzw,
+                F::Vdata4VaddrSvSoffsIdxen,
+                "%tbuffer_load_format_xyzw",
+            ),
+        ];
+
+        for &(word0, type_, format, helper) in ROWS {
+            let label = format!("{type_:?} [{format:?}] unified 75 ({word0:#010x})");
+            let (source, code) = mubuf_typed_source(word0, 75)
+                .unwrap_or_else(|e| panic!("{label} must recompile: {e}"));
+
+            // The fixture really is the row under test.
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, type_, "{label}: decoded type");
+            assert_eq!(inst.format, format, "{label}: decoded format");
+
+            assert!(
+                source.contains(&format!("OpFunctionCall %void {helper} ")),
+                "{label} must call {helper}:\n{source}"
+            );
+            // Packed, not unified: `14 * 8 + 4` = 116, never the raw 75.
+            assert!(
+                source.contains("OpStore %temp_int_5 %int_116"),
+                "{label}: unified 75 must reach {helper} as PACKED 116:\n{source}"
+            );
+            // The guard constant has to be declared too — an undeclared
+            // `%int_116` is a forward reference that fails assembly outright.
+            assert!(
+                source.contains("OpConstant %int 116"),
+                "{label}: %int_116 must be declared:\n{source}"
+            );
+
+            let words = spirv_run(&source).unwrap_or_else(|e| panic!("{label} assembles: {e}"));
+            spirv_val_ok(&words, &label);
+        }
+    }
+
+    /// Every format a typed helper *claims* in `accepted` must be one its
+    /// SPIR-V body's runtime guard actually tests — and vice versa.
+    ///
+    /// The two halves live in different files and fail in opposite directions,
+    /// which is why this is checked as an equality rather than a subset:
+    ///
+    /// * a format in `accepted` that the guard rejects translates cleanly and
+    ///   then does nothing at all — the silent no-op this whole table exists to
+    ///   prevent, and not hypothetical: the emitting row passes the *resolved*
+    ///   descriptor format (`OpStore %temp_int_5 %int_{packed_format}`), so
+    ///   widening `accepted` alone reintroduces it;
+    /// * a format the guard tests but `accepted` omits is refused with a
+    ///   message claiming the helper cannot serve it, when it can — Dead Cells'
+    ///   x4 store spent every frame on the wrong side of exactly that.
+    ///
+    /// `BUF_LOAD_FORMAT_XYZW_UNORM8` is excluded by `takes_format_arg`: it
+    /// resolves the format at translate time and carries no guard to agree with.
+    #[test]
+    fn every_format_the_typed_helpers_accept_is_one_their_spirv_guard_tests() {
+        use crate::shader::spirv::{
+            TBUFFER_LOAD_FORMAT_X, TBUFFER_LOAD_FORMAT_XYZW, TBUFFER_STORE_FORMAT_X,
+            TBUFFER_STORE_FORMAT_XY, TBUFFER_STORE_FORMAT_XYZW,
+        };
+
+        let pairs: [(&TypedBufferHelper, &str); 5] = [
+            (&TBUF_LOAD_FORMAT_X, TBUFFER_LOAD_FORMAT_X),
+            (&TBUF_STORE_FORMAT_X, TBUFFER_STORE_FORMAT_X),
+            (&TBUF_STORE_FORMAT_XY, TBUFFER_STORE_FORMAT_XY),
+            (&TBUF_LOAD_FORMAT_XYZW, TBUFFER_LOAD_FORMAT_XYZW),
+            (&TBUF_STORE_FORMAT_XYZW, TBUFFER_STORE_FORMAT_XYZW),
+        ];
+
+        for (helper, body) in pairs {
+            assert!(
+                helper.takes_format_arg,
+                "{}: only a runtime-guarded helper can be paired this way",
+                helper.name
+            );
+
+            // What the body's guard really tests: the `%int_N` operand of every
+            // equality in it.
+            let mut guarded: Vec<u32> = body
+                .lines()
+                .filter(|line| line.contains("OpIEqual %bool"))
+                .filter_map(|line| line.rsplit("%int_").next())
+                .filter_map(|n| n.trim().parse::<u32>().ok())
+                .collect();
+            guarded.sort_unstable();
+            assert!(
+                !guarded.is_empty(),
+                "{}: the body must guard on at least one format, or this test \
+                 is vacuous — check the OpIEqual spelling",
+                helper.name
+            );
+
+            let mut claimed: Vec<u32> = helper.accepted.iter().map(|&(p, _)| p).collect();
+            claimed.sort_unstable();
+
+            assert_eq!(
+                claimed, guarded,
+                "{}: `accepted` claims {claimed:?} but its SPIR-V guard tests \
+                 {guarded:?} — the refusal table and the body must agree, or a \
+                 format is either silently dropped or needlessly refused",
+                helper.name
+            );
         }
     }
 
