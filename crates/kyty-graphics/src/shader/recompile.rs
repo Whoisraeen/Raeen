@@ -729,6 +729,185 @@ fn buffer_store_dwordxn(
     Ok(true)
 }
 
+/// One of Kyty's typed-buffer SPIR-V helpers, described by what its own
+/// `OpIEqual` chain actually accepts.
+///
+/// The helpers (`TBUFFER_LOAD_FORMAT_X` L772, `TBUFFER_STORE_FORMAT_X` L817,
+/// `TBUFFER_STORE_FORMAT_XY` L862, `TBUFFER_LOAD_FORMAT_XYZW` L715 and its
+/// beyond-Kyty store twin) each guard their body with an equality test against
+/// hardcoded **legacy MTBUF packing** constants and do nothing at all when it
+/// fails. `accepted` is that literal set, taken from the constants in
+/// [`crate::shader::spirv`], with the format each one spells.
+struct TypedBufferHelper {
+    /// The SPIR-V function name, for the refusal message.
+    name: &'static str,
+    /// `(dfmt * 8 + nfmt, what it spells)` — every value the helper's guard
+    /// lets through.
+    accepted: &'static [(u32, &'static str)],
+    /// vdata registers the access covers, for the refusal message.
+    channels: i32,
+    /// Stores write nothing on a failed guard; loads leave vdata untouched.
+    is_store: bool,
+}
+
+/// `%tbuffer_load_format_x`: "dfmt = 4, nfmt = 4 or 7" (`TBUFFER_LOAD_FORMAT_X`).
+const TBUF_LOAD_FORMAT_X: TypedBufferHelper = TypedBufferHelper {
+    name: "tbuffer_load_format_x",
+    accepted: &[(36, "32_UINT"), (39, "32_FLOAT")],
+    channels: 1,
+    is_store: false,
+};
+
+/// `%tbuffer_store_format_x`: same guard as the load (`TBUFFER_STORE_FORMAT_X`).
+const TBUF_STORE_FORMAT_X: TypedBufferHelper = TypedBufferHelper {
+    name: "tbuffer_store_format_x",
+    accepted: &[(36, "32_UINT"), (39, "32_FLOAT")],
+    channels: 1,
+    is_store: true,
+};
+
+/// `%tbuffer_store_format_xy`: "dfmt = 11, nfmt = 4 or 7"
+/// (`TBUFFER_STORE_FORMAT_XY`).
+const TBUF_STORE_FORMAT_XY: TypedBufferHelper = TypedBufferHelper {
+    name: "tbuffer_store_format_xy",
+    accepted: &[(92, "32_32_UINT"), (95, "32_32_FLOAT")],
+    channels: 2,
+    is_store: true,
+};
+
+/// `%tbuffer_load_format_xyzw`: "dfmt = 14, nfmt = 7"
+/// (`TBUFFER_LOAD_FORMAT_XYZW`).
+const TBUF_LOAD_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
+    name: "tbuffer_load_format_xyzw",
+    accepted: &[(119, "32_32_32_32_FLOAT")],
+    channels: 4,
+    is_store: false,
+};
+
+/// `%tbuffer_store_format_xyzw`: the beyond-Kyty store twin, same 119-only
+/// guard (`TBUFFER_STORE_FORMAT_XYZW`).
+const TBUF_STORE_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
+    name: "tbuffer_store_format_xyzw",
+    accepted: &[(119, "32_32_32_32_FLOAT")],
+    channels: 4,
+    is_store: true,
+};
+
+/// The packed `dfmt * 8 + nfmt` constant a MUBUF typed access must hand its
+/// Kyty helper, resolved from the BOUND descriptor at translate time.
+///
+/// # Why this is not the descriptor field
+///
+/// MTBUF carries `dfmt`/`nfmt` in the *instruction*, so Kyty's MTBUF rows
+/// hardcode the packed number (36 / 39 / 92 / 95 / 119) and its helpers compare
+/// against exactly those. MUBUF takes the format from the *descriptor*, where
+/// RDNA2 stores the **unified** FORMAT number — `(V#.dword3 >> 12) & 0x7f`,
+/// as SharpEmu `Gen5ShaderScalarEvaluator.cs::TryDecodeBufferDescriptor`
+/// (L2205) reads it. Every MUBUF body used to extract that field at *runtime*
+/// and pass it straight in:
+///
+/// ```text
+/// %t208 = OpShiftRightLogical %uint %t206 %int_12
+/// %t210 = OpBitwiseAnd %uint %t208 %uint_127
+///         OpStore %temp_int_5 ...
+/// ```
+///
+/// The two numbering schemes do not overlap where it matters —
+/// `32_32_32_32_FLOAT` is unified **77** and packed **119**, and 119 is not
+/// even a valid unified encoding — so the guard could never pass and every
+/// MUBUF typed access was a silent no-op: loads left their destination VGPRs
+/// untouched, stores wrote nothing.
+///
+/// The descriptor is known at translate time (it is the one this shader binds
+/// for the V#), so the conversion belongs here, once, as a constant — not in
+/// the shader.
+///
+/// A format the helper does not serve is refused **by name** and counted in
+/// `UNSUPPORTED_BUFFER_FORMAT_SKIPS`: the helper's upstream behaviour there is
+/// silent garbage, which is invisible in a log, and a real unpack for the other
+/// formats is the follow-up this counter measures.
+fn mubuf_descriptor_packed_format(
+    inst: &ShaderInstruction,
+    bind_info: &ShaderBindResources,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+    helper: &TypedBufferHelper,
+) -> Result<u32, ShaderRecompileError> {
+    let base = inst.src[1].register_id;
+    let base_end = base + 3;
+
+    // A gs-prolog VS shifts every bound descriptor's start register by 8, the
+    // same convention `shader_bind_vsharp_storage_buffers` binds with.
+    let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
+        8
+    } else {
+        0
+    };
+    let count = usize::try_from(bind_info.storage_buffers.buffers_num.max(0))
+        .unwrap_or(0)
+        .min(bind_info.storage_buffers.buffers.len());
+    let Some(i) =
+        (0..count).find(|&i| bind_info.storage_buffers.start_register[i] + shift_regs == base)
+    else {
+        return Err(not_supported(
+            func,
+            format!(
+                "the V# is not one of this shader's bound descriptors, so its element format \
+                 is unknown: {:?} [{:?}] V#=s[{base}:{base_end}], pc={:#x}",
+                inst.type_, inst.format, inst.pc,
+            ),
+        ));
+    };
+
+    let unified = u32::from(bind_info.storage_buffers.buffers[i].format());
+    let packed = crate::shader::spirv::gfx10_unified_to_packed_dfmt_nfmt(unified);
+    if let Some(packed) = packed {
+        if helper.accepted.iter().any(|&(a, _)| a == packed) {
+            return Ok(packed);
+        }
+    }
+
+    crate::shader::spirv::UNSUPPORTED_BUFFER_FORMAT_SKIPS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let decoded = match crate::shader::spirv::gfx10_unified_to_dfmt_nfmt(unified) {
+        Some((dfmt, nfmt)) => format!("dfmt {dfmt}, nfmt {nfmt}"),
+        None => "no legacy dfmt/nfmt equivalent".to_owned(),
+    };
+    let served = helper
+        .accepted
+        .iter()
+        .map(|&(packed, name)| {
+            match crate::shader::spirv::gfx10_packed_to_unified_dfmt_nfmt(packed) {
+                Some(unified) => format!("{name} (unified {unified} / packed {packed})"),
+                None => format!("{name} (packed {packed})"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let consequence = if helper.is_store {
+        "write nothing".to_owned()
+    } else {
+        format!(
+            "leave v[{d}:{d_end}] untouched",
+            d = inst.dst.register_id,
+            d_end = inst.dst.register_id + helper.channels - 1,
+        )
+    };
+    Err(not_supported(
+        func,
+        format!(
+            "V# unified format {unified} ({decoded}) is not one the {helper_name} helper serves \
+             [{served}]: {:?} [{:?}] V#=s[{base}:{base_end}], stride={}, pc={:#x} — the typed \
+             helper would {consequence}",
+            inst.type_,
+            inst.format,
+            bind_info.storage_buffers.buffers[i].stride(),
+            inst.pc,
+            helper_name = helper.name,
+        ),
+    ))
+}
+
 /// Kyty: `Recompile_BufferLoadFormatX_Vdata1VaddrSvSoffsIdxen`
 /// (ShaderSpirv.cpp L1937).
 fn recompile_buffer_load_format_x_vdata1(
@@ -747,6 +926,14 @@ fn recompile_buffer_load_format_x_vdata1(
             if !operand_is_constant(inst.src[2]) {
                 return Err(not_supported(FUNC, "src2 is not a constant"));
             }
+
+            // The descriptor's unified FORMAT converted to the packed number
+            // `%tbuffer_load_format_x` actually tests — see
+            // [`mubuf_descriptor_packed_format`]. Kyty extracted dword3 in the
+            // shader and handed the unified number straight to the guard, which
+            // could never match, so this fetch was a silent no-op.
+            let packed_format =
+                mubuf_descriptor_packed_format(inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_X)?;
 
             let dst_value = operand_variable_to_str(inst.dst);
             let src0_value = operand_variable_to_str(inst.src[0]);
@@ -780,11 +967,7 @@ fn recompile_buffer_load_format_x_vdata1(
         %t156_<index> = OpBitcast %int %t155_<index>
                OpStore %temp_int_4 %t156_<index>
                OpStore %temp_int_2 %<offset>
-		%t206_<index> = OpLoad %uint %<src1_value3>
-        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
-        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
-        %t211_<index> = OpBitcast %int %t210_<index>
-               OpStore %temp_int_5 %t211_<index>
+               OpStore %temp_int_5 %int_<packed_format>
         %t110_<index> = OpFunctionCall %void %tbuffer_load_format_x %<p0> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
 "#;
             *dst_source += &TEXT
@@ -793,7 +976,7 @@ fn recompile_buffer_load_format_x_vdata1(
                 .replace("<offset>", &offset)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src1_value1>", &src1_value1.value)
-                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<packed_format>", &format!("{packed_format}"))
                 .replace("<p0>", &dst_value.value);
 
             return Ok(true);
@@ -866,75 +1049,12 @@ fn recompile_buffer_load_format_xyzw_vdata4(
                 ),
             ));
         }
-        // The MUBUF form takes its element format from the DESCRIPTOR
-        // (`(V#.dword3 >> 12) & 0x7f`), which on RDNA2 is the **unified**
-        // FORMAT number. Kyty's `tbuffer_load_format_xyzw` helper compares
-        // against the **legacy MTBUF packing** `dfmt * 8 + nfmt` — MTBUF
-        // carries dfmt/nfmt in the instruction, so its rows hardcode 36/39/
-        // 92/95/119. Feeding the unified number straight in (what the row did)
-        // could therefore NEVER match: 32_32_32_32_FLOAT is unified **77** and
-        // packed **119**, and 119 is not even a valid unified encoding. Every
-        // MUBUF four-channel fetch silently left its destination VGPRs
-        // untouched. Convert here, at translate time, from the bound
-        // descriptor.
-        let packed_format = {
-            let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
-                8
-            } else {
-                0
-            };
-            let count = usize::try_from(bind_info.storage_buffers.buffers_num.max(0))
-                .unwrap_or(0)
-                .min(bind_info.storage_buffers.buffers.len());
-            let Some(i) = (0..count).find(|&i| {
-                bind_info.storage_buffers.start_register[i] + shift_regs == inst.src[1].register_id
-            }) else {
-                return Err(not_supported(
-                    FUNC,
-                    format!(
-                        "the V# is not one of this shader's bound descriptors, so its element \
-                         format is unknown: {:?} [{:?}] V#=s[{base}:{base_end}], pc={:#x}",
-                        inst.type_,
-                        inst.format,
-                        inst.pc,
-                        base = inst.src[1].register_id,
-                        base_end = inst.src[1].register_id + 3,
-                    ),
-                ));
-            };
-            let unified = bind_info.storage_buffers.buffers[i].format();
-            let packed =
-                crate::shader::spirv::gfx10_unified_to_packed_dfmt_nfmt(u32::from(unified));
-            // Silent garbage is worse than a refusal and invisible in a log, so
-            // a format the helper does not serve is named and counted.
-            if packed != Some(119) {
-                crate::shader::spirv::UNSUPPORTED_BUFFER_FORMAT_SKIPS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let decoded = crate::shader::spirv::gfx10_unified_to_dfmt_nfmt(u32::from(unified));
-                return Err(not_supported(
-                    FUNC,
-                    format!(
-                        "V# unified format {unified} ({}) is not 32_32_32_32_FLOAT \
-                         (unified 77 / packed 119): {:?} [{:?}] V#=s[{base}:{base_end}], \
-                         stride={}, pc={:#x} — the typed helper would leave \
-                         v[{d}:{d_end}] untouched",
-                        match decoded {
-                            Some((dfmt, nfmt)) => format!("dfmt {dfmt}, nfmt {nfmt}"),
-                            None => "no legacy dfmt/nfmt equivalent".to_owned(),
-                        },
-                        inst.type_,
-                        inst.format,
-                        bind_info.storage_buffers.buffers[i].stride(),
-                        inst.pc,
-                        base = inst.src[1].register_id,
-                        base_end = inst.src[1].register_id + 3,
-                        d = inst.dst.register_id,
-                        d_end = inst.dst.register_id + 3,
-                    ),
-                ));
-            }
-            119
-        };
+        // The element format comes from the DESCRIPTOR, in RDNA2's unified
+        // numbering, while the helper's guard tests the legacy MTBUF packing —
+        // see [`mubuf_descriptor_packed_format`] for why extracting it in the
+        // shader could never match.
+        let packed_format =
+            mubuf_descriptor_packed_format(inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_XYZW)?;
         {
             if !operand_is_constant(inst.src[2]) {
                 return Err(not_supported(FUNC, "src2 is not a constant"));
@@ -3728,6 +3848,13 @@ fn recompile_buffer_store_format_x_vdata1(
                 return Err(not_supported(FUNC, "src2 is not a constant"));
             }
 
+            // Packed at translate time from the bound descriptor; the runtime
+            // dword3 extraction handed `%tbuffer_store_format_x` a unified
+            // number its guard can never equal, so the store wrote nothing.
+            // See [`mubuf_descriptor_packed_format`].
+            let packed_format =
+                mubuf_descriptor_packed_format(inst, bind_info, spirv, FUNC, &TBUF_STORE_FORMAT_X)?;
+
             let dst_value = operand_variable_to_str(inst.dst);
             let src0_value = operand_variable_to_str(inst.src[0]);
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
@@ -3766,11 +3893,7 @@ fn recompile_buffer_store_format_x_vdata1(
         %t156_<index> = OpBitcast %int %t155_<index>
                OpStore %temp_int_4 %t156_<index>
                OpStore %temp_int_2 %<offset>
-		%t206_<index> = OpLoad %uint %<src1_value3>
-        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
-        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
-        %t211_<index> = OpBitcast %int %t210_<index>
-               OpStore %temp_int_5 %t211_<index>
+               OpStore %temp_int_5 %int_<packed_format>
         %t110_<index> = OpFunctionCall %void %tbuffer_store_format_x %<p0> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
 
                OpBranch %t278_<index>
@@ -3782,7 +3905,7 @@ fn recompile_buffer_store_format_x_vdata1(
                 .replace("<offset>", &offset)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src1_value1>", &src1_value1.value)
-                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<packed_format>", &format!("{packed_format}"))
                 .replace("<p0>", &dst_value.value);
 
             return Ok(true);
@@ -3810,6 +3933,17 @@ fn recompile_buffer_store_format_xy_vdata2(
             if !operand_is_constant(inst.src[2]) {
                 return Err(not_supported(FUNC, "src2 is not a constant"));
             }
+
+            // Packed at translate time from the bound descriptor — see
+            // [`mubuf_descriptor_packed_format`]. `%tbuffer_store_format_xy`
+            // tests 92 / 95, which no unified FORMAT field ever holds.
+            let packed_format = mubuf_descriptor_packed_format(
+                inst,
+                bind_info,
+                spirv,
+                FUNC,
+                &TBUF_STORE_FORMAT_XY,
+            )?;
 
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
@@ -3850,11 +3984,7 @@ fn recompile_buffer_store_format_xy_vdata2(
         %t156_<index> = OpBitcast %int %t155_<index>
                OpStore %temp_int_4 %t156_<index>
                OpStore %temp_int_2 %<offset>
-		%t206_<index> = OpLoad %uint %<src1_value3>
-        %t208_<index> = OpShiftRightLogical %uint %t206_<index> %int_12
-        %t210_<index> = OpBitwiseAnd %uint %t208_<index> %uint_127
-        %t211_<index> = OpBitcast %int %t210_<index>
-               OpStore %temp_int_5 %t211_<index>
+               OpStore %temp_int_5 %int_<packed_format>
         %t110_<index> = OpFunctionCall %void %tbuffer_store_format_xy %<p0> %<p1> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
 
                OpBranch %t278_<index>
@@ -3866,7 +3996,7 @@ fn recompile_buffer_store_format_xy_vdata2(
                 .replace("<offset>", &offset)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src1_value1>", &src1_value1.value)
-                .replace("<src1_value3>", &src1_value3.value)
+                .replace("<packed_format>", &format!("{packed_format}"))
                 .replace("<p0>", &dst_value0.value)
                 .replace("<p1>", &dst_value1.value);
 
@@ -3980,10 +4110,14 @@ fn mubuf_flexible(
         op,
         MubufFlexOp::StoreDword | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw
     );
-    let with_dfmt = matches!(
-        op,
-        MubufFlexOp::LoadFormatX | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw
-    );
+    // The typed helper this op calls, for the ops that take a format argument.
+    // `None` for the raw dword/byte ops, which have no format guard at all.
+    let helper = match op {
+        MubufFlexOp::LoadFormatX => Some(&TBUF_LOAD_FORMAT_X),
+        MubufFlexOp::StoreFormatX => Some(&TBUF_STORE_FORMAT_X),
+        MubufFlexOp::StoreFormatXyzw => Some(&TBUF_STORE_FORMAT_XYZW),
+        MubufFlexOp::LoadDword | MubufFlexOp::LoadUbyte | MubufFlexOp::StoreDword => None,
+    };
     let vdata_n: i32 = if op == MubufFlexOp::StoreFormatXyzw {
         4
     } else {
@@ -4068,21 +4202,22 @@ fn mubuf_flexible(
         );
     }
 
-    // temp_int_5 = dfmt_nfmt (V# dword3 bits 12..18) for the format helpers.
-    if with_dfmt {
+    // temp_int_5 = the packed `dfmt * 8 + nfmt` the typed helper's guard tests,
+    // converted from the BOUND descriptor's unified FORMAT at translate time.
+    // This body used to extract V# dword3 bits 12..18 in the shader and pass
+    // that unified number in — a comparison that can never succeed, so every
+    // flexible-addressing typed access was a silent no-op. See
+    // [`mubuf_descriptor_packed_format`].
+    if let Some(helper) = helper {
+        // Type-check dword3 anyway: this row still reaches the same V# quad,
+        // and a non-uint there means the operand model is wrong, not the
+        // format.
         let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
         if src1_value3.type_ != SpirvType::Uint {
             return Err(not_supported(func, "unexpected V# dword3 type"));
         }
-        text += &format!(
-            "        %mbf_f0_{i} = OpLoad %uint %{}
-        %mbf_f1_{i} = OpShiftRightLogical %uint %mbf_f0_{i} %int_12
-        %mbf_f2_{i} = OpBitwiseAnd %uint %mbf_f1_{i} %uint_127
-        %mbf_f3_{i} = OpBitcast %int %mbf_f2_{i}
-               OpStore %temp_int_5 %mbf_f3_{i}
-",
-            src1_value3.value
-        );
+        let packed_format = mubuf_descriptor_packed_format(inst, bind_info, spirv, func, helper)?;
+        text += &format!("               OpStore %temp_int_5 %int_{packed_format}\n");
     }
 
     let helper = match op {
@@ -4098,7 +4233,7 @@ fn mubuf_flexible(
         args += &format!("%{v} ");
     }
     args += "%temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4";
-    if with_dfmt {
+    if helper.is_some() {
         args += " %temp_int_5";
     }
     text += &format!("        %mbf_c_{i} = OpFunctionCall %void {helper} {args}\n");

@@ -976,6 +976,130 @@ pub(crate) const TBUFFER_LOAD_FORMAT_XYZW: &str = r#"
    OpFunctionEnd
 "#;
 
+/// Beyond Kyty (upstream's typed helpers serve only 32-bit components): the
+/// four-channel `8_8_8_8_UNORM` unpack — legacy `dfmt 10, nfmt 0`, RDNA2
+/// unified FORMAT **56**, packed `dfmt * 8 + nfmt` = **80**.
+///
+/// Measured blocker of Avatar: Frontiers of Pandora after the unit-conversion
+/// fix (`V# unified format 56 (dfmt 10, nfmt 0) is not 32_32_32_32_FLOAT`, 769
+/// occurrences in a 180 s run): the title packs vertex attributes as four
+/// normalized bytes, which `tbuffer_load_format_xyzw` does not implement — it
+/// left the destination VGPRs untouched.
+///
+/// **Channel order and the UNORM rule are taken from two references that agree
+/// row-for-row, not guessed:**
+///
+/// * KytyPS5 (MIT) `src/graphics/shader/recompiler/BufferFormat.h`,
+///   `GetFormatInfo(k8_8_8_8UNorm)` → `component_count 4, byte_size 4,
+///   component_bits {8,8,8,8}, component_bit_offset {0,8,16,24},
+///   packed_bitfield = false`. Because `packed_bitfield` is false the emitter
+///   (`spirvEmitter/spirvEmitterMemory.cpp::EmitFormatRawComponent` L857-882)
+///   takes the **byte** offset `component_bit_offset[c] / 8` = 0,1,2,3 and
+///   loads each component through `EmitMemoryLoadSubDwordValueU32` (L541-575),
+///   which is `(dword[byte_addr >> 2] >> ((byte_addr & 3) * 8)) & 0xff`.
+///   The UNORM conversion is `NormalizeFormatComponent` (L899-908):
+///   `OpConvertUToF` then `OpFDiv` by `(1 << bits) - 1` = **255.0**.
+/// * SharpEmu (GPL-2.0) `src/SharpEmu.ShaderCompiler.Vulkan/
+///   Gen5SpirvTranslator.cs::LoadGfx10BufferFormatComponent` (L2645-2734):
+///   `SetLayout(10, 0, 0, 8) / (10, 1, 0, 8) / (10, 2, 0, 8) / (10, 3, 0, 8)`
+///   — dfmt 10, component `c`, byte offset `c`, bit offset 0, 8 bits — and
+///   `ConvertGfx10BufferComponent` (L2765-2805) makes `numberFormat == 0`
+///   (UNORM) `ConvertUToF(raw) / ConvertUToF(lowMask)` with
+///   `lowMask = (1 << 8) - 1` = **255**.
+///
+/// So component `c` is the byte at `element_byte_address + c`, i.e. bits
+/// `c*8 .. c*8+7` of the containing little-endian dword — x is the **lowest**
+/// byte — and each is `float(byte) / 255.0`.
+///
+/// Per-component byte addressing (rather than one dword load with fixed bit
+/// offsets 0/8/16/24) is what both references do, and it is what makes an
+/// element whose byte address is not 4-aligned decode correctly: such an
+/// element straddles two dwords, and each byte is fetched from whichever dword
+/// contains it. For the common 4-aligned element the four extractions collapse
+/// to exactly offsets 0/8/16/24 of a single dword.
+///
+/// Signature matches `%function_buffer_load_float4` — the format is chosen at
+/// translate time from the bound descriptor, so unlike `tbuffer_*` there is no
+/// `dfmt_nfmt` parameter and no runtime branch.
+pub(crate) const BUFFER_LOAD_FORMAT_XYZW_UNORM8: &str = r#"
+             ; void buffer_load_format_xyzw_unorm8(out float p1, out float p2, out float p3, out float p4,
+             ;                                     in int index, in int offset, in int stride, in int buffer_index)
+             ; {
+             ; 	int base = offset + index * stride;                       // element byte address
+             ; 	for (int c = 0; c < 4; c++) {                             // unrolled below
+             ; 		int a  = base + c;
+             ; 		uint dw = floatBitsToUint(buf[buffer_index].data[a / 4]);
+             ; 		p[c] = float(bitfieldExtract(dw, (a & 3) * 8, 8)) / 255.0;
+             ; 	}
+             ; }
+%buffer_load_format_xyzw_unorm8 = OpFunction %void None %function_buffer_load_float4
+        %buf_l_u8_21 = OpFunctionParameter %_ptr_Function_float
+        %buf_l_u8_22 = OpFunctionParameter %_ptr_Function_float
+        %buf_l_u8_23 = OpFunctionParameter %_ptr_Function_float
+        %buf_l_u8_24 = OpFunctionParameter %_ptr_Function_float
+        %buf_l_u8_25 = OpFunctionParameter %_ptr_Function_int
+        %buf_l_u8_26 = OpFunctionParameter %_ptr_Function_int
+        %buf_l_u8_27 = OpFunctionParameter %_ptr_Function_int
+        %buf_l_u8_28 = OpFunctionParameter %_ptr_Function_int
+        %buf_l_u8_30 = OpLabel
+        %buf_l_u8_45 = OpLoad %int %buf_l_u8_26
+        %buf_l_u8_46 = OpLoad %int %buf_l_u8_25
+        %buf_l_u8_47 = OpLoad %int %buf_l_u8_27
+        %buf_l_u8_48 = OpIMul %int %buf_l_u8_46 %buf_l_u8_47
+        %buf_l_u8_49 = OpIAdd %int %buf_l_u8_45 %buf_l_u8_48
+        %buf_l_u8_50 = OpLoad %int %buf_l_u8_28
+             ; component 0 — byte base + 0
+        %buf_l_u8_60 = OpIAdd %int %buf_l_u8_49 %int_0
+        %buf_l_u8_61 = OpSDiv %int %buf_l_u8_60 %int_4
+        %buf_l_u8_62 = OpBitwiseAnd %int %buf_l_u8_60 %int_3
+        %buf_l_u8_63 = OpIMul %int %buf_l_u8_62 %int_8
+        %buf_l_u8_64 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_u8_50 %int_0 %buf_l_u8_61
+        %buf_l_u8_65 = OpLoad %float %buf_l_u8_64
+        %buf_l_u8_66 = OpBitcast %uint %buf_l_u8_65
+        %buf_l_u8_67 = OpBitFieldUExtract %uint %buf_l_u8_66 %buf_l_u8_63 %int_8
+        %buf_l_u8_68 = OpConvertUToF %float %buf_l_u8_67
+        %buf_l_u8_69 = OpFDiv %float %buf_l_u8_68 %float_255_000000
+              OpStore %buf_l_u8_21 %buf_l_u8_69
+             ; component 1 — byte base + 1
+        %buf_l_u8_70 = OpIAdd %int %buf_l_u8_49 %int_1
+        %buf_l_u8_71 = OpSDiv %int %buf_l_u8_70 %int_4
+        %buf_l_u8_72 = OpBitwiseAnd %int %buf_l_u8_70 %int_3
+        %buf_l_u8_73 = OpIMul %int %buf_l_u8_72 %int_8
+        %buf_l_u8_74 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_u8_50 %int_0 %buf_l_u8_71
+        %buf_l_u8_75 = OpLoad %float %buf_l_u8_74
+        %buf_l_u8_76 = OpBitcast %uint %buf_l_u8_75
+        %buf_l_u8_77 = OpBitFieldUExtract %uint %buf_l_u8_76 %buf_l_u8_73 %int_8
+        %buf_l_u8_78 = OpConvertUToF %float %buf_l_u8_77
+        %buf_l_u8_79 = OpFDiv %float %buf_l_u8_78 %float_255_000000
+              OpStore %buf_l_u8_22 %buf_l_u8_79
+             ; component 2 — byte base + 2
+        %buf_l_u8_80 = OpIAdd %int %buf_l_u8_49 %int_2
+        %buf_l_u8_81 = OpSDiv %int %buf_l_u8_80 %int_4
+        %buf_l_u8_82 = OpBitwiseAnd %int %buf_l_u8_80 %int_3
+        %buf_l_u8_83 = OpIMul %int %buf_l_u8_82 %int_8
+        %buf_l_u8_84 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_u8_50 %int_0 %buf_l_u8_81
+        %buf_l_u8_85 = OpLoad %float %buf_l_u8_84
+        %buf_l_u8_86 = OpBitcast %uint %buf_l_u8_85
+        %buf_l_u8_87 = OpBitFieldUExtract %uint %buf_l_u8_86 %buf_l_u8_83 %int_8
+        %buf_l_u8_88 = OpConvertUToF %float %buf_l_u8_87
+        %buf_l_u8_89 = OpFDiv %float %buf_l_u8_88 %float_255_000000
+              OpStore %buf_l_u8_23 %buf_l_u8_89
+             ; component 3 — byte base + 3
+        %buf_l_u8_90 = OpIAdd %int %buf_l_u8_49 %int_3
+        %buf_l_u8_91 = OpSDiv %int %buf_l_u8_90 %int_4
+        %buf_l_u8_92 = OpBitwiseAnd %int %buf_l_u8_90 %int_3
+        %buf_l_u8_93 = OpIMul %int %buf_l_u8_92 %int_8
+        %buf_l_u8_94 = OpAccessChain %_ptr_StorageBuffer_float %buf %buf_l_u8_50 %int_0 %buf_l_u8_91
+        %buf_l_u8_95 = OpLoad %float %buf_l_u8_94
+        %buf_l_u8_96 = OpBitcast %uint %buf_l_u8_95
+        %buf_l_u8_97 = OpBitFieldUExtract %uint %buf_l_u8_96 %buf_l_u8_93 %int_8
+        %buf_l_u8_98 = OpConvertUToF %float %buf_l_u8_97
+        %buf_l_u8_99 = OpFDiv %float %buf_l_u8_98 %float_255_000000
+              OpStore %buf_l_u8_24 %buf_l_u8_99
+              OpReturn
+              OpFunctionEnd
+"#;
+
 /// Kyty: ShaderSpirv.cpp `TBUFFER_LOAD_FORMAT_X` (L772).
 pub(crate) const TBUFFER_LOAD_FORMAT_X: &str = r#"
              ; void tbuffer_load_format_x(out float p1, in int index, in int offset, in int stride, in int buffer_index, in int dfmt_nfmt)
@@ -2438,6 +2562,21 @@ pub const fn gfx10_unified_to_packed_dfmt_nfmt(unified: u32) -> Option<u32> {
         Some((dfmt, nfmt)) if dfmt <= 14 && nfmt <= 7 => Some(dfmt * 8 + nfmt),
         _ => None,
     }
+}
+
+/// The RDNA2 unified FORMAT encoding that packs to `packed`, i.e. the inverse
+/// of [`gfx10_unified_to_packed_dfmt_nfmt`]. `None` when no unified encoding
+/// spells that legacy pair — which is itself the point for 119: the packed
+/// number a Kyty helper compares against is generally NOT a valid unified one.
+///
+/// Used only to name what a refusal wanted: a MUBUF site whose descriptor
+/// format the typed helper cannot serve reports both numbers so a log line says
+/// which descriptor would have to change. Derived from the one table rather
+/// than a second transcription of it, so the two can never disagree; the map is
+/// injective because every `(dfmt, nfmt)` pair in table 47 is distinct.
+#[must_use]
+pub fn gfx10_packed_to_unified_dfmt_nfmt(packed: u32) -> Option<u32> {
+    (0..=130).find(|&unified| gfx10_unified_to_packed_dfmt_nfmt(unified) == Some(packed))
 }
 
 /// The SPIR-V spellings one Gen5 vertex attribute is declared and consumed
@@ -5359,6 +5498,17 @@ impl<'a> Spirv<'a> {
             self.source += TBUFFER_LOAD_FORMAT_XYZW;
         }
 
+        // The four-channel MUBUF fetch picks its unpack at translate time from
+        // the bound descriptor's format, so the 8_8_8_8_UNORM helper is emitted
+        // alongside the 32_32_32_32_FLOAT one whenever the opcode is present.
+        // It is self-contained (it indexes `%buf` directly rather than going
+        // through `buffer_load_float4`), so it carries no extra dependency, and
+        // it is simply unused — a legal, unreferenced function — in a shader
+        // whose descriptors all turn out to be float4.
+        if has_buffers && self.code.has_any_of(&[T::BufferLoadFormatXyzw]) {
+            self.source += BUFFER_LOAD_FORMAT_XYZW_UNORM8;
+        }
+
         if has_buffers && self.code.has_any_of(&[T::BufferLoadUbyte]) {
             self.source += BUFFER_LOAD_UBYTE;
         }
@@ -5457,6 +5607,9 @@ impl<'a> Spirv<'a> {
             self.add_constant_int(92);
             self.add_constant_int(95);
             self.add_constant_int(119);
+            // The UNORM divisor of an 8-bit component, `(1 << 8) - 1`, used by
+            // `BUFFER_LOAD_FORMAT_XYZW_UNORM8`.
+            self.add_constant_float(255.0);
             self.add_constant_uint(24);
             self.add_constant_uint(31);
             self.add_constant_uint(32);
