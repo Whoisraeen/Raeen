@@ -729,25 +729,36 @@ fn buffer_store_dwordxn(
     Ok(true)
 }
 
-/// One of Kyty's typed-buffer SPIR-V helpers, described by what its own
-/// `OpIEqual` chain actually accepts.
+/// One typed-buffer SPIR-V helper, described by the set of element formats it
+/// actually implements.
 ///
-/// The helpers (`TBUFFER_LOAD_FORMAT_X` L772, `TBUFFER_STORE_FORMAT_X` L817,
+/// Kyty's helpers (`TBUFFER_LOAD_FORMAT_X` L772, `TBUFFER_STORE_FORMAT_X` L817,
 /// `TBUFFER_STORE_FORMAT_XY` L862, `TBUFFER_LOAD_FORMAT_XYZW` L715 and its
 /// beyond-Kyty store twin) each guard their body with an equality test against
 /// hardcoded **legacy MTBUF packing** constants and do nothing at all when it
-/// fails. `accepted` is that literal set, taken from the constants in
-/// [`crate::shader::spirv`], with the format each one spells.
+/// fails. For those, `accepted` is that literal set, taken from the constants
+/// in [`crate::shader::spirv`], with the format each one spells.
+///
+/// A beyond-Kyty helper written for the MUBUF path needs no runtime guard at
+/// all — the descriptor is known here, at translate time — so for those
+/// `accepted` is simply the format the body unpacks
+/// (`BUF_LOAD_FORMAT_XYZW_UNORM8`). Either way the meaning is the same: the
+/// formats this function will decode correctly.
 struct TypedBufferHelper {
     /// The SPIR-V function name, for the refusal message.
     name: &'static str,
-    /// `(dfmt * 8 + nfmt, what it spells)` — every value the helper's guard
-    /// lets through.
+    /// `(dfmt * 8 + nfmt, what it spells)` — every value this helper decodes.
     accepted: &'static [(u32, &'static str)],
     /// vdata registers the access covers, for the refusal message.
     channels: i32,
     /// Stores write nothing on a failed guard; loads leave vdata untouched.
     is_store: bool,
+    /// Whether the SPIR-V signature ends in a `dfmt_nfmt` parameter — true for
+    /// Kyty's guarded `tbuffer_*` helpers, which re-test the format at runtime,
+    /// and false for a beyond-Kyty helper written for a single format because
+    /// the descriptor is already known at translate time. Decides whether the
+    /// emitting row stores `%temp_int_5` and passes it.
+    takes_format_arg: bool,
 }
 
 /// `%tbuffer_load_format_x`: "dfmt = 4, nfmt = 4 or 7" (`TBUFFER_LOAD_FORMAT_X`).
@@ -756,6 +767,7 @@ const TBUF_LOAD_FORMAT_X: TypedBufferHelper = TypedBufferHelper {
     accepted: &[(36, "32_UINT"), (39, "32_FLOAT")],
     channels: 1,
     is_store: false,
+    takes_format_arg: true,
 };
 
 /// `%tbuffer_store_format_x`: same guard as the load (`TBUFFER_STORE_FORMAT_X`).
@@ -764,6 +776,7 @@ const TBUF_STORE_FORMAT_X: TypedBufferHelper = TypedBufferHelper {
     accepted: &[(36, "32_UINT"), (39, "32_FLOAT")],
     channels: 1,
     is_store: true,
+    takes_format_arg: true,
 };
 
 /// `%tbuffer_store_format_xy`: "dfmt = 11, nfmt = 4 or 7"
@@ -773,6 +786,7 @@ const TBUF_STORE_FORMAT_XY: TypedBufferHelper = TypedBufferHelper {
     accepted: &[(92, "32_32_UINT"), (95, "32_32_FLOAT")],
     channels: 2,
     is_store: true,
+    takes_format_arg: true,
 };
 
 /// `%tbuffer_load_format_xyzw`: "dfmt = 14, nfmt = 7"
@@ -782,6 +796,7 @@ const TBUF_LOAD_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
     accepted: &[(119, "32_32_32_32_FLOAT")],
     channels: 4,
     is_store: false,
+    takes_format_arg: true,
 };
 
 /// `%tbuffer_store_format_xyzw`: the beyond-Kyty store twin, same 119-only
@@ -791,6 +806,28 @@ const TBUF_STORE_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
     accepted: &[(119, "32_32_32_32_FLOAT")],
     channels: 4,
     is_store: true,
+    takes_format_arg: true,
+};
+
+/// `%buffer_load_format_xyzw_unorm8`: the beyond-Kyty four-byte normalized
+/// unpack (`BUFFER_LOAD_FORMAT_XYZW_UNORM8`) — legacy `dfmt 10, nfmt 0`, so
+/// packed `10 * 8 + 0` = **80**, RDNA2 unified **56**.
+///
+/// Measured second capability gap of Avatar: Frontiers of Pandora once the
+/// unit conversion made the descriptor's format legible (`V# unified format 56
+/// (dfmt 10, nfmt 0) is not 32_32_32_32_FLOAT`, 769 occurrences in a 180 s
+/// run): the title packs vertex attributes as four normalized bytes.
+///
+/// Unlike the `tbuffer_*` helpers this one carries no `dfmt_nfmt` parameter and
+/// no `OpIEqual` guard, because the format is resolved here rather than in the
+/// shader — so `accepted` states what its body decodes, not what a runtime test
+/// lets through.
+const BUF_LOAD_FORMAT_XYZW_UNORM8: TypedBufferHelper = TypedBufferHelper {
+    name: "buffer_load_format_xyzw_unorm8",
+    accepted: &[(80, "8_8_8_8_UNORM")],
+    channels: 4,
+    is_store: false,
+    takes_format_arg: false,
 };
 
 /// The packed `dfmt * 8 + nfmt` constant a MUBUF typed access must hand its
@@ -822,17 +859,29 @@ const TBUF_STORE_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
 /// for the V#), so the conversion belongs here, once, as a constant — not in
 /// the shader.
 ///
-/// A format the helper does not serve is refused **by name** and counted in
+/// A format no candidate helper serves is refused **by name** and counted in
 /// `UNSUPPORTED_BUFFER_FORMAT_SKIPS`: the helper's upstream behaviour there is
 /// silent garbage, which is invisible in a log, and a real unpack for the other
 /// formats is the follow-up this counter measures.
+///
+/// # Dispatching over several helpers
+///
+/// `candidates` is the set of helpers the calling row can emit, and the return
+/// says which one the descriptor selected. Most rows have exactly one and pass
+/// a single-element slice. The four-channel load has two — `32_32_32_32_FLOAT`
+/// through Kyty's `tbuffer_load_format_xyzw` and `8_8_8_8_UNORM` through the
+/// beyond-Kyty `buffer_load_format_xyzw_unorm8` — and this is where that choice
+/// is made, once, from the bound descriptor. Resolving all candidates in one
+/// call keeps the descriptor lookup and the skip counter single-shot, and lets
+/// the refusal name every format the row could have served rather than only the
+/// first one tried.
 fn mubuf_descriptor_packed_format(
     inst: &ShaderInstruction,
     bind_info: &ShaderBindResources,
     spirv: &Spirv<'_>,
     func: &'static str,
-    helper: &TypedBufferHelper,
-) -> Result<u32, ShaderRecompileError> {
+    candidates: &[&'static TypedBufferHelper],
+) -> Result<(u32, &'static TypedBufferHelper), ShaderRecompileError> {
     let base = inst.src[1].register_id;
     let base_end = base + 3;
 
@@ -862,8 +911,10 @@ fn mubuf_descriptor_packed_format(
     let unified = u32::from(bind_info.storage_buffers.buffers[i].format());
     let packed = crate::shader::spirv::gfx10_unified_to_packed_dfmt_nfmt(unified);
     if let Some(packed) = packed {
-        if helper.accepted.iter().any(|&(a, _)| a == packed) {
-            return Ok(packed);
+        for helper in candidates {
+            if helper.accepted.iter().any(|&(a, _)| a == packed) {
+                return Ok((packed, helper));
+            }
         }
     }
 
@@ -873,9 +924,9 @@ fn mubuf_descriptor_packed_format(
         Some((dfmt, nfmt)) => format!("dfmt {dfmt}, nfmt {nfmt}"),
         None => "no legacy dfmt/nfmt equivalent".to_owned(),
     };
-    let served = helper
-        .accepted
+    let served = candidates
         .iter()
+        .flat_map(|helper| helper.accepted.iter())
         .map(|&(packed, name)| {
             match crate::shader::spirv::gfx10_packed_to_unified_dfmt_nfmt(packed) {
                 Some(unified) => format!("{name} (unified {unified} / packed {packed})"),
@@ -884,14 +935,21 @@ fn mubuf_descriptor_packed_format(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let consequence = if helper.is_store {
-        "write nothing".to_owned()
-    } else {
-        format!(
+    let helper_name = candidates
+        .iter()
+        .map(|helper| helper.name)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    // Every candidate for one row is the same access shape, so the consequence
+    // of refusing is the same whichever would have been picked; take it from
+    // the first, and fall back to the store wording only if there are none.
+    let consequence = match candidates.first() {
+        Some(helper) if !helper.is_store => format!(
             "leave v[{d}:{d_end}] untouched",
             d = inst.dst.register_id,
             d_end = inst.dst.register_id + helper.channels - 1,
-        )
+        ),
+        _ => "write nothing".to_owned(),
     };
     Err(not_supported(
         func,
@@ -903,7 +961,6 @@ fn mubuf_descriptor_packed_format(
             inst.format,
             bind_info.storage_buffers.buffers[i].stride(),
             inst.pc,
-            helper_name = helper.name,
         ),
     ))
 }
@@ -932,8 +989,14 @@ fn recompile_buffer_load_format_x_vdata1(
             // [`mubuf_descriptor_packed_format`]. Kyty extracted dword3 in the
             // shader and handed the unified number straight to the guard, which
             // could never match, so this fetch was a silent no-op.
-            let packed_format =
-                mubuf_descriptor_packed_format(&inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_X)?;
+            let packed_format = mubuf_descriptor_packed_format(
+                &inst,
+                bind_info,
+                spirv,
+                FUNC,
+                &[&TBUF_LOAD_FORMAT_X],
+            )?
+            .0;
 
             let dst_value = operand_variable_to_str(inst.dst);
             let src0_value = operand_variable_to_str(inst.src[0]);
@@ -1013,11 +1076,21 @@ fn recompile_buffer_load_format_x_vdata1(
 /// `Gen5ShaderScalarEvaluator.cs::TryDecodeBufferDescriptor` (L2205) reads it,
 /// and exactly what the `BufferLoadFormatX` row already does.
 ///
-/// `tbuffer_load_format_xyzw` serves the 32_32_32_32_float encoding (119) and
-/// leaves the destination registers untouched for any other, which is Kyty's
-/// upstream behavior for the typed helper. That is a *narrower* result than a
-/// correct fetch, but it is not a guess, and it replaces a refusal that failed
-/// the entire shader.
+/// Two element formats are served, chosen from the bound descriptor at
+/// translate time — there is no runtime format branch in the shader:
+///
+/// * packed **119** = `32_32_32_32_FLOAT` → Kyty's `%tbuffer_load_format_xyzw`,
+///   four dwords straight out of the storage buffer;
+/// * packed **80** = `8_8_8_8_UNORM` (unified 56, `dfmt 10, nfmt 0`) →
+///   `%buffer_load_format_xyzw_unorm8`, the beyond-Kyty four-byte normalized
+///   unpack. Measured on Avatar: Frontiers of Pandora, which packs its vertex
+///   attributes this way; see `BUFFER_LOAD_FORMAT_XYZW_UNORM8` for the channel
+///   order and the `/ 255.0` rule, both taken from KytyPS5 `BufferFormat.h` and
+///   SharpEmu `Gen5SpirvTranslator.cs`.
+///
+/// Any other format is a named, counted refusal rather than a silent no-op —
+/// Kyty's upstream behaviour for the typed helper is to leave the destination
+/// VGPRs untouched, which is invisible in a log.
 fn recompile_buffer_load_format_xyzw_vdata4(
     index: u32,
     code: &ShaderCode,
@@ -1052,9 +1125,16 @@ fn recompile_buffer_load_format_xyzw_vdata4(
         // The element format comes from the DESCRIPTOR, in RDNA2's unified
         // numbering, while the helper's guard tests the legacy MTBUF packing —
         // see [`mubuf_descriptor_packed_format`] for why extracting it in the
-        // shader could never match.
-        let packed_format =
-            mubuf_descriptor_packed_format(&inst, bind_info, spirv, FUNC, &TBUF_LOAD_FORMAT_XYZW)?;
+        // shader could never match. It also picks WHICH unpack this site emits:
+        // the descriptor is known here, so the choice is a constant, not a
+        // branch the shader re-evaluates per invocation.
+        let (packed_format, helper) = mubuf_descriptor_packed_format(
+            &inst,
+            bind_info,
+            spirv,
+            FUNC,
+            &[&TBUF_LOAD_FORMAT_XYZW, &BUF_LOAD_FORMAT_XYZW_UNORM8],
+        )?;
         {
             if !operand_is_constant(inst.src[2]) {
                 return Err(not_supported(FUNC, "src2 is not a constant"));
@@ -1078,7 +1158,10 @@ fn recompile_buffer_load_format_xyzw_vdata4(
                 return Err(not_supported(FUNC, "unexpected operand types"));
             }
 
-            const TEXT: &str = r#"
+            // Addressing is identical for both unpacks — index, offset, stride
+            // and buffer_index into the same four temporaries. Only the callee
+            // differs, and whether it takes the format argument at all.
+            const PROLOG: &str = r#"
         %t100_<index> = OpLoad %float %<src0>
         %t101_<index> = OpBitcast %int %t100_<index>
                OpStore %temp_int_1 %t101_<index>
@@ -1091,10 +1174,23 @@ fn recompile_buffer_load_format_xyzw_vdata4(
         %t156_<index> = OpBitcast %int %t155_<index>
                OpStore %temp_int_4 %t156_<index>
                OpStore %temp_int_2 %<offset>
-               OpStore %temp_int_5 %int_<packed_format>
-        %t110_<index> = OpFunctionCall %void %tbuffer_load_format_xyzw %<p0> %<p1> %<p2> %<p3> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
 "#;
-            *dst_source += &TEXT
+            let mut text = PROLOG.to_owned();
+            if helper.takes_format_arg {
+                text += "               OpStore %temp_int_5 %int_<packed_format>\n";
+            }
+            text += &format!(
+                "        %t110_<index> = OpFunctionCall %void %{name} %<p0> %<p1> %<p2> %<p3> \
+                 %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4{fmt_arg}\n",
+                name = helper.name,
+                fmt_arg = if helper.takes_format_arg {
+                    " %temp_int_5"
+                } else {
+                    ""
+                },
+            );
+
+            *dst_source += &text
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0>", &src0_value.value)
                 .replace("<offset>", &offset)
@@ -3857,8 +3953,9 @@ fn recompile_buffer_store_format_x_vdata1(
                 bind_info,
                 spirv,
                 FUNC,
-                &TBUF_STORE_FORMAT_X,
-            )?;
+                &[&TBUF_STORE_FORMAT_X],
+            )?
+            .0;
 
             let dst_value = operand_variable_to_str(inst.dst);
             let src0_value = operand_variable_to_str(inst.src[0]);
@@ -3947,8 +4044,9 @@ fn recompile_buffer_store_format_xy_vdata2(
                 bind_info,
                 spirv,
                 FUNC,
-                &TBUF_STORE_FORMAT_XY,
-            )?;
+                &[&TBUF_STORE_FORMAT_XY],
+            )?
+            .0;
 
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
@@ -4221,7 +4319,8 @@ fn mubuf_flexible(
         if src1_value3.type_ != SpirvType::Uint {
             return Err(not_supported(func, "unexpected V# dword3 type"));
         }
-        let packed_format = mubuf_descriptor_packed_format(&inst, bind_info, spirv, func, helper)?;
+        let (packed_format, _) =
+            mubuf_descriptor_packed_format(&inst, bind_info, spirv, func, &[helper])?;
         text += &format!("               OpStore %temp_int_5 %int_{packed_format}\n");
     }
 
@@ -21312,8 +21411,16 @@ mod tests {
     ) -> Result<(String, ShaderCode), ShaderRecompileError> {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
-        shader_parse(0, &[word0, 0x8001_0400, S_ENDPGM], &mut code, true)
-            .unwrap_or_else(|e| panic!("parse MUBUF {word0:#010x}: {e}"));
+        // The trailing `s_nop` is what the other MUBUF fixtures use: the
+        // recompiler refuses an `s_endpgm` that is the last instruction of an
+        // otherwise one-instruction program.
+        shader_parse(
+            0,
+            &[word0, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("parse MUBUF {word0:#010x}: {e}"));
 
         let mut input_info = ShaderComputeInputInfo::default();
         input_info.threads_num = [1, 1, 1];
@@ -21547,18 +21654,19 @@ mod tests {
                 "tbuffer_store_format_xyzw",
                 "unified 77 / packed 119",
             ),
-            (
-                0xE00C_2000,
-                "tbuffer_load_format_xyzw",
-                "unified 77 / packed 119",
-            ),
+            // `0xE00C_2000` — `BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen]` —
+            // is deliberately NOT in this table: it is the one row that now
+            // serves unified 56 through `%buffer_load_format_xyzw_unorm8`. Its
+            // own refusal is covered by
+            // `the_four_channel_load_still_refuses_a_format_neither_helper_serves`,
+            // against a format neither of its two helpers implements.
         ];
 
         for &(word0, helper, served) in ROWS {
             let before = crate::shader::spirv::unsupported_buffer_format_skips();
             // Unified 56 = (dfmt 10, nfmt 0) — 8_8_8_8_UNORM, the format the
             // retail measurement actually hits once unified-77 streams
-            // translate. No helper here serves it.
+            // translate. None of the helpers in this table serves it.
             let err = mubuf_typed_source(word0, 56)
                 .expect_err("a format no helper serves must not translate silently");
             let text = err.to_string();
@@ -21579,6 +21687,158 @@ mod tests {
                 "{word0:#010x}: the refusal must be counted"
             );
         }
+    }
+
+    /// Avatar: Frontiers of Pandora's measured shader blocker, end to end.
+    ///
+    /// After the unit conversion made the descriptor's format legible, the
+    /// title's remaining refusal named itself precisely — `V# unified format 56
+    /// (dfmt 10, nfmt 0) is not 32_32_32_32_FLOAT`, 769 occurrences in a 180 s
+    /// run. `dfmt 10, nfmt 0` is `8_8_8_8_UNORM`: four normalized bytes, which
+    /// Kyty's 32-bit-only `tbuffer_load_format_xyzw` does not implement.
+    ///
+    /// The dispatch is a translate-time choice from the bound descriptor, so
+    /// the assertion is that the unified-56 site calls the UNORM helper and
+    /// passes it NO format argument (there is nothing left to test at runtime),
+    /// while the unified-77 site is unchanged.
+    #[test]
+    fn a_unified_56_descriptor_selects_the_8_8_8_8_unorm_unpack() {
+        // `BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen]`, Avatar's row.
+        const WORD0: u32 = 0xE00C_2000;
+
+        // Not asserted against `unsupported_buffer_format_skips()`: that
+        // counter is a process-global atomic and the refusal tests run
+        // concurrently, so only its monotonic `>` direction is testable. That
+        // this format is no longer counted as a skip is established by the
+        // translation succeeding at all — the counter is only ever bumped on
+        // the refusal path.
+        let (source, code) = mubuf_typed_source(WORD0, 56)
+            .expect("unified 56 (8_8_8_8_UNORM) must now translate, not refuse");
+        assert_eq!(
+            code.get_instructions()[0].type_,
+            T::BufferLoadFormatXyzw,
+            "fixture must be the four-channel load row"
+        );
+
+        assert!(
+            source.contains("OpFunctionCall %void %buffer_load_format_xyzw_unorm8 "),
+            "unified 56 must select the UNORM unpack:\n{source}"
+        );
+        assert!(
+            !source.contains("OpFunctionCall %void %tbuffer_load_format_xyzw "),
+            "unified 56 must NOT go through the 119-only float4 helper:\n{source}"
+        );
+        // No runtime format test survives on this path: the helper has no
+        // `dfmt_nfmt` parameter at all, so nothing stores or passes temp_int_5.
+        assert!(
+            !source.contains("OpStore %temp_int_5"),
+            "the UNORM path must carry no runtime format argument:\n{source}"
+        );
+        for gone in ["%mbf_f0_", "%t206_0", "%t208_0"] {
+            assert!(
+                !source.contains(gone),
+                "runtime format extraction `{gone}` must be gone:\n{source}"
+            );
+        }
+        // The channel order and the normalization, as emitted: component `c` is
+        // the byte at `base + c` (KytyPS5 `BufferFormat.h` `component_bit_offset
+        // {0,8,16,24}` with `packed_bitfield = false`; SharpEmu
+        // `SetLayout(10, c, 0, 8)`), scaled by 1/255 (`(1 << 8) - 1`).
+        for (component, offset_const) in
+            [(0, "%int_0"), (1, "%int_1"), (2, "%int_2"), (3, "%int_3")]
+        {
+            assert!(
+                source.contains(&format!(
+                    "%buf_l_u8_{n}0 = OpIAdd %int %buf_l_u8_49 {offset_const}",
+                    n = component + 6
+                )),
+                "component {component} must read the byte at base + {component}:\n{source}"
+            );
+        }
+        assert_eq!(
+            source.matches("OpBitFieldUExtract %uint").count(),
+            4,
+            "exactly four byte extractions, one per channel:\n{source}"
+        );
+        assert_eq!(
+            source.matches("OpFDiv %float").count(),
+            4,
+            "exactly four normalizations:\n{source}"
+        );
+        assert_eq!(
+            source.matches("%float_255_000000").count(),
+            5, // four uses + the OpConstant declaration
+            "each channel divides by 255.0:\n{source}"
+        );
+
+        let words = spirv_run(&source).expect("the UNORM path assembles");
+        spirv_val_ok(&words, "buffer_load_format_xyzw unified 56 (8_8_8_8_UNORM)");
+
+        // The float4 sibling is untouched by the dispatch.
+        let (float4, _) = mubuf_typed_source(WORD0, 77).expect("unified 77 must still translate");
+        assert!(
+            float4.contains("OpFunctionCall %void %tbuffer_load_format_xyzw ")
+                && float4.contains("OpStore %temp_int_5 %int_119"),
+            "unified 77 must still take the packed-119 float4 path:\n{float4}"
+        );
+    }
+
+    /// The four-channel load now serves two formats, so its refusal must list
+    /// both — and must still fire for a third. Unified 13 = `(dfmt 2, nfmt 7)`
+    /// is a real RDNA2 format that neither helper unpacks.
+    #[test]
+    fn the_four_channel_load_still_refuses_a_format_neither_helper_serves() {
+        const WORD0: u32 = 0xE00C_2000;
+
+        let before = crate::shader::spirv::unsupported_buffer_format_skips();
+        let err = mubuf_typed_source(WORD0, 13)
+            .expect_err("a format neither helper serves must not translate silently");
+        let text = err.to_string();
+        for want in [
+            "unified format 13",
+            "dfmt 2, nfmt 7",
+            // both candidates are named, and both of their formats listed
+            "tbuffer_load_format_xyzw / buffer_load_format_xyzw_unorm8",
+            "32_32_32_32_FLOAT (unified 77 / packed 119)",
+            "8_8_8_8_UNORM (unified 56 / packed 80)",
+            "s[4:7]",
+            // the consequence is still the load wording, not the store one
+            "untouched",
+        ] {
+            assert!(text.contains(want), "refusal must name {want}, got: {text}");
+        }
+        assert!(
+            crate::shader::spirv::unsupported_buffer_format_skips() > before,
+            "the refusal must be counted"
+        );
+    }
+
+    /// `8_8_8_8_UNORM` is `dfmt 10, nfmt 0`, so it packs to `10 * 8 + 0` = 80
+    /// and lives at RDNA2 unified 56. Both directions must agree, because the
+    /// dispatch keys on the packed number while the descriptor and every log
+    /// line speak the unified one.
+    #[test]
+    fn the_8_8_8_8_unorm_encoding_round_trips_between_both_numberings() {
+        use crate::shader::spirv::{
+            gfx10_packed_to_unified_dfmt_nfmt, gfx10_unified_to_dfmt_nfmt,
+            gfx10_unified_to_packed_dfmt_nfmt,
+        };
+
+        assert_eq!(gfx10_unified_to_dfmt_nfmt(56), Some((10, 0)));
+        assert_eq!(gfx10_unified_to_packed_dfmt_nfmt(56), Some(80));
+        assert_eq!(gfx10_packed_to_unified_dfmt_nfmt(80), Some(56));
+        assert_eq!(
+            BUF_LOAD_FORMAT_XYZW_UNORM8.accepted,
+            &[(80, "8_8_8_8_UNORM")],
+            "the helper must advertise exactly the packed number the dispatch keys on"
+        );
+        // 80 is not the unified spelling of anything else — the two schemes
+        // must not be conflated the way 77/119 were.
+        assert_ne!(
+            gfx10_unified_to_packed_dfmt_nfmt(80),
+            Some(80),
+            "unified 80 is a different format from packed 80"
+        );
     }
 
     /// `mubuf_flexible` is shared with the RAW dword/byte rows, which have no

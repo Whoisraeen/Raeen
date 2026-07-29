@@ -348,20 +348,60 @@ exits 0.
 
 ---
 
-## The same unit mismatch, still present in four other rows
+## The same unit mismatch in the four other rows — now closed
 
-`BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen]` was fixed because it is the
-measured blocker. The identical runtime extraction
+`BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen]` was fixed first because it is
+the measured blocker. The identical runtime extraction
 (`OpShiftRightLogical %int_12` + `OpBitwiseAnd %uint_127` → a helper that tests
-the *packed* number) survives in `recompile.rs` at lines ~785, ~3749, ~3833 and
-~4058 — the `BufferLoadFormatX` / `BufferStoreFormatX` / `BufferStoreFormatXyzw`
-bodies and `mubuf_flexible`'s shared path. Those MUBUF typed accesses are
-therefore **silently no-ops today** for every descriptor, exactly as `Xyzw` was.
+the *packed* number) survived at `recompile.rs` ~785, ~3749, ~3833 and ~4058 —
+the `BufferLoadFormatX` / `BufferStoreFormatX` / `BufferStoreFormatXy` bodies
+and `mubuf_flexible`'s shared path — so those MUBUF typed accesses were
+**silently no-ops for every descriptor**, exactly as `Xyzw` was. (The follow-up
+note said `BufferStoreFormatXyzw` for the third site; the standalone row there
+is `BufferStoreFormatXy`. `BufferStoreFormatXyzw` reaches the defect through
+`mubuf_flexible`, the fourth site.)
 
-They were deliberately not changed in this pass: `mubuf_flexible` is shared by
-twelve rows, the fix needs the same bound-descriptor lookup, and there is no
-measurement in hand to verify twelve rows at once. `gfx10_unified_to_packed_dfmt_nfmt`
-is in place and this is the highest-value mechanical follow-up.
+All four now resolve the format at translate time. The conversion is factored
+into one resolver rather than copied five ways:
+
+* `TypedBufferHelper` describes a Kyty typed helper by what its own `OpIEqual`
+  guard accepts — `tbuffer_load_format_x` / `tbuffer_store_format_x` 36 & 39,
+  `tbuffer_store_format_xy` 92 & 95, `tbuffer_{load,store}_format_xyzw` 119 —
+  taken from the constants in `spirv.rs`, not restated from the ISA.
+* `mubuf_descriptor_packed_format` finds the instruction's V# among
+  `bind.storage_buffers` (`start_register[i] + shift == inst.src[1].register_id`,
+  shift 8 for a gs-prolog VS), converts `buffers[i].format()` through
+  `gfx10_unified_to_packed_dfmt_nfmt`, and returns the packed constant the row
+  then emits as `OpStore %temp_int_5 %int_<packed>`. All five packed constants
+  are already declared by `find_constants`, so no new SPIR-V id is needed.
+* A format the row's helpers do not serve is refused **by name** — naming both
+  numbering schemes, since the fix is descriptor-side — and counted in
+  `UNSUPPORTED_BUFFER_FORMAT_SKIPS`.
+
+`gfx10_packed_to_unified_dfmt_nfmt` (spirv.rs) inverts the table so a refusal
+can print `32_32_32_32_FLOAT (unified 77 / packed 119)` without a second
+transcription of table 47.
+
+**Behaviour change worth stating.** These rows previously always *compiled*;
+they just did nothing. They can now fail the shader. That is the same trade the
+`Xyzw` row already made — a silent no-op is invisible in a log and a refusal is
+not — and the skip counter is what measures how much a real format unpack would
+recover. The four-channel load is the case where that follow-up landed: it now
+carries two candidates (`tbuffer_load_format_xyzw` for 119 and
+`buffer_load_format_xyzw_unorm8` for 80), and the resolver picks between them
+from the bound descriptor.
+
+`mubuf_flexible` is shared by ten format-carrying dispatch rows plus the raw
+dword/ubyte rows, so each is covered separately:
+`every_mubuf_typed_row_passes_the_packed_format_not_the_unified_one` drives all
+fourteen typed rows (four standalone + ten flexible) from real MUBUF encodings
+through to spirv-val-clean SPIR-V, asserting both the packed constant and the
+absence of the runtime extraction;
+`a_format_the_helper_cannot_serve_is_refused_per_row_and_counted` checks the
+named refusal per row; `the_raw_mubuf_rows_keep_no_format_argument` proves the
+raw rows gained no format lookup and therefore no new refusal.
+
+Counts after this pass: kyty-graphics **601 lib**, raeen-gpu **310**.
 
 ## Avatar's next named gap
 
@@ -389,3 +429,98 @@ exist upstream). Left for a follow-up rather than invented here.
 * The offset-quad relaxation is established from Avatar's dumped table load and
   GTA V's logged `s[8:15]` producer, not from re-running GTA V's exact failing
   pixel shader.
+
+---
+
+# Follow-up (2026-07-28): Avatar's `8_8_8_8_UNORM` unpack
+
+Closes the capability gap §3 left open ("An `8_8_8_8_UNORM` unpack … is the next
+step and is a real feature, not a bug fix — so it was not invented here").
+
+## Channel order and the UNORM rule — established, not guessed
+
+Two references agree row-for-row, so the layout is sourced rather than inferred:
+
+| | KytyPS5 (MIT) | SharpEmu (GPL-2.0) |
+|---|---|---|
+| file | `src/graphics/shader/recompiler/BufferFormat.h`, `spirvEmitter/spirvEmitterMemory.cpp` | `src/SharpEmu.ShaderCompiler.Vulkan/Gen5SpirvTranslator.cs` |
+| layout | `GetFormatInfo(k8_8_8_8UNorm)` → `component_bits {8,8,8,8}`, `component_bit_offset {0,8,16,24}`, `packed_bitfield = false` | `LoadGfx10BufferFormatComponent`: `SetLayout(10, c, 0, 8)` for c = 0..3 |
+| component `c` | byte at `base + c`, loaded by `EmitMemoryLoadSubDwordValueU32` (L541-575) as `(dword[a >> 2] >> ((a & 3) * 8)) & 0xff` | byte offset `c`, bit offset 0, 8 bits |
+| UNORM | `NormalizeFormatComponent` (L899-908): `OpConvertUToF` then `OpFDiv` by `(1 << bits) - 1` = **255.0** | `ConvertGfx10BufferComponent`: `ConvertUToF(raw) / ConvertUToF(lowMask)`, `lowMask = 255` |
+
+So **x is the lowest byte** of the containing little-endian dword — bits
+`c*8 .. c*8+7` — and each channel is `float(byte) / 255.0`. Both sources are
+cited by file and line in the helper's doc comment.
+
+**Per-component byte addressing, not one dword load with fixed offsets.** Both
+references address each component by byte (`base + c`, dword `= a >> 2`, shift
+`= (a & 3) * 8`) rather than bit-slicing a single dword at 0/8/16/24. That is
+what makes an element whose byte address is not 4-aligned decode correctly — it
+straddles two dwords, and each byte is fetched from whichever dword holds it.
+For a 4-aligned element the four extractions collapse to exactly 0/8/16/24 of
+one dword, so the measured case costs nothing. It reuses the `BUFFER_LOAD_UBYTE`
+pattern already in this tree.
+
+## Shape
+
+* `spirv.rs` — `BUFFER_LOAD_FORMAT_XYZW_UNORM8` on the existing
+  `%function_buffer_load_float4` signature. **No `dfmt_nfmt` parameter and no
+  `OpIEqual` guard**: the descriptor is known at translate time, so unlike the
+  `tbuffer_*` helpers there is nothing left to test per invocation. Plus
+  `add_constant_float(255.0)` and an emission gate on `BufferLoadFormatXyzw`.
+* `recompile.rs` — `mubuf_descriptor_packed_format` now takes a slice of
+  candidate helpers and returns which one the descriptor selected. The
+  four-channel load passes `[&TBUF_LOAD_FORMAT_XYZW, &BUF_LOAD_FORMAT_XYZW_UNORM8]`;
+  the other four rows pass a one-element slice and are otherwise unchanged. One
+  descriptor lookup, one skip-counter increment, and a refusal that names every
+  format the row could have served. A new `takes_format_arg` field decides
+  whether the emitting row stores and passes `%temp_int_5`, so emission is
+  data-driven rather than a `match` that could drift from the candidate list.
+
+## Measured (retail, this machine, 2026-07-28)
+
+Build `21:39:09` release, `RAEEN_VBLANK_HZ=0 RAEEN_ASYNC_FLIP=1
+RAEEN_TIME_WORKER=1`, `--run-eboot`, 3 m 19 s, 71 flips, no device loss.
+
+| | before (§3, build `+ unit conversion`) | after |
+|---|---:|---:|
+| `V# unified format 56` refusals | 769 | **0** |
+| refusals naming `BufferLoadFormatXyzw` | 769 | **0** |
+| total shader `not supported:` in the run | — | **5** |
+
+The 51 `BufferLoadFormatXyzw` lines still in the log are plain disassembly of
+sites that translated. The whole run's remaining `not supported:` volume is 5
+occurrences of a **different** row — `Recompile_BufferStoreFormatXyzw_Vdata4VaddrSvSoffs`,
+`unified format 75 (dfmt 14, nfmt 4)` = `32_32_32_32_UINT`, a store, out of
+scope here.
+
+The top gap is now the one §"Avatar's next named gap" predicted:
+`BufferLoadFormatXyz [Vdata3VaddrSvSoffsIdxen]`, 49 sites — a genuinely missing
+three-channel row with no upstream helper to compose from.
+
+## Tests
+
+`kyty-graphics` 601 lib (three new) + 8 integration; `raeen-gpu` 310 lib;
+`cargo fmt --all --check` clean; `cargo clippy -p kyty-graphics -p raeen-gpu
+--all-targets -- -D warnings` exits 0.
+
+| Test | Gate |
+|------|------|
+| `a_unified_56_descriptor_selects_the_8_8_8_8_unorm_unpack` | a unified-56 descriptor calls `%buffer_load_format_xyzw_unorm8` and passes it **no** format argument; no `OpStore %temp_int_5`; no runtime `(dword3 >> 12) & 0x7f` extraction; component `c` reads byte `base + c`; four `OpBitFieldUExtract`, four `OpFDiv`, all by `%float_255_000000`; spirv-val (Vulkan 1.3); and unified 77 still takes the packed-119 float4 path |
+| `the_four_channel_load_still_refuses_a_format_neither_helper_serves` | unified 13 refuses by name, listing **both** candidates and both served formats, with the load consequence wording, and is counted |
+| `the_8_8_8_8_unorm_encoding_round_trips_between_both_numberings` | 56 ↔ (10,0) ↔ packed 80, and unified 80 is a different format from packed 80 |
+
+Failing-first is established by construction rather than by hand: the
+pre-existing `a_format_the_helper_cannot_serve_is_refused_per_row_and_counted`
+listed `0xE00C_2000` + unified 56 as a **refusal** row, so it failed until that
+row was removed and replaced with unified 13.
+
+## Not claimed
+
+* **The title still does not render.** `BufferLoadFormatXyz` refuses at 49 sites
+  and a shader that refuses anywhere still fails. This is a translate-path
+  result, not a rendering claim.
+* No before/after A/B was run on this machine: the pre-change release binary was
+  already overwritten, so "769" is quoted from §3's measurement, not re-measured
+  today. The after-run's zero is direct, and the path is proven exercised by the
+  51 translated sites and the moved blocker.
