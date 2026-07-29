@@ -359,6 +359,20 @@ pub struct AgcGpuSession {
     shader_cache: Mutex<crate::shader_fetch::ShaderTranslateCache>,
     /// Draws skipped because a bound guest shader failed translation.
     shader_skip_count: Mutex<u64>,
+    /// Draws/dispatches the SINK refused and the command processor skipped, per
+    /// queue: `[graphics, compute]`.
+    ///
+    /// A refusal never touches the sink's own `draws`/`draw_skips` — the sink
+    /// returned `Err` before it could count anything — so these were invisible
+    /// here. Dead Cells submitted 1558 draw packets, completed 0 draws, and
+    /// reported `draw_skips=0`: three counters that all read "no work was asked
+    /// for" while `CommandProcessor::refused_draws` climbed unread. Each slot
+    /// holds the owning processor's CUMULATIVE total (not a delta), so
+    /// re-recording is idempotent — see [`Self::record_refusals`].
+    refused_draws: Mutex<[u64; 2]>,
+    /// Most recent refusal reason across both queues, for the black-frame
+    /// diagnostic. See [`kyty_graphics::run::CommandProcessor::last_refusal`].
+    last_refusal: Mutex<Option<String>>,
     /// Persistent per-render-target pixels (keyed by `CB_COLOR0_BASE`), so
     /// draws compose into a frame across DCBs instead of each starting from
     /// a cleared attachment.
@@ -730,6 +744,8 @@ impl AgcGpuSession {
             draw_count: Mutex::new(0),
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
             shader_skip_count: Mutex::new(0),
+            refused_draws: Mutex::new([0; 2]),
+            last_refusal: Mutex::new(None),
             framebuffers: Mutex::new(std::collections::HashMap::new()),
             gpu_present_overrides: Mutex::new(std::collections::HashMap::new()),
             scanout_address: Mutex::new(None),
@@ -859,6 +875,38 @@ impl AgcGpuSession {
     /// Draws skipped because a bound guest shader failed translation.
     pub fn shader_skip_count(&self) -> u64 {
         *self.shader_skip_count.lock()
+    }
+
+    /// Draws/dispatches the sink REFUSED, summed over both queues — work the
+    /// title asked for that produced no pixels.
+    ///
+    /// This is the counter that makes `completed_draws=0` interpretable. Zero
+    /// draws with zero refusals means the command processor never reached a draw
+    /// packet; zero draws with N refusals means it reached N and dropped them,
+    /// and [`Self::last_refusal`] says why.
+    pub fn refused_draws(&self) -> u64 {
+        self.refused_draws.lock().iter().sum()
+    }
+
+    /// Why the most recent refused draw/dispatch was refused, across both
+    /// queues.
+    pub fn last_refusal(&self) -> Option<String> {
+        self.last_refusal.lock().clone()
+    }
+
+    /// Latch a command processor's cumulative refusal state onto the session
+    /// after a walk.
+    ///
+    /// Stores the processor's ABSOLUTE total rather than adding a delta: each
+    /// queue's `CommandProcessor` is long-lived and its counter only grows
+    /// (`reset` deliberately preserves it), so an absolute store is idempotent
+    /// and cannot drift the way repeated delta arithmetic across suspend/resume
+    /// re-entries would.
+    fn record_refusals(&self, is_compute: bool, cp: &CommandProcessor) {
+        self.refused_draws.lock()[usize::from(is_compute)] = cp.refused_draws();
+        if let Some(reason) = cp.last_refusal() {
+            *self.last_refusal.lock() = Some(reason.to_owned());
+        }
     }
 
     /// Publish the owned shader metadata produced by AGC shader creation.
@@ -1667,6 +1715,15 @@ impl AgcGpuSession {
                     scanout_target_known = flip_target_known,
                     render_targets = ?render_targets,
                     completed_draws = *self.draw_count.lock(),
+                    // Without these two, `completed_draws=0` is ambiguous
+                    // between "the command processor never reached a draw
+                    // packet" and "it reached them and the sink refused every
+                    // one" — the second is what held Dead Cells at 447 black
+                    // frames, and it named nothing.
+                    refused_draws = self.refused_draws(),
+                    refusal_reason = self
+                        .last_refusal()
+                        .unwrap_or_else(|| "(none — no draw was refused)".to_owned()),
                     shader_skips = *self.shader_skip_count.lock(),
                     shader_cache = ?self.shader_stats(),
                     descriptor = ?*self.scanout_descriptor.lock(),
@@ -2147,6 +2204,7 @@ impl AgcGpuSession {
             // for HLE delivery in execution order iff the defer gate is on
             // (gate off: the HLE already applied them eagerly at submit).
             crate::ordered_side_effects::publish_cp_side_effects(cp.take_side_effects());
+            self.record_refusals(is_compute, &cp);
             drop(cp);
             self.latch_produced_waits(&produced);
             return Ok((None, suspended_of(outcome)));
@@ -2191,6 +2249,10 @@ impl AgcGpuSession {
         // state-only path above; a suspended walk has published nothing past
         // its unmet wait, so delivery order is PM4 execution order.
         crate::ordered_side_effects::publish_cp_side_effects(cp.take_side_effects());
+        // Draws the sink refused. Latch them BEFORE the early returns below
+        // (deferred present, present-allocation failure) so a black frame can
+        // always name what the GPU dropped.
+        self.record_refusals(is_compute, &cp);
         self.latch_produced_waits(&produced);
         // Carry any compute shader this submission observed forward to the next.
         if let Some(cs) = sink.current_compute {
@@ -4961,6 +5023,66 @@ mod tests {
             cp.refused_draws(),
             1,
             "the register-less draw must be REFUSED (not silently drawn or a fixture)"
+        );
+    }
+
+    /// A refused draw must be visible on the SESSION, not only on the command
+    /// processor that swallowed it.
+    ///
+    /// Dead Cells presented 447 black frames while `refused_draws` was climbing
+    /// inside the per-queue `CommandProcessor` and nothing on this side ever read
+    /// it. The BLACK FRAME diagnostic reported `completed_draws=0
+    /// draw_skips=0 shader_skips=0` — three zeros that together read as "the GPU
+    /// was never asked to draw", when the truth was "the GPU refused 1558 draws
+    /// for one nameable reason". `record_refusals` closes the seam.
+    #[test]
+    fn session_surfaces_refused_draws_and_their_reason() {
+        let session = AgcGpuSession::new(deny_memory());
+        assert_eq!(session.refused_draws(), 0);
+        assert_eq!(session.last_refusal(), None);
+
+        // A real walk that refuses: the sink rejects every draw.
+        struct Refusing;
+        impl kyty_graphics::run::DrawSink for Refusing {
+            fn draw_index_auto(
+                &mut self,
+                _ctx: &kyty_graphics::hw_regs::Context,
+                _ucfg: &kyty_graphics::hw_regs::UserConfig,
+                _sh: &kyty_graphics::hw_regs::Shader,
+                _index_count: u32,
+                _flags: u32,
+            ) -> Result<(), kyty_graphics::run::DrawError> {
+                Err(kyty_graphics::run::DrawError(
+                    "indexed draw with no index buffer: addr=0x0 count=6".to_owned(),
+                ))
+            }
+        }
+        let one_draw = [pm4::header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), 3, 0];
+        let dcb: Vec<u32> = one_draw.iter().chain(one_draw.iter()).copied().collect();
+
+        let mut cp = CommandProcessor::new();
+        cp.run(&dcb, &mut Refusing).expect("refusals are skipped");
+        session.record_refusals(false, &cp);
+        assert_eq!(session.refused_draws(), 2, "both refusals must surface");
+        assert_eq!(
+            session.last_refusal().as_deref(),
+            Some("indexed draw with no index buffer: addr=0x0 count=6"),
+            "the diagnostic must be able to NAME the refusal"
+        );
+
+        // The compute queue keeps its own cumulative total; the session reports
+        // the sum, and re-recording the same absolute total must not double-count
+        // (the graphics CP is long-lived and its counter only ever grows).
+        let mut compute_cp = CommandProcessor::new();
+        compute_cp
+            .run(&one_draw, &mut Refusing)
+            .expect("refusals are skipped");
+        session.record_refusals(true, &compute_cp);
+        session.record_refusals(false, &cp);
+        assert_eq!(
+            session.refused_draws(),
+            3,
+            "graphics 2 + compute 1, with no double-count on re-record"
         );
     }
 }
