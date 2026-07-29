@@ -56,10 +56,24 @@ pub struct Capabilities {
     /// owns the command stream can supply). Extraction from the PM4 stream is a
     /// follow-up; the flag lets an MV-aware plugin advertise the need now.
     pub wants_motion_vectors: bool,
-    /// Can consume GPU-resident (`VULKAN`-kind) frames via ABI v2. Purely
-    /// descriptive until the GPU-resident present path advertises
-    /// `RAEEN_HOST_GPU_FRAMES`; such plugins still receive CPU frames today
-    /// and may decline them.
+    /// Can consume GPU-resident frames — borrowed `VkImage`s recorded into a
+    /// host command buffer, rather than CPU pixels.
+    ///
+    /// **Load-bearing on the ABI-v3 path.** A plugin reaches
+    /// [`PresentPlugin::process_gpu_v3`] only when it sets this AND returns
+    /// [`PresentPlugin::vulkan_requirements_v3`]; declaring one without the
+    /// other selects the CPU path. Both halves are needed and they answer
+    /// different questions: the requirements say what device the plugin needs,
+    /// this says whether it wants images instead of bytes. A plugin that
+    /// implements the v3 methods but leaves this false is treated as CPU-only —
+    /// it keeps receiving `PresentFrame` pixels through
+    /// [`PresentPlugin::process`], and Raeen neither requests its Vulkan
+    /// requirements at device creation nor hands it a borrowed image.
+    ///
+    /// (The v2 `RAEEN_HOST_GPU_FRAMES` host flag is a different, older
+    /// mechanism and remains unset: v2's GPU delivery needs a populated
+    /// `RaeenVulkanContext`, which ABI v3's host/requirements/resource
+    /// handshake replaced.)
     pub gpu_frames: bool,
 }
 
@@ -272,15 +286,32 @@ impl Registry {
             .collect()
     }
 
+    /// The active plugin, but only when it is genuinely GPU-resident: it both
+    /// declares [`Capabilities::gpu_frames`] and states its Vulkan
+    /// requirements. Every v3 step routes through this so the four of them
+    /// cannot disagree about which path a plugin is on — a plugin whose
+    /// requirements were skipped at device creation must never then be
+    /// initialized against, or handed images from, a device that does not meet
+    /// them.
+    fn active_gpu_v3_plugin(&self) -> Option<&dyn PresentPlugin> {
+        let plugin = self.plugins.get(self.active.as_ref()?)?.as_ref();
+        (plugin.capabilities().gpu_frames && plugin.vulkan_requirements_v3().is_some())
+            .then_some(plugin)
+    }
+
+    /// Name of the active plugin when it is GPU-resident, for the `&mut self`
+    /// entry points that cannot hold the shared borrow above.
+    fn active_gpu_v3_name(&self) -> Option<String> {
+        self.active_gpu_v3_plugin()?;
+        self.active.clone()
+    }
+
     fn active_vulkan_requirements_v3(&self) -> Option<cabi_v3::RaeenVulkanRequirementsV3> {
-        let name = self.active.as_ref()?;
-        self.plugins.get(name)?.vulkan_requirements_v3()
+        self.active_gpu_v3_plugin()?.vulkan_requirements_v3()
     }
 
     fn active_gpu_v3_request(&self) -> Option<GpuV3Request> {
-        let name = self.active.as_ref()?;
-        let plugin = self.plugins.get(name)?;
-        plugin.vulkan_requirements_v3()?;
+        let plugin = self.active_gpu_v3_plugin()?;
         Some(GpuV3Request {
             capabilities: plugin.capabilities(),
             output_scale: self.output_scale,
@@ -291,7 +322,7 @@ impl Registry {
         &mut self,
         host: &cabi_v3::RaeenVulkanHostV3,
     ) -> Result<(), String> {
-        let Some(name) = self.active.clone() else {
+        let Some(name) = self.active_gpu_v3_name() else {
             return Ok(());
         };
         let Some(plugin) = self.plugins.get_mut(&name) else {
@@ -305,7 +336,7 @@ impl Registry {
         frame: &cabi_v3::RaeenPresentFrameV3,
         output: &mut cabi_v3::RaeenPluginOutputV3,
     ) -> i32 {
-        let Some(name) = self.active.clone() else {
+        let Some(name) = self.active_gpu_v3_name() else {
             return cabi_v3::RAEEN_V3_DECLINED;
         };
         let Some(plugin) = self.plugins.get_mut(&name) else {
@@ -449,6 +480,21 @@ pub fn set_output_scale(scale: f32) {
 /// are `None` today; they will be populated when PM4-side extraction lands.
 #[must_use]
 pub(crate) fn apply_to_image(image: Arc<RenderedImage>) -> Arc<RenderedImage> {
+    apply_to_image_inner(image)
+}
+
+/// [`apply_to_image`] for integration tests, which need to assert that a
+/// CPU-routed plugin really receives the frame's pixels — and that the
+/// no-plugin path is still the same-`Arc` identity. Not part of the supported
+/// API; the present path itself calls the crate-private form above.
+#[doc(hidden)]
+#[must_use]
+pub fn apply_to_image_for_tests(image: Arc<RenderedImage>) -> Arc<RenderedImage> {
+    apply_to_image_inner(image)
+}
+
+#[must_use]
+fn apply_to_image_inner(image: Arc<RenderedImage>) -> Arc<RenderedImage> {
     let mut reg = registry().lock();
     let ctx = PresentContext {
         output_scale: reg.output_scale,
