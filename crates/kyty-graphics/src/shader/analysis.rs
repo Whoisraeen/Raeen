@@ -4330,10 +4330,14 @@ fn read_extended_user_data(
         // descriptors PAST the declared `eud_size_dw` (measured on ASTRO.BOT
         // CS 0x500543b00 — storage T# at virtual s68 = EUD dword 36 with
         // eud_size_dw=28; the metadata size is a driver hint, not a bound —
-        // the load just adds its offset to the same pointer). Cap at the
-        // recompiler's mapping size so capture can never outrun
-        // `WriteLocalVariables`. Fall back to the declared size when the
-        // memory behind the pointer is shorter.
+        // the load just adds its offset to the same pointer). Take at least
+        // the recompiler's mapping FLOOR (`EXTENDED_MAPPING_DWORDS`), then the
+        // declared size when it is larger — a table deeper than the floor is
+        // exactly the case `extended_mapping_len` sizes the mapping for, and a
+        // declared descriptor whose dwords fall beyond what `eud_size_dw`
+        // covers stays a named `read_sharp_fields` refusal ("extended (EUD)
+        // buffer too small") rather than a silent short read. Fall back to the
+        // declared size when the memory behind the pointer is shorter.
         let want = size.max(super::spirv::EXTENDED_MAPPING_DWORDS);
         if src.len() >= want {
             return Some(src[..want].to_vec());

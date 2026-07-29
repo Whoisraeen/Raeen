@@ -1898,6 +1898,33 @@ pub(crate) fn operand_variable_to_str(op: ShaderOperand) -> SpirvValue {
 
 /// Kyty: ShaderSpirv.cpp `operand_variable_to_str` multi-dword overload
 /// (L1627).
+///
+/// Beyond Kyty — the `VccHi`/`ExecHi` arms. RDNA2's scalar-destination field
+/// (ISA 70648, "Scalar ALU Operands" / SMEM `SDATA`) is a flat 7-bit encoding
+/// in which the aliases sit BESIDE the SGPRs: 106 = `VCC_LO`, 107 = `VCC_HI`,
+/// 126 = `EXEC_LO`, 127 = `EXEC_HI`. A one-dword write may therefore name the
+/// HIGH half directly, and that is what Blasphemous II's PS emits:
+///
+/// ```text
+/// s_buffer_load_dword vcc_lo, s[12:15], 0x10    ; dst = VccLo, shift 0
+/// s_buffer_load_dword vcc_hi, s[12:15], 0x18    ; dst = VccHi, shift 0
+/// ```
+///
+/// Kyty (and this port until now) only mapped the LO aliases, relying on
+/// `shift == 1` to reach the high half, so a `VccHi`/`ExecHi` destination fell
+/// to the `_ => {}` arm, returned an `Unknown`-typed empty value, and every
+/// caller refused the shader ("unexpected operand types" —
+/// `Recompile_SBufferLoadDword_SdstSvSoffset`). KytyPS5 handles this by
+/// re-decoding `destination_code + dword_index` through the shared scalar
+/// destination space (`src/graphics/shader/recompiler/shaderIR/ShaderIR.cpp`
+/// `TryGetScalarDestinationCode` / `TryOffsetScalarDestination`, which
+/// enumerate exactly these four aliases); the two arms below are that mapping
+/// for the only reachable offset, `shift == 0`.
+///
+/// `shift >= 1` off a HI alias stays unmapped on purpose: 107 + 1 = 108 is
+/// TTMP0 and 127 + 1 = 128 is an inline constant, neither of which is a
+/// register variable this generator declares, so a wide load starting at a HI
+/// half must keep refusing by name rather than invent a destination.
 #[must_use]
 pub(crate) fn operand_variable_to_str_shift(op: ShaderOperand, shift: i32) -> SpirvValue {
     use ShaderOperandType as O;
@@ -1920,6 +1947,10 @@ pub(crate) fn operand_variable_to_str_shift(op: ShaderOperand, shift: i32) -> Sp
                 ret.type_ = SpirvType::Uint;
             }
         }
+        O::VccHi if shift == 0 => {
+            ret.value = "vcc_hi".to_string();
+            ret.type_ = SpirvType::Uint;
+        }
         O::ExecLo => {
             if shift == 0 {
                 ret.value = "exec_lo".to_string();
@@ -1928,6 +1959,10 @@ pub(crate) fn operand_variable_to_str_shift(op: ShaderOperand, shift: i32) -> Sp
                 ret.value = "exec_hi".to_string();
                 ret.type_ = SpirvType::Uint;
             }
+        }
+        O::ExecHi if shift == 0 => {
+            ret.value = "exec_hi".to_string();
+            ret.type_ = SpirvType::Uint;
         }
         _ => {}
     }
@@ -1996,9 +2031,83 @@ pub(crate) fn eud_rel_index(
     Ok(start_reg - bind.extended.start_register)
 }
 
-/// Size of the extended (EUD) dword mapping `WriteLocalVariables` builds and
-/// `GetMappedIndex` resolves against.
+/// MINIMUM size of the extended (EUD) dword mapping `WriteLocalVariables`
+/// builds and `GetMappedIndex` resolves against — Kyty's fixed window
+/// (`Core::Array2<int, 64, 2> m_extended_mapping`).
+///
+/// Deviation: this is a floor, not the size. The real window is
+/// [`extended_mapping_len`], which raises it to cover whatever the shader's
+/// DECLARED EUD-resident descriptors occupy. Kept as the floor so every shader
+/// whose descriptors fit inside 64 dwords keeps a byte-identical mapping,
+/// coverage map and refusal message.
 pub(crate) const EXTENDED_MAPPING_DWORDS: usize = 64;
+
+/// Every DECLARED EUD-resident descriptor as `(first EUD dword, dword count)`,
+/// in the same order and with the same widths `WriteLocalVariables` maps
+/// (storage V#s cover 4 dwords, T#s 8, S#s 4, GDS pointers 1, all rebased by
+/// [`eud_rel_index`]'s residence rules).
+///
+/// A sharp whose rel index does not resolve is skipped: `WriteLocalVariables`
+/// refuses such a bind by name before any window query could matter. This is
+/// the single source both [`extended_mapping_len`] and [`eud_covered_map`] read,
+/// so the window can never be smaller than the descriptors written into it.
+fn eud_declared_spans(bind: &ShaderBindResources) -> Vec<(i32, i32)> {
+    let mut spans = Vec::new();
+    let mut push = |start_reg: i32, dwords: i32| {
+        if let Ok(rel) = eud_rel_index(bind, start_reg, 0, "eud declared span") {
+            spans.push((rel, dwords));
+        }
+    };
+    for i in 0..bind.storage_buffers.buffers_num.max(0) as usize {
+        if bind.storage_buffers.extended[i] {
+            push(bind.storage_buffers.start_register[i], 4);
+        }
+    }
+    for i in 0..bind.textures2d.textures_num.max(0) as usize {
+        if bind.textures2d.desc[i].extended {
+            push(bind.textures2d.desc[i].start_register, 8);
+        }
+    }
+    for i in 0..bind.samplers.samplers_num.max(0) as usize {
+        if bind.samplers.extended[i] {
+            push(bind.samplers.start_register[i], 4);
+        }
+    }
+    for i in 0..bind.gds_pointers.pointers_num.max(0) as usize {
+        if bind.gds_pointers.extended[i] {
+            push(bind.gds_pointers.start_register[i], 1);
+        }
+    }
+    spans
+}
+
+/// How many EUD dwords the extended mapping must span for `bind`:
+/// [`EXTENDED_MAPPING_DWORDS`] raised to one past the last dword any declared
+/// EUD-resident descriptor occupies.
+///
+/// Beyond Kyty. Kyty's window is a fixed 64 entries, which silently assumes no
+/// descriptor table reaches past EUD dword 63. Blasphemous II's PS
+/// (`0x10001d00300`, measured) breaks that: it addresses its descriptor table
+/// through one pointer pair with byte offsets running
+/// `0x00,0x20,0x40,0x60,0x80` for the T#s (`s_load_dwordx8`) and
+/// `0xa0..0x100` step `0x10` for the S#s (`s_load_dwordx4`), so the last
+/// sampler sits at EUD dwords 64..67 — one past the fixed window. The usage
+/// table declares it at `start_register = SGPRS_MAX + 64 = 96`, `eud_rel_index`
+/// rebases it to 64, and `WriteLocalVariables` refused the whole shader
+/// ("extended mapping overflow"). The table is a guest allocation whose length
+/// the shader chooses; the mapping is a dense index over it, so it has to be
+/// sized from the declared descriptors rather than a constant.
+///
+/// Growth only ADDS entries at indices that were previously out of range and
+/// unconditionally refused, so no shape that translates today can change.
+pub(crate) fn extended_mapping_len(bind: &ShaderBindResources) -> usize {
+    eud_declared_spans(bind)
+        .into_iter()
+        .filter_map(|(rel, dwords)| usize::try_from(rel.saturating_add(dwords)).ok())
+        .max()
+        .unwrap_or(0)
+        .max(EXTENDED_MAPPING_DWORDS)
+}
 
 /// Beyond Kyty — SharpEmu port (see [`ShaderEudRawResources`]): decide
 /// whether the shader scalar-loads EUD dwords no captured descriptor covers,
@@ -2032,39 +2141,20 @@ pub(crate) const EXTENDED_MAPPING_DWORDS: usize = 64;
 /// push-constant descriptor field (safe: base fields carry descriptor-array
 /// indices); an UNCOVERED dword read through the `%eud_raw` fallback yields
 /// the RAW guest dword (never safe to use as a descriptor-array index).
-pub(crate) fn eud_covered_map(bind: &ShaderBindResources) -> [bool; EXTENDED_MAPPING_DWORDS] {
-    let mut covered = [false; EXTENDED_MAPPING_DWORDS];
-    let b: &ShaderBindResources = bind;
-    let cover = |covered: &mut [bool; EXTENDED_MAPPING_DWORDS], start_reg: i32, dwords: i32| {
-        let Ok(rel) = eud_rel_index(b, start_reg, 0, "eud coverage map") else {
-            return;
-        };
+///
+/// Sized by [`extended_mapping_len`], so the map is exactly as long as the
+/// mapping `WriteLocalVariables` builds; a dword past its end reads as
+/// uncovered (`covered.get(i)` → `None`), which is what the fixed-64 array did
+/// for every index above 63.
+pub(crate) fn eud_covered_map(bind: &ShaderBindResources) -> Vec<bool> {
+    let mut covered = vec![false; extended_mapping_len(bind)];
+    for (rel, dwords) in eud_declared_spans(bind) {
         for f in 0..dwords {
             if let Ok(idx) = usize::try_from(rel + f)
                 && idx < covered.len()
             {
                 covered[idx] = true;
             }
-        }
-    };
-    for i in 0..b.storage_buffers.buffers_num.max(0) as usize {
-        if b.storage_buffers.extended[i] {
-            cover(&mut covered, b.storage_buffers.start_register[i], 4);
-        }
-    }
-    for i in 0..b.textures2d.textures_num.max(0) as usize {
-        if b.textures2d.desc[i].extended {
-            cover(&mut covered, b.textures2d.desc[i].start_register, 8);
-        }
-    }
-    for i in 0..b.samplers.samplers_num.max(0) as usize {
-        if b.samplers.extended[i] {
-            cover(&mut covered, b.samplers.start_register[i], 4);
-        }
-    }
-    for i in 0..b.gds_pointers.pointers_num.max(0) as usize {
-        if b.gds_pointers.extended[i] {
-            cover(&mut covered, b.gds_pointers.start_register[i], 1);
         }
     }
     covered
@@ -3353,8 +3443,12 @@ pub struct Spirv<'a> {
     cs_input_info: Option<&'a ShaderComputeInputInfo>,
     ps_input_info: Option<&'a ShaderPixelInputInfo>,
     bind: Option<&'a ShaderBindResources>,
-    /// Kyty: `Core::Array2<int, 64, 2> m_extended_mapping`.
-    extended_mapping: [[i32; 2]; 64],
+    /// Kyty: `Core::Array2<int, 64, 2> m_extended_mapping`. Deviation: the
+    /// length is not fixed — `write_local_variables` sizes it to
+    /// [`extended_mapping_len`] for the bind it is generating against, so a
+    /// descriptor table reaching past EUD dword 63 maps instead of refusing.
+    /// Until then it holds Kyty's [`EXTENDED_MAPPING_DWORDS`] unfilled slots.
+    extended_mapping: Vec<[i32; 2]>,
     /// Deviation: Kyty reads the global `Config::SpirvDebugPrintfEnabled()`;
     /// the port threads it as a field (default off).
     pub debug_printf_enabled: bool,
@@ -3386,7 +3480,7 @@ impl<'a> Spirv<'a> {
             cs_input_info: None,
             ps_input_info: None,
             bind: None,
-            extended_mapping: [[-1; 2]; 64],
+            extended_mapping: vec![[-1; 2]; EXTENDED_MAPPING_DWORDS],
             debug_printf_enabled: false,
             reloop_blocks: None,
         }
@@ -4779,10 +4873,12 @@ impl<'a> Spirv<'a> {
             // the -1 sentinel so `GetMappedIndex` refuses an EUD dword no
             // captured descriptor covers instead of silently reading push
             // constant (0, 0).
-            for m in &mut self.extended_mapping {
-                m[0] = -1;
-                m[1] = -1;
-            }
+            //
+            // Second deviation: the window is SIZED here rather than fixed at
+            // Kyty's 64, so a descriptor table reaching past EUD dword 63 maps
+            // (see `extended_mapping_len`). The floor keeps every shader that
+            // fits Kyty's window byte-identical.
+            self.extended_mapping = vec![[-1; 2]; extended_mapping_len(bind)];
 
             let push_slots = bind.push_constant_size as i32 / 16;
             let mut out = String::new();
