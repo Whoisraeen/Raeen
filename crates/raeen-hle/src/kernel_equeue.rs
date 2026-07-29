@@ -98,11 +98,35 @@ fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
 /// All producers use the Raeen-owned wait contract instead of reaching into
 /// the kernel's host synchronization primitive directly.
 pub(crate) fn wake_equeue(ctx: &HleContext, eq: u64, reason: WakeReason) {
-    ctx.services.wake(
+    wake_equeue_via(ctx.services, eq, ctx.guest_threads.current_thread(), reason);
+}
+
+/// The equeue wake seam, expressed over the **only** capability a wake needs:
+/// a [`WaitSubsystem`]. That is the whole reason a host thread can now deliver
+/// events at all.
+///
+/// [`wake_equeue`] takes an [`HleContext`], which is a borrowed struct of
+/// `&dyn` references with a lifetime — no host thread can own one, so every
+/// producer of an equeue event had to be a guest call. Splitting the two
+/// arguments a wake actually uses out of that context (the subsystem, and a
+/// guest-thread id that `OrbisKernel::wake` only records for diagnostics) makes
+/// the seam reachable from an `Arc<OrbisKernel>`: `WaitSubsystem` is
+/// `Send + Sync` and `OrbisKernel` implements it, so a background thread can
+/// pass `&*kernel`. `guest_thread` is `0` from a host thread — no guest thread
+/// caused the wake.
+///
+/// See `docs/host-vblank-source.md` and `crate::host_vblank`.
+pub(crate) fn wake_equeue_via(
+    waker: &dyn raeen_core::subsystems::WaitSubsystem,
+    eq: u64,
+    guest_thread: u64,
+    reason: WakeReason,
+) {
+    waker.wake(
         WaitKey {
             class: "kernel-equeue",
             object: eq,
-            guest_thread: ctx.guest_threads.current_thread(),
+            guest_thread,
         },
         reason,
     );

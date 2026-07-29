@@ -295,10 +295,16 @@ fn hle_delete_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
 /// `VideoOutAddVblankEvent` (VideoOutExports.cs, NID `Xru92wHJRmg`): same
 /// (equeue, handle, udata) ABI as AddFlipEvent, re-registration replaces the
 /// existing registration for that queue (here: same `(equeue, ident)` key).
-/// SharpEmu starts a 60 Hz vblank thread; Raeen instead ticks vblank events
-/// from `sceVideoOutWaitVblank` and from every completed flip (a flip implies
-/// a display refresh), which keeps event-driven frame loops advancing without
-/// a host timer thread.
+/// SharpEmu starts a 60 Hz vblank thread. Raeen ticks vblank events from
+/// `sceVideoOutWaitVblank` and from every completed flip (a flip implies a
+/// display refresh), which keeps a **polling** frame loop advancing without a
+/// host timer thread — but deadlocks an event-driven one that waits for its
+/// first vblank *before* its first flip, because the only two tickers are the
+/// two calls it is blocked from making.
+///
+/// [`crate::host_vblank`] is the timer thread that closes that hole
+/// (`RAEEN_HOST_VBLANK`, default off). While it runs it owns the sequence and
+/// the two guest-driven advances stand down.
 fn hle_add_vblank_event(ctx: &HleContext, args: &[u64]) -> u64 {
     add_video_out_event(ctx, args, VIDEO_OUT_EVENT_VBLANK_ID, "vblank", None)
 }
@@ -449,9 +455,37 @@ fn delete_video_out_event(ctx: &HleContext, args: &[u64], ident: u64, kind: &str
 /// sequence number — a registered pre-vblank-start event is delivered rather
 /// than parked forever, at the cost of the intra-frame ordering.
 fn trigger_vblank_events(ctx: &HleContext, count: u64) {
+    trigger_vblank_events_via(
+        ctx.kernel,
+        ctx.services,
+        ctx.guest_threads.current_thread(),
+        count,
+    );
+}
+
+/// The [`HleContext`]-free body of [`trigger_vblank_events`].
+///
+/// Everything a vblank delivery touches is either an [`raeen_kernel::OrbisKernel`]
+/// field (`kernel_equeue_events`) or a [`WaitSubsystem::wake`] — it never reads
+/// or writes guest memory, never allocates guest memory, and never submits to
+/// the GPU. So it does not need the `mem` / `alloc` / `gpu` / `guest_calls`
+/// borrows an [`HleContext`] carries, and a host thread holding an
+/// `Arc<OrbisKernel>` can call it: `OrbisKernel` implements `WaitSubsystem`,
+/// which is `Send + Sync`.
+///
+/// `guest_thread` is the diagnostics label for the wake (`0` from a host
+/// thread). See [`crate::kernel_equeue::wake_equeue_via`].
+///
+/// [`WaitSubsystem::wake`]: raeen_core::subsystems::WaitSubsystem::wake
+pub(crate) fn trigger_vblank_events_via(
+    kernel: &raeen_kernel::OrbisKernel,
+    waker: &dyn raeen_core::subsystems::WaitSubsystem,
+    guest_thread: u64,
+    count: u64,
+) {
     let sequence = (count & 0x0000_ffff_ffff_ffff) << 16;
     let mut queues = Vec::new();
-    for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
+    for mut event in kernel.kernel_equeue_events.iter_mut() {
         let ident = event.key().1;
         if (ident == VIDEO_OUT_EVENT_VBLANK_ID || ident == VIDEO_OUT_EVENT_PRE_VBLANK_START_ID)
             && event.filter == KERNEL_EVENT_FILTER_VIDEO_OUT
@@ -466,9 +500,44 @@ fn trigger_vblank_events(ctx: &HleContext, count: u64) {
         }
     }
     for eq in queues {
-        crate::kernel_equeue::wake_equeue(ctx, eq, raeen_core::subsystems::WakeReason::Signal);
+        crate::kernel_equeue::wake_equeue_via(
+            waker,
+            eq,
+            guest_thread,
+            raeen_core::subsystems::WakeReason::Signal,
+        );
     }
 }
+
+/// One **host-driven** display refresh: advance the process vblank sequence and
+/// deliver it to every registered vblank / pre-vblank-start event. Returns the
+/// new sequence number.
+///
+/// This is the guest-independent tick KytyPS5 runs from its window loop
+/// (`GameShowWindow` → `VideoOutBeginVblank` / `VideoOutEndVblank`,
+/// `src/graphics/presentation/window/window.cpp:350-354` and
+/// `videoOut.cpp:649-686`). Called only by [`crate::host_vblank`]; when it is
+/// running it is the **sole** advancer of `video_out_vblank_count` (see
+/// [`crate::host_vblank::owns_sequence`]).
+///
+/// "Every opened handle" in KytyPS5 terms is "every registered vblank event" in
+/// Raeen: our registrations are keyed by `(equeue, ident)` and `sceVideoOutOpen`
+/// only ever hands out handle 1, so the per-handle loop and the per-registration
+/// loop cover the same set.
+pub(crate) fn host_vblank_refresh(
+    kernel: &raeen_kernel::OrbisKernel,
+    waker: &dyn raeen_core::subsystems::WaitSubsystem,
+) -> u64 {
+    let sequence = kernel
+        .video_out_vblank_count
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    trigger_vblank_events_via(kernel, waker, HOST_VBLANK_GUEST_THREAD, sequence);
+    sequence
+}
+
+/// Diagnostics `guest_thread` label for a wake that no guest thread caused.
+const HOST_VBLANK_GUEST_THREAD: u64 = 0;
 
 /// `sceVideoOutSubmitFlip(handle, bufferIndex, flipMode, flipArg)`: records
 /// the flip as completed (bumps process-local state and stores `flipArg`) so a
@@ -535,14 +604,22 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
         );
     }
     // A completed flip implies a display refresh: advance the vblank sequence
-    // and wake any vblank-parked frame loop (Raeen has no host vblank timer
-    // thread — see `hle_add_vblank_event`).
-    let vblanks = ctx
-        .kernel
-        .video_out_vblank_count
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
-    trigger_vblank_events(ctx, vblanks);
+    // and wake any vblank-parked frame loop.
+    //
+    // ONE OWNER. When the host vblank source is running it is the sole advancer
+    // of the sequence, and this inference is dropped — a flip that happens to
+    // land between two host edges must not manufacture an extra refresh, or the
+    // sequence a title uses for frame timing runs ahead of the display clock it
+    // is supposed to measure. The flip events above still fire either way: a
+    // flip really did complete, and that is not an inference.
+    if !crate::host_vblank::owns_sequence() {
+        let vblanks = ctx
+            .kernel
+            .video_out_vblank_count
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        trigger_vblank_events(ctx, vblanks);
+    }
     SCE_OK
 }
 
@@ -896,7 +973,7 @@ fn hle_get_vblank_status(ctx: &HleContext, args: &[u64]) -> u64 {
 /// MEASURED (stage C): the old unconditional 16.667 ms sleep was the
 /// whole-title FPS ceiling — Minecraft's flip loop paced off this wait while
 /// the GPU path had ~8x headroom (min flip interval 2.03 ms vs p50 16.5 ms).
-fn configured_vblank_period(value: Option<&str>) -> Option<std::time::Duration> {
+pub(crate) fn configured_vblank_period(value: Option<&str>) -> Option<std::time::Duration> {
     match value.and_then(|value| value.parse::<u64>().ok()) {
         Some(0) => None,
         Some(hz @ 24..=480) => Some(std::time::Duration::from_nanos(1_000_000_000 / hz)),
@@ -904,7 +981,7 @@ fn configured_vblank_period(value: Option<&str>) -> Option<std::time::Duration> 
     }
 }
 
-fn vblank_period() -> Option<std::time::Duration> {
+pub(crate) fn vblank_period() -> Option<std::time::Duration> {
     static PERIOD: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *PERIOD
         .get_or_init(|| configured_vblank_period(std::env::var("RAEEN_VBLANK_HZ").ok().as_deref()))
@@ -924,12 +1001,12 @@ fn vblank_period() -> Option<std::time::Duration> {
 /// timer (~0.5 ms) instead of `Sleep`, and only the last millisecond spins.
 /// That removes up to a whole tick of yield-spin per wait from the guest core
 /// the title parks here. At 120 Hz the whole 8.3 ms wait is one timer signal.
-trait VblankClock {
+pub(crate) trait VblankClock {
     fn elapsed(&self) -> std::time::Duration;
     fn wait_until(&self, deadline: std::time::Duration);
 }
 
-struct HostVblankClock {
+pub(crate) struct HostVblankClock {
     epoch: std::time::Instant,
 }
 
@@ -969,7 +1046,10 @@ impl VblankClock for HostVblankClock {
     }
 }
 
-fn wait_next_vblank_edge_with_clock(period: std::time::Duration, clock: &impl VblankClock) {
+pub(crate) fn wait_next_vblank_edge_with_clock(
+    period: std::time::Duration,
+    clock: &impl VblankClock,
+) {
     let elapsed = clock.elapsed();
     let next = elapsed.as_nanos() / period.as_nanos() + 1;
     let deadline_nanos = next.saturating_mul(period.as_nanos());
@@ -977,13 +1057,30 @@ fn wait_next_vblank_edge_with_clock(period: std::time::Duration, clock: &impl Vb
     clock.wait_until(deadline);
 }
 
+/// The one process-wide vblank epoch. Absolute edges are `epoch + n·period`,
+/// so `sceVideoOutWaitVblank` and the host vblank source
+/// ([`crate::host_vblank`]) land on the **same** edge grid instead of on two
+/// clocks that beat against each other.
+pub(crate) fn vblank_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Block until the next edge of the shared vblank grid.
+pub(crate) fn wait_next_host_vblank_edge(period: std::time::Duration) {
+    wait_next_vblank_edge_with_clock(
+        period,
+        &HostVblankClock {
+            epoch: vblank_epoch(),
+        },
+    );
+}
+
 fn wait_next_vblank_edge() {
     let Some(period) = vblank_period() else {
         return;
     };
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
-    wait_next_vblank_edge_with_clock(period, &HostVblankClock { epoch });
+    wait_next_host_vblank_edge(period);
 }
 
 #[cfg(test)]
@@ -1102,12 +1199,20 @@ fn hle_wait_vblank(ctx: &HleContext, args: &[u64]) -> u64 {
     // (no-op unless `RAEEN_DEFER_GPU_SIDE_EFFECTS` filled the queue).
     crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
     wait_next_vblank_edge();
-    let vblanks = ctx
-        .kernel
-        .video_out_vblank_count
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
-    trigger_vblank_events(ctx, vblanks);
+    // ONE OWNER (see `hle_submit_flip`). The pacing wait above is what the guest
+    // asked for and always happens; only the *advance* is conditional. With the
+    // host source running, the edge this wait returned on is the same absolute
+    // edge that source ticks on — it shares the epoch and the period — so the
+    // sequence the guest observes on resuming was advanced by the host tick for
+    // this very refresh, not by a second count for it.
+    if !crate::host_vblank::owns_sequence() {
+        let vblanks = ctx
+            .kernel
+            .video_out_vblank_count
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        trigger_vblank_events(ctx, vblanks);
+    }
     SCE_OK
 }
 
@@ -1378,6 +1483,10 @@ mod tests {
 
     #[test]
     fn wait_vblank_advances_a_separate_frame_sequence() {
+        // The guest-driven vblank advance under test only happens while no
+        // host vblank source owns the sequence; pin that against a concurrent
+        // ownership test (crate::host_vblank).
+        let _vblank_owner = crate::host_vblank::OwnershipGuard::released();
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);
@@ -1390,6 +1499,81 @@ mod tests {
 
         let registry = HleRegistry::new();
         assert!(registry.is_implemented("libSceVideoOut", "sceVideoOutWaitVblank"));
+    }
+
+    /// ONE OWNER, the double-tick rule. With a host vblank source running, the
+    /// two guest-driven advance sites must contribute **zero** sequence numbers:
+    /// a flip plus a `WaitVblank` leave the count exactly where the host source
+    /// put it. Without this, a title's frame sequence outruns the display clock
+    /// it is measuring, and any timestamp-fence logic keyed to it drifts.
+    #[test]
+    fn a_running_host_source_is_the_only_advancer_of_the_vblank_sequence() {
+        let _vblank_owner = crate::host_vblank::OwnershipGuard::claimed();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_add_vblank_event(&ctx, &[eq, 1, 0xBEEF]), SCE_OK);
+        assert_eq!(hle_add_flip_event(&ctx, &[eq, 1, 0xCAFE]), SCE_OK);
+
+        // One host refresh: sequence 1, vblank event delivered.
+        let waker = crate::host_vblank::RecordingWaker::default();
+        assert_eq!(host_vblank_refresh(&kernel, &waker), 1);
+
+        // Now the guest does both of the things that used to advance it.
+        assert_eq!(hle_submit_flip(&ctx, &[1, 0, 1, 0xABCD]), SCE_OK);
+        assert_eq!(hle_wait_vblank(&ctx, &[1]), SCE_OK);
+
+        assert_eq!(
+            kernel.video_out_vblank_count.load(Ordering::Relaxed),
+            1,
+            "the host source is the sole advancer: a flip and a WaitVblank add nothing"
+        );
+        // The flip itself is NOT an inference and still completes + fires its
+        // own event class — only the implied refresh is dropped.
+        assert_eq!(kernel.video_out_flip_count.load(Ordering::Relaxed), 1);
+        let flip = kernel
+            .kernel_equeue_events
+            .get(&(eq, VIDEO_OUT_EVENT_FLIP_ID))
+            .expect("flip registration");
+        assert!(
+            flip.triggered,
+            "a completed flip still fires its flip event"
+        );
+        assert_eq!(flip.data as u64, VIDEO_OUT_EVENT_FLIP_ID | (0xABCD << 16));
+        drop(flip);
+        // And the vblank event still carries the HOST sequence, not a guest one.
+        let vblank = kernel
+            .kernel_equeue_events
+            .get(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+            .expect("vblank registration");
+        assert_eq!(vblank.data as u64, VIDEO_OUT_EVENT_VBLANK_ID | (1 << 16));
+    }
+
+    /// The default: with no host source, `sceVideoOutSubmitFlip` advances and
+    /// delivers the vblank sequence exactly as it did before this feature
+    /// existed. This is the regression guard for Minecraft / ASTRO.BOT — a
+    /// disabled host source must change nothing observable.
+    #[test]
+    fn with_no_host_source_a_flip_still_implies_a_refresh() {
+        let _vblank_owner = crate::host_vblank::OwnershipGuard::released();
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+        assert_eq!(hle_add_vblank_event(&ctx, &[eq, 1, 0xBEEF]), SCE_OK);
+
+        assert_eq!(hle_submit_flip(&ctx, &[1, 0, 1, 0xABCD]), SCE_OK);
+
+        assert_eq!(kernel.video_out_vblank_count.load(Ordering::Relaxed), 1);
+        let vblank = kernel
+            .kernel_equeue_events
+            .get(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+            .expect("vblank registration");
+        assert!(vblank.triggered);
+        assert_eq!(vblank.data as u64, VIDEO_OUT_EVENT_VBLANK_ID | (1 << 16));
     }
 
     #[test]
@@ -1688,6 +1872,10 @@ mod tests {
     /// delivered SceKernelEvent per SharpEmu.
     #[test]
     fn vblank_events_fire_and_get_event_id_classifies() {
+        // The guest-driven vblank advance under test only happens while no
+        // host vblank source owns the sequence; pin that against a concurrent
+        // ownership test (crate::host_vblank).
+        let _vblank_owner = crate::host_vblank::OwnershipGuard::released();
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);
@@ -1852,6 +2040,10 @@ mod tests {
     /// deleted registration.
     #[test]
     fn delete_vblank_event_undoes_add_vblank_event() {
+        // The guest-driven vblank advance under test only happens while no
+        // host vblank source owns the sequence; pin that against a concurrent
+        // ownership test (crate::host_vblank).
+        let _vblank_owner = crate::host_vblank::OwnershipGuard::released();
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);
@@ -1883,6 +2075,10 @@ mod tests {
     /// and deletes.
     #[test]
     fn pre_vblank_start_events_register_fire_and_delete() {
+        // The guest-driven vblank advance under test only happens while no
+        // host vblank source owns the sequence; pin that against a concurrent
+        // ownership test (crate::host_vblank).
+        let _vblank_owner = crate::host_vblank::OwnershipGuard::released();
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);

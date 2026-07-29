@@ -1693,6 +1693,14 @@ fn main() -> anyhow::Result<()> {
         // and the Shell remain one launch path observably.
         splash::stage_boot_splash(std::path::Path::new(&path));
 
+        // Free-running host vblank (`RAEEN_HOST_VBLANK`, default OFF — see
+        // `docs/host-vblank-source.md`). Started here, in the process that owns
+        // the guest's `Arc<OrbisKernel>`, and bound to a local whose `Drop`
+        // stops and joins the thread when the run returns. A title that
+        // registers a vblank event and then blocks in `sceKernelWaitEqueue`
+        // before its first flip has nothing else that could ever fire it.
+        let _host_vblank = raeen_hle::host_vblank::HostVblankSource::start_from_env(&kernel);
+
         info!("entering guest _start via execute_process ...");
         let outcome = raeen_runtime::execute_process_shared(
             std::sync::Arc::clone(&linked),

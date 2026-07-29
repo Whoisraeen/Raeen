@@ -177,6 +177,41 @@ Claude `/goal` (≤200 chars):
 - The completion walker (`apr_complete_command_buffer`) now skips the
   self-sizing type-4 records; corrupt sizes fail loudly with `EINVAL`.
 
+### Host vblank source 2026-07-28 (KytyPS5 `window.cpp` + `videoOut.cpp`)
+
+- **`crates/raeen-hle/src/host_vblank.rs` — new, `done`, default OFF.**
+  Behaviorally re-implements KytyPS5's guest-independent display tick:
+  `src/graphics/presentation/window/window.cpp:350-354` (`VideoOutBeginVblank`
+  → `VideoOutFlipWindow(0)` → `VideoOutEndVblank` once per displayed host
+  frame), `videoOut.cpp:649-686` (`VblankBegin`/`VblankEnd` advance the
+  counters and `TriggerVideoOutEventsLocked` for every opened handle), and
+  `videoOut.cpp:402` (paced against `Config::GetVblankFrequency()`). Closes the
+  design deferred in `docs/silent-zero-frame-cluster.md` §5; full write-up in
+  `docs/host-vblank-source.md`.
+- **The blocker that deferred it is gone.** `HleContext` is a borrowed `&dyn`
+  struct no host thread can hold, and both `trigger_vblank_events` and
+  `wake_equeue` took one. A vblank delivery needs only
+  `OrbisKernel::kernel_equeue_events` and a `WaitSubsystem::wake`, both already
+  `Arc`-reachable, so the seam is those two arguments lifted out:
+  `kernel_equeue::wake_equeue_via` and
+  `libsce_video_out::trigger_vblank_events_via`. No guest-visible ABI moved; the
+  ticker holds a `Weak<OrbisKernel>`.
+- **Single-owner rule (documented, tested):** while the source runs it is the
+  sole advancer of `video_out_vblank_count` and the two guest-driven advances
+  (`hle_submit_flip`, `hle_wait_vblank`) stand down — both sources advancing
+  would run a title's frame sequence ahead of the display clock it measures.
+  Flip events are unaffected. Host and guest share one absolute edge grid
+  (`vblank_epoch`/`vblank_period`), so no second clock was introduced.
+- `RAEEN_HOST_VBLANK` (off / `1` / an explicit 24..=480 Hz rate). Disabled costs
+  one relaxed `AtomicBool` load per advance site. **Not** set by `xtask`, and
+  **not measured against a retail title** — the A/B for Until Dawn + Minecraft
+  is §8 of the write-up. 8 new tests (raeen-hle 592 → 600), all deterministic;
+  the wake is asserted through a recording `WaitSubsystem` rather than a thread.
+- Raeen's Rust module, the seam, the ownership flag, the teardown, and all tests
+  are original. The four remaining `libSceVideoOut` event exports from
+  `docs/silent-zero-frame-cluster.md` §3 were already registered before this
+  batch.
+
 ### Phase 1 live-import batch 2026-07-25
 
 - **SharpEmu `74a5198`, `2272b9b`, `d3600c9` re-audit — DONE.** The required
