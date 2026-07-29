@@ -141,12 +141,22 @@ struct ParsedCodeEntry {
     code_key: CodeKey,
     next_gen: bool,
     register_tag: u64,
-    code: ShaderCode,
+    code: Arc<ShaderCode>,
 }
 
 /// Decoded instruction streams validated against their exact guest-byte
 /// prefix on every reuse. Resource/EUD analysis still runs per bind; only the
 /// stage-static ISA decode is retained.
+///
+/// The decoded stream is **shared, not copied**, on reuse. That distinction is
+/// the whole point of the cache: `ShaderInstruction` is 696 bytes wide (its
+/// `mimg_nsa_addr: [ShaderOperand; 12]` alone is 432), so a 128-instruction
+/// program is ~89 KiB and a 512-instruction one ~348 KiB. Deep-cloning that out
+/// of the cache cost 1.4 us and 5.2 us respectively — per stage, per draw, on a
+/// *hit* — which made a 100%-hot decode cache nearly as expensive as no cache
+/// at all. Every consumer (resource analysis, every capture/synthesis pass, the
+/// SPIR-V recompiler) takes `&ShaderCode` and none mutate it, so an
+/// [`Arc`] hands out the identical bytes for two atomic increments.
 #[derive(Default)]
 struct ParsedCodeCache {
     entries: VecDeque<ParsedCodeEntry>,
@@ -163,7 +173,7 @@ impl ParsedCodeCache {
         register_tag: u64,
         mem: &impl ShaderMemory,
         parse: impl FnOnce() -> Result<ShaderCode, ShaderAnalysisError>,
-    ) -> Result<ShaderCode, ShaderAnalysisError> {
+    ) -> Result<Arc<ShaderCode>, ShaderAnalysisError> {
         let source = mem.dwords_at(addr);
         if let Some(source) = source.as_deref() {
             for entry in self.entries.iter().rev().filter(|entry| {
@@ -181,7 +191,7 @@ impl ParsedCodeCache {
                         crate::vulkan::offscreen::DRAW_STAGE_PARSE_HITS
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    return Ok(entry.code.clone());
+                    return Ok(Arc::clone(&entry.code));
                 }
             }
         }
@@ -191,7 +201,7 @@ impl ParsedCodeCache {
             crate::vulkan::offscreen::DRAW_STAGE_PARSE_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let code = parse()?;
+        let code = Arc::new(parse()?);
         let parsed_dwords = shader_code_dwords(&code);
         if parsed_dwords != 0
             && let Some(source) = mem.dwords_at(addr)
@@ -204,7 +214,7 @@ impl ParsedCodeCache {
                 code_key: CodeKey::new(stage, addr, prefix),
                 next_gen,
                 register_tag,
-                code: code.clone(),
+                code: Arc::clone(&code),
             });
         }
         Ok(code)
@@ -216,7 +226,7 @@ impl ParsedCodeCache {
         sh_regs: &ShaderRegisters,
         mem: &impl ShaderMemory,
         next_gen: bool,
-    ) -> Result<ShaderCode, ShaderAnalysisError> {
+    ) -> Result<Arc<ShaderCode>, ShaderAnalysisError> {
         let gs_instead_of_vs = regs.vs_regs.data_addr == 0
             && regs.gs_regs.data_addr == 0
             && regs.es_regs.data_addr != 0
@@ -246,7 +256,7 @@ impl ParsedCodeCache {
         sh_regs: &ShaderRegisters,
         mem: &impl ShaderMemory,
         next_gen: bool,
-    ) -> Result<ShaderCode, ShaderAnalysisError> {
+    ) -> Result<Arc<ShaderCode>, ShaderAnalysisError> {
         let register_tag = parse_register_tag(&[
             u64::from(regs.ps_embedded),
             u64::from(regs.ps_embedded_id),
@@ -270,7 +280,7 @@ impl ParsedCodeCache {
         sh_regs: &ShaderRegisters,
         mem: &impl ShaderMemory,
         next_gen: bool,
-    ) -> Result<ShaderCode, ShaderAnalysisError> {
+    ) -> Result<Arc<ShaderCode>, ShaderAnalysisError> {
         let register_tag = parse_register_tag(&[
             u64::from(regs.cs_regs.user_sgpr),
             u64::from(regs.cs_user_sgpr.count),
@@ -299,35 +309,69 @@ fn parse_register_tag(values: &[u64]) -> u64 {
     hasher.finish()
 }
 
+/// The stage ABIs the three stages default to when a `TranslatedShader` does not
+/// carry them.
+///
+/// `ShaderVertexInputInfo` is 6664 bytes, `ShaderPixelInputInfo` 3836 and
+/// `ShaderComputeInputInfo` 3720. A [`TranslatedShader`] names all three but
+/// only ever fills the one its stage analyzed, so building the struct used to
+/// zero ~7.5 KiB of never-read `Default` per stage per draw. These shared
+/// immutable singletons make the unused arms two atomic increments instead.
+fn empty_vs_info() -> Arc<ShaderVertexInputInfo> {
+    static EMPTY: std::sync::LazyLock<Arc<ShaderVertexInputInfo>> =
+        std::sync::LazyLock::new(|| Arc::new(ShaderVertexInputInfo::default()));
+    Arc::clone(&EMPTY)
+}
+
+pub(crate) fn empty_ps_info() -> Arc<ShaderPixelInputInfo> {
+    static EMPTY: std::sync::LazyLock<Arc<ShaderPixelInputInfo>> =
+        std::sync::LazyLock::new(|| Arc::new(ShaderPixelInputInfo::default()));
+    Arc::clone(&EMPTY)
+}
+
+fn empty_cs_info() -> Arc<ShaderComputeInputInfo> {
+    static EMPTY: std::sync::LazyLock<Arc<ShaderComputeInputInfo>> =
+        std::sync::LazyLock::new(|| Arc::new(ShaderComputeInputInfo::default()));
+    Arc::clone(&EMPTY)
+}
+
 /// A translated shader plus the stage resource ABI recovered during analysis.
 ///
-/// Both fields are retained because Vulkan pipeline creation and descriptor
-/// binding need the same metadata that shaped the generated SPIR-V. The
-/// irrelevant stage field remains `Default`, which keeps cache entries a
-/// single concrete type without erasing either ABI.
+/// All three stage fields are retained because Vulkan pipeline creation and
+/// descriptor binding need the same metadata that shaped the generated SPIR-V,
+/// and keeping one concrete type erases neither ABI. They are shared handles
+/// rather than inline values: the analyzed ABI is immutable once derived, is
+/// forwarded through several layers per draw, and is large enough (14.2 KiB for
+/// the three together) that passing it by value dominated the per-draw cost.
+/// The two stages this translation did not analyze point at the shared empty
+/// singletons above.
 #[derive(Clone, Debug)]
 pub struct TranslatedShader {
     pub spirv: Arc<Vec<u32>>,
-    pub vs_info: ShaderVertexInputInfo,
-    pub ps_info: ShaderPixelInputInfo,
-    pub cs_info: ShaderComputeInputInfo,
+    pub vs_info: Arc<ShaderVertexInputInfo>,
+    pub ps_info: Arc<ShaderPixelInputInfo>,
+    pub cs_info: Arc<ShaderComputeInputInfo>,
 }
 
 /// Parse/analysis result held just long enough to consult the binding-aware
 /// module cache before running the expensive SPIR-V recompiler.
+///
+/// `code` is the shared decoded program from [`ParsedCodeCache`] and the infos
+/// are already the shared handles [`TranslatedShader`] publishes, so
+/// [`PreparedShader::into_translated`] moves pointers rather than kilobytes.
 enum PreparedShader {
     Vs {
-        code: ShaderCode,
-        info: Box<ShaderVertexInputInfo>,
+        code: Arc<ShaderCode>,
+        info: Arc<ShaderVertexInputInfo>,
     },
     Ps {
-        code: ShaderCode,
-        vs_info: Box<ShaderVertexInputInfo>,
-        info: Box<ShaderPixelInputInfo>,
+        code: Arc<ShaderCode>,
+        vs_info: Arc<ShaderVertexInputInfo>,
+        info: Arc<ShaderPixelInputInfo>,
     },
     Cs {
-        code: ShaderCode,
-        info: Box<ShaderComputeInputInfo>,
+        code: Arc<ShaderCode>,
+        info: Arc<ShaderComputeInputInfo>,
     },
 }
 
@@ -444,21 +488,21 @@ impl PreparedShader {
         match self {
             Self::Vs { info, .. } => TranslatedShader {
                 spirv,
-                vs_info: *info,
-                ps_info: ShaderPixelInputInfo::default(),
-                cs_info: ShaderComputeInputInfo::default(),
+                vs_info: info,
+                ps_info: empty_ps_info(),
+                cs_info: empty_cs_info(),
             },
             Self::Ps { vs_info, info, .. } => TranslatedShader {
                 spirv,
-                vs_info: *vs_info,
-                ps_info: *info,
-                cs_info: ShaderComputeInputInfo::default(),
+                vs_info,
+                ps_info: info,
+                cs_info: empty_cs_info(),
             },
             Self::Cs { info, .. } => TranslatedShader {
                 spirv,
-                vs_info: ShaderVertexInputInfo::default(),
-                ps_info: ShaderPixelInputInfo::default(),
-                cs_info: *info,
+                vs_info: empty_vs_info(),
+                ps_info: empty_ps_info(),
+                cs_info: info,
             },
         }
     }
@@ -847,7 +891,7 @@ impl ShaderTranslateCache {
                 );
                 Ok(PreparedShader::Vs {
                     code,
-                    info: Box::new(vs_info),
+                    info: Arc::new(vs_info),
                 })
             })
         })
@@ -863,13 +907,13 @@ impl ShaderTranslateCache {
         &mut self,
         ps: &PixelShaderInfo,
         sh_regs: &ShaderRegisters,
-        vs_info: &ShaderVertexInputInfo,
+        vs_info: &Arc<ShaderVertexInputInfo>,
     ) -> Result<TranslatedShader, Arc<str>> {
         let addr = ps.ps_regs.data_addr;
         let shader_map = self.shader_map_handle();
         let ps = *ps;
         let sh_regs = *sh_regs;
-        let vs_info = *vs_info;
+        let vs_info = Arc::clone(vs_info);
         self.translate(Stage::Ps, addr, move |mem, parsed_code| {
             attempt_generations(|next_gen| {
                 let code = parsed_code
@@ -928,8 +972,8 @@ impl ShaderTranslateCache {
                 );
                 Ok(PreparedShader::Ps {
                     code,
-                    vs_info: Box::new(vs_info),
-                    info: Box::new(ps_info),
+                    vs_info: Arc::clone(&vs_info),
+                    info: Arc::new(ps_info),
                 })
             })
         })
@@ -1073,7 +1117,7 @@ impl ShaderTranslateCache {
                 );
                 Ok(PreparedShader::Cs {
                     code,
-                    info: Box::new(cs_info),
+                    info: Arc::new(cs_info),
                 })
             })
         })
@@ -1779,11 +1823,7 @@ mod tests {
             &[(addr, std::mem::size_of_val(blob.as_slice()))],
             || {
                 let t = cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect("fixture PS must translate");
                 assert_eq!(t.spirv[0], 0x0723_0203, "SPIR-V magic");
             },
@@ -1840,11 +1880,7 @@ mod tests {
             &[(addr, std::mem::size_of_val(shader.as_slice()))],
             || {
                 let translated = cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect("PC-relative PS scalar load must translate");
                 let captured = translated
                     .ps_info
@@ -1890,8 +1926,8 @@ mod tests {
             info.bind.textures2d.desc[0].texture.fields[1] |= format << 20;
             info.bind.textures2d.desc[0].texture.fields[3] |= 8 << 28;
             PreparedShader::Cs {
-                code: ShaderCode::new(),
-                info: Box::new(info),
+                code: Arc::new(ShaderCode::new()),
+                info: Arc::new(info),
             }
         };
         let code = CodeKey {
@@ -1935,8 +1971,8 @@ mod tests {
             info.bind.samplers.samplers_num = 1;
             info.bind.samplers.samplers[0].fields = [records; 4];
             PreparedShader::Cs {
-                code: ShaderCode::new(),
-                info: Box::new(info),
+                code: Arc::new(ShaderCode::new()),
+                info: Arc::new(info),
             }
         };
 
@@ -1976,11 +2012,7 @@ mod tests {
             &[(addr, std::mem::size_of_val(garbage.as_slice()))],
             || {
                 let e1 = cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect_err("garbage must not translate");
                 assert!(
                     e1.contains("next_gen:") && e1.contains("legacy:"),
@@ -1988,11 +2020,7 @@ mod tests {
                 );
 
                 let e2 = cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect_err("backoff returns the same named failure");
                 assert_eq!(e1, e2);
                 let s = cache.stats();
@@ -2004,19 +2032,11 @@ mod tests {
 
                 for _ in 1..ANALYSIS_FAILURE_RETRY_BINDS {
                     cache
-                        .translate_ps(
-                            &ps_regs_at(addr),
-                            &sh_regs,
-                            &ShaderVertexInputInfo::default(),
-                        )
+                        .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                         .expect_err("bounded backoff remains a named failure");
                 }
                 cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect_err("analysis must retry after the bounded backoff");
                 let s = cache.stats();
                 assert_eq!(
@@ -2039,19 +2059,11 @@ mod tests {
             &[(addr, std::mem::size_of_val(garbage.as_slice()))],
             || {
                 cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect_err("garbage must not translate");
                 cache.map_shader_metadata(addr + 0x1000, ShaderMappedData::default());
                 cache
-                    .translate_ps(
-                        &ps_regs_at(addr),
-                        &sh_regs,
-                        &ShaderVertexInputInfo::default(),
-                    )
+                    .translate_ps(&ps_regs_at(addr), &sh_regs, &empty_vs_info())
                     .expect_err("metadata invalidation must force a fresh attempt");
                 let s = cache.stats();
                 assert_eq!((s.distinct_fetched, s.translate_failed, s.hits), (2, 2, 0));
@@ -2125,15 +2137,11 @@ mod tests {
         let mut cache = ShaderTranslateCache::with_dump_dir(None);
         let sh_regs = ShaderRegisters::default();
         let e = cache
-            .translate_ps(&ps_regs_at(0), &sh_regs, &ShaderVertexInputInfo::default())
+            .translate_ps(&ps_regs_at(0), &sh_regs, &empty_vs_info())
             .expect_err("null");
         assert!(e.contains("null or unaligned"), "{e}");
         let e = cache
-            .translate_ps(
-                &ps_regs_at(0x1002),
-                &sh_regs,
-                &ShaderVertexInputInfo::default(),
-            )
+            .translate_ps(&ps_regs_at(0x1002), &sh_regs, &empty_vs_info())
             .expect_err("unaligned");
         assert!(e.contains("null or unaligned"), "{e}");
     }
@@ -2155,7 +2163,7 @@ mod tests {
         let mut cache = ShaderTranslateCache::with_dump_dir(Some(dir.clone()));
         let mut sh_regs = ShaderRegisters::default();
         sh_regs.target_output_mode[0] = 9;
-        let vs_info = ShaderVertexInputInfo::default();
+        let vs_info = empty_vs_info();
 
         crate::guest_mem::with_test_ranges(
             &[
@@ -2222,5 +2230,494 @@ mod tests {
 
         let garbage = vec![0u32; 3000];
         assert_eq!(dump_len_heuristic(&garbage), CHUNK_DWORDS);
+    }
+
+    // ---------------------------------------------------------------------
+    // Program-derived sharing vs draw-derived re-derivation.
+    //
+    // A draw's shader resolve splits into two halves with very different
+    // costs and very different validity:
+    //
+    // * the **decoded program** — the ISA stream `ParsedCodeCache` retains. It
+    //   is a pure function of the shader's guest bytes, so two draws that bind
+    //   the same bytes may share one copy. `ShaderInstruction` is 696 bytes
+    //   wide, so a copy here is 89-348 KiB and 1.4-5.2 us.
+    // * the **analyzed stage ABI** — descriptors, EUD windows, embedded
+    //   constants, direct SGPRs. This is derived by reading guest memory
+    //   *through the draw's user-SGPR values*, so it must be re-derived on
+    //   every bind. Reusing it across differing SGPRs would serve a stale
+    //   push constant (`analysis.rs` latches `user_sgpr.value[..]` into
+    //   `info.sgprs[..].field`), which is the `d21e727` defect class.
+    //
+    // These tests pin both halves: the program is shared, and the ABI is not.
+    // ---------------------------------------------------------------------
+
+    /// Guest-memory view over one blob, as `translate` builds it per bind.
+    fn window_over(blob: &[u32]) -> WindowMem {
+        WindowMem {
+            base: blob.as_ptr() as u64,
+            data: blob.to_vec(),
+        }
+    }
+
+    /// The same program bound with different user-SGPR *values* reuses one
+    /// decoded instruction stream rather than deep-copying it.
+    ///
+    /// `Arc::ptr_eq` is the assertion that matters: `assert_eq!` would pass on
+    /// a copy too, and a copy is exactly the cost this cache exists to avoid.
+    #[test]
+    fn same_program_with_different_user_sgprs_shares_one_decoded_stream() {
+        let blob = build_blob(VS_BODY, 0xAAAA_5001, 0xBBBB_5001);
+        let addr = blob.as_ptr() as u64;
+        let window = window_over(&blob);
+        let sh_regs = ShaderRegisters::default();
+        let mut parsed = ParsedCodeCache::default();
+
+        let mut first_regs = vs_regs_at(addr);
+        first_regs.vs_user_sgpr.count = 4;
+        first_regs.vs_user_sgpr.value[0] = 0x1000_0000;
+        let first = parsed
+            .parse_vs(&first_regs, &sh_regs, &window, false)
+            .expect("first decode");
+
+        // Exactly the measured `resolve_misses_same_program` shape: the SGPR
+        // *values* the analysis reads change; the program does not.
+        let mut second_regs = first_regs;
+        second_regs.vs_user_sgpr.value[0] = 0x2000_0000;
+        second_regs.vs_user_sgpr.value[2] = 0xDEAD_BEEF;
+        let second = parsed
+            .parse_vs(&second_regs, &sh_regs, &window, false)
+            .expect("second decode");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a changed user SGPR must not force a fresh decode or a deep copy"
+        );
+        assert_eq!(
+            (parsed.hits, parsed.misses),
+            (1, 1),
+            "the second bind is served from the retained decode"
+        );
+        assert_eq!(
+            Arc::strong_count(&first),
+            3,
+            "one cache entry plus the two handed-out handles — no third buffer"
+        );
+    }
+
+    /// A changed program must NOT be served from the retained decode, even at
+    /// the same address with identical registers. This is the guard that keeps
+    /// the sharing above from becoming a stale-code bug.
+    #[test]
+    fn changed_program_bytes_do_not_reuse_the_retained_decode() {
+        let first_blob = build_blob(VS_BODY, 0xAAAA_5002, 0xBBBB_5002);
+        // Same length and same trailer, different instruction body: `v_mov_b32
+        // v1, 0` becomes `v_mov_b32 v1, -1` (inline constant 0x80 -> 0xC1).
+        let mut changed_body = VS_BODY.to_vec();
+        changed_body[2] = 0x7E02_02C1;
+        let second_blob = build_blob(&changed_body, 0xAAAA_5002, 0xBBBB_5002);
+        assert_eq!(first_blob.len(), second_blob.len(), "same-length rebuild");
+
+        let sh_regs = ShaderRegisters::default();
+        let mut parsed = ParsedCodeCache::default();
+
+        let first = parsed
+            .parse_vs(
+                &vs_regs_at(first_blob.as_ptr() as u64),
+                &sh_regs,
+                &window_over(&first_blob),
+                false,
+            )
+            .expect("first decode");
+        // Re-point the window at the *changed* bytes while keeping the entry's
+        // address, which is how a guest overwrite presents.
+        let restated = WindowMem {
+            base: first_blob.as_ptr() as u64,
+            data: second_blob.clone(),
+        };
+        let second = parsed
+            .parse_vs(
+                &vs_regs_at(first_blob.as_ptr() as u64),
+                &sh_regs,
+                &restated,
+                false,
+            )
+            .expect("second decode");
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "changed code bytes must re-decode, never share the old stream"
+        );
+        assert_eq!(
+            (parsed.hits, parsed.misses),
+            (0, 2),
+            "both binds are decodes; neither is a reuse"
+        );
+        // `build_blob` prepends the `0xBEEB03FF` sentinel (itself a decodable
+        // `s_mov_b32`), so instruction 0 is the sentinel, 1 is `v_mov_b32 v0,
+        // lit(1.0)` and 2 is the rewritten `v_mov_b32 v1, <imm>`.
+        let changed_at = first
+            .get_instructions()
+            .iter()
+            .zip(second.get_instructions())
+            .position(|(a, b)| a.src[0].constant.u != b.src[0].constant.u)
+            .expect("the re-decode reflects the new bytes, not the retained stream");
+        assert_eq!(
+            changed_at, 2,
+            "exactly the rewritten `v_mov_b32 v1, <imm>` decoded differently"
+        );
+    }
+
+    /// The half that must NOT be shared: the analyzed stage ABI is re-derived
+    /// per bind, so two binds of one program with different user SGPRs get
+    /// their own `vs_info` — never one aliased handle.
+    #[test]
+    fn stage_abi_is_re_derived_per_bind_even_when_the_program_is_shared() {
+        let blob = build_blob(VS_BODY, 0xAAAA_5003, 0xBBBB_5003);
+        let addr = blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                let mut regs = vs_regs_at(addr);
+                regs.vs_user_sgpr.count = 4;
+                regs.vs_user_sgpr.value[0] = 0x1000_0000;
+                let first = cache.translate_vs(&regs, &sh_regs).expect("first bind");
+
+                regs.vs_user_sgpr.value[0] = 0x2000_0000;
+                let second = cache.translate_vs(&regs, &sh_regs).expect("second bind");
+
+                assert!(
+                    !Arc::ptr_eq(&first.vs_info, &second.vs_info),
+                    "the analyzed ABI must be a fresh derivation for this bind, \
+                     not a handle aliased from the previous draw"
+                );
+                assert!(
+                    Arc::ptr_eq(&first.spirv, &second.spirv),
+                    "an unchanged program and ABI still reuse one cached module"
+                );
+                assert_eq!(
+                    cache.stats().parse_hits,
+                    1,
+                    "the decode was reused across the two differing SGPR states"
+                );
+            },
+        );
+    }
+
+    /// The two stages a translation did not analyze point at shared empty
+    /// singletons instead of two freshly zeroed multi-KiB structs.
+    #[test]
+    fn untouched_stage_abis_are_shared_singletons() {
+        let blob = build_blob(VS_BODY, 0xAAAA_5004, 0xBBBB_5004);
+        let addr = blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                let t = cache
+                    .translate_vs(&vs_regs_at(addr), &sh_regs)
+                    .expect("fixture VS");
+                assert!(
+                    Arc::ptr_eq(&t.ps_info, &empty_ps_info()),
+                    "a VS translation must not build a pixel ABI"
+                );
+                assert!(
+                    Arc::ptr_eq(&t.cs_info, &empty_cs_info()),
+                    "a VS translation must not build a compute ABI"
+                );
+                assert_eq!(
+                    *t.ps_info,
+                    ShaderPixelInputInfo::default(),
+                    "the shared singleton is still exactly the previous Default value"
+                );
+                assert_eq!(*t.cs_info, ShaderComputeInputInfo::default());
+            },
+        );
+    }
+
+    /// Byte-for-byte pin on the SPIR-V the fixture VS/PS pair translates to,
+    /// through the real per-draw path (`translate_vs` then `translate_ps` fed
+    /// the vertex stage's ABI, exactly as `resolve_shaders` composes them).
+    ///
+    /// This is the faithfulness gate for any change to how the resolve path
+    /// shares or copies its intermediates: the generated module is the only
+    /// thing that reaches the driver, so if these words are unchanged the
+    /// rendered pixels are unchanged. The snapshots were generated *before*
+    /// the program/ABI sharing split and must keep passing after it.
+    #[test]
+    fn fixture_shader_pair_spirv_is_byte_pinned() {
+        let vs_blob = build_blob(VS_BODY, 0xAAAA_5005, 0xBBBB_5005);
+        let ps_blob = build_blob(PS_BODY, 0xAAAA_5006, 0xBBBB_5006);
+        let vs_addr = vs_blob.as_ptr() as u64;
+        let ps_addr = ps_blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let mut sh_regs = ShaderRegisters::default();
+        sh_regs.target_output_mode[0] = 9;
+
+        let hex = |words: &[u32]| {
+            words
+                .iter()
+                .enumerate()
+                .map(|(i, w)| format!("{i:04}: {w:#010x}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        crate::guest_mem::with_test_ranges(
+            &[
+                (vs_addr, std::mem::size_of_val(vs_blob.as_slice())),
+                (ps_addr, std::mem::size_of_val(ps_blob.as_slice())),
+            ],
+            || {
+                let vs = cache
+                    .translate_vs(&vs_regs_at(vs_addr), &sh_regs)
+                    .expect("fixture VS must translate");
+                // `&vs.vs_info` is how the draw path threads the vertex ABI
+                // into the pixel stage.
+                let ps = cache
+                    .translate_ps(&ps_regs_at(ps_addr), &sh_regs, &vs.vs_info)
+                    .expect("fixture PS must translate");
+                insta::assert_snapshot!("fixture_vs_spirv", hex(&vs.spirv));
+                insta::assert_snapshot!("fixture_ps_spirv", hex(&ps.spirv));
+            },
+        );
+    }
+
+    /// The relocated shader metadata is shared with each bind's analysis
+    /// closure, not copied into it.
+    ///
+    /// Two things must hold, and both are observable:
+    ///
+    /// * no bind retains a handle, so the map stays uniquely owned between
+    ///   draws — which is what lets `map_shader_metadata` mutate in place; and
+    /// * mapping a *second* shader does not move the first entry's heap
+    ///   buffers, proving `Arc::make_mut` mutated rather than cloned. If any
+    ///   closure had kept a handle, the pointers below would change.
+    ///
+    /// Cloning here is not merely a copy: every `ShaderMappedData` owns six
+    /// separate allocations, so a per-stage-per-draw clone scales with how many
+    /// shaders the title ever created.
+    #[test]
+    fn relocated_shader_metadata_is_shared_with_binds_not_copied_into_them() {
+        let blob = build_blob(VS_BODY, 0xAAAA_5008, 0xBBBB_5008);
+        let addr = blob.as_ptr() as u64;
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        let sh_regs = ShaderRegisters::default();
+
+        let mapped = ShaderMappedData {
+            user_data: Some(kyty_graphics::shader::resources::ShaderUserData {
+                direct_resource_offset: vec![0xffff; 8],
+                sharp_resource_offset: [
+                    vec![kyty_graphics::shader::ShaderSharp::new(0, 1); 4],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ],
+                eud_size_dw: 16,
+                srt_size_dw: 0,
+            }),
+            input_semantics: vec![kyty_graphics::shader::ShaderSemantic { raw: 0x0002_0200 }; 3],
+        };
+        cache.map_shader_metadata(addr, mapped);
+
+        let entry_pointers = |cache: &ShaderTranslateCache| {
+            let data = cache.shader_map.find(addr).expect("mapped entry");
+            let user_data = data.user_data.as_ref().expect("user data");
+            (
+                data.input_semantics.as_ptr() as usize,
+                user_data.direct_resource_offset.as_ptr() as usize,
+                user_data.sharp_resource_offset[0].as_ptr() as usize,
+            )
+        };
+        let before = entry_pointers(&cache);
+        assert_eq!(
+            Arc::strong_count(&cache.shader_map),
+            1,
+            "the map must be uniquely owned before any bind"
+        );
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(blob.as_slice()))],
+            || {
+                for _ in 0..4 {
+                    cache
+                        .translate_vs(&vs_regs_at(addr), &sh_regs)
+                        .expect("fixture VS binds with metadata mapped");
+                }
+            },
+        );
+
+        assert_eq!(
+            Arc::strong_count(&cache.shader_map),
+            1,
+            "no bind may retain a handle to the metadata map"
+        );
+        assert_eq!(
+            entry_pointers(&cache),
+            before,
+            "binding must not reallocate the mapped metadata"
+        );
+
+        // A second creation mutates the map in place rather than copying it.
+        cache.map_shader_metadata(addr + 0x1000, ShaderMappedData::default());
+        assert_eq!(
+            entry_pointers(&cache),
+            before,
+            "mapping another shader must not clone the existing entries"
+        );
+        assert!(
+            cache.shader_map.find(addr + 0x1000).is_some(),
+            "the second creation is visible"
+        );
+    }
+    /// Synthetic demonstration that per-bind cost must not scale with how many
+    /// shaders the title has created. Printed, not asserted (see the harness
+    /// above for why wall clock is not a gate).
+    ///
+    /// The bound program is identical in every row; only the number of
+    /// unrelated `sceAgcCreateShader` metadata entries changes. A flat column
+    /// is the correct shape — the analysis only ever looks up its own address.
+    #[test]
+    #[ignore = "measurement, not a pass/fail gate"]
+    fn resolve_cost_versus_created_shader_count() {
+        let blob = build_blob(VS_BODY, 0xAAAA_5009, 0xBBBB_5009);
+        let addr = blob.as_ptr() as u64;
+        let sh_regs = ShaderRegisters::default();
+
+        // A representative created-shader record: six owned allocations.
+        let record = || ShaderMappedData {
+            user_data: Some(kyty_graphics::shader::resources::ShaderUserData {
+                direct_resource_offset: vec![0xffff; 8],
+                sharp_resource_offset: [
+                    vec![kyty_graphics::shader::ShaderSharp::new(0, 1); 4],
+                    vec![kyty_graphics::shader::ShaderSharp::new(0, 1); 2],
+                    Vec::new(),
+                    Vec::new(),
+                ],
+                eud_size_dw: 16,
+                srt_size_dw: 0,
+            }),
+            input_semantics: vec![kyty_graphics::shader::ShaderSemantic { raw: 0x0002_0200 }; 4],
+        };
+
+        for created in [0usize, 64, 512] {
+            let iters = 2000u32;
+            let mut best = f64::MAX;
+            crate::guest_mem::with_test_ranges(
+                &[(addr, std::mem::size_of_val(blob.as_slice()))],
+                || {
+                    for _ in 0..5 {
+                        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+                        // Unrelated addresses: the bound shader's own analysis
+                        // is unchanged, only the map's size grows.
+                        for i in 0..created {
+                            cache.map_shader_metadata(0x9000_0000 + (i as u64) * 0x100, record());
+                        }
+                        let mut regs = vs_regs_at(addr);
+                        regs.vs_user_sgpr.count = 4;
+                        let _ = cache.translate_vs(&regs, &sh_regs);
+                        let start = std::time::Instant::now();
+                        for i in 0..iters {
+                            regs.vs_user_sgpr.value[0] = 0x1000_0000 + i;
+                            cache.translate_vs(&regs, &sh_regs).expect("bind");
+                        }
+                        best = best.min(start.elapsed().as_secs_f64() * 1e6 / f64::from(iters));
+                    }
+                },
+            );
+            println!(
+                "vs resolve with {created:4} created shaders mapped: {best:8.3} us/bind (min of 5)"
+            );
+        }
+    }
+    /// Synthetic per-bind resolve cost, printed rather than asserted — a
+    /// wall-clock threshold in CI is a flake, but the number is what justifies
+    /// sharing the decoded program. Run with
+    /// `cargo test -p raeen-gpu --release --lib resolve_cost -- --nocapture --ignored`.
+    ///
+    /// Two figures are reported. The wall-clock one is the *minimum* over
+    /// several repetitions, because the cost this change removes is a large
+    /// short-lived heap allocation whose price swings by an order of magnitude
+    /// with system memory pressure; the minimum is the "how fast can this go"
+    /// statistic and the only one comparable across runs. The byte figure is
+    /// deterministic: it is exactly the instruction-stream traffic the shared
+    /// decode avoids, `reuses * instructions * size_of::<ShaderInstruction>()`.
+    #[test]
+    #[ignore = "measurement, not a pass/fail gate"]
+    fn resolve_cost_per_bind_with_changing_user_sgprs() {
+        println!(
+            "size_of::<ShaderInstruction>() = {}",
+            size_of::<kyty_graphics::shader::ShaderInstruction>()
+        );
+        // Pad the fixture body toward a realistic program length: the measured
+        // title shaders are hundreds of instructions, and the decode copy this
+        // change removes scales with that length.
+        for pad in [0usize, 96, 480] {
+            // `v_mov_b32 v1, 0` repeated: filler the parser decodes into real
+            // instructions without changing what the shader exports.
+            let mut body: Vec<u32> = vec![0x7E02_0280; pad];
+            body.extend_from_slice(VS_BODY);
+            let blob = build_blob(&body, 0xAAAA_5007, 0xBBBB_5007);
+            let addr = blob.as_ptr() as u64;
+            let sh_regs = ShaderRegisters::default();
+            let iters = 2000u32;
+            let mut best = f64::MAX;
+            let mut reported = (0u64, 0u64, 0usize);
+
+            crate::guest_mem::with_test_ranges(
+                &[(addr, std::mem::size_of_val(blob.as_slice()))],
+                || {
+                    for _ in 0..5 {
+                        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+                        let mut regs = vs_regs_at(addr);
+                        regs.vs_user_sgpr.count = 4;
+                        // Warm the decode + module caches so the loop below
+                        // measures the per-bind path, not first translation.
+                        let _ = cache.translate_vs(&regs, &sh_regs);
+                        let start = std::time::Instant::now();
+                        for i in 0..iters {
+                            regs.vs_user_sgpr.value[0] = 0x1000_0000 + i;
+                            cache.translate_vs(&regs, &sh_regs).expect("bind");
+                        }
+                        let per = start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+                        best = best.min(per);
+                        let stats = cache.stats();
+                        reported = (
+                            stats.parse_hits,
+                            stats.parse_misses,
+                            decoded_instruction_count(&cache, addr),
+                        );
+                    }
+                },
+            );
+
+            let (hits, misses, decoded) = reported;
+            let avoided = hits
+                * decoded as u64
+                * size_of::<kyty_graphics::shader::ShaderInstruction>() as u64;
+            println!(
+                "vs resolve: {:4} source dwords / {decoded:4} decoded instructions  \
+                 {best:7.3} us/bind (min of 5)  parse_hits={hits} parse_misses={misses}  \
+                 instruction bytes shared instead of copied: {:.1} MiB",
+                body.len(),
+                avoided as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
+    /// Decoded instruction count of the retained program at `addr`, for the
+    /// measurement harness's copy-volume arithmetic.
+    fn decoded_instruction_count(cache: &ShaderTranslateCache, addr: u64) -> usize {
+        cache
+            .parsed_code
+            .entries
+            .iter()
+            .find(|entry| entry.code_key.addr == addr)
+            .map_or(0, |entry| entry.code.get_instructions().len())
     }
 }

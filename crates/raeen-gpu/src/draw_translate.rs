@@ -645,13 +645,19 @@ fn assemble_solid_diagnostic_ps() -> Result<Vec<u32>, DrawError> {
         .map_err(|e| err(format!("assembling diagnostic solid fragment shader: {e}")))
 }
 
-/// Both stages' SPIR-V, each either embedded or fetched from guest memory.
+/// Both stages' SPIR-V, each either embedded or fetched from guest memory,
+/// plus the analyzed stage ABI each one was generated against.
+///
+/// Every field is a shared handle. The two infos together are 10.5 KiB and this
+/// struct is built, stored in [`ResolvedShaderMemo`] and read back out of it on
+/// every draw, so inline values meant three ~10 KiB memcpys per draw for data
+/// that is immutable once analyzed.
 #[derive(Debug, Clone)]
 struct ResolvedShaders {
     vs: Arc<Vec<u32>>,
     ps: Arc<Vec<u32>>,
-    vs_info: ShaderVertexInputInfo,
-    ps_info: ShaderPixelInputInfo,
+    vs_info: Arc<ShaderVertexInputInfo>,
+    ps_info: Arc<ShaderPixelInputInfo>,
 }
 
 /// Everything [`resolve_shaders`] reads from the mutable PM4 register files.
@@ -1220,10 +1226,10 @@ fn resolve_shaders(
         let vs = Arc::new(assemble_embedded(sh.vs.vs_embedded_id, "vs")?);
         // An embedded VS exports exactly its position+param set; the PS
         // input-info builder only needs the export count.
-        let vs_info = ShaderVertexInputInfo {
+        let vs_info = Arc::new(ShaderVertexInputInfo {
             export_count: ctx.sh_regs.get_export_count() as i32,
             ..Default::default()
-        };
+        });
         (vs, vs_info)
     } else {
         let t: TranslatedShader = cache
@@ -1235,7 +1241,7 @@ fn resolve_shaders(
     let (ps, ps_info) = if sh.ps.ps_embedded {
         (
             Arc::new(assemble_embedded(sh.ps.ps_embedded_id, "ps")?),
-            ShaderPixelInputInfo::default(),
+            crate::shader_fetch::empty_ps_info(),
         )
     } else if shader_addr_selected("RAEEN_SOLID_PS_ADDR", 0, sh.ps.ps_regs.data_addr) {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1248,7 +1254,7 @@ fn resolve_shaders(
         }
         (
             Arc::new(assemble_solid_diagnostic_ps()?),
-            ShaderPixelInputInfo::default(),
+            crate::shader_fetch::empty_ps_info(),
         )
     } else {
         let translated = cache
@@ -7779,8 +7785,8 @@ mod tests {
         let shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
         let mut memo = ResolvedShaderMemo::default();
 
@@ -7811,8 +7817,8 @@ mod tests {
         let shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
         let mut memo = ResolvedShaderMemo::default();
         let working_set = 128u32;
@@ -7846,15 +7852,16 @@ mod tests {
         let mut shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
-        shaders.vs_info.bind.extended.used = true;
-        shaders.vs_info.bind.extended.start_register = 12;
-        shaders.vs_info.bind.extended.data.update_address(0x80_0000);
-        shaders.vs_info.bind.storage_buffers.buffers_num = 1;
-        shaders.vs_info.bind.storage_buffers.extended[0] = true;
-        shaders.vs_info.bind.storage_buffers.start_register[0] = 12;
+        let vs_info = Arc::make_mut(&mut shaders.vs_info);
+        vs_info.bind.extended.used = true;
+        vs_info.bind.extended.start_register = 12;
+        vs_info.bind.extended.data.update_address(0x80_0000);
+        vs_info.bind.storage_buffers.buffers_num = 1;
+        vs_info.bind.storage_buffers.extended[0] = true;
+        vs_info.bind.storage_buffers.start_register[0] = 12;
 
         let mut memo = ResolvedShaderMemo::default();
         memo.insert(key, shaders.clone());
@@ -7890,12 +7897,23 @@ mod tests {
     #[test]
     fn resolved_shader_memo_moves_pointers_not_kilobytes() {
         let inline = std::mem::size_of::<(ResolvedShaderKey, ResolvedShaders)>();
-        assert!(
-            inline >= 4096,
-            "the entry stored INLINE really is multiple pages ({inline} B) — if \
-             it ever shrinks this test stops proving anything"
-        );
         let slot = std::mem::size_of::<Box<ResolvedShaderEntry>>();
+        // Premise guard. This used to require `inline >= 4096`, which was true
+        // while `ResolvedShaders` named all three stage ABIs by value. The stage
+        // ABIs are now `Arc`s (they are re-derived per bind and shared as
+        // singletons when untouched), so the payload is no longer multi-page and
+        // that literal no longer holds — the guard fired exactly as its own
+        // comment promised it would.
+        //
+        // What still matters, and what this now asserts, is the RATIO: an inline
+        // entry is still many times a pointer, so boxing the slot is still what
+        // keeps the LRU's move-to-back cheap. The two invariants below are
+        // unchanged.
+        assert!(
+            inline >= 8 * slot,
+            "an inline entry ({inline} B) must still dwarf a pointer slot \
+             ({slot} B), or boxing the slots no longer proves anything"
+        );
         assert!(slot <= 16, "memo slots must be pointer-sized, got {slot} B");
         let shifted = RESOLVED_SHADER_MEMO_CAPACITY * slot;
         assert!(
@@ -7917,8 +7935,8 @@ mod tests {
             ResolvedShaders {
                 vs: Arc::new(vec![1, 2, 3]),
                 ps: Arc::new(vec![4, 5, 6]),
-                vs_info: ShaderVertexInputInfo::default(),
-                ps_info: ShaderPixelInputInfo::default(),
+                vs_info: Arc::new(ShaderVertexInputInfo::default()),
+                ps_info: Arc::new(ShaderPixelInputInfo::default()),
             },
         );
         let mut memo = ResolvedShaderMemo::default();
@@ -7944,8 +7962,8 @@ mod tests {
         let shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
         // Eight distinct exact bindings, each with real (distinct) code
         // addresses well away from the label page.
@@ -7996,8 +8014,8 @@ mod tests {
             ResolvedShaders {
                 vs: Arc::new(vec![1]),
                 ps: Arc::new(vec![2]),
-                vs_info: ShaderVertexInputInfo::default(),
-                ps_info: ShaderPixelInputInfo::default(),
+                vs_info: Arc::new(ShaderVertexInputInfo::default()),
+                ps_info: Arc::new(ShaderPixelInputInfo::default()),
             },
         );
 
@@ -8973,8 +8991,8 @@ mod tests {
         let base_shaders = || ResolvedShaders {
             vs: Arc::new(vec![1]),
             ps: Arc::new(vec![2]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
 
         // Plain guest VS + PS, no EUD.
@@ -9001,20 +9019,37 @@ mod tests {
         gs.vs.gs_regs.chksum = 7;
         gs.ps.ps_regs.data_addr = 0x60_0000;
         let mut eud = base_shaders();
-        eud.vs_info.bind.extended.used = true;
-        eud.vs_info.bind.extended.start_register = 8;
-        eud.vs_info.bind.extended.data.update_address(0x70_0000);
-        eud.vs_info.bind.storage_buffers.buffers_num = 2;
-        eud.vs_info.bind.storage_buffers.extended[0] = true;
-        eud.vs_info.bind.storage_buffers.start_register[0] = 12;
-        eud.ps_info.bind.extended.used = true;
-        eud.ps_info.bind.extended.start_register = 4;
-        eud.ps_info.bind.extended.data.update_address(0x80_0000);
-        eud.ps_info.bind.eud_raw.used = true;
-        eud.ps_info.bind.eud_raw.required_dwords = 32;
-        eud.ps_info.bind.textures2d.textures_num = 1;
-        eud.ps_info.bind.textures2d.desc[0].extended = true;
-        eud.ps_info.bind.textures2d.desc[0].start_register = 20;
+        Arc::make_mut(&mut eud.vs_info).bind.extended.used = true;
+        Arc::make_mut(&mut eud.vs_info).bind.extended.start_register = 8;
+        Arc::make_mut(&mut eud.vs_info)
+            .bind
+            .extended
+            .data
+            .update_address(0x70_0000);
+        Arc::make_mut(&mut eud.vs_info)
+            .bind
+            .storage_buffers
+            .buffers_num = 2;
+        Arc::make_mut(&mut eud.vs_info)
+            .bind
+            .storage_buffers
+            .extended[0] = true;
+        Arc::make_mut(&mut eud.vs_info)
+            .bind
+            .storage_buffers
+            .start_register[0] = 12;
+        Arc::make_mut(&mut eud.ps_info).bind.extended.used = true;
+        Arc::make_mut(&mut eud.ps_info).bind.extended.start_register = 4;
+        Arc::make_mut(&mut eud.ps_info)
+            .bind
+            .extended
+            .data
+            .update_address(0x80_0000);
+        Arc::make_mut(&mut eud.ps_info).bind.eud_raw.used = true;
+        Arc::make_mut(&mut eud.ps_info).bind.eud_raw.required_dwords = 32;
+        Arc::make_mut(&mut eud.ps_info).bind.textures2d.textures_num = 1;
+        Arc::make_mut(&mut eud.ps_info).bind.textures2d.desc[0].extended = true;
+        Arc::make_mut(&mut eud.ps_info).bind.textures2d.desc[0].start_register = 20;
         cases.push((gs, eud));
 
         // Write spans: inside each code window, inside each EUD table, and well
@@ -9074,8 +9109,8 @@ mod tests {
             ResolvedShaders {
                 vs: Arc::new(vec![1]),
                 ps: Arc::new(vec![2]),
-                vs_info: ShaderVertexInputInfo::default(),
-                ps_info: ShaderPixelInputInfo::default(),
+                vs_info: Arc::new(ShaderVertexInputInfo::default()),
+                ps_info: Arc::new(ShaderPixelInputInfo::default()),
             },
         );
 
@@ -9171,8 +9206,8 @@ mod tests {
         let shaders = ResolvedShaders {
             vs: Arc::new(vec![1]),
             ps: Arc::new(vec![2]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
         let mut memo = ResolvedShaderMemo::default();
         memo.insert(key, shaders.clone());
@@ -9293,8 +9328,8 @@ mod tests {
             ResolvedShaders {
                 vs: Arc::new(vec![1]),
                 ps: Arc::new(vec![2]),
-                vs_info: ShaderVertexInputInfo::default(),
-                ps_info: ShaderPixelInputInfo::default(),
+                vs_info: Arc::new(ShaderVertexInputInfo::default()),
+                ps_info: Arc::new(ShaderPixelInputInfo::default()),
             },
         );
         let before = crate::vulkan::offscreen::DRAW_STAGE_MISS_DIFF_PS_SGPR_INSIDE
@@ -9319,10 +9354,17 @@ mod tests {
         let mut shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
-        for bind in [&mut shaders.vs_info.bind, &mut shaders.ps_info.bind] {
+        // The stage ABIs are `Arc`-shared now (they are re-derived per bind but
+        // shared as singletons when untouched), so a test that mutates them goes
+        // through `make_mut` — uniquely owned here, so it never clones.
+        let (vs_info, ps_info) = (
+            Arc::make_mut(&mut shaders.vs_info),
+            Arc::make_mut(&mut shaders.ps_info),
+        );
+        for bind in [&mut vs_info.bind, &mut ps_info.bind] {
             bind.extended.used = true;
             bind.extended.start_register = 8;
             bind.extended
