@@ -85,6 +85,13 @@ pub struct SessionInputs {
 ///
 /// `outcome` is `None` for a heartbeat (the session is still running).
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independently sourced observation about the run \
+              (outcome, frame count, two labels, and the counters); bundling them into \
+              a struct would only move the same eight values to the call site, which \
+              already reads them from eight different places"
+)]
 pub fn classify(
     outcome: Option<&Result<raeen_runtime::RunOutcome, raeen_runtime::RuntimeError>>,
     frames_published: u64,
@@ -325,10 +332,14 @@ impl SessionReportWriter {
                 unchanged_secs = 0;
                 last_frames = frames;
             }
-            if unchanged_secs >= STALL_SAMPLE_AFTER_SECS {
-                if let Some(sample) = self.sample_stall() {
-                    self.set_stall(sample);
-                }
+            // Sample only once the frame counter has been static long enough;
+            // `then().flatten()` keeps that gate and the `Option` in one
+            // expression instead of nesting two `if`s.
+            if let Some(sample) = (unchanged_secs >= STALL_SAMPLE_AFTER_SECS)
+                .then(|| self.sample_stall())
+                .flatten()
+            {
+                self.set_stall(sample);
             }
             self.write_once();
         }
@@ -552,8 +563,8 @@ mod tests {
     fn classify_maps_every_ending_to_a_stage_and_a_verdict() {
         // A fault.
         let faulted = Err(raeen_runtime::RuntimeError::Faulted {
-            addr: 0x200a103c6,
-            access: 0x3000_0000_010,
+            addr: 0x2_00a1_03c6,
+            access: 0x300_0000_0010,
             kind: raeen_runtime::FaultKind::Read,
         });
         let (stage, verdict) = classify(

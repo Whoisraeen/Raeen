@@ -481,8 +481,11 @@ pub fn digest(max_entries: usize, max_bytes: usize) -> String {
 #[doc(hidden)]
 pub fn reset_for_tests() {
     let mut table = table();
-    for index in 0..table.meta.len() {
-        COUNTS[index].0.store(0, Ordering::Relaxed);
+    // Zero exactly the slots this table interned; `COUNTS` is a fixed-size
+    // array, so iterate it and stop at the used length rather than indexing by
+    // a range over `meta`.
+    for slot in COUNTS.iter().take(table.meta.len()) {
+        slot.0.store(0, Ordering::Relaxed);
     }
     *table = Table::default();
 }

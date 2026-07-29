@@ -1087,17 +1087,23 @@ mod platform {
 
         /// The status block must fit the header page and sit clear of the
         /// rumble word. Arithmetic in a comment is not a guarantee.
+        ///
+        /// Every operand is a `const`, so these are checked when the crate is
+        /// compiled rather than when the test runs — a bad layout fails the
+        /// build instead of waiting for `cargo test`. That is strictly stronger
+        /// than the runtime assertions this replaced, and it is why clippy's
+        /// `assertions_on_constants` was firing here.
         #[test]
         fn the_status_block_fits_the_header_page_and_clears_the_rumble_word() {
-            assert!(
+            const _: () = assert!(
                 STATUS_SEQ_OFFSET >= RUMBLE_WORD_OFFSET + 8,
                 "status block overlaps the rumble word"
             );
-            assert!(
+            const _: () = assert!(
                 STATUS_TEXT_OFFSET >= STATUS_TEXT_LEN_OFFSET + 8,
                 "status text overlaps its own length field"
             );
-            assert!(
+            const _: () = assert!(
                 STATUS_TEXT_OFFSET + STATUS_TEXT_CAPACITY <= HEADER_BYTES,
                 "status text runs past the header into pixel slot 0"
             );
