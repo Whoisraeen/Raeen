@@ -876,12 +876,35 @@ fn shader_parse_sop2(
         0x2a => return Err(ni(dst, S, "s_bfe_i64", opcode, pc, b0)),
         0x2b => return Err(ni(dst, S, "s_cbranch_g_fork", opcode, pc, b0)),
         0x2c => return Err(ni(dst, S, "s_absdiff_i32", opcode, pc, b0)),
-        0x31 => {
+        // The `s_lshlN_add_u32` family, 0x2e..=0x31. Identity established from
+        // two independent references that agree on every row:
+        // KytyPS5 `src/graphics/shader/recompiler/ScalarAluOps.cpp` L26-28
+        // (`{0x2eu, SLshl1AddU32}, {0x2fu, SLshl2AddU32}, {0x30u, SLshl3AddU32},
+        // {0x31u, SLshl4AddU32}`) and SharpEmu
+        // `src/SharpEmu.ShaderCompiler/Gen5ShaderTranslator.cs` L804-807.
+        // 0x30 is ASTRO.BOT's measured `unknown sop2 opcode` — the other three
+        // shifts are the same instruction with a different `N`, so all four are
+        // decoded together rather than waiting for each to be measured.
+        0x2e..=0x31 => {
             // Kyty L575: EXIT_NOT_IMPLEMENTED(!next_gen).
             if !next_gen {
-                return Err(feature(S, "s_lshl4_add_u32 requires next_gen", pc));
+                return Err(feature(
+                    S,
+                    match opcode {
+                        0x2e => "s_lshl1_add_u32 requires next_gen",
+                        0x2f => "s_lshl2_add_u32 requires next_gen",
+                        0x30 => "s_lshl3_add_u32 requires next_gen",
+                        _ => "s_lshl4_add_u32 requires next_gen",
+                    },
+                    pc,
+                ));
             }
-            inst.type_ = T::SLshl4AddU32;
+            inst.type_ = match opcode {
+                0x2e => T::SLshl1AddU32,
+                0x2f => T::SLshl2AddU32,
+                0x30 => T::SLshl3AddU32,
+                _ => T::SLshl4AddU32,
+            };
         }
         0x32 => inst.type_ = T::SPackLlB32B16,
         0x33 => return Err(ni(dst, S, "s_pack_lh_b32_b16", opcode, pc, b0)),

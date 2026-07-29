@@ -232,6 +232,14 @@ pub enum ShaderInstructionType {
     SLoadDwordx4,
     SLoadDwordx8,
     SLoadDwordx16,
+    /// SOP2 0x2e: `sdst = (ssrc0 << 1) + ssrc1; scc = 33-bit carry-out`.
+    SLshl1AddU32,
+    /// SOP2 0x2f: `sdst = (ssrc0 << 2) + ssrc1; scc = 33-bit carry-out`.
+    SLshl2AddU32,
+    /// SOP2 0x30: `sdst = (ssrc0 << 3) + ssrc1; scc = 33-bit carry-out`.
+    /// Measured first blocker of ASTRO.BOT (`parse: unknown sop2 opcode: 0x30`,
+    /// 92 occurrences in the 2026-07-28 baseline).
+    SLshl3AddU32,
     SLshl4AddU32,
     SLshlB32,
     SLshrB32,
