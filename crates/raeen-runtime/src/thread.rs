@@ -827,12 +827,42 @@ impl GuestThreadScheduler for GuestProcessHandle {
                 // Unconditional is also cheap and idempotent: a thread holding
                 // nothing produces an all-zero summary and logs nothing.
                 let freed = process.kernel.release_locks_owned_by(handle);
+                let exit = match &result {
+                    Ok(RunOutcome::Returned(_)) => "returned/pthread-exit",
+                    Ok(RunOutcome::Exited(_)) => "process-exit",
+                    Err(_) => "faulted",
+                };
+                // A guest thread's exit was logged NOWHERE unless it happened to
+                // die holding a lock, and `RunOutcome` reached a human only if
+                // some other guest thread later called `scePthreadJoin`. A
+                // detached worker therefore died in complete silence — and the
+                // only evidence was its absence from the next stall dump's
+                // thread inventory.
+                //
+                // That cost a whole investigation. Blasphemous II's IL2CPP
+                // collector raises SIGUSR1, waits for the mutator's
+                // acknowledgement, and must then set "resumeEvent" to release
+                // the world. It acknowledges, and then its guest thread ends
+                // without ever setting the flag — so every other thread parks on
+                // `resumeEvent` forever. Whether it RETURNED or FAULTED is the
+                // whole question, and neither was recoverable after the fact.
+                //
+                // Unconditional, at INFO: one line per guest thread for a whole
+                // session, and the thread that ends unexpectedly names itself.
+                let name = process
+                    .kernel
+                    .thread_names
+                    .get(&handle)
+                    .map(|n| n.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    guest_thread = handle,
+                    name = %name,
+                    exit,
+                    outcome = ?result,
+                    "guest thread exited"
+                );
                 if freed.any() {
-                    let exit = match &result {
-                        Ok(RunOutcome::Returned(_)) => "returned/pthread-exit",
-                        Ok(RunOutcome::Exited(_)) => "process-exit",
-                        Err(_) => "faulted",
-                    };
                     tracing::warn!(
                         guest_thread = handle,
                         exit,
