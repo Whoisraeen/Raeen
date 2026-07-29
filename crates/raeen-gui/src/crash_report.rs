@@ -42,8 +42,33 @@ pub const REPORT_SUFFIX: &str = ".report.md";
 /// Kept as a named constant so the renderer and the parser cannot drift.
 const FAULT_LINE_PREFIX: &str = "- Fault: ";
 
+/// The session's outcome, in the project's one outcome vocabulary
+/// ([`crate::compat::Stage`]).
+pub const OUTCOME_LINE_PREFIX: &str = "- Outcome: ";
+
+/// What went wrong **first**, chronologically.
+pub const FIRST_BLOCKER_LINE_PREFIX: &str = "- First blocker: ";
+
+/// The most explanatory thing that went wrong. Often not the first — reported
+/// as its own line rather than collapsed, because picking one and calling it
+/// the other is how a report starts lying.
+pub const WORST_BLOCKER_LINE_PREFIX: &str = "- Worst blocker: ";
+
+/// Marks a report written by the heartbeat while the session is still alive.
+/// The parent strips it when it finalizes what it killed.
+pub const PROVISIONAL_MARKER: &str = " (provisional — session still running)";
+
+/// Machine-readable sidecar written beside every `.report.md`.
+pub const JSON_SUFFIX: &str = ".report.json";
+
+/// The one spelling of "we genuinely have nothing here". An empty section says
+/// this rather than being omitted: a missing section reads as a tool that did
+/// not look, and the difference matters when the whole point is to know where a
+/// title stopped.
+pub const NONE_RECORDED: &str = "<none recorded>";
+
 /// Host facts, mirroring the `host system` block `main.rs` logs at startup.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HostInfo {
     pub cpu: String,
     pub cores: usize,
@@ -73,7 +98,7 @@ impl HostInfo {
 /// Where in the composed guest image a fault landed: which module owns the
 /// address, the offset within that module, and the bytes there (decodable on
 /// the spot — see `main.rs::report_fault_site` for why a bare RIP is useless).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FaultSite {
     pub module: String,
     pub offset: u64,
@@ -169,8 +194,54 @@ pub fn recent_hle_for_report(kernel: &raeen_kernel::OrbisKernel) -> Vec<(String,
 
 /// Everything one crash report says. Fields are plain data so the renderer
 /// stays a pure function; collection happens at the two wiring sites.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CrashReport {
+    /// How the session ended, in the project's one outcome vocabulary. A
+    /// report written while the guest is still alive carries the default
+    /// ([`crate::compat::Stage::Launching`]) plus `provisional`.
+    pub outcome: crate::compat::Stage,
+    /// True while the session is still running: this file is a heartbeat
+    /// snapshot, not a verdict. The parent clears it when it finalizes.
+    pub provisional: bool,
+    /// One sentence naming where the session stopped and why — the line a
+    /// human reads first. For a silent zero-frame run this is
+    /// `raeen_core::frame_path::silent_zero_frame_verdict`, so the report and
+    /// the compatibility harness cannot describe one run two different ways.
+    pub verdict: String,
+    /// The whole progress chain: which load phases and which presentation
+    /// stages the guest reached, and when it first reached each.
+    pub frame_path: Option<raeen_core::frame_path::Snapshot>,
+    /// Every distinct refusal, ranked most-explanatory first.
+    pub blockers: Vec<raeen_core::blockers::Blocker>,
+    /// `(category slug, count)` for distinct blockers dropped at a per-category
+    /// cap — so a truncated table always says it was truncated.
+    pub blockers_dropped: Vec<(String, u64)>,
+    /// The rendered one-liner for the **chronologically first** blocker.
+    pub first_blocker: Option<String>,
+    /// The rendered one-liner for the **most explanatory** blocker. Reported
+    /// separately from `first_blocker` because they are different questions
+    /// and are frequently different answers.
+    pub worst_blocker: Option<String>,
+    /// Guest-process CPU milliseconds. Read against `wall_ms`, this is what
+    /// separates a title parked in a wait from one spinning a core.
+    pub cpu_ms: Option<u64>,
+    /// Guest-process wall-clock milliseconds.
+    pub wall_ms: Option<u64>,
+    /// Imports that linked to nothing but were never observed being called —
+    /// deliberately separate from `unresolved_nids`, which the guest actually
+    /// invoked. Conflating them inflates every scope estimate.
+    pub linked_missing_nids: Vec<String>,
+    /// Shims this title imports that are registered as deliberately
+    /// incomplete. Being imported is not proof of being called.
+    pub incomplete_imports: Vec<String>,
+    /// What the stall observer saw, when one ran.
+    pub stall: Option<String>,
+    /// Tail of the guest's own stdout/stderr — often the only statement of
+    /// intent a title makes before dying.
+    pub guest_console_tail: Option<String>,
+    /// Device-level graphics notes (device lost, validation errors).
+    pub host_gpu_notes: Vec<String>,
     /// Real title id from `sce_sys/param.json`, or the game-folder name.
     pub title_id: String,
     /// Display title, when metadata provides one.
@@ -200,6 +271,126 @@ pub struct CrashReport {
 }
 
 impl CrashReport {
+    /// `3.2 s over 180.4 s wall (1.8% of one core) — parked in a wait`.
+    ///
+    /// This one line split the measured silent-zero-frame cluster into two
+    /// different bugs: three titles burned ~2% of a core across 180 s (parked
+    /// on a primitive that never fired) while one burned 99.7% (a guest busy
+    /// loop). `None` when the host could not be asked.
+    #[must_use]
+    pub fn cpu_line(&self) -> Option<String> {
+        let (cpu_ms, wall_ms) = (self.cpu_ms?, self.wall_ms?);
+        if wall_ms == 0 {
+            return None;
+        }
+        let ratio = cpu_ms as f64 / wall_ms as f64;
+        // Normalised to ONE core, not to wall: a single hot guest thread on an
+        // 8-core host is only 12.5% of wall, and a ratio-to-wall test would
+        // misfile it as parked.
+        let shape = if ratio >= 0.8 {
+            "at least one thread is spinning"
+        } else if ratio <= 0.1 {
+            "parked in a wait — almost no CPU burned"
+        } else {
+            "partially active"
+        };
+        Some(format!(
+            "{:.1} s over {:.1} s wall ({:.1}% of one core) — {shape}",
+            cpu_ms as f64 / 1000.0,
+            wall_ms as f64 / 1000.0,
+            ratio * 100.0,
+        ))
+    }
+
+    /// The `## Frame path` section: how far the guest got, and when.
+    fn render_frame_path(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "\n## Frame path\n");
+        let Some(snapshot) = &self.frame_path else {
+            let _ = writeln!(out, "{NONE_RECORDED}");
+            return;
+        };
+        let _ = writeln!(out, "- Load phase reached: `{}`", snapshot.phase_label());
+        let _ = writeln!(
+            out,
+            "- Presentation stage reached: `{}`\n",
+            snapshot.reached_label()
+        );
+
+        let _ = writeln!(out, "| phase | first seen |");
+        let _ = writeln!(out, "|---|---|");
+        for (index, phase) in raeen_core::frame_path::Phase::ALL.into_iter().enumerate() {
+            let when = match (
+                snapshot.phase_reached[index],
+                snapshot.phase_first_ms[index],
+            ) {
+                (false, _) => "<not reached>".to_string(),
+                (true, Some(ms)) => format!("first at +{ms} ms"),
+                (true, None) => "<reached, timing unavailable>".to_string(),
+            };
+            let _ = writeln!(out, "| `{}` | {when} |", phase.label());
+        }
+
+        let _ = writeln!(out, "\n| stage | count | first seen |");
+        let _ = writeln!(out, "|---|---|---|");
+        for (index, stage) in raeen_core::frame_path::Stage::ALL.into_iter().enumerate() {
+            let count = snapshot.counts[index];
+            // `count == 0` and "reached but untimed" are genuinely different
+            // findings; neither may render as a bare `0 ms`.
+            let when = match (count, snapshot.first_ms[index]) {
+                (0, _) => "<not reached>".to_string(),
+                (_, Some(ms)) => format!("first at +{ms} ms"),
+                (_, None) => "<reached, timing unavailable>".to_string(),
+            };
+            let _ = writeln!(out, "| `{}` | {count} | {when} |", stage.label());
+        }
+    }
+
+    /// The `## Blockers` section: every distinct refusal, ranked.
+    fn render_blockers(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "\n## Blockers\n");
+        if self.blockers.is_empty() {
+            let _ = writeln!(out, "{NONE_RECORDED}");
+        } else {
+            let _ = writeln!(
+                out,
+                "| category | key | subject | count | first seen | detail |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|---|");
+            for blocker in &self.blockers {
+                let subject = if blocker.subject == 0 {
+                    String::new()
+                } else {
+                    format!("{:#x}", blocker.subject)
+                };
+                let when = match blocker.first_ms {
+                    Some(ms) => format!("+{ms} ms"),
+                    None => "before timing started".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | {subject} | {} | {when} | {} |",
+                    blocker.category.slug(),
+                    escape_table_cell(&blocker.key),
+                    blocker.count,
+                    escape_table_cell(&blocker.detail),
+                );
+            }
+        }
+        // A table that hit its cap must say so, or a reader counts what
+        // survived and calls it the total.
+        for (category, dropped) in &self.blockers_dropped {
+            if *dropped > 0 {
+                let _ = writeln!(
+                    out,
+                    "\n> {dropped} further distinct `{category}` blocker(s) were dropped at the \
+                     per-category cap — this table is not the whole set."
+                );
+            }
+        }
+    }
+
     /// Render the whole report as self-contained markdown. Pure.
     pub fn render(&self, unix_secs: u64) -> String {
         use std::fmt::Write as _;
@@ -213,12 +404,47 @@ impl CrashReport {
             (None, None) => self.title_id.clone(),
         };
         let _ = writeln!(out, "- Title: {title_line}");
+        let _ = writeln!(
+            out,
+            "{OUTCOME_LINE_PREFIX}{}{}",
+            self.outcome.slug(),
+            if self.provisional {
+                PROVISIONAL_MARKER
+            } else {
+                ""
+            }
+        );
         let _ = writeln!(out, "{FAULT_LINE_PREFIX}{}", one_liner(&self.fault, 200));
+        let _ = writeln!(
+            out,
+            "{FIRST_BLOCKER_LINE_PREFIX}{}",
+            self.first_blocker.as_deref().unwrap_or(NONE_RECORDED)
+        );
+        // Only when it is a different entry: repeating one blocker under two
+        // labels would imply the report found two things.
+        if let Some(worst) = &self.worst_blocker
+            && Some(worst) != self.first_blocker.as_ref()
+        {
+            let _ = writeln!(out, "{WORST_BLOCKER_LINE_PREFIX}{worst}");
+        }
         let _ = writeln!(out, "- Generated: {}", utc_display(unix_secs));
         if let Some(duration) = self.session_duration {
             let _ = writeln!(out, "- Session duration: {:.1} s", duration.as_secs_f64());
         }
+        if let Some(cpu_line) = self.cpu_line() {
+            let _ = writeln!(out, "- CPU: {cpu_line}");
+        }
         let _ = writeln!(out, "- Emulator: Raeen v{}", raeen_core::VERSION);
+
+        let _ = writeln!(
+            out,
+            "\n## Verdict\n\n{}",
+            if self.verdict.is_empty() {
+                NONE_RECORDED
+            } else {
+                &self.verdict
+            }
+        );
 
         let _ = writeln!(out, "\n## Fault\n\n{}", self.fault);
         if let Some(site) = &self.fault_site {
@@ -226,6 +452,9 @@ impl CrashReport {
             let bytes: Vec<String> = site.rip_bytes.iter().map(|b| format!("{b:02x}")).collect();
             let _ = writeln!(out, "- Bytes at RIP: {}", bytes.join(" "));
         }
+
+        self.render_frame_path(&mut out);
+        self.render_blockers(&mut out);
 
         let _ = writeln!(out, "\n## Recent HLE calls (most recent first)\n");
         if self.recent_hle.is_empty() {
@@ -248,8 +477,64 @@ impl CrashReport {
             let _ = writeln!(out, "- {line}");
         }
 
+        // Deliberately a separate section from the one above. An import that
+        // linked to nothing and was never called is not a blocker; counting the
+        // two together is how a "271 missing NIDs" figure gets quoted as scope
+        // when most of them are never reached.
+        let _ = writeln!(
+            out,
+            "\n## Linked-but-missing imports\n\n> Linked to nothing, NOT necessarily called. See \
+             *Unresolved-NID calls* above for what the guest actually invoked.\n"
+        );
+        if self.linked_missing_nids.is_empty() {
+            let _ = writeln!(out, "{NONE_RECORDED}");
+        }
+        for line in &self.linked_missing_nids {
+            let _ = writeln!(out, "- {line}");
+        }
+
+        let _ = writeln!(
+            out,
+            "\n## Incomplete shims imported by this title\n\n> Registered as deliberately \
+             incomplete AND imported. Being imported is not proof of being called.\n"
+        );
+        if self.incomplete_imports.is_empty() {
+            let _ = writeln!(out, "{NONE_RECORDED}");
+        }
+        for line in &self.incomplete_imports {
+            let _ = writeln!(out, "- {line}");
+        }
+
         if let Some(gpu) = &self.gpu_summary {
             let _ = writeln!(out, "\n## GPU\n\n{gpu}");
+        }
+
+        let _ = writeln!(out, "\n## Host GPU\n");
+        if self.host_gpu_notes.is_empty() {
+            let _ = writeln!(out, "{NONE_RECORDED}");
+        }
+        for note in &self.host_gpu_notes {
+            let _ = writeln!(out, "- {note}");
+        }
+
+        let _ = writeln!(out, "\n## Stall\n");
+        match &self.stall {
+            Some(stall) => {
+                let _ = writeln!(out, "{stall}");
+            }
+            None => {
+                let _ = writeln!(out, "{NONE_RECORDED}");
+            }
+        }
+
+        let _ = writeln!(out, "\n## Guest console (tail)\n");
+        match &self.guest_console_tail {
+            Some(tail) if !tail.trim().is_empty() => {
+                let _ = writeln!(out, "```\n{}\n```", tail.trim_end());
+            }
+            _ => {
+                let _ = writeln!(out, "{NONE_RECORDED}");
+            }
         }
 
         if let Some(host) = &self.host {
@@ -264,8 +549,14 @@ impl CrashReport {
             Some(dump) => {
                 let _ = writeln!(out, "- Minidump: {}", dump.display());
             }
-            None => {
+            // "caught in-process" is only true of a fault. Saying it for a
+            // stalled or cleanly-exited session claimed a fault that never
+            // happened.
+            None if self.outcome == crate::compat::Stage::Crashed => {
                 let _ = writeln!(out, "- Minidump: none (fault was caught in-process)");
+            }
+            None => {
+                let _ = writeln!(out, "- Minidump: none");
             }
         }
         if let Some(log) = &self.log_path {
@@ -300,6 +591,170 @@ impl CrashReport {
     pub fn write_now(&self, dir: &Path) -> std::io::Result<PathBuf> {
         self.write_to(dir, now_unix_secs())
     }
+
+    /// Write the markdown report **and** its machine-readable sidecar under a
+    /// caller-chosen stem.
+    ///
+    /// A fixed stem is what lets the heartbeat overwrite one pair in place
+    /// instead of littering one file per tick, and what lets the parent find
+    /// and finalize the session it killed. The sidecar is what stops every
+    /// consumer from having to re-parse formatted prose.
+    pub fn write_pair(
+        &self,
+        dir: &Path,
+        stem: &str,
+        unix_secs: u64,
+    ) -> std::io::Result<(PathBuf, PathBuf)> {
+        std::fs::create_dir_all(dir)?;
+        let stem = sanitize_component(stem);
+        let md_path = dir.join(format!("{stem}{REPORT_SUFFIX}"));
+        let json_path = dir.join(format!("{stem}{JSON_SUFFIX}"));
+        std::fs::write(&md_path, self.render(unix_secs))?;
+        // A sidecar we cannot serialize must not cost us the markdown report,
+        // which is the artifact a human actually reads.
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => std::fs::write(&json_path, json)?,
+            Err(error) => {
+                tracing::warn!(%error, "crash report sidecar could not be serialized");
+            }
+        }
+        Ok((md_path, json_path))
+    }
+}
+
+/// Escape the characters that would break out of a markdown table cell.
+fn escape_table_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+/// The `.report.json` beside a `.report.md`.
+#[must_use]
+pub fn sidecar_path(md_path: &Path) -> Option<PathBuf> {
+    let name = md_path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(REPORT_SUFFIX)?;
+    Some(md_path.with_file_name(format!("{stem}{JSON_SUFFIX}")))
+}
+
+/// Read a report's JSON sidecar back, given the path of its markdown twin.
+pub fn read_sidecar(md_path: &Path) -> Option<CrashReport> {
+    let text = std::fs::read_to_string(sidecar_path(md_path)?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Turn a provisional heartbeat report into a final one.
+///
+/// Called by the parent for a session it resolved by killing — the case that
+/// produced no artifact at all before, and the largest failure class in the
+/// measured library. Falls back to rewriting the `- Outcome:` line in place
+/// when the sidecar is missing or unreadable, so a half-usable report is never
+/// discarded in favour of none.
+pub fn finalize_report(
+    md_path: &Path,
+    outcome: crate::compat::Stage,
+    verdict: &str,
+    fault: Option<&str>,
+    dump: Option<&Path>,
+) -> std::io::Result<()> {
+    let dir = md_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = md_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(REPORT_SUFFIX))
+        .unwrap_or("unknown-title")
+        .to_string();
+
+    if let Some(mut report) = read_sidecar(md_path) {
+        report.outcome = outcome;
+        report.provisional = false;
+        if !verdict.is_empty() {
+            report.verdict = verdict.to_string();
+        }
+        if let Some(fault) = fault {
+            report.fault = fault.to_string();
+        }
+        if let Some(dump) = dump {
+            report.dump_path = Some(dump.to_path_buf());
+        }
+        report.write_pair(dir, &stem, now_unix_secs())?;
+        return Ok(());
+    }
+
+    // No usable sidecar: rewrite the one line that would otherwise be wrong,
+    // and say plainly that the rest predates the outcome.
+    let mut text: String = std::fs::read_to_string(md_path)?
+        .lines()
+        .map(|line| {
+            if line.starts_with(OUTCOME_LINE_PREFIX) {
+                format!("{OUTCOME_LINE_PREFIX}{}", outcome.slug())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push_str(&format!(
+        "\n\n## Finalized by parent\n\nThe session was resolved externally as `{}`.\n\n{verdict}\n\
+         \nEverything above was written by the guest process before it ended, so it describes the \
+         session up to its last heartbeat, not its final moment.\n",
+        outcome.slug()
+    ));
+    std::fs::write(md_path, text)
+}
+
+/// Keep the newest `keep` report **pairs**, deleting the rest.
+///
+/// Deletes each dropped report's JSON sidecar alongside it: [`list_reports`]
+/// only ever sees `.report.md` files, so an unpaired sidecar would accumulate
+/// one per session forever and never be noticed. Returns how many pairs went.
+pub fn prune_reports(dir: &Path, keep: usize) -> usize {
+    let mut removed = 0;
+    for listing in list_reports(dir).into_iter().skip(keep) {
+        if std::fs::remove_file(&listing.path).is_ok() {
+            removed += 1;
+        }
+        if let Some(sidecar) = sidecar_path(&listing.path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+    removed
+}
+
+/// Guest-process CPU milliseconds (kernel + user), for the CPU-vs-wall line.
+#[cfg(windows)]
+#[must_use]
+pub fn process_cpu_ms() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut exit, mut kernel, mut user) = (creation, creation, creation);
+    // SAFETY: plain Win32 call; all four out-params are valid local FILETIMEs
+    // and the pseudo-handle from GetCurrentProcess needs no close.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let to_ms =
+        |t: FILETIME| ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) / 10_000;
+    Some(to_ms(kernel) + to_ms(user))
+}
+
+/// Non-Windows hosts have no guest runtime yet, so there is no process to ask.
+#[cfg(not(windows))]
+#[must_use]
+pub fn process_cpu_ms() -> Option<u64> {
+    None
 }
 
 /// Current wall clock as seconds since the Unix epoch.
@@ -437,6 +892,33 @@ pub fn parse_fault_line(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract `(outcome, provisional)` from rendered report text. Pure.
+///
+/// An unrecognized outcome word yields `None` rather than a guess: a reader
+/// that cannot parse the vocabulary must say so, not substitute a plausible
+/// stage.
+pub fn parse_outcome_line(text: &str) -> Option<(crate::compat::Stage, bool)> {
+    let value = text
+        .lines()
+        .take(32)
+        .find_map(|line| line.strip_prefix(OUTCOME_LINE_PREFIX))?;
+    let provisional = value.contains(PROVISIONAL_MARKER.trim_start());
+    let slug = value.split_whitespace().next()?;
+    Some((crate::compat::Stage::from_slug(slug)?, provisional))
+}
+
+/// Extract the first-blocker one-liner from rendered report text. Pure.
+///
+/// The literal [`NONE_RECORDED`] reads back as `None` — an honest absence is
+/// not a finding.
+pub fn parse_first_blocker_line(text: &str) -> Option<String> {
+    let value = text
+        .lines()
+        .take(32)
+        .find_map(|line| line.strip_prefix(FIRST_BLOCKER_LINE_PREFIX))?;
+    (value != NONE_RECORDED).then(|| value.to_string())
+}
+
 /// List the crash reports under `dir`, newest first (by modification time).
 /// A missing directory is an empty list, never an error.
 pub fn list_reports(dir: &Path) -> Vec<ReportListing> {
@@ -558,15 +1040,19 @@ pub fn ensure_report_for_crashed_runner(
         title_id,
         title,
         version,
+        outcome: crate::compat::Stage::Crashed,
         session_duration: session_start.elapsed().ok(),
         fault: format!("{fault} — the runner died before it could describe the fault itself"),
-        fault_site: None,
-        recent_hle: Vec::new(),
-        unresolved_nids: Vec::new(),
-        gpu_summary: None,
+        verdict: "The guest process died hard enough that it could not write its own report. \
+                  Everything below came from the Shell, which was not inside the fault."
+            .to_string(),
         host: Some(HostInfo::collect()),
         dump_path: Some(dump),
         log_path: Some(PathBuf::from("logs/raeen.log")),
+        // The Shell is a different process: it cannot see the child's frame
+        // path, blocker table or call rings. Leaving them empty renders
+        // `<none recorded>`, which is true — inventing them would not be.
+        ..CrashReport::default()
     };
     match report.write_now(dir) {
         Ok(path) => {
@@ -616,6 +1102,9 @@ mod tests {
             }),
             dump_path: Some(PathBuf::from("logs/crashes/raeen-runner-1.dmp")),
             log_path: Some(PathBuf::from("logs/raeen.log")),
+            outcome: crate::compat::Stage::Crashed,
+            verdict: "Guest fault at 0x200a103c6".to_string(),
+            ..CrashReport::default()
         }
     }
 
@@ -709,8 +1198,19 @@ mod tests {
         }
         .render(0);
 
+        // Scoped to the section under test. Other sections legitimately render
+        // `<none recorded>` here — this fixture records no blockers and no
+        // frame path — and asserting on the whole document would make this test
+        // fail for the honest behaviour of an unrelated section.
+        let hle_section = text
+            .split_once("## Recent HLE calls")
+            .expect("the section exists")
+            .1
+            .split("\n## ")
+            .next()
+            .expect("bounded by the next heading");
         assert!(
-            !text.contains("<none recorded>"),
+            !hle_section.contains(NONE_RECORDED),
             "a fault with a recorded call ring must not render the empty section:\n{text}"
         );
         // Most recent first, joined by `<-`, under the thread's real name.
@@ -731,11 +1231,50 @@ mod tests {
             ..CrashReport::default()
         };
         let text = report.render(0);
-        assert!(text.contains("<none recorded>"));
+        assert!(text.contains(NONE_RECORDED));
         assert!(text.contains("<none — every called import resolved>"));
-        assert!(text.contains("- Minidump: none (fault was caught in-process)"));
         assert!(!text.contains("## GPU"));
-        assert!(!text.contains("## Host"));
+        assert!(!text.contains("## Host\n"));
+
+        // "caught in-process" is a claim about a FAULT. This report has no
+        // outcome (it is a default), so it must not make that claim — saying it
+        // for a stalled or cleanly-exited session asserted a fault that never
+        // happened.
+        assert!(text.contains("- Minidump: none\n"), "{text}");
+        assert!(!text.contains("fault was caught in-process"), "{text}");
+
+        // A genuinely crashed session does keep the parenthetical.
+        let crashed = CrashReport {
+            outcome: crate::compat::Stage::Crashed,
+            ..report
+        }
+        .render(0);
+        assert!(crashed.contains("- Minidump: none (fault was caught in-process)"));
+
+        // Every new section is present and honest rather than omitted: a
+        // missing section reads as a tool that did not look.
+        for section in [
+            "## Verdict",
+            "## Frame path",
+            "## Blockers",
+            "## Linked-but-missing imports",
+            "## Incomplete shims imported by this title",
+            "## Host GPU",
+            "## Stall",
+            "## Guest console (tail)",
+        ] {
+            assert!(text.contains(section), "missing {section}:\n{text}");
+        }
+        // And the outcome round-trips through the parser the Shell list uses.
+        assert_eq!(
+            parse_outcome_line(&text),
+            Some((crate::compat::Stage::Launching, false))
+        );
+        assert_eq!(
+            parse_first_blocker_line(&text),
+            None,
+            "absence is not a find"
+        );
     }
 
     #[test]

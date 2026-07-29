@@ -13,6 +13,7 @@ mod crash_report;
 mod crashdump;
 mod launcher;
 mod library;
+mod session_report;
 mod shell;
 mod splash;
 mod stall_dump;
@@ -138,11 +139,14 @@ fn write_runner_crash_report(
     );
 
     let (title_id, title, version) = crash_report::title_meta_for(eboot);
+    let snapshot = raeen_core::frame_path::snapshot();
     let report = crash_report::CrashReport {
         title_id,
         title,
         version,
+        outcome: compat::Stage::Crashed,
         session_duration: Some(kernel.uptime()),
+        verdict: fault.clone(),
         fault,
         fault_site,
         recent_hle,
@@ -151,6 +155,19 @@ fn write_runner_crash_report(
         host: Some(crash_report::HostInfo::collect()),
         dump_path: None,
         log_path: Some(std::path::PathBuf::from("logs/raeen.log")),
+        // The diagnostics every report carries regardless of how the session
+        // ended: how far the guest got, and every distinct refusal on the way.
+        first_blocker: raeen_core::blockers::first().map(|b| b.line()),
+        worst_blocker: raeen_core::blockers::worst().map(|b| b.line()),
+        blockers: raeen_core::blockers::ranked(),
+        blockers_dropped: raeen_core::blockers::dropped_by_category()
+            .into_iter()
+            .map(|(category, count)| (category.slug().to_string(), count))
+            .collect(),
+        frame_path: Some(snapshot),
+        cpu_ms: crash_report::process_cpu_ms(),
+        wall_ms: raeen_core::frame_path::since_origin_ms(),
+        ..crash_report::CrashReport::default()
     };
     match report.write_now(Path::new(crash_report::REPORTS_DIR)) {
         Ok(path) => info!("crash report written: {}", path.display()),
@@ -216,6 +233,11 @@ fn main() -> anyhow::Result<()> {
     // set; when on, a reporter thread logs `frame path: reached=...` on an
     // interval, so a title killed for timing out still leaves the chain state
     // in its log (see `docs/silent-zero-frame-cluster.md`).
+    // Stamp the diagnostics epoch before anything can record against it. Both
+    // the frame path and the blocker table measure from here, so every artifact
+    // a session produces shares one origin — and a stage recorded before this
+    // renders as "timing unavailable" rather than a fabricated 0 ms.
+    raeen_core::frame_path::mark_origin();
     raeen_core::frame_path::init_from_env();
 
     // Host facts (CPU model, cores, RAM, OS build) at the top of every log —
@@ -1071,6 +1093,13 @@ fn main() -> anyhow::Result<()> {
         if let Ok(socket) = std::env::var("RAEEN_CRASH_SOCKET") {
             crashdump::attach_client(&socket);
         }
+        // Open the session report FIRST — before the `?`s below, which on a
+        // missing eboot, an encrypted retail SELF with no user key, or a parse
+        // failure propagate straight out of `main` and print a bare `Error:`
+        // with no artifact behind them. `start` writes one report
+        // synchronously before spawning its heartbeat, so even a death two
+        // seconds in leaves a file saying what was being attempted.
+        let session = session_report::SessionReportWriter::start(Path::new(path.as_str()));
         let runner_config =
             raeen_core::config::EmulatorConfig::load(std::path::Path::new("config.toml"))?;
         raeen_gpu::AgcGpuSession::set_runtime_config(
@@ -1281,6 +1310,10 @@ fn main() -> anyhow::Result<()> {
                 d.name, d.image_offset, d.exports, d.unresolved
             );
         }
+        // The heartbeat can now resolve a faulting address to module+offset and
+        // read the kernel's call rings, so every report from here on is the
+        // rich one rather than the "we were still loading" placeholder.
+        session.attach_dependencies(dep_offset_pairs(&process.dependencies));
         // Diagnostic: RAEEN_TRAP_CXA_THROW patches the eboot's STATICALLY-LINKED
         // __cxa_throw (which is not an import, so it can't be redirected by the
         // linker) so the C++ exception a title's worker threads throw gets
@@ -1480,6 +1513,13 @@ fn main() -> anyhow::Result<()> {
             );
         }
         let linked = std::sync::Arc::new(linked);
+        // `Arc`, never a clone: `linked.image` is the whole composed guest
+        // image (hundreds of megabytes for a retail title) and the heartbeat
+        // touches this every ten seconds.
+        session.attach_image(
+            std::sync::Arc::clone(&linked),
+            std::sync::Arc::clone(&kernel),
+        );
         info!(
             "loaded: entry={:#x} image={:#x} byte(s) resolved={} unresolved={} \
              (+{} dlsym-only reservation(s), not imports)",
@@ -1685,6 +1725,10 @@ fn main() -> anyhow::Result<()> {
         // before its first flip has nothing else that could ever fire it.
         let _host_vblank = raeen_hle::host_vblank::HostVblankSource::start_from_env(&kernel);
 
+        // The last rung of the load half of the chain: control is about to
+        // leave us for guest code. A session that never gets past here has a
+        // load problem, not a rendering one.
+        raeen_core::frame_path::record_phase(raeen_core::frame_path::Phase::EntryReached);
         info!("entering guest _start via execute_process ...");
         let outcome = raeen_runtime::execute_process_shared(
             std::sync::Arc::clone(&linked),
@@ -1726,11 +1770,18 @@ fn main() -> anyhow::Result<()> {
             }
             Err(e) => info!("RESULT: {e:?}"),
         }
-        // The actionable crash report: everything above (fault site, call
-        // rings, unresolved inventory, GPU counters) folded into ONE file
-        // under logs/crashes/, next to any minidump. Written here — in the
-        // guest-executing process — because only this process still holds
-        // the kernel and the composed image.
+        // The session report: everything above (outcome, verdict, frame path,
+        // blockers, fault site, call rings, unresolved inventory, GPU counters)
+        // folded into ONE file under logs/crashes/, next to any minidump.
+        // Written here — in the guest-executing process — because only this
+        // process still holds the kernel and the composed image.
+        //
+        // UNCONDITIONAL, not `if let Err`. A title that runs cleanly and
+        // presents nothing is the largest measured failure class
+        // (`docs/silent-zero-frame-cluster.md`) and used to produce no artifact
+        // at all, because the only writer sat in the error arm.
+        session.set_guest_console(kernel.console.contents());
+        session.write_final(&outcome);
         if let Err(error) = &outcome {
             write_runner_crash_report(
                 Path::new(path.as_str()),

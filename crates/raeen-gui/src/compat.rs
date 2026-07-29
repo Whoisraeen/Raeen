@@ -51,7 +51,7 @@ use crate::library::{ItemKind, LibraryItem};
 use crate::shell::ledger::TitleLedger;
 use crate::theme::Palette;
 use egui::Color32;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -64,16 +64,67 @@ pub const DEFAULT_BASELINE_PATH: &str = "artifacts/compat/latest.json";
 // ---------------------------------------------------------------------------
 
 /// Mirror of `xtask/src/schema.rs::Stage`. Serde names must stay identical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// This is the project's **one** outcome vocabulary — the compatibility
+/// harness, `compat/schema-v1.json`, and the session report written for every
+/// launch all speak it. A second copy declared elsewhere would be a fourth
+/// spelling of the same seven words, so new consumers extend this enum rather
+/// than declaring their own.
+///
+/// `Launching` is the [`Default`] because that is the honest state of a session
+/// that has begun and not yet reported: a report written at t≈0 must not claim
+/// an outcome it cannot know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Detected,
+    #[default]
     Launching,
     Rendering,
     Crashed,
     TimedOut,
     Exited,
     Refused,
+}
+
+impl Stage {
+    /// Every stage, in the schema's declaration order.
+    pub const ALL: [Stage; 7] = [
+        Stage::Detected,
+        Stage::Launching,
+        Stage::Rendering,
+        Stage::Crashed,
+        Stage::TimedOut,
+        Stage::Exited,
+        Stage::Refused,
+    ];
+
+    /// The wire spelling — byte-identical to the serde name, so a report's
+    /// `- Outcome:` line and its JSON sidecar can never disagree.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Stage::Detected => "detected",
+            Stage::Launching => "launching",
+            Stage::Rendering => "rendering",
+            Stage::Crashed => "crashed",
+            Stage::TimedOut => "timed_out",
+            Stage::Exited => "exited",
+            Stage::Refused => "refused",
+        }
+    }
+
+    /// Inverse of [`Stage::slug`].
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Stage::ALL.into_iter().find(|s| s.slug() == slug)
+    }
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.slug())
+    }
 }
 
 /// The subset of `xtask/src/schema.rs::Metrics` the badge mapping reads.
@@ -460,6 +511,43 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::theme::default_theme;
+
+    /// The outcome vocabulary is shared with `xtask/src/schema.rs` and
+    /// `compat/schema-v1.json`. `slug` and the serde name are two spellings of
+    /// one thing; a renamed variant that updated only one of them would split
+    /// the vocabulary silently — every report would still parse, and the
+    /// harness and the Shell would quietly disagree about what `timed_out`
+    /// means. Pinning the literals here makes that a test failure.
+    #[test]
+    fn stage_slugs_match_their_serde_names_and_the_schema_literals() {
+        for stage in Stage::ALL {
+            let json = serde_json::to_string(&stage).expect("stage serializes");
+            assert_eq!(
+                json,
+                format!("\"{}\"", stage.slug()),
+                "slug and serde name must be the same word"
+            );
+            assert_eq!(Stage::from_slug(stage.slug()), Some(stage));
+            let parsed: Stage = serde_json::from_str(&json).expect("round trip");
+            assert_eq!(parsed, stage);
+        }
+        assert_eq!(
+            Stage::ALL.map(Stage::slug),
+            [
+                "detected",
+                "launching",
+                "rendering",
+                "crashed",
+                "timed_out",
+                "exited",
+                "refused"
+            ]
+        );
+        assert_eq!(Stage::from_slug("not_a_stage"), None);
+        // A session that has begun and not yet reported is `launching` — the
+        // report written at t=0 must not claim an outcome it cannot know.
+        assert_eq!(Stage::default(), Stage::Launching);
+    }
 
     fn result(stage: Stage, flips: u64, shader: u64, gpu: u64, fps: Option<f64>) -> CompatResult {
         CompatResult {
