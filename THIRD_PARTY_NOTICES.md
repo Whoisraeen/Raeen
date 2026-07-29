@@ -202,6 +202,25 @@ SOFTWARE.
   `RAEEN_HOST_VBLANK` gate, and all tests are its own; see
   `docs/host-vblank-source.md`. No C++ is vendored or compiled into Raeen.
 
+  **Signal delivery into a blocking wait** (`crates/raeen-hle/src/exception.rs`
+  `deliver_at_wait_slice`/`wake_target_for_exception` and the wait sites that call
+  them, 2026-07-29) re-implements the *structure* of KytyPS5's pending-signal
+  polling in Rust:
+  `src/libs/libKernel.cpp::KernelDispatchPendingSignalForCurrentThread` as a
+  per-thread chokepoint the *target* calls, invoked from inside each wait's slice
+  loop (`src/kernel/semaphore.cpp:238` and `:430`, `src/kernel/pthread.cpp`'s
+  `SleepMicroWithSignalPoll`/`SleepNanoWithSignalPoll`) with the wait's own lock
+  **released** across the dispatch (`m_mutex.Unlock()` → dispatch →
+  `m_mutex.Lock()`), after which the loop simply continues — i.e. the wait resumes
+  rather than returning. `QueuePendingSignal` before the wake, and
+  `PthreadWakeForSignal` + `Common::CondVar::SignalThread` as the prompt wake of a
+  parked target, are the evidence for Raeen's queue-then-wake ordering and for
+  waking a condition waiter without marking it signalled. KytyPS5's Windows
+  mechanism (`NtQueueApcThreadEx` special user APC, `SuspendThread` +
+  `GetThreadContext` fallback, and dispatching a non-guest context on a helper
+  `std::thread`) is **not** adopted: Raeen has no APC path and runs the handler on
+  the target's own guest stack via `call_guest`. No C++ is copied.
+
 ---
 
 ## SharpEmu — PS5 emulator (reference & porting source)
@@ -534,6 +553,13 @@ re-implementations are license-compatible; this notice preserves attribution.
   `PCONTEXT`; Raeen instead queues the raise and delivers at the target thread's
   next HLE safe point through its own `call_guest` re-entry, so no C++ and no
   delivery mechanism is copied.
+
+  The 2026-07-29 extension of that work — delivering a queued exception into a
+  thread that is already parked in a blocking HLE wait — takes one further fact
+  from the same shadPS4 file: `sceKernelInstallExceptionHandler` installs the
+  title's handler with `POSIX_SA_RESTART`, which is why Raeen **resumes** an
+  interrupted wait instead of returning an `EINTR`-shaped error to the guest.
+  No code.
 
   The 2026-07-28 `libSceAudioIn` capture library
   (`crates/raeen-hle/src/libsce_audio_in.rs`) re-implements the **values and

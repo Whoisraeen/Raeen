@@ -148,6 +148,9 @@ fn posix_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
 fn posix_sleep(ctx: &HleContext, args: &[u64]) -> u64 {
     let seconds = args.first().copied().unwrap_or(0);
     debug!("sleep(seconds={seconds})");
+    // Exception delivery lives inside `sleep_interruptibly` rather than being
+    // open-coded here, so `usleep`/`nanosleep` — which share that helper — are
+    // signal targets on the same terms as this call.
     let unslept = libkernel::sleep_interruptibly(ctx, std::time::Duration::from_secs(seconds));
     // POSIX reports the unslept whole seconds (rounded up).
     u64::try_from(unslept.as_millis().div_ceil(1000)).unwrap_or(u64::MAX)

@@ -382,6 +382,13 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         // relaxed-load no-op otherwise) — a waiter parked here IS the
         // observer those effects must reach.
         crate::libsce_agc::apply_ordered_gpu_side_effects(ctx);
+        // A queued Orbis exception interrupts this wait, then it RESUMES against
+        // the same events and deadline (see `crate::exception`). Deliberately
+        // *outside* `wait_until`, which holds the kernel's notification lock for
+        // the whole park — the lock every event producer takes.
+        if crate::exception::pending_at_wait_slice(ctx) {
+            crate::exception::deliver_at_wait_slice(ctx);
+        }
         let delivered = std::cell::Cell::new(None);
         let deleted = std::cell::Cell::new(false);
         let mut ready = || {

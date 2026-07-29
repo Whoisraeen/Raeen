@@ -47,6 +47,42 @@
 //! (`core/libraries/kernel/threads/exception.h`, GPL-2.0). Re-implemented in
 //! Rust; no code copied.
 //!
+//! # A signal must also interrupt a thread that is already blocked
+//!
+//! "Delivery at the next HLE call" is not enough, and the shape that proves it
+//! is the one this module was written for. Measured on Blasphemous II
+//! (Unity/IL2CPP, `docs/host-park-stall.md`): an installed handler for signum 30
+//! (SIGUSR1), a raise from `t15`, and all fifteen guest threads parked forever —
+//! thirteen inside `sceKernelWaitSema`, the main thread inside
+//! `pthread_cond_wait`, and the raiser itself inside `sceKernelWaitSema` waiting
+//! for the acknowledgement. **Not one delivery ever happened**, because
+//! [`deliver_pending`] ran only *after* an HLE handler returned and none of those
+//! handlers ever returns. Even the deferral counter never moved, so
+//! [`GATEWAY_STALL_WARNING`] was unreachable and the stall was completely silent.
+//!
+//! POSIX is the model: a signal **interrupts** a blocking wait. Raeen's blocking
+//! waits are already bounded re-check loops, so the fix is a second delivery
+//! point — [`deliver_at_wait_slice`] — called by every one of them, once per
+//! slice, plus a prompt wake ([`wake_target_for_exception`]) so the latency is
+//! the wake rather than the slice.
+//!
+//! **After the handler returns the wait RESUMES**; it does not return an error.
+//! Two independent reasons, both from references that boot Unity titles:
+//! shadPS4 installs a title's handler with `SA_RESTART`
+//! (`core/libraries/kernel/threads/exception.cpp`, GPL-2.0), which *is* the
+//! "restart the interrupted call" flag; and KytyPS5 polls exactly this way —
+//! `KernelDispatchPendingSignalForCurrentThread` is called from inside its
+//! semaphore and condition wait loops, between `m_mutex.Unlock()` and
+//! `m_mutex.Lock()`, after which the loop simply continues
+//! (`src/kernel/semaphore.cpp`, `src/libs/libKernel.cpp`; Kyty/MIT lineage).
+//! Structure and behaviour studied; re-implemented in Rust, no code copied.
+//!
+//! The alternative — returning something like `EINTR` — is not available: Orbis
+//! `sceKernelWaitSema` has no such error in its set, and handing a guest's own
+//! pthread wrapper a code it cannot classify is a failure mode this tree has
+//! already measured and fixed once (see `pthread_cond.rs` on POSIX `60` versus
+//! SCE `0x8002003C` turning into an uncaught `std::system_error`).
+//!
 //! # What is delivered, and what is not
 //!
 //! Delivered: the correct `signum`, a pointer to a real per-thread
@@ -55,15 +91,18 @@
 //!
 //! **Not** delivered, and named here rather than hidden:
 //!
-//! * **Timing.** Delivery happens at the target's next HLE call, not
-//!   pre-emptively. A thread spinning in pure guest compute with no imports is
-//!   not interrupted. Hardware would deliver immediately.
+//! * **Timing outside a wait.** A thread spinning in pure guest compute with no
+//!   imports and no blocking wait is still only interrupted at its next import.
+//!   Hardware would deliver immediately.
 //! * **Direct-gateway-only threads.** `raeen-runtime`'s direct leaf gateway
 //!   (`trampoline::direct_dispatchable`) reaches its imports by a plain `call`
-//!   on a private host stack and therefore *cannot* re-enter guest code. A
-//!   thread whose only imports are on that list — `scePthreadMutexLock`,
-//!   `scePthreadCondWait`, `sceKernelWaitSema` — never reaches a delivering
-//!   safe point. The raise is requeued rather than dropped, and after
+//!   on a private host stack and therefore *cannot* re-enter guest code, nor
+//!   does it capture a machine context ([`HleContext::caller_gprs`] is `None`
+//!   there). The blocking waits are consequently **off** that list — a call that
+//!   parks the thread is not the per-call-overhead-dominated leaf the list
+//!   exists for — but a thread whose only imports are the ones that remain
+//!   (`scePthreadMutexLock` and friends) still never reaches a delivering safe
+//!   point. The raise is requeued rather than dropped, and after
 //!   [`GATEWAY_STALL_WARNING`] consecutive deferrals a single `warn` names the
 //!   condition and the `RAEEN_DISABLE_DIRECT_HLE=1` escape hatch, which routes
 //!   every import through the VEH path where delivery always works.
@@ -145,10 +184,132 @@ const GATEWAY_STALL_WARNING: u64 = 64;
 static GATEWAY_STALL_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Exceptions delivered from **inside** a blocking wait rather than after a
+/// completed HLE call. Diagnostics: a non-zero value is the positive evidence
+/// that [`deliver_at_wait_slice`] is doing its job.
+static WAIT_DELIVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Total exceptions successfully delivered to a guest handler this process.
 #[must_use]
 pub fn delivered_count() -> u64 {
     DELIVERIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Prompt wakes issued by [`wake_target_for_exception`]. Diagnostics, and the
+/// only race-free way for a test to assert that a raise really did try to wake
+/// its target (the wake itself lands in whichever host primitive the target is
+/// parked on, which nothing can observe from outside).
+static EXCEPTION_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many of [`delivered_count`] were delivered from inside a blocking wait.
+#[must_use]
+pub fn wait_delivered_count() -> u64 {
+    WAIT_DELIVERIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times a raise woke its target out of a blocking wait. Monotonic; a
+/// caller comparing two reads sees a lower bound on the wakes in between.
+#[must_use]
+pub fn exception_wake_count() -> u64 {
+    EXCEPTION_WAKES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the calling guest thread has an exception waiting for it.
+///
+/// The predicate a blocking wait tests **before** releasing its own
+/// notification lock, so the lock is only dropped when there is really something
+/// to deliver. One relaxed atomic load in the (overwhelmingly common) case where
+/// no title has raised anything; see
+/// [`raeen_kernel::OrbisKernel::has_pending_exception_for`].
+pub(crate) fn pending_at_wait_slice(ctx: &HleContext) -> bool {
+    ctx.kernel
+        .has_pending_exception_for(ctx.guest_threads.current_thread())
+}
+
+/// **The one place a blocking HLE wait delivers a queued Orbis exception.**
+///
+/// Every blocking wait in `raeen-hle` calls this once per slice —
+/// `kernel_semaphore`, `pthread_cond`, `kernel_eventflag`, `kernel_equeue`, and
+/// `libsce_posix`'s `sleep`. Returns whether a guest handler ran.
+///
+/// # The contract every call site must honour
+///
+/// **No lock may be held.** This runs guest code on the calling thread via
+/// [`crate::GuestCallScheduler::call_guest`], and that guest code is free to
+/// call straight back into the HLE — a stop-the-world collector's handler
+/// acknowledging a suspension typically calls `sceKernelSignalSema` or
+/// `pthread_cond_signal`. If the wait still held the notification lock its own
+/// producer takes, that call would deadlock on a non-reentrant host mutex and
+/// the "fix" would be strictly worse than the stall it replaced. Wait sites that
+/// park under a lock must therefore release it, call this, and re-acquire —
+/// which is exactly what KytyPS5 does around its own
+/// `KernelDispatchPendingSignalForCurrentThread`.
+///
+/// Sites gate on [`pending_at_wait_slice`] so the release/re-acquire only
+/// happens when there is work.
+///
+/// # Why this is not a spurious wake
+///
+/// Nothing here touches the wait's own condition, and the caller resumes waiting
+/// afterwards. The wait's real predicate, its deadline, and its FIFO position are
+/// all untouched; the only observable difference is that guest code ran on this
+/// thread in the middle of the wait — which is precisely what a signal is.
+pub(crate) fn deliver_at_wait_slice(ctx: &HleContext) -> bool {
+    if !deliver_pending(ctx) {
+        return false;
+    }
+    WAIT_DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Wake the target thread out of whatever blocking wait it is parked in, so it
+/// reaches [`deliver_at_wait_slice`] now rather than at its next slice.
+///
+/// Called by `sceKernelRaiseException` **after** the exception is queued: a wake
+/// that overtook the queue would find nothing and be wasted. Returns how many
+/// condition-variable waiters were interrupted (diagnostics/tests).
+///
+/// Without this, a signal costs up to one wait slice — 100 ms for
+/// `sceKernelWaitSema` — and a collector that suspends every cycle pays that
+/// per thread, per cycle. With it the latency is a host unpark.
+///
+/// Three wake paths, because Raeen's waits park on three different primitives:
+///
+/// * the [`WaitSubsystem`](raeen_core::subsystems::WaitSubsystem) seam, which
+///   covers every wait built on `OrbisKernel::wait_until` (event flags, event
+///   queues). Expressed over the trait rather than the concrete kernel so a test
+///   can assert the wake with a recording double instead of a second thread.
+/// * the semaphore condvars — the process-wide one behind `sceKernelWaitSema`
+///   and each live POSIX `sem_t`'s own.
+/// * an interrupt — *not* a signal — of the target's `pthread_cond` and futex
+///   (`sceKernelSyncOnAddress*`) waiters; see
+///   [`raeen_kernel::OrbisKernel::interrupt_cond_waiters_of`] and
+///   [`raeen_kernel::SyncAddressTable::interrupt_waiters_of`].
+///
+/// All of them are safe to invoke when the target is not waiting at all, and none
+/// changes any guest-visible condition: a woken wait re-checks its own predicate
+/// and parks again if it is still unsatisfied. That is what keeps this from
+/// shortening a wait the guest asked for.
+///
+/// Not covered: `scePthreadMutexLock`'s ownership FIFO, because a mutex wait is
+/// not a delivery site (it stays on the direct leaf gateway, which cannot run
+/// guest code). Waking it would achieve nothing.
+pub(crate) fn wake_target_for_exception(
+    waker: &dyn raeen_core::subsystems::WaitSubsystem,
+    kernel: &raeen_kernel::OrbisKernel,
+    target: u64,
+) -> usize {
+    EXCEPTION_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    waker.wake(
+        raeen_core::subsystems::WaitKey {
+            class: "orbis-exception",
+            object: target,
+            guest_thread: target,
+        },
+        raeen_core::subsystems::WakeReason::Signal,
+    );
+    kernel.notify_semaphore_slices();
+    kernel.interrupt_cond_waiters_of(target) + kernel.sync_addresses.interrupt_waiters_of(target)
 }
 
 /// The Orbis signals `sceKernelInstallExceptionHandler` accepts: SIGHUP(1),
@@ -685,6 +846,87 @@ mod tests {
         assert_eq!(
             kernel.claim_pending_exception(1).map(|p| p.handler),
             Some(0x2000)
+        );
+    }
+
+    /// Queueing an exception must **wake** the target rather than let it sit out
+    /// its wait slice — up to 100 ms for `sceKernelWaitSema`. Asserted through the
+    /// injectable wait seam with a recording double, so promptness is a recorded
+    /// wake with the right key and reason rather than a measured duration.
+    #[test]
+    fn a_queued_raise_wakes_the_target_out_of_its_wait() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let recorder = crate::host_vblank::RecordingWaker::default();
+        kernel.queue_pending_exception(
+            5,
+            PendingException {
+                signum: 30,
+                handler: 0x1234,
+                raised_by: 9,
+            },
+        );
+
+        let interrupted = wake_target_for_exception(&recorder, &kernel, 5);
+
+        let wakes = recorder.wakes();
+        assert_eq!(wakes.len(), 1, "exactly one wait-subsystem wake");
+        assert_eq!(wakes[0].0.class, "orbis-exception");
+        assert_eq!(wakes[0].0.object, 5, "the wake must name the TARGET thread");
+        assert_eq!(
+            wakes[0].1,
+            raeen_core::subsystems::WakeReason::Signal,
+            "the reason must read as a signal in a diagnostic trace, not as a queue event"
+        );
+        assert_eq!(
+            interrupted, 0,
+            "no condition waiter exists, so none is interrupted"
+        );
+        assert!(
+            kernel.has_pending_exception_for(5),
+            "waking must not consume the queued exception — the target still has to claim it"
+        );
+        assert!(
+            !kernel.has_pending_exception_for(1),
+            "and no other thread may see it"
+        );
+    }
+
+    /// The in-wait chokepoint and the post-dispatch one share a body, but the
+    /// in-wait deliveries must be separately countable: a run whose only evidence
+    /// is `delivered_count` cannot distinguish "signals worked" from "signals
+    /// worked only for threads that were not blocked", which is exactly the
+    /// distinction the Blasphemous II stall turned on.
+    #[test]
+    fn an_in_wait_delivery_is_counted_as_one() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x4000);
+        let alloc = crate::TestAllocator::new(0x1000);
+        let calls = RecordingCalls::ok();
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &calls);
+
+        let before = wait_delivered_count();
+        assert!(!pending_at_wait_slice(&ctx), "nothing queued yet");
+        assert!(!deliver_at_wait_slice(&ctx));
+        assert_eq!(
+            wait_delivered_count(),
+            before,
+            "a chokepoint call with nothing pending must not be counted as a delivery"
+        );
+
+        kernel.queue_pending_exception(
+            1,
+            PendingException {
+                signum: 30,
+                handler: 0xDEAD_BEEF,
+                raised_by: 4,
+            },
+        );
+        assert!(pending_at_wait_slice(&ctx));
+        assert!(deliver_at_wait_slice(&ctx));
+        assert_eq!(calls.calls.borrow().len(), 1, "the handler ran");
+        assert!(
+            wait_delivered_count() > before,
+            "an in-wait delivery must be attributed to the in-wait chokepoint"
         );
     }
 
