@@ -1735,9 +1735,17 @@ mod tests {
         // measured anonymous import (no dictionary name survives the hash
         // gate), bound in libsce_online_misc.rs to the disabled-recorder
         // refusal.
+        // 2026-07-29: -1 — libSceAgc 0x7cf482750c60a52c left this set. It was
+        // held here under the invented label `sceAgcWriteDataPatchAddress`
+        // because its real name was unknown; an audit of every registered name
+        // against the in-tree NID catalogue named it
+        // `sceAgcWriteDataPatchSetAddressOrOffset`, which hashes to exactly that
+        // NID. It is now an ordinary name-derived `register`, which is what this
+        // test's "none could have used ordinary name-derived registration"
+        // invariant asks for.
         assert_eq!(
             bindings.len(),
-            12,
+            11,
             "the explicit-NID surface changed; review every added/removed binding and update \
              this audited count"
         );
