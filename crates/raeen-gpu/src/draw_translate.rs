@@ -645,13 +645,19 @@ fn assemble_solid_diagnostic_ps() -> Result<Vec<u32>, DrawError> {
         .map_err(|e| err(format!("assembling diagnostic solid fragment shader: {e}")))
 }
 
-/// Both stages' SPIR-V, each either embedded or fetched from guest memory.
+/// Both stages' SPIR-V, each either embedded or fetched from guest memory,
+/// plus the analyzed stage ABI each one was generated against.
+///
+/// Every field is a shared handle. The two infos together are 10.5 KiB and this
+/// struct is built, stored in [`ResolvedShaderMemo`] and read back out of it on
+/// every draw, so inline values meant three ~10 KiB memcpys per draw for data
+/// that is immutable once analyzed.
 #[derive(Debug, Clone)]
 struct ResolvedShaders {
     vs: Arc<Vec<u32>>,
     ps: Arc<Vec<u32>>,
-    vs_info: ShaderVertexInputInfo,
-    ps_info: ShaderPixelInputInfo,
+    vs_info: Arc<ShaderVertexInputInfo>,
+    ps_info: Arc<ShaderPixelInputInfo>,
 }
 
 /// Everything [`resolve_shaders`] reads from the mutable PM4 register files.
@@ -878,10 +884,10 @@ fn resolve_shaders(
         let vs = Arc::new(assemble_embedded(sh.vs.vs_embedded_id, "vs")?);
         // An embedded VS exports exactly its position+param set; the PS
         // input-info builder only needs the export count.
-        let vs_info = ShaderVertexInputInfo {
+        let vs_info = Arc::new(ShaderVertexInputInfo {
             export_count: ctx.sh_regs.get_export_count() as i32,
             ..Default::default()
-        };
+        });
         (vs, vs_info)
     } else {
         let t: TranslatedShader = cache
@@ -893,7 +899,7 @@ fn resolve_shaders(
     let (ps, ps_info) = if sh.ps.ps_embedded {
         (
             Arc::new(assemble_embedded(sh.ps.ps_embedded_id, "ps")?),
-            ShaderPixelInputInfo::default(),
+            crate::shader_fetch::empty_ps_info(),
         )
     } else if shader_addr_selected("RAEEN_SOLID_PS_ADDR", 0, sh.ps.ps_regs.data_addr) {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -906,7 +912,7 @@ fn resolve_shaders(
         }
         (
             Arc::new(assemble_solid_diagnostic_ps()?),
-            ShaderPixelInputInfo::default(),
+            crate::shader_fetch::empty_ps_info(),
         )
     } else {
         let translated = cache
@@ -7343,8 +7349,8 @@ mod tests {
         let shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
         let mut memo = ResolvedShaderMemo::default();
 
@@ -7375,8 +7381,8 @@ mod tests {
         let shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
         let mut memo = ResolvedShaderMemo::default();
         let working_set = 128u32;
@@ -7410,15 +7416,16 @@ mod tests {
         let mut shaders = ResolvedShaders {
             vs: Arc::new(vec![1, 2, 3]),
             ps: Arc::new(vec![4, 5, 6]),
-            vs_info: ShaderVertexInputInfo::default(),
-            ps_info: ShaderPixelInputInfo::default(),
+            vs_info: Arc::new(ShaderVertexInputInfo::default()),
+            ps_info: Arc::new(ShaderPixelInputInfo::default()),
         };
-        shaders.vs_info.bind.extended.used = true;
-        shaders.vs_info.bind.extended.start_register = 12;
-        shaders.vs_info.bind.extended.data.update_address(0x80_0000);
-        shaders.vs_info.bind.storage_buffers.buffers_num = 1;
-        shaders.vs_info.bind.storage_buffers.extended[0] = true;
-        shaders.vs_info.bind.storage_buffers.start_register[0] = 12;
+        let vs_info = Arc::make_mut(&mut shaders.vs_info);
+        vs_info.bind.extended.used = true;
+        vs_info.bind.extended.start_register = 12;
+        vs_info.bind.extended.data.update_address(0x80_0000);
+        vs_info.bind.storage_buffers.buffers_num = 1;
+        vs_info.bind.storage_buffers.extended[0] = true;
+        vs_info.bind.storage_buffers.start_register[0] = 12;
 
         let mut memo = ResolvedShaderMemo::default();
         memo.insert(key, shaders.clone());
