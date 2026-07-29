@@ -5334,3 +5334,96 @@ fn a_worker_exiting_via_pthread_exit_releases_the_mutex_it_still_held() {
     );
     assert_eq!(held.recursion, 0);
 }
+
+/// A fault must leave the HLE call ring where the crash report can read it.
+///
+/// The report `raeen-gui` writes reads `OrbisKernel::recent_hle_calls`, but the
+/// always-on `CallTrace` that the fault log distils lives in the faulting
+/// thread's dispatch context and dies with the run. Nothing bridged the two, so
+/// a real crash report shipped
+///
+/// ```text
+/// ## Recent HLE calls (most recent first)
+///
+/// <none recorded>
+/// ```
+///
+/// for a fault whose own log line said "35 HLE call(s) recorded before the
+/// fault" (Dead Cells PPSA15552, 2026-07-29). That section is what
+/// `.github/ISSUE_TEMPLATE/game-report.yml` asks users to paste.
+///
+/// The synthetic guest here calls one HLE import through the VEH dispatcher and
+/// then dereferences address 0. Deterministic: no threads, no timing.
+#[test]
+fn a_fault_publishes_its_hle_call_ring_for_the_crash_report() {
+    const SLOT_OFF: usize = 0x40;
+
+    let mut image = vec![0u8; 0x100];
+    // call qword ptr [rip+disp32]  -> the HLE trampoline slot
+    let disp32 = (SLOT_OFF as i64 - 6) as i32;
+    image[0] = 0xFF;
+    image[1] = 0x15;
+    image[2..6].copy_from_slice(&disp32.to_le_bytes());
+    // mov rax, [0]  -- the genuine fault, after the call has been recorded.
+    let fault_off = 6usize;
+    image[fault_off..fault_off + 8]
+        .copy_from_slice(&[0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]);
+    image[fault_off + 8] = 0xC3; // ret (never reached)
+    image[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&HLE_TRAMPOLINE_BASE.to_le_bytes());
+
+    let linked = LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![HleTrampoline {
+            library: "libtest".to_owned(),
+            function: "sceTestSentinel".to_owned(),
+            addr: HLE_TRAMPOLINE_BASE,
+        }],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    };
+    let hle = HleRegistry::new();
+    hle.register("libtest", "sceTestSentinel", sentinel);
+
+    let kernel = OrbisKernel::new();
+    let err = execute_linked(&linked, &hle, &kernel, 0, &[])
+        .expect_err("the dereference of address 0 must be reported as a fault");
+    assert_eq!(
+        err,
+        RuntimeError::Faulted {
+            addr: GUEST_ARENA_BASE + fault_off as u64,
+            access: 0,
+            kind: raeen_runtime::FaultKind::Read,
+        }
+    );
+
+    let published: Vec<String> = kernel
+        .recent_hle_calls
+        .iter()
+        .flat_map(|entry| entry.value().lock().iter().cloned().collect::<Vec<_>>())
+        .collect();
+    assert!(
+        !published.is_empty(),
+        "the fault must publish its call ring to kernel.recent_hle_calls — an empty \
+         ring here is exactly the blank 'Recent HLE calls' section users were asked \
+         to paste into bug reports"
+    );
+    assert!(
+        published
+            .iter()
+            .any(|call| call.contains("libtest::sceTestSentinel")),
+        "the published ring must name the call the guest actually made, got {published:?}"
+    );
+    assert!(
+        published.iter().any(|call| call.contains("0xc0de")),
+        "the published ring must keep each call's return value — a `-> 0x0` before a \
+         null dereference is the whole lead; got {published:?}"
+    );
+}

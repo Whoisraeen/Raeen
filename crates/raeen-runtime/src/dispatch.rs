@@ -554,6 +554,15 @@ impl Drop for GuestGilYield {
 /// allocates, and only after the guest has already stopped.
 const CALL_TRACE_LEN: usize = 4096;
 
+/// How many of the most recent calls a fault publishes to
+/// `OrbisKernel::recent_hle_calls` for the crash report.
+///
+/// The report is a markdown file a user pastes into a GitHub issue, so this is
+/// a readability budget, not a diagnostic one — the full 4096-entry ring still
+/// goes to the log at DEBUG. Matches the cap the `RAEEN_TRACE_EINVAL`
+/// diagnostic writer uses for the same deque.
+const CRASH_REPORT_RING_LEN: usize = 24;
+
 /// A bounded ring of the most recent HLE calls, for explaining a fault.
 ///
 /// # Why this exists
@@ -2150,6 +2159,46 @@ fn log_call_trace(ctx: &ActiveContext, trampolines: &[HleTrampoline], err: &Runt
     if entries.is_empty() {
         tracing::error!("{err} — no HLE calls were serviced before it");
         return;
+    }
+
+    // ---- Publish the ring for the crash report. ----
+    //
+    // This `CallTrace` lives in the faulting thread's `ActiveContext` and dies
+    // with the run, so the crash report — assembled afterwards in `raeen-gui`
+    // from `kernel.recent_hle_calls` — used to find nothing. That DashMap was
+    // only ever written by the `RAEEN_TRACE_EINVAL` diagnostic, so on a normal
+    // run the report's "Recent HLE calls" section rendered `<none recorded>`
+    // for a fault whose own log line said "35 HLE call(s) recorded"
+    // (measured: Dead Cells PPSA15552, 2026-07-29). That section is the one
+    // `.github/ISSUE_TEMPLATE/game-report.yml` asks users to paste, so shipping
+    // it blank threw away the most useful thing a report can carry.
+    //
+    // Written oldest-first (the deque convention the diagnostic writer uses and
+    // the report's renderer reverses), and the return value is kept: a `-> 0x0`
+    // a few calls before a null dereference is the usual cause, and it is the
+    // same lead the distillation below promotes.
+    {
+        // SAFETY: `ctx.kernel` is the live kernel installed by `run` for this
+        // call; this runs on the normal path after the guest has stopped, on
+        // the same thread, before the context slot is cleared.
+        let kernel = unsafe { &*ctx.kernel };
+        let start = entries.len().saturating_sub(CRASH_REPORT_RING_LEN);
+        let published: Vec<String> = entries[start..]
+            .iter()
+            .map(|&(idx, ret, _args)| match trampolines.get(idx as usize) {
+                Some(t) => format!("{}::{} -> {ret:#x}", t.library, t.function),
+                None => format!("<trampoline #{idx}> -> {ret:#x}"),
+            })
+            .collect();
+        let ring = kernel
+            .recent_hle_calls
+            .entry(ctx.current_thread())
+            .or_default();
+        let mut queue = ring.lock();
+        // Replace rather than append: this ring is authoritative (always-on and
+        // 4096 deep) where the diagnostic writer's is opt-in and 24 deep.
+        queue.clear();
+        queue.extend(published);
     }
 
     // ---- Distilled crash report: emitted FIRST and PROMINENTLY. ----

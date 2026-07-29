@@ -121,33 +121,7 @@ fn write_runner_crash_report(
         other => (format!("Runtime error: {other:?}"), None),
     };
 
-    // Most-recent-first call ring per guest thread, labeled by thread name.
-    let mut recent_hle: Vec<(String, Vec<String>)> = kernel
-        .recent_hle_calls
-        .iter()
-        .map(|entry| {
-            let tid = *entry.key();
-            let name = kernel
-                .thread_names
-                .get(&tid)
-                .map_or_else(String::new, |n| n.clone());
-            let label = if name.is_empty() {
-                format!("t{tid}")
-            } else {
-                format!("t{tid} ({name})")
-            };
-            let calls: Vec<String> = entry
-                .value()
-                .lock()
-                .iter()
-                .rev()
-                .take(10)
-                .cloned()
-                .collect();
-            (label, calls)
-        })
-        .collect();
-    recent_hle.sort();
+    let recent_hle = crash_report::recent_hle_for_report(kernel);
 
     let gpu = raeen_gpu::AgcGpuSession::global();
     let shader = gpu.shader_stats();
@@ -1385,23 +1359,37 @@ fn main() -> anyhow::Result<()> {
             // retail impl faulting on the null. Title-agnostic and zero-overhead —
             // the common (non-null) free path runs the real function directly.
             const SCE_LIBC_MSPACE_FREE_NID: u64 = 0x5656_bf67_e797_971a;
-            if let Some(target) = linked
+            let owner = linked
                 .unwind_modules
                 .iter()
-                .find(|m| m.name.contains("libc"))
-                .and_then(|m| {
+                .position(|m| m.name.contains("libc"))
+                .and_then(|index| {
+                    let m = &linked.unwind_modules[index];
                     m.exports
                         .iter()
                         .find(|e| e.nid == SCE_LIBC_MSPACE_FREE_NID)
-                        .map(|e| m.image_offset + e.value)
-                })
-            {
-                raeen_runtime::native_trap::install_null_free_guard(
+                        .map(|e| (index, m.image_offset + e.value))
+                });
+            if let Some((index, target)) = owner
+                && let Some(stub) = raeen_runtime::native_trap::install_null_free_guard(
                     &mut linked.image,
                     target,
-                    13,
                     "sceLibcMspaceFree",
-                );
+                )
+            {
+                // The stub lands past the end of the composed image, which is one
+                // byte past libc.prx when (as here) it is the last module placed.
+                // Fold it into libc's registered extent so a fault inside it is
+                // attributed to the module it guards instead of reporting as
+                // "rip is in NO loaded module".
+                let m = &mut linked.unwind_modules[index];
+                if raeen_runtime::native_trap::cover_guard_stub(m, stub) {
+                    info!(
+                        "null_free_guard: extended {} registered extent by {:#x} to cover its \
+                         guard stub",
+                        m.name, stub.len
+                    );
+                }
             }
         }
         // Diagnostic: RAEEN_TRAP_MODULE_EXPORTS=<substring> plants a one-shot

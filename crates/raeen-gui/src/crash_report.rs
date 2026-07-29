@@ -125,6 +125,48 @@ pub fn locate_fault(image: &[u8], deps: &[(String, u64)], base: u64, addr: u64) 
     })
 }
 
+/// How many calls per thread the report shows. The full ring goes to the log.
+const REPORT_CALLS_PER_THREAD: usize = 10;
+
+/// Collect [`CrashReport::recent_hle`] from the kernel: most-recent-first calls
+/// per guest thread, labeled by thread name, sorted for a stable report.
+///
+/// The ring itself is filled by the runtime's fault path
+/// (`dispatch::log_call_trace`), which publishes the always-on `CallTrace` here
+/// because that trace dies with the faulting thread's dispatch context. Before
+/// that wiring existed this map was only ever written by the opt-in
+/// `RAEEN_TRACE_EINVAL` diagnostic, so every shipped report rendered
+/// `<none recorded>` — see `report_names_the_calls_the_ring_recorded`.
+pub fn recent_hle_for_report(kernel: &raeen_kernel::OrbisKernel) -> Vec<(String, Vec<String>)> {
+    let mut recent: Vec<(String, Vec<String>)> = kernel
+        .recent_hle_calls
+        .iter()
+        .map(|entry| {
+            let tid = *entry.key();
+            let name = kernel
+                .thread_names
+                .get(&tid)
+                .map_or_else(String::new, |n| n.clone());
+            let label = if name.is_empty() {
+                format!("t{tid}")
+            } else {
+                format!("t{tid} ({name})")
+            };
+            let calls: Vec<String> = entry
+                .value()
+                .lock()
+                .iter()
+                .rev()
+                .take(REPORT_CALLS_PER_THREAD)
+                .cloned()
+                .collect();
+            (label, calls)
+        })
+        .collect();
+    recent.sort();
+    recent
+}
+
 /// Everything one crash report says. Fields are plain data so the renderer
 /// stays a pure function; collection happens at the two wiring sites.
 #[derive(Debug, Clone, Default)]
@@ -631,6 +673,53 @@ mod tests {
         assert_eq!(
             parse_fault_line(&text).as_deref(),
             Some("Guest fault at 0x200a103c6 (read of 0x30000000010)")
+        );
+    }
+
+    /// A report built from a fault whose call ring is non-empty must actually
+    /// contain those calls.
+    ///
+    /// The regression: `logs/crashes/PPSA15552_20260729-002158Z.report.md`
+    /// rendered `<none recorded>` under "Recent HLE calls" for a fault whose own
+    /// log line read "35 HLE call(s) recorded before the fault". The renderer was
+    /// fine — nothing filled `OrbisKernel::recent_hle_calls`, because the
+    /// always-on trace lived in the faulting thread's dispatch context. The
+    /// runtime now publishes it there (see the raeen-runtime acceptance
+    /// `a_fault_publishes_its_hle_call_ring_for_the_crash_report`); this covers
+    /// the second half — that a populated ring survives the trip into the file
+    /// the issue template asks users to paste.
+    #[test]
+    fn report_names_the_calls_the_ring_recorded() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        kernel.thread_names.insert(7, "MainThread".to_string());
+        {
+            let ring = kernel.recent_hle_calls.entry(7).or_default();
+            let mut queue = ring.lock();
+            // Oldest first, exactly as the runtime publishes it.
+            queue.push_back("libc::sceLibcMspaceCreate -> 0x0".to_string());
+            queue.push_back("libkernel::scePthreadMutexLock -> 0x0".to_string());
+        }
+
+        let recent = recent_hle_for_report(&kernel);
+        let text = CrashReport {
+            title_id: "PPSA15552".to_string(),
+            fault: "Guest fault at 0x100002a95b97 (read of 0x0)".to_string(),
+            recent_hle: recent,
+            ..CrashReport::default()
+        }
+        .render(0);
+
+        assert!(
+            !text.contains("<none recorded>"),
+            "a fault with a recorded call ring must not render the empty section:\n{text}"
+        );
+        // Most recent first, joined by `<-`, under the thread's real name.
+        assert!(
+            text.contains(
+                "- t7 (MainThread): libkernel::scePthreadMutexLock -> 0x0 <- \
+                 libc::sceLibcMspaceCreate -> 0x0"
+            ),
+            "the report must name the calls, newest first, with their returns:\n{text}"
         );
     }
 
