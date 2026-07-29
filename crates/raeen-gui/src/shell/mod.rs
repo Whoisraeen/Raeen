@@ -107,6 +107,14 @@ const MAX_RECENT_TITLES: usize = 6;
 /// Reports Folder" row.
 const MAX_CRASH_REPORT_ROWS: usize = 8;
 
+/// How many session report pairs to keep on disk.
+///
+/// Comfortably more than the eight rows shown, because the extra ones are what
+/// a compatibility sweep across a library leaves behind — and comparing this
+/// run against the last few is how most of this project's diagnoses have
+/// actually been made.
+const KEPT_CRASH_REPORTS: usize = 40;
+
 /// How often a running session re-reads its local trophy store to toast new
 /// unlocks. File-mtime cheap, but no reason to touch disk every frame.
 const TROPHY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2129,8 +2137,17 @@ fn crash_report_row_infos(
 /// [`MAX_CRASH_REPORT_ROWS`] for the Settings ▸ System rows. A missing
 /// directory (no crash yet) is an empty list.
 fn list_recent_crash_reports() -> Vec<crate::crash_report::ReportListing> {
-    let mut reports =
-        crate::crash_report::list_reports(std::path::Path::new(crate::crash_report::REPORTS_DIR));
+    let dir = std::path::Path::new(crate::crash_report::REPORTS_DIR);
+    // Bound the directory here rather than in the runner. Every session now
+    // writes a report pair, not only the ones that fault, so an unbounded
+    // directory would grow one pair per launch forever. Pruning when the user
+    // opens the list keeps the newest history and costs one scan of a directory
+    // they are about to read anyway.
+    let pruned = crate::crash_report::prune_reports(dir, KEPT_CRASH_REPORTS);
+    if pruned > 0 {
+        tracing::debug!(pruned, "pruned old session reports");
+    }
+    let mut reports = crate::crash_report::list_reports(dir);
     reports.truncate(MAX_CRASH_REPORT_ROWS);
     reports
 }

@@ -274,11 +274,6 @@ impl SessionReportWriter {
         writer
     }
 
-    /// The markdown report's path, for logging and for the parent's finalize.
-    pub fn report_path(&self) -> &Path {
-        &self.md_path
-    }
-
     /// Supply the dependency offsets, once `load_process` has succeeded.
     pub fn attach_dependencies(&self, dep_offsets: Vec<(String, u64)>) {
         lock(&self.inputs).dep_offsets = dep_offsets;

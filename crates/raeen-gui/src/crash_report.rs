@@ -865,6 +865,12 @@ pub fn display_stamp(stamp: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportListing {
     pub path: PathBuf,
+    /// The session outcome and whether the report is still provisional.
+    /// `None` when the file predates the outcome line or its word is not in
+    /// the vocabulary — a reader that cannot parse it says so.
+    pub outcome: Option<(crate::compat::Stage, bool)>,
+    /// The first-blocker one-liner, when one was recorded.
+    pub first_blocker: Option<String>,
     /// Title id parsed from the file name.
     pub title_id: String,
     /// Short UTC display parsed from the file name.
@@ -936,13 +942,16 @@ pub fn list_reports(dir: &Path) -> Vec<ReportListing> {
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
             // Bounded read: the one-liner lives in the header.
-            let fault = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| parse_fault_line(&text))
+            let text = std::fs::read_to_string(&path).ok();
+            let fault = text
+                .as_deref()
+                .and_then(parse_fault_line)
                 .unwrap_or_else(|| "<unreadable report>".to_string());
             Some((
                 modified,
                 ReportListing {
+                    outcome: text.as_deref().and_then(parse_outcome_line),
+                    first_blocker: text.as_deref().and_then(parse_first_blocker_line),
                     path,
                     title_id,
                     when,

@@ -491,6 +491,14 @@ fn run_isolated_child(
                     windows_sys::Win32::Foundation::CloseHandle(job as *mut core::ffi::c_void);
                 }
             }
+            // Whatever the child left behind is a *provisional* heartbeat
+            // report: it was written while the guest was still alive and says
+            // `launching`/`rendering` with no verdict. The parent is the only
+            // party that knows how the session actually ended — a killed or
+            // hard-crashed child never runs its own final write — so promote it
+            // here. Without this the largest failure class leaves a file whose
+            // outcome line is permanently wrong.
+            finalize_child_report(session_started, &status);
             return if status.success() {
                 SessionOutcome::RunnerExited {
                     code: status.code().unwrap_or(0),
@@ -516,6 +524,70 @@ fn run_isolated_child(
             };
         }
         std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+/// Promote the runner child's provisional report to a final one.
+///
+/// The child heartbeats a report while it runs but can only finalize it if it
+/// ends on its own terms. A `child.kill()` (the stall path) and a hard crash
+/// both skip that, leaving a file that says `launching (provisional …)` forever.
+/// Only the parent knows which happened, so it writes the verdict.
+///
+/// Best-effort throughout: a report we cannot finalize is still a report, and
+/// failing to rewrite it must never affect the session's own outcome.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn finalize_child_report(
+    session_started: std::time::SystemTime,
+    status: &std::process::ExitStatus,
+) {
+    use crate::compat::Stage;
+
+    let dir = std::path::Path::new(crate::crash_report::REPORTS_DIR);
+    let Some(report) = crate::crash_report::newest_report_since(dir, session_started) else {
+        return;
+    };
+    // Already final: the child ended on its own terms and wrote its verdict.
+    // Overwriting it here would replace a report assembled inside the guest
+    // process — with its call rings and fault site — with one assembled by a
+    // process that saw none of that.
+    let text = std::fs::read_to_string(&report).unwrap_or_default();
+    if !matches!(
+        crate::crash_report::parse_outcome_line(&text),
+        Some((_, true))
+    ) {
+        return;
+    }
+
+    let (outcome, verdict) = if status.success() {
+        (
+            Stage::Exited,
+            "The guest process exited successfully, but ended before it could write its own \
+             final report — so everything above is its last heartbeat rather than its final \
+             moment."
+                .to_string(),
+        )
+    } else {
+        (
+            Stage::Crashed,
+            format!(
+                "The guest process ended with {status} without writing a final report, which \
+                 means it died faster than its own reporting path could run (a hard fault, an \
+                 abort, or an external kill). Everything above is its last heartbeat."
+            ),
+        )
+    };
+    let dump = crate::crash_report::newest_dump_since(dir, session_started);
+    if let Err(error) =
+        crate::crash_report::finalize_report(&report, outcome, &verdict, None, dump.as_deref())
+    {
+        tracing::warn!(%error, report = %report.display(), "session report could not be finalized");
+    } else {
+        tracing::info!(
+            report = %report.display(),
+            outcome = %outcome.slug(),
+            "session report finalized by the Shell"
+        );
     }
 }
 

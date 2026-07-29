@@ -175,6 +175,49 @@ fn write_runner_crash_report(
     }
 }
 
+/// Snapshot the guest runner's diagnostics for the Shell's F10 Status tab.
+///
+/// The Shell cannot compute any of this: it is a different process, and its
+/// console ring only ever sees its own tracing events. Everything here is a
+/// relaxed read of counters this process already maintains — 14 loads for the
+/// frame path, one mutex acquisition for the blocker table — so publishing once
+/// a second is free next to a frame.
+fn guest_session_status() -> raeen_gpu::frame_ipc::SessionStatus {
+    let snapshot = raeen_core::frame_path::snapshot();
+    let totals = raeen_core::blockers::totals();
+    // The frame-path summary, then the ranked blockers, bounded to the
+    // channel's budget. `blockers::digest` announces its own truncation, so a
+    // full pane never reads as a complete picture when it is not.
+    let digest = format!(
+        "{}\n{}",
+        raeen_core::frame_path::summary(),
+        raeen_core::blockers::digest(16, 3_400)
+    );
+    raeen_gpu::frame_ipc::SessionStatus {
+        // The seqlock owns publication numbering; this field is ignored by the
+        // writer and only ever read back.
+        seq: 0,
+        stage: snapshot.stage.map(|s| {
+            raeen_core::frame_path::Stage::ALL
+                .iter()
+                .position(|c| *c == s)
+                .unwrap_or(0) as u8
+        }),
+        phase: snapshot.phase.map(|p| {
+            raeen_core::frame_path::Phase::ALL
+                .iter()
+                .position(|c| *c == p)
+                .unwrap_or(0) as u8
+        }),
+        distinct_blockers: totals.distinct as u64,
+        total_events: totals.total_events,
+        dropped_distinct: totals.dropped_distinct,
+        cpu_ms: crash_report::process_cpu_ms().unwrap_or(0),
+        wall_ms: raeen_core::frame_path::since_origin_ms().unwrap_or(0),
+        digest,
+    }
+}
+
 /// Reattach the parent process's console so CLI invocations (`--run-eboot`,
 /// `--firmware-info`, dev `cargo run`) still print to the terminal they were
 /// launched from despite the GUI subsystem. Launched from Explorer there is
@@ -1180,6 +1223,13 @@ fn main() -> anyhow::Result<()> {
                     // child's own native pads through the same router rules.
                     let mut last_rumble_motors: Option<(u8, u8)> = None;
                     let mut rumble_router = raeen_input::rumble::RumbleRouter::new();
+                    // Child → Shell diagnostics, once a second on this existing
+                    // thread. Without it the Shell's F10 console cannot see a
+                    // single guest event: its ring is a process-local tracing
+                    // layer and the guest runs over here, with inherited (not
+                    // piped) stdio. Reuses the already-mapped IPC page, so this
+                    // costs no thread, no handle and no mapping.
+                    let mut last_status_publish = std::time::Instant::now();
                     loop {
                         let scripted = input_script
                             .as_ref()
@@ -1256,6 +1306,15 @@ fn main() -> anyhow::Result<()> {
                                 pads.set_rumble(command.large, command.small);
                             }
                         }
+                        // One publish per second: the Shell renders it at its
+                        // own frame rate, and a stalled title's state does not
+                        // change faster than that.
+                        if let Some(input) = shared_input.as_ref()
+                            && last_status_publish.elapsed() >= std::time::Duration::from_secs(1)
+                        {
+                            last_status_publish = std::time::Instant::now();
+                            input.publish_status(&guest_session_status());
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(4));
                     }
                 })?;
@@ -1296,14 +1355,27 @@ fn main() -> anyhow::Result<()> {
         kernel.filesystem.set_temp_directory(&temp_dir);
         kernel.filesystem.set_download_directory(&download_dir);
         kernel.filesystem.set_savedata_directory(&savedata_dir);
-        let process = raeen_firmware::load_process(
+        // Loading is where a launch is most often *refused* rather than broken:
+        // an encrypted retail SELF with no user key, a parse failure, a missing
+        // dependency. Those propagate out of `main` as a bare `Error:` on
+        // stderr — invisible from the Shell, which is where a user is standing.
+        // Finalize the session report as `refused` first, so the refusal leaves
+        // an artifact instead of a message nobody sees.
+        let process = match raeen_firmware::load_process(
             &bytes,
             dir,
             &raeen_firmware::NoKeysProvider,
             &mut registry,
             &hle,
             raeen_runtime::GUEST_ARENA_BASE,
-        )?;
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                session.write_refused(&error);
+                return Err(error);
+            }
+        };
         for d in &process.dependencies {
             info!(
                 "  dep {} at +{:#x}: {} exports, {} unresolved",
