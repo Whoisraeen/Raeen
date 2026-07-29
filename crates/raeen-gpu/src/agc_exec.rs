@@ -2787,6 +2787,14 @@ impl AgcGpuSession {
     /// (`last_image`, `draw_count`, a render-target census) must drain first or
     /// it races the worker and reads the frame before the draws land.
     pub fn wait_idle(&self) {
+        // `sceAgcSuspendPoint` is one call to this function, and it measured
+        // 86 ms/frame on Dead Cells while every GPU cost we could see was
+        // tiny (13 us worker drain, 1.9 us/draw). Splitting the two phases is
+        // what tells us which half owns those milliseconds -- and the GAP
+        // between calls says whether the guest or we are the slow party.
+        let timing = crate::diagnostics::gpu_env().time_draw;
+        let t0 = std::time::Instant::now();
+
         let (lock, cvar) = &self.in_flight;
         {
             let mut n = lock.lock();
@@ -2794,10 +2802,62 @@ impl AgcGpuSession {
                 cvar.wait(&mut n);
             }
         }
+        let drain = t0.elapsed();
+
         // wait_idle is a flush consumer (stage C): anything reading a render
         // result afterwards (framebuffer census, draw pixels, shutdown) must
         // see the deferred batch's pixels, not GPU-side-only targets.
         self.consume_flush(None, true);
+
+        if timing {
+            Self::record_wait_idle_phases(drain, t0.elapsed());
+        }
+    }
+
+    /// Accumulate `wait_idle`'s two phases plus the guest-side gap between
+    /// calls, and report every 256 calls under `RAEEN_TIME_DRAW`.
+    ///
+    /// `gap` is wall time from the previous call's return to this one's entry:
+    /// with one `SuspendPoint` per frame it is exactly the time the guest spent
+    /// outside this function, so `drain + flush + gap` reconstructs the frame.
+    /// Whichever term dominates is the thing to fix.
+    fn record_wait_idle_phases(drain: std::time::Duration, total: std::time::Duration) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static DRAIN_US: AtomicU64 = AtomicU64::new(0);
+        static FLUSH_US: AtomicU64 = AtomicU64::new(0);
+        static GAP_US: AtomicU64 = AtomicU64::new(0);
+        static LAST_EXIT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+        let flush = total.saturating_sub(drain);
+        let gap = {
+            let mut last = LAST_EXIT.lock();
+            let gap = last.map(|t| t.elapsed().saturating_sub(total));
+            *last = Some(std::time::Instant::now());
+            gap.unwrap_or_default()
+        };
+
+        DRAIN_US.fetch_add(drain.as_micros() as u64, Ordering::Relaxed);
+        FLUSH_US.fetch_add(flush.as_micros() as u64, Ordering::Relaxed);
+        GAP_US.fetch_add(gap.as_micros() as u64, Ordering::Relaxed);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if !n.is_multiple_of(256) {
+            return;
+        }
+        let (d, f, g) = (
+            DRAIN_US.load(Ordering::Relaxed),
+            FLUSH_US.load(Ordering::Relaxed),
+            GAP_US.load(Ordering::Relaxed),
+        );
+        tracing::warn!(
+            calls = n,
+            mean_drain_us = d / n,
+            mean_flush_us = f / n,
+            mean_guest_gap_us = g / n,
+            mean_frame_us = (d + f + g) / n,
+            "TIME_DRAW: wait_idle (sceAgcSuspendPoint) phase split -- drain is waiting for the \
+             GPU worker, flush is readback, gap is the guest's own time between calls"
+        );
     }
 
     pub fn try_execute_dcb_cp(&self, words: &[u32], is_compute: bool) {
