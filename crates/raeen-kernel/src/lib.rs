@@ -1925,6 +1925,34 @@ impl OrbisKernel {
         self.has_pending_exceptions() && self.pending_exceptions.contains_key(&thread)
     }
 
+    /// The live guest thread stack registered for `thread`, as `[base, top)`.
+    ///
+    /// The authoritative answer to "where is this thread's stack?", and the only
+    /// one Raeen has: guest stacks are arena-owned, so they are in neither
+    /// [`Self::memory`]'s region table nor any address range that distinguishes
+    /// them from ordinary heap objects. `None` means the thread is unknown or
+    /// already reaped.
+    #[must_use]
+    pub fn guest_stack_of(&self, thread: u64) -> Option<(u64, u64)> {
+        let (base, top) = *self.guest_thread_stacks.get(&thread)?;
+        (base < top).then_some((base, top))
+    }
+
+    /// The live guest thread stack that contains `addr`, as `[base, top)`.
+    ///
+    /// Lets the address-keyed queries a title uses to discover stack extents
+    /// (`sceKernelIsStack`, `sceKernelVirtualQuery`) answer for an arena-owned
+    /// stack instead of reporting "not mapped". Linear in the number of live
+    /// guest threads, which is why only those two rare calls use it — never a
+    /// per-call hot path.
+    #[must_use]
+    pub fn guest_stack_containing(&self, addr: u64) -> Option<(u64, u64)> {
+        self.guest_thread_stacks.iter().find_map(|entry| {
+            let (base, top) = *entry.value();
+            (base < top && addr >= base && addr < top).then_some((base, top))
+        })
+    }
+
     /// Wake every thread parked in a **semaphore** wait — both the Orbis
     /// counting semaphores (`sceKernelWaitSema`) and the POSIX ones
     /// (`sem_wait`) — so each re-runs its per-slice checks now.

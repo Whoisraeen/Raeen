@@ -2535,7 +2535,10 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libkernel", "scePthreadAttrSetaffinity", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGetaffinity", hle_ok_stub);
-    registry.register("libkernel", "scePthreadAttrGet", hle_ok_stub);
+    // scePthreadAttrGet is registered by `pthread_attr` — it is FreeBSD's
+    // `pthread_attr_get_np` and must report the LIVE thread's real stack, which
+    // the old hle_ok_stub here did not: it returned success and wrote nothing,
+    // leaving a collector to compute its scan bounds from the default base of 0.
     registry.register("libkernel", "scePthreadAttrSetschedparam", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrGetschedparam", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrSetinheritsched", hle_ok_stub);
@@ -4444,7 +4447,31 @@ fn hle_virtual_query(ctx: &HleContext, args: &[u64]) -> u64 {
             .then(|| ctx.kernel.memory.region_at_or_after(address))
             .flatten()
     });
+    // A guest thread stack is arena-owned and therefore in no VMM region, so
+    // every query against one used to be EACCES — measured as the FIRST blocker
+    // of a Blasphemous II run (`sceKernelVirtualQuery 0x8002000d ×7`, before the
+    // title had created its second thread, i.e. queries against the main stack).
+    // A title probing where its own stack lives has to get an answer; the
+    // registered bounds are that answer. Reached only after the region table has
+    // already declined, so no query that used to succeed can change.
     let Some(region) = region else {
+        if let Some((base, top)) = ctx.kernel.guest_stack_containing(address) {
+            let mut payload = [0u8; INFO_SIZE];
+            payload[0..8].copy_from_slice(&base.to_le_bytes());
+            payload[8..16].copy_from_slice(&top.to_le_bytes());
+            let prot = raeen_core::types::MemoryProtection::READ
+                | raeen_core::types::MemoryProtection::WRITE;
+            payload[24..28].copy_from_slice(&prot.bits().to_le_bytes());
+            payload[32] = raeen_core::types::MappingKind::Stack.query_flag_bit() | 0x10;
+            payload[33..38].copy_from_slice(b"stack");
+            if !ctx.mem.write(info, &payload) {
+                return SCE_KERNEL_ERROR_EFAULT;
+            }
+            debug!(
+                "sceKernelVirtualQuery({address:#x}) -> guest thread stack [{base:#x}, {top:#x})"
+            );
+            return SCE_OK;
+        }
         return SCE_KERNEL_ERROR_EACCES;
     };
     let Some(end) = region.vaddr.checked_add(region.size) else {
@@ -4486,14 +4513,19 @@ fn hle_virtual_query(ctx: &HleContext, args: &[u64]) -> u64 {
 /// a region the kernel tracks as a thread STACK. Returns 1 with the region's
 /// bounds when it does; 0 otherwise.
 ///
-/// Raeen records no `MappingKind::Stack` regions today (guest stacks are
-/// arena-owned, outside the VMM's region table), so the honest answer for
-/// every current query is 0. The outputs are still ZEROED in that case rather
-/// than left untouched: the caller (libc's VM allocator probing whether a
-/// range is a pthread stack) consumes them unconditionally, and stale stack
-/// garbage there becomes an invalid fixed-range reservation — the failure
-/// SharpEmu's `KernelIsStack` (GPL-2.0) documents, whose always-zero answer
-/// this matches for non-stack ranges.
+/// Raeen records no `MappingKind::Stack` regions in the VMM (guest stacks are
+/// arena-owned, outside its region table), so the region table is consulted
+/// first and the **registered guest thread stacks** —
+/// [`raeen_kernel::OrbisKernel::guest_stack_containing`] — answer for every real
+/// stack. Reporting 0 for a live guest stack is not "honest but harmless": it is
+/// how a title that asks where a thread's stack is gets told the range does not
+/// exist, and a managed runtime's collector then scans from a base it invented.
+///
+/// A non-stack address still writes ZEROES rather than leaving the outputs
+/// untouched: the caller (libc's VM allocator probing whether a range is a
+/// pthread stack) consumes them unconditionally, and stale stack garbage there
+/// becomes an invalid fixed-range reservation — the failure SharpEmu's
+/// `KernelIsStack` (GPL-2.0) documents.
 fn hle_is_stack(ctx: &HleContext, args: &[u64]) -> u64 {
     let addr = args.first().copied().unwrap_or(0);
     let start_out = args.get(1).copied().unwrap_or(0);
@@ -4501,18 +4533,18 @@ fn hle_is_stack(ctx: &HleContext, args: &[u64]) -> u64 {
     debug!("sceKernelIsStack(addr={addr:#x}, startOut={start_out:#x}, endOut={end_out:#x})");
 
     let region = ctx.kernel.memory.region_containing(addr);
-    let stack = region.filter(|r| r.kind == raeen_core::types::MappingKind::Stack);
-    let (start, end) = match &stack {
-        Some(region) => (region.vaddr, region.vaddr.saturating_add(region.size)),
-        None => (0, 0),
-    };
+    let bounds = region
+        .filter(|r| r.kind == raeen_core::types::MappingKind::Stack)
+        .map(|r| (r.vaddr, r.vaddr.saturating_add(r.size)))
+        .or_else(|| ctx.kernel.guest_stack_containing(addr));
+    let (start, end) = bounds.unwrap_or((0, 0));
     if start_out != 0 && !ctx.mem.write(start_out, &start.to_le_bytes()) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     if end_out != 0 && !ctx.mem.write(end_out, &end.to_le_bytes()) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    u64::from(stack.is_some())
+    u64::from(bounds.is_some())
 }
 
 /// `sceKernelQueryMemoryProtection(addr, startOut, endOut, protOut)`: report
@@ -5864,6 +5896,63 @@ mod tests {
         assert_eq!(u64::from_le_bytes(anon[16..24].try_into().unwrap()), 0);
         assert_eq!(i32::from_le_bytes(anon[28..32].try_into().unwrap()), 0);
         assert_eq!(anon[32] & IS_DIRECT, 0, "anonymous is not direct");
+    }
+
+    /// A guest thread stack is arena-owned and in no VMM region, so both
+    /// address-keyed stack queries used to deny it existed: `sceKernelVirtualQuery`
+    /// returned `EACCES` (measured as the FIRST blocker of a Blasphemous II run —
+    /// `0x8002000d ×7`, before the title had a second thread) and
+    /// `sceKernelIsStack` returned 0 with zeroed bounds.
+    ///
+    /// A title asking where a thread's stack is must get the real bounds, at full
+    /// 64-bit width: a managed runtime's collector scans `[stack_ptr, top)` and a
+    /// denied query leaves it scanning a range it invented.
+    #[test]
+    fn the_stack_queries_report_a_registered_guest_thread_stack() {
+        const IS_STACK: u8 = 0x04;
+        const IS_COMMITTED: u8 = 0x10;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        // Full 64-bit bounds: the real arena base is above 2^32.
+        const BASE: u64 = 0x1000_8000_0000;
+        const TOP: u64 = 0x1000_A000_0000;
+        kernel.guest_thread_stacks.insert(1, (BASE, TOP));
+
+        // sceKernelVirtualQuery: the region table has nothing, so the registered
+        // stack answers instead of EACCES.
+        assert_eq!(
+            hle_virtual_query(&ctx, &[BASE + 0x1234, 0, 0x100, 72]),
+            SCE_OK
+        );
+        let mut info = [0u8; 72];
+        assert!(mem.read(0x100, &mut info));
+        assert_eq!(u64::from_le_bytes(info[0..8].try_into().unwrap()), BASE);
+        assert_eq!(u64::from_le_bytes(info[8..16].try_into().unwrap()), TOP);
+        assert_eq!(info[32] & IS_STACK, IS_STACK, "is_stack must be set");
+        assert_eq!(info[32] & IS_COMMITTED, IS_COMMITTED);
+        assert_eq!(&info[33..38], b"stack");
+        // An address in no mapping and no stack is still EACCES.
+        assert_eq!(
+            hle_virtual_query(&ctx, &[0x1000_7000_0000, 0, 0x100, 72]),
+            0x8002_000D
+        );
+
+        // sceKernelIsStack: 1 with the real bounds, and both out slots are 8 bytes.
+        assert!(mem.write(0x200, &[0xFFu8; 16]));
+        assert_eq!(hle_is_stack(&ctx, &[BASE + 0x10, 0x200, 0x208]), 1);
+        let mut start = [0u8; 8];
+        let mut end = [0u8; 8];
+        assert!(mem.read(0x200, &mut start));
+        assert!(mem.read(0x208, &mut end));
+        assert_eq!(u64::from_le_bytes(start), BASE);
+        assert_eq!(u64::from_le_bytes(end), TOP);
+        // One byte past the top is not in the stack, and reports zeroes.
+        assert_eq!(hle_is_stack(&ctx, &[TOP, 0x200, 0x208]), 0);
+        assert!(mem.read(0x200, &mut start));
+        assert_eq!(u64::from_le_bytes(start), 0);
     }
 
     /// `sceKernelAioInitializeParam` must not memset a caller frame.
