@@ -2492,6 +2492,12 @@ pub(crate) static DRAW_STAGE_RESOLVE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_RESOLVE_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Resolve misses where the memo already held the SAME VS/PS program and only
+/// the surrounding register state differed — see
+/// `ResolvedShaderMemo::misses_same_program`. Tracking `resolve_misses` means
+/// the memo key is wider than what the shader analysis reads.
+pub(crate) static DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_MISSES: std::sync::atomic::AtomicU64 =
@@ -2513,6 +2519,12 @@ pub(crate) static DRAW_STAGE_CS_TRANSLATE_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static DRAW_STAGE_CS_PREPARE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_CS_BACKEND_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Per-draw work the sink does BEFORE `draw_common` starts its timer, so it is
+/// invisible in the `drawcommon` split: the compute→graphics dependency flush
+/// and the guest index-buffer fetch. Without this the sum of the reported draw
+/// phases could never be reconciled against the worker's submit time.
+pub(crate) static DRAW_STAGE_PREDRAW_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 fn draw_stage_timing_enabled() -> bool {
@@ -2573,6 +2585,7 @@ fn draw_stage_tick() {
     let resolve = DRAW_STAGE_RESOLVE_NS.swap(0, Relaxed);
     let resolve_hits = DRAW_STAGE_RESOLVE_HITS.swap(0, Relaxed);
     let resolve_misses = DRAW_STAGE_RESOLVE_MISSES.swap(0, Relaxed);
+    let resolve_misses_same_program = DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM.swap(0, Relaxed);
     let parse_hits = DRAW_STAGE_PARSE_HITS.swap(0, Relaxed);
     let parse_misses = DRAW_STAGE_PARSE_MISSES.swap(0, Relaxed);
     let setup = DRAW_STAGE_SETUP_NS.swap(0, Relaxed);
@@ -2584,6 +2597,22 @@ fn draw_stage_tick() {
     let cs_translate = DRAW_STAGE_CS_TRANSLATE_NS.swap(0, Relaxed);
     let cs_prepare = DRAW_STAGE_CS_PREPARE_NS.swap(0, Relaxed);
     let cs_backend = DRAW_STAGE_CS_BACKEND_NS.swap(0, Relaxed);
+    let predraw = DRAW_STAGE_PREDRAW_NS.swap(0, Relaxed);
+    // EXHAUSTIVE split. `resolve/setup/census/bind/backend` are the timed
+    // top-level regions of `draw_common`; `other` is everything between them
+    // that carries no timer of its own (the own-target feedback scan and its
+    // conditional flush, the sampling-scope construction, the `index` binding,
+    // any enabled trace block). A large `other` means the next timer belongs in
+    // one of those gaps — never "the time is unaccounted for".
+    let phases = resolve
+        .saturating_add(setup)
+        .saturating_add(census)
+        .saturating_add(bind)
+        .saturating_add(backend);
+    let other = drawcommon.saturating_sub(phases);
+    // `build()` is a subset of `backend`; the remainder is the deferred
+    // record + batch commit (and the prior-pixel seed / MRT handling).
+    let record = backend.saturating_sub(build);
     let bpct = |x: u64| x.saturating_mul(100).checked_div(build).unwrap_or(0);
     let dpct = |x: u64| x.saturating_mul(100).checked_div(drawcommon).unwrap_or(0);
     let per_draw_us = |x: u64| x / 1000 / 512;
@@ -2605,13 +2634,18 @@ fn draw_stage_tick() {
         resolve_us = per_draw_us(resolve),
         resolve_hits,
         resolve_misses,
+        resolve_misses_same_program,
         parse_hits,
         parse_misses,
         setup_us = per_draw_us(setup),
         census_us = per_draw_us(census),
         bind_us = per_draw_us(bind),
         backend_us = per_draw_us(backend),
-        "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, and Vulkan backend (per draw)"
+        record_us = per_draw_us(record),
+        other_us = per_draw_us(other),
+        other_of_draw_pct = dpct(other),
+        predraw_us = per_draw_us(predraw),
+        "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, Vulkan backend (record = backend minus build), the untimed remainder, and the pre-draw_common index/compute work"
     );
     tracing::warn!(
         dispatches,

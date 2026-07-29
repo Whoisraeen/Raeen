@@ -420,11 +420,21 @@ pub struct DrawIndirectArgs {
 pub trait DrawSink {
     /// A PM4 packet that can write guest memory was consumed.
     ///
-    /// The command processor does not know which embedder-side decoded
-    /// resources alias that range, so sinks with submission-local guest-memory
-    /// caches must conservatively invalidate them. The default keeps simple
-    /// recording/test sinks source-compatible.
-    fn guest_memory_write_boundary(&mut self) {}
+    /// `writes` carries the EXACT `(base, len)` guest ranges the packet wrote,
+    /// coalesced. Sinks holding guest-memory-derived caches (decoded
+    /// descriptors, analyzed shaders, texture content hashes) should invalidate
+    /// only the entries those ranges can have changed.
+    ///
+    /// An EMPTY slice means the packet was write-capable but wrote nothing (a
+    /// non-memory destination selector, a null address, a refused range, or no
+    /// [`GuestMemory`] at all) — there is nothing to invalidate. The
+    /// notification still fires so a sink that wants the old blanket-clear
+    /// policy can keep it.
+    ///
+    /// The default keeps simple recording/test sinks source-compatible.
+    fn guest_memory_write_boundary(&mut self, writes: &[(u64, u64)]) {
+        let _ = writes;
+    }
 
     /// Kyty: `GraphicsRenderDrawIndexAuto` (GraphicsRender.cpp).
     fn draw_index_auto(
@@ -551,6 +561,15 @@ pub struct CommandProcessor {
     /// [`SideEffect`]. Drained by [`Self::take_side_effects`]; bounded by
     /// [`Self::MAX_SIDE_EFFECTS`].
     side_effects: Vec<SideEffect>,
+    /// Guest byte ranges the CURRENT packet actually wrote, as `(base, len)`.
+    ///
+    /// Drained into [`DrawSink::guest_memory_write_boundary`] after each
+    /// write-capable packet and cleared before the next one, so a sink can
+    /// invalidate exactly the guest-memory-derived caches the write can have
+    /// changed instead of throwing all of them away. Coalesced (see
+    /// [`Self::record_guest_write`]) so a `WRITE_DATA` increment loop reports
+    /// one span, and bounded by [`Self::MAX_PACKET_WRITE_RANGES`].
+    packet_guest_writes: Vec<(u64, u64)>,
     /// Overriding clock for `RELEASE_MEM` DATA_SEL 3/4 GPU-timestamp writes.
     /// `None` from the source (or no source at all) falls back to the legacy
     /// process-local counter ([`next_release_timestamp`]) — bit-identical
@@ -682,6 +701,68 @@ impl CommandProcessor {
     fn record_produced(&mut self, address: u64, value: u64) {
         if self.produced_labels.len() < Self::MAX_PRODUCED_LABELS {
             self.produced_labels.push((address, value));
+        }
+    }
+
+    /// Cap on distinct write spans reported for ONE packet. Past it the spans
+    /// collapse into a single covering range: still correct (a superset
+    /// over-invalidates), still bounded, and never a silent omission.
+    const MAX_PACKET_WRITE_RANGES: usize = 16;
+
+    /// Note that this packet wrote `len` bytes at `addr`.
+    ///
+    /// Called at every guest-memory write site in the walk, so
+    /// [`DrawSink::guest_memory_write_boundary`] receives the exact extent of
+    /// what changed. Spans that abut or overlap the previous one are merged —
+    /// `WRITE_DATA` writes dword by dword (incrementing, or repeatedly to the
+    /// same address), and reporting one span per dword would defeat the cap.
+    fn record_guest_write(&mut self, addr: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.packet_guest_writes.last_mut() {
+            let (base, span) = *last;
+            let end = base.saturating_add(span);
+            if addr >= base && addr <= end {
+                last.1 = end.max(addr.saturating_add(len)).saturating_sub(base);
+                return;
+            }
+        }
+        if self.packet_guest_writes.len() >= Self::MAX_PACKET_WRITE_RANGES {
+            let start = self
+                .packet_guest_writes
+                .iter()
+                .map(|&(base, _)| base)
+                .chain(std::iter::once(addr))
+                .min()
+                .unwrap_or(addr);
+            let end = self
+                .packet_guest_writes
+                .iter()
+                .map(|&(base, span)| base.saturating_add(span))
+                .chain(std::iter::once(addr.saturating_add(len)))
+                .max()
+                .unwrap_or_else(|| addr.saturating_add(len));
+            self.packet_guest_writes.clear();
+            self.packet_guest_writes
+                .push((start, end.saturating_sub(start)));
+            return;
+        }
+        self.packet_guest_writes.push((addr, len));
+    }
+
+    /// [`GuestMemory::write_bytes`] that records the written extent for the
+    /// packet's [`DrawSink::guest_memory_write_boundary`] report.
+    ///
+    /// Every guest write in the walk goes through here: a new write site that
+    /// bypassed it would leave a sink's guest-memory caches stale, so this is
+    /// the one chokepoint rather than seven bookkeeping calls.
+    fn guest_write(&mut self, mem: &dyn GuestMemory, addr: u64, bytes: &[u8]) -> bool {
+        if mem.write_bytes(addr, bytes) {
+            self.record_guest_write(addr, bytes.len() as u64);
+            true
+        } else {
+            false
         }
     }
 
@@ -911,6 +992,10 @@ impl CommandProcessor {
                 pm4::r_code(cmd_id),
                 pm4::R_WRITE_DATA | pm4::R_RELEASE_MEM | pm4::R_DMA_DATA
             ));
+        // Per-PACKET scope: the ranges this packet writes, never the previous
+        // one's. Cheap (a `clear` on an already-empty Vec) for the overwhelming
+        // majority of packets, which write nothing.
+        self.packet_guest_writes.clear();
         let result = match op {
             pm4::IT_NOP => self.cp_op_nop(cmd_id, body, offset, sink, mem),
             pm4::IT_SET_CONTEXT_REG => self.cp_op_set_context_reg(cmd_id, body, offset),
@@ -1036,11 +1121,14 @@ impl CommandProcessor {
                 Ok(pm4::body_dw(cmd_id))
             }
         };
-        if guest_memory_write_boundary && result.is_ok() {
-            // This is deliberately conservative: malformed/unwritable packets
-            // may clear a cache unnecessarily, but a real write must never
-            // leave stale decoded guest resources bound later in the stream.
-            sink.guest_memory_write_boundary();
+        // Notify on the write-capable opcodes (even when they wrote nothing, so
+        // a sink may keep a blanket-clear policy) AND on any packet that
+        // actually wrote guest memory, so a future write site can never bypass
+        // invalidation silently. `packet_guest_writes` names the exact extent:
+        // a completion label written next to a texture must not throw away the
+        // analysis of every shader in the frame.
+        if (guest_memory_write_boundary || !self.packet_guest_writes.is_empty()) && result.is_ok() {
+            sink.guest_memory_write_boundary(&self.packet_guest_writes);
         }
         result
     }
@@ -1351,7 +1439,7 @@ impl CommandProcessor {
             return Ok(body_len);
         };
         match mem.read_bytes(src, u64::from(byte_count)) {
-            Some(bytes) if mem.write_bytes(dst, &bytes) => {
+            Some(bytes) if self.guest_write(mem, dst, &bytes) => {
                 debug!(
                     src = format_args!("{src:#x}"),
                     dst = format_args!("{dst:#x}"),
@@ -1442,7 +1530,7 @@ impl CommandProcessor {
             for _ in 0..num_bytes / 4 {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
-            if mem.write_bytes(dst, &bytes) {
+            if self.guest_write(mem, dst, &bytes) {
                 debug!(
                     dst = format_args!("{dst:#x}"),
                     value = format_args!("{value:#x}"),
@@ -1465,7 +1553,7 @@ impl CommandProcessor {
             return Ok(body_len);
         }
         match mem.read_bytes(src, u64::from(num_bytes)) {
-            Some(bytes) if mem.write_bytes(dst, &bytes) => {
+            Some(bytes) if self.guest_write(mem, dst, &bytes) => {
                 debug!(
                     src = format_args!("{src:#x}"),
                     dst = format_args!("{dst:#x}"),
@@ -1563,7 +1651,7 @@ impl CommandProcessor {
             } else {
                 dst
             };
-            if mem.write_bytes(addr, &value.to_le_bytes()) {
+            if self.guest_write(mem, addr, &value.to_le_bytes()) {
                 self.record_produced(addr, u64::from(value));
             } else {
                 if self.first(SkipKey::Note("write_data_unwritable")) {
@@ -1645,14 +1733,14 @@ impl CommandProcessor {
         match data_sel {
             1 => {
                 let value = Self::body_at(body, 4, offset)?;
-                if mem.write_bytes(dst, &value.to_le_bytes()) {
+                if self.guest_write(mem, dst, &value.to_le_bytes()) {
                     self.record_produced(dst, u64::from(value));
                 }
             }
             2 => {
                 let value = u64::from(Self::body_at(body, 4, offset)?)
                     | (u64::from(Self::body_at(body, 5, offset)?) << 32);
-                if mem.write_bytes(dst, &value.to_le_bytes()) {
+                if self.guest_write(mem, dst, &value.to_le_bytes()) {
                     self.record_produced(dst, value);
                 }
             }
@@ -1670,7 +1758,7 @@ impl CommandProcessor {
                     .timestamp_source
                     .and_then(|source| source())
                     .unwrap_or_else(next_release_timestamp);
-                let _ = mem.write_bytes(dst, &ts.to_le_bytes());
+                let _ = self.guest_write(mem, dst, &ts.to_le_bytes());
             }
             _ => {
                 if self.first(SkipKey::Note("release_mem_data_sel")) {
@@ -3136,6 +3224,8 @@ mod tests {
         draws: Vec<(u32, u32, u32, bool, bool)>,
         dispatches: Vec<RecordedDispatch>,
         guest_memory_write_boundaries: u32,
+        /// Every `(base, len)` span reported across all boundaries, in order.
+        guest_writes: Vec<(u64, u64)>,
         fail: Option<String>,
     }
 
@@ -3143,8 +3233,9 @@ mod tests {
     type RecordedDispatch = ([u32; 3], u32, u64, [u32; 3], u8, u32);
 
     impl DrawSink for RecordingSink {
-        fn guest_memory_write_boundary(&mut self) {
+        fn guest_memory_write_boundary(&mut self, writes: &[(u64, u64)]) {
             self.guest_memory_write_boundaries += 1;
+            self.guest_writes.extend_from_slice(writes);
         }
 
         fn draw_index_auto(
@@ -4107,7 +4198,13 @@ mod tests {
         );
         assert_eq!(
             sink.guest_memory_write_boundaries, 3,
-            "every potentially writing packet conservatively invalidates sink caches"
+            "every potentially writing packet notifies the sink"
+        );
+        assert_eq!(
+            sink.guest_writes,
+            vec![(dst_a, 16), (dst_b, 16)],
+            "each copy reports its exact destination span; the skipped \
+             non-memory-selector packet reports none"
         );
     }
 
@@ -5295,6 +5392,95 @@ mod tests {
             .expect("producer must not fault");
         assert_eq!(mem.word(1), 0x5B, "standard WRITE_DATA wrote the label");
         assert_eq!(cp.take_produced_labels(), vec![(0x9004, 0x5B)]);
+    }
+
+    /// The write boundary carries the EXACT span each packet wrote.
+    ///
+    /// A sink's guest-memory caches (analyzed shaders, decoded descriptors,
+    /// texture content hashes) are invalidated from this. Reporting "a write
+    /// happened, somewhere" forced the embedder to throw all of them away on
+    /// every completion label a title interleaves with its draws — which is why
+    /// the resolved-shader memo never hit and every draw re-ran the full VS+PS
+    /// resource analysis.
+    #[test]
+    fn guest_write_boundary_reports_the_exact_written_span() {
+        // Three incrementing dwords at 0x9000 are ONE span, not three entries.
+        let mem = RwMem::new(0x9000, 8);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(7, pm4::IT_NOP, pm4::R_WRITE_DATA),
+            1, // dst_sel = memory, addr-increment enabled
+            0x9000,
+            0,
+            0xA,
+            0xB,
+            0xC,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(
+            sink.guest_writes,
+            vec![(0x9000, 12)],
+            "three consecutive dwords coalesce into one 12-byte span"
+        );
+
+        // A 32-bit RELEASE_MEM label is a 4-byte span at its own address.
+        let mut sink = RecordingSink::default();
+        let mut cp = CommandProcessor::new();
+        cp.run_with_memory(&release_mem_agc(0x9004, 7), &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(sink.guest_writes, vec![(0x9004, 4)]);
+    }
+
+    /// `ADDR_INCR` disabled makes every payload dword land on the SAME address
+    /// (hardware behaviour, last wins). That is one 4-byte span, not N.
+    #[test]
+    fn guest_write_boundary_coalesces_a_non_incrementing_write_data() {
+        let mem = RwMem::new(0x9000, 8);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(7, pm4::IT_NOP, pm4::R_WRITE_DATA),
+            1 | (1 << 16), // dst_sel = memory, addr-increment DISABLED
+            0x9000,
+            0,
+            0xA,
+            0xB,
+            0xC,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(0), 0xC, "last write wins at the fixed address");
+        assert_eq!(sink.guest_writes, vec![(0x9000, 4)]);
+    }
+
+    /// A write-capable packet that wrote NOTHING (non-memory destination
+    /// selector) still notifies — so a sink may keep a blanket-clear policy —
+    /// but reports no span, so a range-precise sink invalidates nothing.
+    #[test]
+    fn guest_write_boundary_reports_no_span_when_the_packet_wrote_nothing() {
+        let mem = RwMem::new(0x9000, 4);
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(5, pm4::IT_NOP, pm4::R_WRITE_DATA),
+            0, // dst_sel = 0: not a memory destination
+            0x9000,
+            0,
+            0x2A,
+        ];
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("producer must not fault");
+        assert_eq!(mem.word(0), 0, "nothing was written");
+        assert_eq!(
+            sink.guest_memory_write_boundaries, 1,
+            "the notification still fires"
+        );
+        assert!(
+            sink.guest_writes.is_empty(),
+            "no span means nothing to invalidate"
+        );
     }
 
     /// Both `RELEASE_MEM` forms write a 32-bit immediate completion label.

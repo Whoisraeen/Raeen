@@ -616,7 +616,16 @@ pub struct ShaderTranslateCache {
     analysis_failures: HashMap<CodeKey, AnalysisFailure>,
     analysis_failure_order: VecDeque<CodeKey>,
     parsed_code: ParsedCodeCache,
-    shader_map: ShaderMap,
+    /// Shader metadata relocated by `sceAgcCreateShader`, SHARED with every
+    /// in-flight analysis closure.
+    ///
+    /// `Arc` because [`Self::translate_vs`] / `_ps` / `_cs` each need an owned
+    /// handle (the closure outlives the `&mut self` borrow that `parsed_code`
+    /// takes), and `ShaderMap` is a `HashMap<u64, ShaderMappedData>` whose values
+    /// own a `Vec<ShaderSemantic>` — deep-cloning it handed out one heap
+    /// allocation per registered shader, twice per DRAW. Registration
+    /// ([`Self::map_shader_metadata`]) is rare and copies on write.
+    shader_map: Arc<ShaderMap>,
     dump_dir: Option<PathBuf>,
     persistent_dir: Option<PathBuf>,
     stats: ShaderCacheStats,
@@ -669,7 +678,7 @@ impl ShaderTranslateCache {
             analysis_failures: HashMap::new(),
             analysis_failure_order: VecDeque::new(),
             parsed_code: ParsedCodeCache::default(),
-            shader_map: ShaderMap::new(),
+            shader_map: Arc::new(ShaderMap::new()),
             dump_dir,
             persistent_dir,
             stats: ShaderCacheStats::default(),
@@ -685,10 +694,20 @@ impl ShaderTranslateCache {
         }
     }
 
+    /// Shared handle to the shader metadata map for one analysis closure.
+    ///
+    /// A refcount bump, not a deep copy of every registered shader's
+    /// input-semantics `Vec` — this runs twice per draw (VS + PS) and once per
+    /// compute dispatch. `shader_map_handle_is_shared_until_registration` pins
+    /// the shape.
+    fn shader_map_handle(&self) -> Arc<ShaderMap> {
+        Arc::clone(&self.shader_map)
+    }
+
     /// Register metadata relocated by `sceAgcCreateShader` for later
     /// next-generation resource analysis.
     pub fn map_shader_metadata(&mut self, addr: u64, data: ShaderMappedData) {
-        self.shader_map.map_user_data(addr, data);
+        Arc::make_mut(&mut self.shader_map).map_user_data(addr, data);
         // A create call can replace the analyzed ABI at this address. Remove
         // prior binding-aware modules eagerly. Mapped user data can also make a
         // shader at another address analyzable, so invalidate all provisional
@@ -754,7 +773,7 @@ impl ShaderTranslateCache {
         } else {
             vs.vs_regs.data_addr
         };
-        let shader_map = self.shader_map.clone();
+        let shader_map = self.shader_map_handle();
         let vs = *vs;
         let sh_regs = *sh_regs;
         self.translate(Stage::Vs, addr, move |mem, parsed_code| {
@@ -847,7 +866,7 @@ impl ShaderTranslateCache {
         vs_info: &ShaderVertexInputInfo,
     ) -> Result<TranslatedShader, Arc<str>> {
         let addr = ps.ps_regs.data_addr;
-        let shader_map = self.shader_map.clone();
+        let shader_map = self.shader_map_handle();
         let ps = *ps;
         let sh_regs = *sh_regs;
         let vs_info = *vs_info;
@@ -923,7 +942,7 @@ impl ShaderTranslateCache {
         sh_regs: &ShaderRegisters,
     ) -> Result<TranslatedShader, Arc<str>> {
         let addr = cs.cs_regs.data_addr;
-        let shader_map = self.shader_map.clone();
+        let shader_map = self.shader_map_handle();
         let cs = *cs;
         let sh_regs = *sh_regs;
         self.translate(Stage::Cs, addr, move |mem, parsed_code| {
@@ -1095,6 +1114,17 @@ impl ShaderTranslateCache {
         // Analyze on every bind before the positive-cache lookup. Descriptor
         // type/format and embedded metadata can change while code bytes stay
         // identical, and those fields shape generated SPIR-V.
+        //
+        // COST: this is the whole pass chain (parse + `get_input_info_*` + every
+        // capture pass), and it is why a draw that hits the SPIR-V cache still
+        // costs tens to hundreds of microseconds. `OffscreenDrawSink`'s
+        // `resolved_shaders` memo is what keeps it off the per-draw path;
+        // anything that empties that memo puts the whole chain back on every
+        // draw. shadPS4 avoids the question by caching the analyzed ABI WITH the
+        // module (`Program { Shader::Info info; ModuleList modules; }`,
+        // vk_pipeline_cache.h:40, up to 8 specialization permutations) rather
+        // than re-deriving it per bind — the model to move to if the memo ever
+        // stops being enough. Design reference only; nothing is ported here.
         let mut window = WindowMem {
             base: addr,
             data: head,
@@ -1509,6 +1539,48 @@ fn attempt_generations<T>(
 mod tests {
     use super::*;
     use kyty_graphics::hw_regs::PsStageRegisters;
+
+    /// Every bind takes a handle on the shader metadata map. That handle must be
+    /// SHARED, not a deep copy of every registered shader's input-semantics
+    /// `Vec` — `translate_vs` + `translate_ps` take one each, so a deep clone was
+    /// two full map copies per DRAW. Registration copies on write, so a handle
+    /// taken earlier keeps observing the map it was taken from.
+    #[test]
+    fn shader_map_handle_is_shared_until_registration() {
+        let mut cache = ShaderTranslateCache::with_dump_dir(None);
+        cache.map_shader_metadata(
+            0x1000,
+            ShaderMappedData {
+                user_data: None,
+                input_semantics: vec![Default::default(); 8],
+            },
+        );
+
+        let vs_handle = cache.shader_map_handle();
+        let ps_handle = cache.shader_map_handle();
+        assert!(
+            Arc::ptr_eq(&vs_handle, &ps_handle),
+            "both stages of one draw must share the metadata map"
+        );
+        assert!(vs_handle.find(0x1000).is_some());
+
+        // Copy-on-write: registering does not mutate a handle already out.
+        cache.map_shader_metadata(
+            0x2000,
+            ShaderMappedData {
+                user_data: None,
+                input_semantics: Vec::new(),
+            },
+        );
+        assert!(
+            vs_handle.find(0x2000).is_none(),
+            "an outstanding handle is a snapshot, not a live view"
+        );
+        assert!(
+            cache.shader_map_handle().find(0x2000).is_some(),
+            "the next bind sees the newly registered shader"
+        );
+    }
 
     #[test]
     fn draw_trace_bypasses_persistent_spirv_but_not_normal_configuration() {
