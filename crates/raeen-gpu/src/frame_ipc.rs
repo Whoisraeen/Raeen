@@ -447,8 +447,13 @@ mod platform {
                 return cache.clone();
             }
 
-            let mut pixels = Vec::new();
-            if pixels.try_reserve_exact(len).is_err() {
+            // Recycle the previous frame's buffer when one is retained: this
+            // runs on the Shell's UI thread once per published frame, and a
+            // fresh 8 MB mapping costs ~870 us of page faults alone (see
+            // [`crate::frame_pool`]). The copy below fills every byte, so the
+            // frame is identical either way.
+            let mut pixels = crate::frame_pool::take(len).unwrap_or_default();
+            if pixels.capacity() < len && pixels.try_reserve_exact(len).is_err() {
                 tracing::warn!(
                     bytes = len,
                     "Shell frame IPC allocation failed under host memory pressure; \
