@@ -184,7 +184,23 @@ SOFTWARE.
   capture-port pacing in `crates/raeen-hle/src/libsce_audio_in.rs`, and
   `libDialog.cpp:114-116` for the `sceMsgDialogProgressBar*` trio. Raeen's
   canonicalization function, the sandboxed path normalization, the port table,
-  and all tests are its own. No C++ is vendored or compiled into Raeen.
+  and all tests are its own. The **free-running host vblank source**
+  (`crates/raeen-hle/src/host_vblank.rs`, 2026-07-28) behaviorally
+  re-implements the structure of KytyPS5's guest-independent display tick:
+  `src/graphics/presentation/window/window.cpp:350-354` (`GameShowWindow`
+  calling `VideoOutBeginVblank()` → `VideoOutFlipWindow(0)` →
+  `VideoOutEndVblank()` once per displayed host frame),
+  `src/graphics/presentation/videoOut.cpp:649-686`
+  (`VideoOutContext::VblankBegin`/`VblankEnd` advancing the pre-vblank and
+  vblank counters and calling `TriggerVideoOutEventsLocked` for **every opened
+  handle**), and `videoOut.cpp:402` (`WaitForNextVblank` pacing against
+  `Config::GetVblankFrequency()`). Raeen's Rust module, the `&dyn
+  WaitSubsystem` equeue-wake seam that makes the tick reachable without an
+  `HleContext` (`kernel_equeue::wake_equeue_via`,
+  `libsce_video_out::trigger_vblank_events_via`), the single-owner rule that
+  stands the guest-driven advances down, the `Weak<OrbisKernel>` teardown, the
+  `RAEEN_HOST_VBLANK` gate, and all tests are its own; see
+  `docs/host-vblank-source.md`. No C++ is vendored or compiled into Raeen.
 
 ---
 

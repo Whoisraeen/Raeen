@@ -253,11 +253,17 @@ use this configuration for a performance measurement.
 
 ---
 
-## 5. Design: a host vblank source (not implemented)
+## 5. Design: a host vblank source
 
-Deliberately **not** implemented in this change. It is not a small fix, and
-shipping an unverified pacing change would risk Minecraft and ASTRO.BOT, which
-currently render.
+> **IMPLEMENTED 2026-07-28, default OFF** — `crates/raeen-hle/src/host_vblank.rs`,
+> gated behind `RAEEN_HOST_VBLANK`. What was built, the equeue-wake seam that
+> removed the blocker below, the single-owner rule, and the retail A/B that
+> decides whether it ships on by default: **`docs/host-vblank-source.md`**.
+> Still unmeasured against a title; §4's run and that A/B are what settle it.
+
+Deliberately **not** implemented in the change that wrote this document. It is
+not a small fix, and shipping an unverified pacing change would risk Minecraft
+and ASTRO.BOT, which currently render.
 
 Why it is not small: `HleContext` is a borrowed struct of `&dyn` trait objects
 with a lifetime (`crates/raeen-hle/src/lib.rs:653`), and both
@@ -282,8 +288,14 @@ Sketch, following KytyPS5's structure:
 4. Gate behind `RAEEN_HOST_VBLANK=1` for the first hardware A/B, then flip the
    default once Minecraft and ASTRO.BOT are re-measured unchanged.
 
+All four steps are done as described, with two documented deviations (the ticker
+starts at process bootstrap rather than on the first `sceVideoOutOpen`, because
+`hle_open` has only a borrowed kernel — and free-running from display init is
+KytyPS5's behavior anyway; and step 4's default stays off pending the A/B).
+
 Also worth doing independently, and cheap: implement the five missing VideoOut
-event exports from the §3 table.
+event exports from the §3 table. **Done** — all five are registered in
+`libsce_video_out.rs`, so the §3 table is stale in Raeen's favor.
 
 **Do not treat §3 as proven for this cluster** until step 3 of §4 shows a
 thread parked in `sceKernelWaitEqueue`. It is a real defect either way — a
