@@ -288,6 +288,14 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         if ctx.guest_threads.process_is_terminating() {
             return OK;
         }
+        // A queued Orbis exception interrupts this wait, then it RESUMES against
+        // the same predicate and deadline (see `crate::exception`). Deliberately
+        // *outside* `wait_until`: that call holds the kernel's notification lock
+        // for the whole park, and running a guest handler under it would deadlock
+        // any handler that sets an event flag.
+        if crate::exception::pending_at_wait_slice(ctx) {
+            crate::exception::deliver_at_wait_slice(ctx);
+        }
         let wait = match deadline {
             None => slice,
             Some(dl) => {
@@ -424,6 +432,79 @@ mod tests {
             hle_wait(&ctx, &[h, 0b1000, WAIT_AND, 0, 0x120]),
             SCE_KERNEL_ERROR_ETIMEDOUT
         );
+    }
+
+    /// A `GuestCallScheduler` standing in for a guest signal handler that sets
+    /// the event flag its target is waiting on — the shape of a runtime
+    /// acknowledging a suspend request. Also the reentrancy assertion: setting a
+    /// flag takes the kernel's event notification lock, the very lock
+    /// `wait_until` holds for the whole park, so this can only work because
+    /// delivery happens *outside* that call.
+    struct FlagSettingHandler<'k> {
+        kernel: &'k raeen_kernel::OrbisKernel,
+        calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        set: Option<(u64, u64)>,
+    }
+
+    impl crate::GuestCallScheduler for FlagSettingHandler<'_> {
+        fn request(&self, _request: crate::GuestCallRequest) -> bool {
+            false
+        }
+
+        fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, crate::GuestCallError> {
+            self.calls.lock().unwrap().push((entry, args[0]));
+            if let Some((handle, bits)) = self.set {
+                let mem = crate::TestMemory::new(0x100);
+                let alloc = crate::TestAllocator::new(0);
+                let ctx = test_ctx(self.kernel, &mem, &alloc);
+                assert_eq!(hle_set(&ctx, &[handle, bits]), OK);
+            }
+            Ok(0)
+        }
+    }
+
+    /// The chokepoint is wired into the event-flag wait too, and it fires
+    /// **before** the first host park: the handler sets the bits, so the very
+    /// first `wait_until` finds the predicate satisfied and returns `OK` without
+    /// sleeping. Without delivery this test would park for its 1 ms timeout and
+    /// report `ETIMEDOUT` — a different value, not a slower one, so the assertion
+    /// is on behaviour rather than timing.
+    #[test]
+    fn a_signal_queued_for_a_thread_parked_in_an_event_flag_wait_is_delivered() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        // Room for the delivery machinery's 0x500-byte guest ucontext.
+        let mem = crate::TestMemory::new(0x4000);
+        let alloc = crate::TestAllocator::new(0x1000);
+        let h = create(&test_ctx(&kernel, &mem, &alloc), 0, 0);
+
+        let handler = FlagSettingHandler {
+            kernel: &kernel,
+            calls: std::sync::Mutex::new(Vec::new()),
+            set: Some((h, 0b0001)),
+        };
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+        kernel.queue_pending_exception(
+            1,
+            raeen_kernel::PendingException {
+                signum: 30,
+                handler: 0x5150_0000,
+                raised_by: 99,
+            },
+        );
+        assert!(mem.write(0x120, &1_000u32.to_le_bytes()));
+
+        assert_eq!(
+            hle_wait(&ctx, &[h, 0b0001, WAIT_AND, 0, 0x120]),
+            OK,
+            "the handler set the bits from inside the wait, so the wait must be satisfied \
+             by its REAL predicate"
+        );
+        assert_eq!(
+            *handler.calls.lock().unwrap(),
+            vec![(0x5150_0000, 30)],
+            "the registered handler runs once with the Orbis signum"
+        );
+        assert!(!kernel.has_pending_exceptions(), "consumed");
     }
 
     /// The blocking-wait contract: a waiter must sleep until a producer sets

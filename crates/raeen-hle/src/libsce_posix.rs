@@ -157,6 +157,14 @@ fn posix_sleep(ctx: &HleContext, args: &[u64]) -> u64 {
         let slice = remaining.min(SLICE);
         ctx.services.sleep(slice);
         remaining = remaining.saturating_sub(slice);
+        // A sleeping thread is a legitimate signal target, and this loop is a
+        // slice boundary like any other blocking wait's — so it delivers too, and
+        // then keeps sleeping out the remaining time (see `crate::exception`).
+        // The handler's own runtime is not deducted from `remaining`: the guest
+        // asked to sleep for `seconds`, and a signal must not shorten that.
+        if crate::exception::pending_at_wait_slice(ctx) {
+            crate::exception::deliver_at_wait_slice(ctx);
+        }
     }
     0
 }

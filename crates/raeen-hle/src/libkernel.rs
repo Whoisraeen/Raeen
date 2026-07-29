@@ -3504,6 +3504,15 @@ fn sync_on_address_wait(ctx: &HleContext, args: &[u64], width: Option<SyncWidth>
             queue.cancel_waiter(&waiter);
             return SCE_OK;
         }
+        // A queued Orbis exception interrupts this park, and then it RESUMES:
+        // this waiter keeps its FIFO place, the watched word is untouched, and the
+        // wake/timeout race below still decides the outcome. No lock is held here
+        // (`wait_for_signal` released the waiter's own), so a handler is free to
+        // call back into the HLE — including `sceKernelSyncOnAddressWake`. See
+        // `crate::exception`.
+        if crate::exception::pending_at_wait_slice(ctx) {
+            crate::exception::deliver_at_wait_slice(ctx);
+        }
         if let Some(deadline) = deadline {
             if std::time::Instant::now() >= deadline {
                 // Wake and timeout can race; the queue lock decides. If we are
@@ -4806,6 +4815,19 @@ fn hle_raise_exception(ctx: &HleContext, args: &[u64]) -> u64 {
             signum, "sceKernelRaiseException superseded an undelivered raise"
         );
     }
+    // Wake the target out of any blocking wait it is parked in, so it reaches the
+    // delivery chokepoint now instead of at its next 10-100 ms slice. Strictly
+    // after the queue above: a wake that overtook it would find nothing.
+    //
+    // This is the half that turns "eventually" into "promptly", and without it a
+    // collector that suspends every cycle pays a full wait slice per thread per
+    // cycle. Nothing guest-visible changes — see `exception::wake_target_for_exception`.
+    let interrupted =
+        crate::exception::wake_target_for_exception(ctx.services, ctx.kernel, target_thread);
+    debug!(
+        target_thread = format_args!("{target_thread:#x}"),
+        signum, interrupted, "sceKernelRaiseException queued and woke the target"
+    );
     SCE_OK
 }
 
@@ -8461,6 +8483,63 @@ mod tests {
         assert_eq!(
             hle_install_exception_handler(&ctx, &[2, 0x1234]),
             SCE_KERNEL_ERROR_EINVAL
+        );
+    }
+
+    /// `sceKernelRaiseException` must **queue and then wake**. Without the wake a
+    /// target parked in `sceKernelWaitSema` waits out its 100 ms slice before it
+    /// notices, and a collector that suspends every cycle pays that per thread
+    /// per cycle.
+    ///
+    /// The wake itself lands in whichever host primitive the target is parked on,
+    /// which nothing outside can observe — so it is asserted as a monotonic
+    /// counter delta (`>` rather than `==`, since a parallel test may raise too).
+    /// The key/reason of the `WaitSubsystem` wake is pinned separately, with a
+    /// recording double, in `exception::tests`.
+    #[test]
+    fn raising_an_exception_queues_it_and_then_wakes_the_target() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_install_exception_handler(&ctx, &[30, 0x9000]), SCE_OK);
+
+        // A cond waiter for the target, to prove the interrupt path reaches it
+        // without pretending its condition was signalled.
+        let cond = std::sync::Arc::new(raeen_kernel::PthreadCond::default());
+        let waiter = cond.enqueue_waiter(7);
+        kernel.pthread_conds.insert(0x4000, cond);
+
+        let wakes_before = crate::exception::exception_wake_count();
+        assert_eq!(hle_raise_exception(&ctx, &[7, 30]), SCE_OK);
+
+        assert_eq!(
+            kernel.pending_exceptions.get(&7).map(|p| p.signum),
+            Some(30),
+            "the raise must queue against the TARGET thread"
+        );
+        assert!(
+            crate::exception::exception_wake_count() > wakes_before,
+            "the raise must WAKE the target, not leave it to notice at its next slice"
+        );
+        assert!(
+            !waiter.is_signaled(),
+            "the target's condition waiter must be interrupted, NOT signalled — signalling \
+             would make its pthread_cond_wait return OK with the guest's predicate false"
+        );
+        assert_eq!(
+            kernel.pthread_conds.get(&0x4000).unwrap().waiter_count(),
+            1,
+            "an interrupt is not a dequeue"
+        );
+
+        // No handler installed for signum 11: accepted, but nothing is queued, so
+        // the earlier signum-30 entry must still be the one waiting.
+        assert_eq!(hle_raise_exception(&ctx, &[7, 11]), SCE_OK);
+        assert_eq!(
+            kernel.pending_exceptions.get(&7).map(|p| p.signum),
+            Some(30),
+            "a raise with no installed handler must queue nothing"
         );
     }
 

@@ -213,6 +213,17 @@ fn acquire(ctx: &HleContext, sem: u64, deadline: Option<std::time::SystemTime>) 
             // Unblock a parked worker so process teardown can finish.
             return Acquire::Interrupted;
         }
+        // A queued Orbis exception interrupts this wait, and then it RESUMES —
+        // *not* `Acquire::Interrupted`/`EINTR`, which is reserved for teardown.
+        // The count guard is released across delivery: `sem_post` takes it, and a
+        // handler that acknowledges by posting is the normal case (see
+        // `crate::exception`).
+        if crate::exception::pending_at_wait_slice(ctx) {
+            drop(count);
+            crate::exception::deliver_at_wait_slice(ctx);
+            count = state.count.lock();
+            continue;
+        }
         if let Some(deadline) = deadline {
             let Ok(remaining) = deadline.duration_since(std::time::SystemTime::now()) else {
                 return Acquire::TimedOut;

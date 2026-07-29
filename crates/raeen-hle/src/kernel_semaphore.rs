@@ -11,6 +11,12 @@
 //! at boot. A NULL timeout waits forever (never synthesizes `ETIMEDOUT`); a
 //! finite one returns `ETIMEDOUT` only when the deadline genuinely passes. This
 //! mirrors the same conversion already done for event flags (`kernel_eventflag`).
+//!
+//! The wait is also **interruptible by a queued Orbis exception**: each slice it
+//! calls `exception::deliver_at_wait_slice` with the condvar guard released, runs
+//! the guest signal handler on this thread, and then resumes waiting for its real
+//! condition. See `crate::exception` for the model and the measured stall
+//! (Blasphemous II: fourteen threads parked here forever with a SIGUSR1 pending).
 
 use crate::{HleContext, HleRegistry};
 use tracing::debug;
@@ -161,6 +167,23 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         // making the wait truly block: an infinite block must still be escapable.
         if ctx.guest_threads.process_is_terminating() {
             return OK;
+        }
+        // A queued Orbis exception must interrupt this wait — POSIX semantics,
+        // and the measured Blasphemous II stall (see `crate::exception`). The
+        // guard is RELEASED across delivery and re-taken afterwards: the handler
+        // is guest code, and a handler that calls `sceKernelSignalSema` takes
+        // this very lock. Holding it here would trade a silent stall for a hard
+        // deadlock.
+        //
+        // Before `try_consume`, so a handler that posts the count is observed on
+        // this same iteration instead of after another park.
+        if crate::exception::pending_at_wait_slice(ctx) {
+            drop(guard);
+            crate::exception::deliver_at_wait_slice(ctx);
+            guard = lock.lock().unwrap();
+            // The wait RESUMES: fall through to re-check the real condition
+            // against the original deadline. The handler running is not itself a
+            // reason to return, and never an error (see `crate::exception`).
         }
         // Re-check under the condvar lock, serialised against Signal's notify.
         let attempt = try_consume(ctx, handle, need, SCE_KERNEL_ERROR_EBUSY);
@@ -335,6 +358,224 @@ mod tests {
         assert_eq!(hle_delete(&ctx, &[h as u64]), OK);
         assert_eq!(hle_delete(&ctx, &[h as u64]), SCE_KERNEL_ERROR_ESRCH);
         assert_eq!(hle_signal(&ctx, &[0xDEAD, 1]), SCE_KERNEL_ERROR_ESRCH);
+    }
+
+    /// A `GuestCallScheduler` standing in for a guest signal handler, so
+    /// "the handler ran on this thread from inside the wait" is a plain
+    /// assertion with no second thread and no sleeping.
+    struct SignalHandler<'k> {
+        kernel: &'k raeen_kernel::OrbisKernel,
+        /// `(handler entry, signum)` of every invocation, in order.
+        calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        /// A `(handle, count)` for the handler to post, modelling the collector
+        /// handler that acknowledges by signalling the semaphore its target is
+        /// waiting on. Also the reentrancy test: `hle_signal` takes the very lock
+        /// the wait parks under.
+        post: Option<(u32, i32)>,
+        /// Set when the handler found the semaphore notification lock **held** —
+        /// i.e. the wait did not release it across delivery, which would deadlock
+        /// any real handler that signals.
+        notify_lock_was_held: std::sync::atomic::AtomicBool,
+    }
+
+    impl<'k> SignalHandler<'k> {
+        fn new(kernel: &'k raeen_kernel::OrbisKernel, post: Option<(u32, i32)>) -> Self {
+            Self {
+                kernel,
+                calls: std::sync::Mutex::new(Vec::new()),
+                post,
+                notify_lock_was_held: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn calls(&self) -> Vec<(u64, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::GuestCallScheduler for SignalHandler<'_> {
+        fn request(&self, _request: crate::GuestCallRequest) -> bool {
+            false
+        }
+
+        fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, crate::GuestCallError> {
+            self.calls.lock().unwrap().push((entry, args[0]));
+            // `try_lock` rather than `lock`: if the wait still holds this lock a
+            // real handler would deadlock, and a deadlocked test hangs instead of
+            // failing. Turn it into a recorded fact.
+            let held = self.kernel.semaphore_signal.0.try_lock().is_err();
+            if held {
+                self.notify_lock_was_held
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some((handle, count)) = self.post {
+                let mem = crate::TestMemory::new(0x100);
+                let alloc = crate::TestAllocator::new(0);
+                let ctx = test_ctx(self.kernel, &mem, &alloc);
+                assert_eq!(
+                    hle_signal(&ctx, &[u64::from(handle), count as u64]),
+                    OK,
+                    "the handler's own signal must succeed"
+                );
+            }
+            Ok(0)
+        }
+    }
+
+    /// Room for the delivery machinery: a `ucontext_t` is 0x500 bytes and must be
+    /// allocated inside the test memory.
+    fn delivery_env() -> (
+        raeen_kernel::OrbisKernel,
+        crate::TestMemory,
+        crate::TestAllocator,
+    ) {
+        (
+            raeen_kernel::OrbisKernel::new(),
+            crate::TestMemory::new(0x4000),
+            crate::TestAllocator::new(0x1000),
+        )
+    }
+
+    fn queue_signal(kernel: &raeen_kernel::OrbisKernel, thread: u64, handler: u64) {
+        kernel.queue_pending_exception(
+            thread,
+            raeen_kernel::PendingException {
+                signum: 30,
+                handler,
+                raised_by: 99,
+            },
+        );
+    }
+
+    /// **The Blasphemous II stall, as a unit test.** A thread parked in
+    /// `sceKernelWaitSema` with a SIGUSR1 queued for it must run its handler
+    /// *from inside the wait*, and the wait must then be satisfied by its real
+    /// condition.
+    ///
+    /// The timeout is **zero**, which is what makes this deterministic rather
+    /// than timing-dependent: delivery happens before the deadline check on the
+    /// very first iteration, so if the check were placed after the park (or after
+    /// the deadline test) this returns `ETIMEDOUT` and the handler never runs.
+    #[test]
+    fn a_signal_queued_for_a_thread_parked_in_wait_sema_is_delivered_and_the_wait_resumes() {
+        let (kernel, mem, alloc) = delivery_env();
+        let h = create(&test_ctx(&kernel, &mem, &alloc), 0, 4);
+        // The handler acknowledges by posting the count its target waits on.
+        let handler = SignalHandler::new(&kernel, Some((h, 1)));
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+
+        queue_signal(&kernel, 1, 0xABCD_0000);
+        // Zero microseconds: an already-expired deadline. Nothing may park.
+        assert!(mem.write(0x200, &0u32.to_le_bytes()));
+
+        assert_eq!(
+            hle_wait(&ctx, &[u64::from(h), 1, 0x200]),
+            OK,
+            "the handler posted the count from inside the wait, so the wait must be \
+             satisfied by its REAL condition — not time out, and not return an error"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![(0xABCD_0000, 30)],
+            "the registered handler must run exactly once, with the Orbis signum"
+        );
+        assert!(
+            !handler
+                .notify_lock_was_held
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the wait must RELEASE its notification lock across delivery: a handler that \
+             calls sceKernelSignalSema takes that same lock, and holding it here trades a \
+             silent stall for a deadlock"
+        );
+        assert!(
+            !kernel.has_pending_exceptions(),
+            "a delivered exception must be consumed"
+        );
+        assert!(
+            crate::exception::wait_delivered_count() > 0,
+            "the delivery must be attributed to the in-wait chokepoint"
+        );
+    }
+
+    /// Resume, not return. A handler that does **not** satisfy the wait must
+    /// leave the wait governed by its own condition and deadline: here the
+    /// deadline has passed, so `ETIMEDOUT` — the same answer the wait would have
+    /// given with no signal at all. The handler must not turn the wait into a
+    /// success, and must not invent an `EINTR`-style error the guest cannot
+    /// classify.
+    #[test]
+    fn a_delivered_signal_does_not_change_what_the_wait_returns() {
+        let (kernel, mem, alloc) = delivery_env();
+        let h = create(&test_ctx(&kernel, &mem, &alloc), 0, 4);
+        let handler = SignalHandler::new(&kernel, None);
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+
+        queue_signal(&kernel, 1, 0xABCD_0000);
+        assert!(mem.write(0x200, &0u32.to_le_bytes()));
+
+        assert_eq!(
+            hle_wait(&ctx, &[u64::from(h), 1, 0x200]),
+            SCE_KERNEL_ERROR_ETIMEDOUT,
+            "an interrupted wait whose condition is still unsatisfied reports its real \
+             outcome, unchanged by the handler having run"
+        );
+        assert_eq!(handler.calls().len(), 1, "the handler still ran");
+        assert_eq!(
+            kernel.kernel_semaphores.get(&h).unwrap().count,
+            0,
+            "the count is untouched by delivery"
+        );
+    }
+
+    /// A signal queued for **another** thread must leave this wait
+    /// byte-identical to its prior behaviour: no handler call, and the exception
+    /// still waiting for its real target.
+    #[test]
+    fn another_threads_signal_does_not_touch_this_wait() {
+        let (kernel, mem, alloc) = delivery_env();
+        let h = create(&test_ctx(&kernel, &mem, &alloc), 0, 4);
+        // `post` names a handle that does not exist: if the handler ever runs on
+        // this thread its own `hle_signal` assertion fails loudly.
+        let handler = SignalHandler::new(&kernel, Some((0xDEAD, 1)));
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+
+        // Thread 4; `test_ctx`'s current thread is 1.
+        queue_signal(&kernel, 4, 0xABCD_0000);
+        assert!(mem.write(0x200, &0u32.to_le_bytes()));
+
+        assert_eq!(
+            hle_wait(&ctx, &[u64::from(h), 1, 0x200]),
+            SCE_KERNEL_ERROR_ETIMEDOUT
+        );
+        assert!(handler.calls().is_empty(), "no handler may run on thread 1");
+        assert!(
+            kernel.has_pending_exceptions(),
+            "thread 4's signal must still be waiting for thread 4"
+        );
+    }
+
+    /// With nothing pending the wait must not even reach for its notification
+    /// lock a second time — the fast path is one relaxed atomic load, and the
+    /// observable behaviour is exactly what it was before the interrupt existed.
+    #[test]
+    fn no_pending_exception_means_the_prior_wait_behaviour_exactly() {
+        let (kernel, mem, alloc) = delivery_env();
+        let h = create(&test_ctx(&kernel, &mem, &alloc), 0, 4);
+        // Same tripwire: a handler that runs here fails its own assertion.
+        let handler = SignalHandler::new(&kernel, Some((0xDEAD, 1)));
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+        assert!(mem.write(0x200, &0u32.to_le_bytes()));
+
+        assert!(!kernel.has_pending_exceptions());
+        assert_eq!(
+            hle_wait(&ctx, &[u64::from(h), 1, 0x200]),
+            SCE_KERNEL_ERROR_ETIMEDOUT
+        );
+        assert!(handler.calls().is_empty());
+        // And the satisfied fast path is likewise untouched.
+        assert_eq!(hle_signal(&ctx, &[u64::from(h), 2]), OK);
+        assert_eq!(hle_wait(&ctx, &[u64::from(h), 2, 0x200]), OK);
+        assert!(handler.calls().is_empty());
     }
 
     #[test]

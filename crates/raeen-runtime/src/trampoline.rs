@@ -215,14 +215,44 @@ pub(crate) fn resolve(fault_addr: u64, trampolines: &[HleTrampoline]) -> Option<
 /// capture put these functions at the top of the VEH path (tens of millions of
 /// calls), while every entry is an ordinary return-value/memory operation.
 ///
-/// Blocking synchronization and socket calls are safe here: the gateway has
-/// already switched to the per-thread host stack and `direct_hle_gateway`
-/// releases the diagnostic guest GIL around the handler.  Exit, fibers,
-/// `pthread_once`, module initializers, and fatal-exception handlers remain on
-/// VEH because they can replace the context or schedule a guest callback.
+/// Socket calls and the *non-blocking* synchronization leaves are safe here: the
+/// gateway has already switched to the per-thread host stack and
+/// `direct_hle_gateway` releases the diagnostic guest GIL around the handler.
+/// Exit, fibers, `pthread_once`, module initializers, and fatal-exception
+/// handlers remain on VEH because they can replace the context or schedule a
+/// guest callback.
+///
+/// # Why the *blocking* waits are not on this list
+///
+/// `sceKernelWaitSema` and the `pthread_cond` waits were here, and were removed
+/// when Orbis signal delivery learned to interrupt a blocking wait
+/// (`raeen_hle::exception`). Two reasons, one correctness and one cost:
+///
+/// * A wait that parks the thread now needs both things this gateway
+///   structurally cannot provide — `GuestCallScheduler::call_guest` (refused
+///   here: the generated bridge re-bases RSP to a fixed private host-stack top,
+///   so re-entering guest code would clobber the outer frame) and a captured
+///   machine context (`HleContext::caller_gprs` is `None` here, so a guest signal
+///   handler would receive a `ucontext_t` with a zeroed register file). Leaving
+///   them here makes delivery to a parked thread impossible by construction,
+///   which is the entire Blasphemous II stall (`docs/host-park-stall.md`).
+/// * The list exists to remove a per-call VEH round trip (single-digit
+///   microseconds) from leaves called tens of millions of times. A call whose own
+///   cost is a host park/unpark — or a multi-millisecond block — cannot be one of
+///   those; `docs/perf/mutex-spin.md` makes the same judgement in the other
+///   direction ("a cond wait is expected to be long").
+///
+/// The measured hot entries stay: `scePthreadMutexLock`/`Unlock` (138k calls in
+/// ~15 s on Minecraft's main thread alone), `sceKernelSignalSema`, the libc
+/// leaves, and the AGC emitters. `RAEEN_DIRECT_BLOCKING_WAITS=1` puts the waits
+/// back for a perf A/B — at the price of signal delivery to a parked thread.
 fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
     if std::env::var_os("RAEEN_DISABLE_DIRECT_HLE").is_some() {
         return false;
+    }
+    if std::env::var_os("RAEEN_DIRECT_BLOCKING_WAITS").is_some() && blocking_wait_import(trampoline)
+    {
+        return true;
     }
     matches!(
         trampoline.function.as_str(),
@@ -261,12 +291,8 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
             | "pthread_rwlock_tryrdlock"
             | "pthread_rwlock_trywrlock"
             | "pthread_rwlock_unlock"
-            | "scePthreadCondWait"
-            | "scePthreadCondTimedwait"
             | "scePthreadCondSignal"
             | "scePthreadCondBroadcast"
-            | "pthread_cond_wait"
-            | "pthread_cond_timedwait"
             | "pthread_cond_signal"
             | "pthread_cond_broadcast"
             // Clock/status polling and non-blocking network polling.
@@ -277,7 +303,7 @@ fn direct_dispatchable(trampoline: &HleTrampoline) -> bool {
             | "sceKernelGetProcessTimeCounterFrequency"
             | "recvfrom"
             // Semaphore/audio loops visible in the same title capture.
-            | "sceKernelWaitSema"
+            // `sceKernelWaitSema` is deliberately absent — see the doc comment.
             | "sceKernelSignalSema"
             | "sceAudioOut2ContextPush"
             | "sceAudioOut2ContextAdvance"
@@ -391,6 +417,25 @@ fn slow_bridge_code() -> Vec<u8> {
     code
 }
 
+/// The imports that park the calling guest thread until another thread changes
+/// something, and therefore must reach the VEH path where an Orbis signal can be
+/// delivered into the wait (`raeen_hle::exception`).
+///
+/// Named as a set rather than inlined so `RAEEN_DIRECT_BLOCKING_WAITS=1` and the
+/// regression test below reference the same list, and so adding a new blocking
+/// wait to `direct_dispatchable` is a visible contradiction rather than a silent
+/// loss of signal delivery.
+fn blocking_wait_import(trampoline: &HleTrampoline) -> bool {
+    matches!(
+        trampoline.function.as_str(),
+        "sceKernelWaitSema"
+            | "scePthreadCondWait"
+            | "scePthreadCondTimedwait"
+            | "pthread_cond_wait"
+            | "pthread_cond_timedwait"
+    )
+}
+
 fn direct_bridge_code() -> Vec<u8> {
     // GS:0x28 is the x64 TEB's application-owned ArbitraryUserPointer. `run`
     // installs DirectThreadState there for the duration of guest execution.
@@ -497,6 +542,49 @@ mod tests {
             assert!(
                 !direct_dispatchable(&trampoline(library, function)),
                 "{library}::{function}"
+            );
+        }
+    }
+
+    /// The imports that park a guest thread must dispatch through VEH, because
+    /// that is the only path with a machine context and the ability to re-enter
+    /// guest code — both of which Orbis signal delivery into a blocking wait
+    /// needs (`raeen_hle::exception`). Putting one back on the direct gateway
+    /// silently disables signal delivery for every thread parked in it, which is
+    /// the whole Blasphemous II stall.
+    #[test]
+    fn blocking_waits_stay_on_veh_so_signals_can_be_delivered_into_them() {
+        for (library, function) in [
+            ("libkernel", "sceKernelWaitSema"),
+            ("libkernel", "scePthreadCondWait"),
+            ("libkernel", "scePthreadCondTimedwait"),
+            ("libScePosix", "pthread_cond_wait"),
+            ("libScePosix", "pthread_cond_timedwait"),
+        ] {
+            let t = trampoline(library, function);
+            assert!(
+                blocking_wait_import(&t),
+                "{library}::{function} must be recognised as a blocking wait"
+            );
+            assert!(
+                !direct_dispatchable(&t),
+                "{library}::{function} must not use the direct leaf gateway"
+            );
+        }
+        // The non-blocking twins keep the gateway: they never park, so nothing
+        // can be parked in them when a signal arrives.
+        for (library, function) in [
+            ("libkernel", "sceKernelSignalSema"),
+            ("libkernel", "scePthreadCondSignal"),
+            ("libkernel", "scePthreadCondBroadcast"),
+            ("libkernel", "scePthreadMutexLock"),
+            ("libkernel", "scePthreadMutexUnlock"),
+        ] {
+            let t = trampoline(library, function);
+            assert!(!blocking_wait_import(&t), "{library}::{function}");
+            assert!(
+                direct_dispatchable(&t),
+                "{library}::{function} must keep the direct leaf gateway"
             );
         }
     }

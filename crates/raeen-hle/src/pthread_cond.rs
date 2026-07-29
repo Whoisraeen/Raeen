@@ -296,6 +296,22 @@ fn wait_core(ctx: &HleContext, args: &[u64], timeout: Option<std::time::Duration
             state.cancel_waiter(&waiter);
             break;
         }
+        // A queued Orbis exception interrupts this wait (POSIX semantics; see
+        // `crate::exception`). Three properties make this the correct point:
+        //
+        // * **No lock is held.** `wait_for_signal` released the waiter's own
+        //   lock on return and the FIFO lock is not held here, so a handler that
+        //   calls `pthread_cond_signal`/`sceKernelSignalSema` cannot deadlock.
+        // * **The guest mutex is already released** (`mutex_unlock_for_cond`
+        //   above), which is also how hardware delivers a signal to a thread
+        //   inside `pthread_cond_wait`.
+        // * **This waiter stays queued.** Delivery neither consumes nor
+        //   fabricates a wake, so it cannot steal a `signal_one` owed to another
+        //   thread, and `woken`/`timed_out` below are decided exclusively by the
+        //   real wake bit and the real deadline. The wait RESUMES.
+        if crate::exception::pending_at_wait_slice(ctx) {
+            crate::exception::deliver_at_wait_slice(ctx);
+        }
         // Forensic: a waiter that is never selected is waiting on a condition
         // nobody signals. Name the cond + waiter so it can be matched against
         // RAEEN_TRACE_COND's signal side.
@@ -634,6 +650,205 @@ mod tests {
         assert_eq!(
             hle_condattr_setclock(&ctx, &[0, crate::libkernel::CLOCK_MONOTONIC]),
             EINVAL
+        );
+    }
+
+    /// A `GuestCallScheduler` standing in for a guest signal handler, so an
+    /// interrupted `pthread_cond_wait` is testable with no second thread and no
+    /// sleeping. When `signal_cond` is set the handler signals that condition —
+    /// the acknowledge-and-release shape a stop-the-world collector uses, and the
+    /// reentrancy assertion: `pthread_cond_signal` takes the condition's own FIFO
+    /// lock, so a wait that held it across delivery would deadlock here.
+    struct CondSignalHandler<'k> {
+        kernel: &'k raeen_kernel::OrbisKernel,
+        calls: std::sync::Mutex<Vec<(u64, u64)>>,
+        signal_cond: Option<u64>,
+    }
+
+    impl<'k> CondSignalHandler<'k> {
+        fn new(kernel: &'k raeen_kernel::OrbisKernel, signal_cond: Option<u64>) -> Self {
+            Self {
+                kernel,
+                calls: std::sync::Mutex::new(Vec::new()),
+                signal_cond,
+            }
+        }
+
+        fn calls(&self) -> Vec<(u64, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::GuestCallScheduler for CondSignalHandler<'_> {
+        fn request(&self, _request: crate::GuestCallRequest) -> bool {
+            false
+        }
+
+        fn call_guest(&self, entry: u64, args: [u64; 6]) -> Result<u64, crate::GuestCallError> {
+            self.calls.lock().unwrap().push((entry, args[0]));
+            if let Some(cond) = self.signal_cond {
+                let mem = TestMemory::new(0x100);
+                let alloc = TestAllocator::new(0);
+                let ctx = test_ctx(self.kernel, &mem, &alloc);
+                assert_eq!(hle_cond_signal(&ctx, &[cond]), OK);
+            }
+            Ok(0)
+        }
+    }
+
+    /// Seed a normal guest mutex already locked by the calling test thread (1),
+    /// so `wait_core`'s release/reacquire bridge succeeds without pulling in the
+    /// whole `pthread_mutex_init` path.
+    fn locked_mutex(kernel: &raeen_kernel::OrbisKernel, addr: u64) {
+        let shared = raeen_kernel::PthreadMutex::shared(3);
+        {
+            let mut state = shared.state.lock();
+            state.owner = 1;
+            state.recursion = 1;
+        }
+        kernel.pthread_mutexes.insert(addr, shared);
+    }
+
+    fn queue_signal(kernel: &raeen_kernel::OrbisKernel, thread: u64, handler: u64) {
+        kernel.queue_pending_exception(
+            thread,
+            raeen_kernel::PendingException {
+                signum: 30,
+                handler,
+                raised_by: 99,
+            },
+        );
+    }
+
+    /// The main thread's half of the Blasphemous II stall: parked in
+    /// `pthread_cond_wait` with a SIGUSR1 queued for it. The handler must run
+    /// from inside the wait, and the wait's outcome must then be decided by its
+    /// real wake — here the handler's own `pthread_cond_signal`, so `OK`.
+    ///
+    /// The timeout is **zero**, which makes this deterministic: nothing parks, so
+    /// only a delivery at the top of the loop can produce the wake this asserts.
+    #[test]
+    fn a_signal_queued_for_a_thread_parked_in_cond_wait_is_delivered_and_the_wait_resumes() {
+        let (kernel, mem, alloc) = fixture();
+        let cond = 0x1000;
+        let mutex = 0x1800;
+        locked_mutex(&kernel, mutex);
+        assert_eq!(
+            hle_cond_init(&test_ctx(&kernel, &mem, &alloc), &[cond, 0]),
+            OK
+        );
+
+        let handler = CondSignalHandler::new(&kernel, Some(cond));
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+        queue_signal(&kernel, 1, 0xFEED_0000);
+
+        assert_eq!(
+            wait_core(&ctx, &[cond, mutex], Some(std::time::Duration::ZERO)),
+            OK,
+            "the handler signalled this condition from inside the wait, so the wait must \
+             report the real wake — not a timeout, and not an EINTR-shaped error"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![(0xFEED_0000, 30)],
+            "the registered handler must run exactly once with the Orbis signum"
+        );
+        assert!(!kernel.has_pending_exceptions(), "consumed");
+        // The mutex must be held again on return, exactly as an uninterrupted
+        // wait leaves it.
+        let entry = kernel.pthread_mutexes.get(&mutex).unwrap();
+        let state = entry.state.lock();
+        assert_eq!(state.owner, 1);
+        assert_eq!(state.recursion, 1);
+    }
+
+    /// Resume, not return: a handler that does not satisfy the condition leaves
+    /// the wait reporting its own real outcome. Same zero deadline as above, so
+    /// `ETIMEDOUT` — the answer an uninterrupted wait would have given.
+    #[test]
+    fn a_delivered_signal_does_not_change_what_a_cond_wait_returns() {
+        let (kernel, mem, alloc) = fixture();
+        let cond = 0x1000;
+        let mutex = 0x1800;
+        locked_mutex(&kernel, mutex);
+        assert_eq!(
+            hle_cond_init(&test_ctx(&kernel, &mem, &alloc), &[cond, 0]),
+            OK
+        );
+
+        let handler = CondSignalHandler::new(&kernel, None);
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+        queue_signal(&kernel, 1, 0xFEED_0000);
+
+        assert_eq!(
+            wait_core(&ctx, &[cond, mutex], Some(std::time::Duration::ZERO)),
+            ETIMEDOUT
+        );
+        assert_eq!(handler.calls().len(), 1, "the handler still ran");
+        let state = condition(&ctx, cond).expect("cond");
+        assert_eq!(
+            state.waiter_count(),
+            0,
+            "the interrupted waiter must still be dequeued by its own timeout — delivery \
+             must not leave a stale FIFO entry that swallows a later signal_one"
+        );
+    }
+
+    /// A signal for another thread must leave this wait exactly as it was.
+    #[test]
+    fn another_threads_signal_does_not_touch_a_cond_wait() {
+        let (kernel, mem, alloc) = fixture();
+        let cond = 0x1000;
+        let mutex = 0x1800;
+        locked_mutex(&kernel, mutex);
+        assert_eq!(
+            hle_cond_init(&test_ctx(&kernel, &mem, &alloc), &[cond, 0]),
+            OK
+        );
+
+        // Signalling a cond that does not exist would panic inside the handler,
+        // so this doubles as a tripwire for a delivery that must not happen.
+        let handler = CondSignalHandler::new(&kernel, Some(cond));
+        let ctx = crate::test_ctx_with_guest_calls(&kernel, &mem, &alloc, &handler);
+        queue_signal(&kernel, 4, 0xFEED_0000);
+
+        assert_eq!(
+            wait_core(&ctx, &[cond, mutex], Some(std::time::Duration::ZERO)),
+            ETIMEDOUT
+        );
+        assert!(handler.calls().is_empty());
+        assert!(kernel.has_pending_exception_for(4));
+    }
+
+    /// A queued exception must reach a parked condition waiter **without**
+    /// pretending the condition was signalled — otherwise `pthread_cond_wait`
+    /// returns `OK` to a guest whose predicate is still false, and one waiter
+    /// silently absorbs a `signal_one` another thread was owed.
+    #[test]
+    fn interrupting_a_cond_waiter_does_not_signal_it() {
+        let (kernel, mem, alloc) = fixture();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cond = 0x1000;
+        let state = condition(&ctx, cond).expect("static condition materialized");
+        let mine = state.enqueue_waiter(1);
+        let other = state.enqueue_waiter(2);
+
+        assert_eq!(
+            kernel.interrupt_cond_waiters_of(1),
+            1,
+            "exactly my waiter is interrupted — and counted once, though the cond is \
+             registered under both its guest pointer and its opaque handle"
+        );
+        assert!(
+            !mine.is_signaled(),
+            "an interrupt must NOT set the wake bit: that bit means 'the condition was \
+             signalled', which is a lie here"
+        );
+        assert!(!other.is_signaled());
+        assert_eq!(
+            state.waiter_count(),
+            2,
+            "an interrupt is not a dequeue — both waiters keep their FIFO places"
         );
     }
 

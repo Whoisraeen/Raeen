@@ -1112,6 +1112,24 @@ impl GuestWaiter {
         self.changed.notify_one();
     }
 
+    /// End this waiter's current host park **without** granting it anything.
+    ///
+    /// The inverse of [`Self::wake`] in the one respect that matters: `signaled`
+    /// stays clear, so [`Self::wait_for_signal`] returns `false` and the caller's
+    /// slice loop re-runs its checks and parks again. Nothing about the guest's
+    /// condition is claimed to have changed.
+    ///
+    /// This is how a reason *outside* the wait's own object — a queued Orbis
+    /// exception for this thread — reaches a parked waiter promptly instead of
+    /// waiting out its slice. Using `wake` for that would make the guest's
+    /// `pthread_cond_wait` return as though the condition had been signalled.
+    ///
+    /// Safe to call on a waiter that is not parked: a `notify_one` with nobody
+    /// waiting is a no-op, and the flag it does not touch cannot be lost.
+    pub fn interrupt(&self) {
+        self.changed.notify_one();
+    }
+
     /// The guest thread handle this waiter parks on behalf of.
     #[must_use]
     pub fn thread(&self) -> u64 {
@@ -1292,6 +1310,22 @@ impl GuestWaitQueue {
         count
     }
 
+    /// End the host park of every queued waiter belonging to `thread` without
+    /// signalling any of them, returning how many were interrupted.
+    ///
+    /// The entries **stay queued** — this is not a dequeue, and it does not
+    /// consume a wake that a later `signal_one` owes to somebody. See
+    /// [`GuestWaiter::interrupt`] for why that distinction is the whole point.
+    pub fn interrupt_waiters_of(&self, thread: u64) -> usize {
+        let waiters = self.waiters.lock();
+        let mut interrupted = 0;
+        for waiter in waiters.iter().filter(|waiter| waiter.thread == thread) {
+            waiter.interrupt();
+            interrupted += 1;
+        }
+        interrupted
+    }
+
     /// Number of currently parked waiters, primarily for diagnostics/tests.
     #[must_use]
     pub fn waiter_count(&self) -> usize {
@@ -1363,6 +1397,12 @@ impl PthreadCond {
     /// Wake and remove every currently queued waiter.
     pub fn broadcast(&self) -> usize {
         self.queue.broadcast()
+    }
+
+    /// End the host park of this condition's waiters belonging to `thread`
+    /// without signalling them — see [`GuestWaitQueue::interrupt_waiters_of`].
+    pub fn interrupt_waiters_of(&self, thread: u64) -> usize {
+        self.queue.interrupt_waiters_of(thread)
     }
 
     /// Number of currently parked waiters, primarily for diagnostics/tests.
@@ -1440,6 +1480,21 @@ impl SyncAddressTable {
         self.queues
             .get(&address)
             .map_or(0, |queue| queue.signal_many(count))
+    }
+
+    /// End the host park of every futex waiter belonging to `thread`, across
+    /// every watched address, without signalling any of them — see
+    /// [`GuestWaitQueue::interrupt_waiters_of`]. Returns how many were
+    /// interrupted.
+    ///
+    /// The watched word is untouched and no entry leaves its queue, so a woken
+    /// waiter re-runs its slice checks (including the queued-exception one) and
+    /// parks again.
+    pub fn interrupt_waiters_of(&self, thread: u64) -> usize {
+        self.queues
+            .iter()
+            .map(|entry| entry.value().interrupt_waiters_of(thread))
+            .sum()
     }
 
     /// How many threads are parked on `address` (diagnostics/tests).
@@ -1535,6 +1590,122 @@ mod pthread_mutex_handoff_tests {
         assert!(live.is_signaled());
         assert_eq!(state.owner_acquire_site, 0x1000_0202);
         assert_eq!(state.owner_acquire_rsp, 0x2000_0202);
+    }
+}
+
+/// Interrupting a parked waiter for a reason its wait object knows nothing about
+/// — a queued Orbis exception — must never look like that object having been
+/// signalled. These pin the distinction, which is the difference between a signal
+/// reaching a blocked thread and a guest's `pthread_cond_wait` returning with its
+/// predicate still false.
+#[cfg(test)]
+mod waiter_interrupt_tests {
+    use super::{GuestWaitQueue, OrbisKernel, PendingException, PthreadCond, SyncAddressTable};
+    use std::sync::Arc;
+
+    #[test]
+    fn interrupt_wakes_the_park_without_claiming_a_signal() {
+        let queue = GuestWaitQueue::default();
+        let mine = queue.enqueue_waiter(11);
+        let other = queue.enqueue_waiter(22);
+
+        assert_eq!(queue.interrupt_waiters_of(11), 1);
+        assert!(
+            !mine.is_signaled(),
+            "the wake bit means 'the condition was signalled' — an interrupt must not set it"
+        );
+        assert!(!other.is_signaled());
+        assert_eq!(
+            queue.waiter_count(),
+            2,
+            "an interrupt is not a dequeue: both waiters keep their FIFO places, so no \
+             later signal_one is stolen"
+        );
+
+        // A signal still works normally afterwards, and still selects the head.
+        assert!(queue.signal_one());
+        assert!(mine.is_signaled());
+        assert!(!other.is_signaled());
+        assert_eq!(queue.waiter_count(), 1);
+    }
+
+    #[test]
+    fn interrupting_a_thread_with_no_waiters_is_a_no_op() {
+        let queue = GuestWaitQueue::default();
+        let waiter = queue.enqueue_waiter(11);
+        assert_eq!(queue.interrupt_waiters_of(99), 0);
+        assert!(!waiter.is_signaled());
+        assert_eq!(queue.waiter_count(), 1);
+    }
+
+    #[test]
+    fn futex_waiters_are_interrupted_across_every_watched_address() {
+        let table = SyncAddressTable::default();
+        let first = table.enqueue(0x1000, 7);
+        let second = table.enqueue(0x2000, 7);
+        let stranger = table.enqueue(0x2000, 8);
+
+        assert_eq!(table.interrupt_waiters_of(7), 2);
+        assert!(!first.is_signaled());
+        assert!(!second.is_signaled());
+        assert!(!stranger.is_signaled());
+        assert_eq!(table.waiter_count(0x1000), 1);
+        assert_eq!(table.waiter_count(0x2000), 2);
+    }
+
+    /// `pthread_conds` deliberately registers one condition under both the guest
+    /// pointer and its opaque handle. A caller trusting the returned count must
+    /// not be told there were twice as many waiters as exist.
+    #[test]
+    fn an_aliased_condition_is_visited_once() {
+        let kernel = OrbisKernel::new();
+        let cond = Arc::new(PthreadCond::default());
+        let waiter = cond.enqueue_waiter(3);
+        kernel.pthread_conds.insert(0x1000, Arc::clone(&cond));
+        kernel.pthread_conds.insert(0x9000, cond);
+
+        assert_eq!(kernel.interrupt_cond_waiters_of(3), 1);
+        assert!(!waiter.is_signaled());
+        assert_eq!(kernel.interrupt_cond_waiters_of(4), 0);
+    }
+
+    #[test]
+    fn a_pending_exception_is_visible_only_to_its_own_target() {
+        let kernel = OrbisKernel::new();
+        assert!(!kernel.has_pending_exception_for(1));
+        kernel.queue_pending_exception(
+            1,
+            PendingException {
+                signum: 30,
+                handler: 0x1000,
+                raised_by: 2,
+            },
+        );
+        assert!(kernel.has_pending_exception_for(1));
+        assert!(
+            !kernel.has_pending_exception_for(2),
+            "the per-thread predicate must not degrade into the process-wide one — every \
+             blocking wait in the tree would then release its lock and attempt a delivery \
+             that is not for it"
+        );
+        assert!(kernel.discard_pending_exception(1));
+        assert!(!kernel.has_pending_exception_for(1));
+    }
+
+    /// Waking semaphore slices must not invent counts. It is a pure "re-run your
+    /// checks" notification, safe with nobody parked.
+    #[test]
+    fn notifying_semaphore_slices_changes_no_count() {
+        let kernel = OrbisKernel::new();
+        let handle = kernel.create_semaphore(2, 4);
+        let posix = Arc::new(super::PosixSem::default());
+        *posix.count.lock() = 5;
+        kernel.posix_semaphores.insert(0x800, Arc::clone(&posix));
+
+        kernel.notify_semaphore_slices();
+
+        assert_eq!(kernel.kernel_semaphores.get(&handle).unwrap().count, 2);
+        assert_eq!(*posix.count.lock(), 5);
     }
 }
 
@@ -1733,6 +1904,72 @@ impl OrbisKernel {
         self.pending_exception_count
             .load(std::sync::atomic::Ordering::Relaxed)
             != 0
+    }
+
+    /// Whether **this** thread has an exception awaiting delivery.
+    ///
+    /// Gated on the relaxed count first, so the common answer costs the same
+    /// single atomic load as [`OrbisKernel::has_pending_exceptions`] and the map
+    /// is only touched once a raise really is outstanding.
+    ///
+    /// Exists for the blocking waits: a wait that holds its own notification
+    /// lock must decide *whether to release it* before attempting delivery, and
+    /// the answer has to be available without releasing it first.
+    pub fn has_pending_exception_for(&self, thread: u64) -> bool {
+        self.has_pending_exceptions() && self.pending_exceptions.contains_key(&thread)
+    }
+
+    /// Wake every thread parked in a **semaphore** wait — both the Orbis
+    /// counting semaphores (`sceKernelWaitSema`) and the POSIX ones
+    /// (`sem_wait`) — so each re-runs its per-slice checks now.
+    ///
+    /// Not a signal: no count is touched, so a woken waiter re-reads it, finds it
+    /// unchanged and parks again. The point is the *other* per-slice checks —
+    /// process teardown, and (the reason this exists) a queued Orbis exception,
+    /// which would otherwise wait out the wait's 100 ms slice.
+    pub fn notify_semaphore_slices(&self) {
+        {
+            let (lock, cvar) = &self.semaphore_signal;
+            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cvar.notify_all();
+        }
+        // POSIX semaphores park per object on their own condvar, so there is no
+        // process-wide notify to piggyback on. Bounded by the number of live
+        // `sem_t`s, and only reached on a raise.
+        for entry in self.posix_semaphores.iter() {
+            entry.value().posted.notify_all();
+        }
+    }
+
+    /// Interrupt — **without signalling** — every `pthread_cond` waiter parked on
+    /// behalf of `thread`, returning how many were interrupted.
+    ///
+    /// A condition waiter parks on its own [`GuestWaiter`] with a 10 ms slice and
+    /// treats its private wake bit as "the condition was signalled". Waking it
+    /// with [`GuestWaitQueue::signal_thread`] would therefore be a *lie*: the
+    /// wait would return `OK` to the guest as though `pthread_cond_signal` had
+    /// run. [`GuestWaiter::interrupt`] leaves the bit clear, so the waiter merely
+    /// returns from its host park early, re-runs its slice checks, and — finding
+    /// no wake — parks again. That is what makes this safe to call for a reason
+    /// the condition variable knows nothing about.
+    ///
+    /// Deduplicated by identity, because `pthread_conds` deliberately keys the
+    /// *same* state under both the guest cond pointer and its allocated opaque
+    /// handle (see `raeen-hle`'s `pthread_cond::condition`). Visiting a condition
+    /// twice would interrupt harmlessly but report twice as many waiters as
+    /// exist, which is exactly the kind of doubled count a caller would trust.
+    pub fn interrupt_cond_waiters_of(&self, thread: u64) -> usize {
+        let mut visited: Vec<*const PthreadCond> = Vec::new();
+        let mut interrupted = 0;
+        for entry in self.pthread_conds.iter() {
+            let identity = Arc::as_ptr(entry.value());
+            if visited.contains(&identity) {
+                continue;
+            }
+            visited.push(identity);
+            interrupted += entry.value().interrupt_waiters_of(thread);
+        }
+        interrupted
     }
 
     /// Claim the exception queued for `thread`, if any, marking the thread as
