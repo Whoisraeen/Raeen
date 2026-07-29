@@ -288,16 +288,13 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         if ctx.guest_threads.process_is_terminating() {
             return OK;
         }
-        let wait = match deadline {
-            None => slice,
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return SCE_KERNEL_ERROR_ETIMEDOUT;
-                }
-                remaining.min(slice)
-            }
-        };
+        // Shared with the equeue and semaphore waits: a slice expiry is never
+        // the guest's timeout, and a finite deadline nearer than the slice wins.
+        let now = std::time::Instant::now();
+        if raeen_core::subsystems::guest_deadline_reached(deadline, now) {
+            return SCE_KERNEL_ERROR_ETIMEDOUT;
+        }
+        let wait = raeen_core::subsystems::park_slice(deadline, now, slice);
         let outcome = ctx.services.wait_until(
             WaitKey {
                 class: "event-flag",

@@ -142,23 +142,15 @@ fn posix_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
 ///
 /// The wait is sliced so teardown is noticed within 100 ms rather than after
 /// the whole interval — a `sleep(3600)` during shutdown must not pin a dying
-/// process open. Unlike `usleep` there is no duration cap: the guest asked
-/// for seconds-scale blocking and a real console would honor it.
+/// process open. There is no duration cap: the guest asked for seconds-scale
+/// blocking and a real console would honor it. `usleep`/`nanosleep` now share
+/// the same helper (they used to cap and under-sleep instead).
 fn posix_sleep(ctx: &HleContext, args: &[u64]) -> u64 {
     let seconds = args.first().copied().unwrap_or(0);
     debug!("sleep(seconds={seconds})");
-    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
-    let mut remaining = std::time::Duration::from_secs(seconds);
-    while !remaining.is_zero() {
-        if ctx.guest_threads.process_is_terminating() {
-            // POSIX reports the unslept whole seconds (rounded up).
-            return u64::try_from(remaining.as_millis().div_ceil(1000)).unwrap_or(u64::MAX);
-        }
-        let slice = remaining.min(SLICE);
-        ctx.services.sleep(slice);
-        remaining = remaining.saturating_sub(slice);
-    }
-    0
+    let unslept = libkernel::sleep_interruptibly(ctx, std::time::Duration::from_secs(seconds));
+    // POSIX reports the unslept whole seconds (rounded up).
+    u64::try_from(unslept.as_millis().div_ceil(1000)).unwrap_or(u64::MAX)
 }
 
 /// POSIX `fcntl(fd, command, argument)` for descriptor/status flag commands.

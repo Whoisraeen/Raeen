@@ -52,6 +52,127 @@ pub trait WaitSubsystem: Send + Sync {
     fn wake(&self, key: WaitKey, reason: WakeReason);
 }
 
+/// How long a single host park inside a sliced guest wait may last.
+///
+/// Every blocking kernel primitive (event flag, equeue, semaphore) parks in
+/// bounded slices rather than for the guest's whole interval, so process
+/// teardown is noticed promptly and an infinite wait stays escapable. The slice
+/// length is the *internal* bound; the guest's own deadline still wins when it
+/// is nearer.
+///
+/// A `None` deadline is an indefinite wait and always parks a full slice. A
+/// finite deadline parks `min(remaining, slice)`, so the wait neither overshoots
+/// the interval the guest asked for nor blocks past teardown.
+///
+/// Pure so the arithmetic is testable against a synthetic clock: the wall-clock
+/// version of this test raced under parallel load. Shared by all three
+/// primitives, which previously each carried their own copy — and one copy
+/// disagreeing with the others is how a fabricated `ETIMEDOUT` gets shipped.
+#[must_use]
+pub fn park_slice(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    slice: Duration,
+) -> Duration {
+    deadline.map_or(slice, |dl| dl.saturating_duration_since(now).min(slice))
+}
+
+/// Whether a park that timed out is the **guest's** timeout, or merely an
+/// internal slice expiring.
+///
+/// This is the whole contract the sliced waits had to be corrected to honour.
+/// Reporting a slice expiry as the guest's timeout is a fabricated
+/// `ETIMEDOUT`: Dragon Ball's AGC workers took one after 50 ms and entered the
+/// title's fatal-reporting path before their first submission. So:
+///
+/// * a `None` timeout is **never** a guest timeout, however many slices elapse;
+///   and
+/// * a finite timeout is a guest timeout only once the real deadline has
+///   arrived, not at the first internal slice boundary.
+#[must_use]
+pub fn guest_deadline_reached(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    deadline.is_some_and(|dl| now >= dl)
+}
+
+#[cfg(test)]
+mod wait_slice_tests {
+    use super::{guest_deadline_reached, park_slice};
+    use std::time::{Duration, Instant};
+
+    /// The slice/deadline decision, on a synthetic clock. This is the shared
+    /// arithmetic behind every kernel wait, so its edges are asserted here once
+    /// instead of three times with three chances to drift.
+    #[test]
+    fn park_slice_prefers_the_nearer_of_slice_and_guest_deadline() {
+        const SLICE: Duration = Duration::from_millis(50);
+        let t0 = Instant::now();
+
+        // Indefinite: always a full slice, no matter how much time passes.
+        assert_eq!(park_slice(None, t0, SLICE), SLICE);
+        assert_eq!(
+            park_slice(None, t0 + Duration::from_secs(3600), SLICE),
+            SLICE
+        );
+
+        // Finite and far away: the slice bounds it.
+        let far = t0 + Duration::from_millis(200);
+        assert_eq!(park_slice(Some(far), t0, SLICE), SLICE);
+
+        // Finite and nearer than the slice: the guest's remaining time wins, so
+        // the wait cannot overshoot what the caller asked for.
+        assert_eq!(
+            park_slice(Some(far), t0 + Duration::from_millis(180), SLICE),
+            Duration::from_millis(20)
+        );
+        let near = t0 + Duration::from_millis(5);
+        assert_eq!(park_slice(Some(near), t0, SLICE), Duration::from_millis(5));
+
+        // Already expired: zero, never a wrapped/huge duration.
+        assert_eq!(park_slice(Some(near), near, SLICE), Duration::ZERO);
+        assert_eq!(
+            park_slice(Some(near), t0 + Duration::from_secs(10), SLICE),
+            Duration::ZERO
+        );
+
+        // A zero slice degenerates to a poll rather than an unbounded park.
+        assert_eq!(park_slice(None, t0, Duration::ZERO), Duration::ZERO);
+    }
+
+    /// An internal slice expiry must never be reported as the guest's timeout.
+    #[test]
+    fn only_a_real_deadline_counts_as_the_guests_timeout() {
+        let t0 = Instant::now();
+
+        // Indefinite waits never time out — this is the fabricated-ETIMEDOUT bug.
+        assert!(!guest_deadline_reached(None, t0));
+        assert!(!guest_deadline_reached(
+            None,
+            t0 + Duration::from_secs(86_400)
+        ));
+
+        let deadline = t0 + Duration::from_millis(200);
+        // Before the deadline — including well past the first 50 ms slice.
+        assert!(!guest_deadline_reached(Some(deadline), t0));
+        assert!(!guest_deadline_reached(
+            Some(deadline),
+            t0 + Duration::from_millis(50)
+        ));
+        assert!(!guest_deadline_reached(
+            Some(deadline),
+            t0 + Duration::from_millis(199)
+        ));
+        // At and after it.
+        assert!(guest_deadline_reached(Some(deadline), deadline));
+        assert!(guest_deadline_reached(
+            Some(deadline),
+            t0 + Duration::from_millis(201)
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventUpdate {
     Set(u64),

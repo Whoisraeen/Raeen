@@ -62,12 +62,24 @@ fn hle_create(ctx: &HleContext, args: &[u64]) -> u64 {
     OK
 }
 
-/// `sceKernelDeleteSema(handle)`.
+/// `sceKernelDeleteSema(handle)`: remove the semaphore, then wake every waiter
+/// so a blocked `WaitSema` observes the deletion and returns `ESRCH`.
+///
+/// The wake is not cosmetic — it was the one wait in this crate that genuinely
+/// depended on its internal slice. `hle_wait` learns about deletion only by
+/// re-running `try_consume` after `wait_timeout` returns, and `Signal`/`Cancel`
+/// both notify while `Delete` did not, so a thread parked on a deleted
+/// semaphore stayed parked for up to the full 100 ms slice — per waiter, per
+/// delete. Every sibling primitive already wakes on delete
+/// (`kernel_eventflag::hle_delete`, `kernel_equeue::hle_delete`); this closes
+/// the gap. Notifying under the shared lock also closes the check-then-sleep
+/// race, exactly as in `hle_signal`.
 fn hle_delete(ctx: &HleContext, args: &[u64]) -> u64 {
     let handle = args.first().copied().unwrap_or(0) as u32;
     if ctx.kernel.kernel_semaphores.remove(&handle).is_none() {
         return SCE_KERNEL_ERROR_ESRCH;
     }
+    ctx.kernel.wake_semaphore_waiters();
     OK
 }
 
@@ -85,11 +97,8 @@ fn hle_signal(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         sem.count += signal;
     }
-    // Wake every blocked `WaitSema` so it re-checks the new count. Notifying
-    // under the shared lock closes the check-then-sleep race (see hle_wait).
-    let (lock, cvar) = &ctx.kernel.semaphore_signal;
-    let _guard = lock.lock().unwrap();
-    cvar.notify_all();
+    // Wake every blocked `WaitSema` so it re-checks the new count.
+    ctx.kernel.wake_semaphore_waiters();
     OK
 }
 
@@ -169,16 +178,12 @@ fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {
         }
         // A NULL timeout waits forever (never synthesizes a timeout the guest
         // asserts on); a finite one returns ETIMEDOUT once the deadline passes.
-        let wait = match deadline {
-            None => slice,
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return SCE_KERNEL_ERROR_ETIMEDOUT;
-                }
-                remaining.min(slice)
-            }
-        };
+        // Shared arithmetic with the event-flag and equeue waits.
+        let now = std::time::Instant::now();
+        if raeen_core::subsystems::guest_deadline_reached(deadline, now) {
+            return SCE_KERNEL_ERROR_ETIMEDOUT;
+        }
+        let wait = raeen_core::subsystems::park_slice(deadline, now, slice);
         let (g, _) = cvar.wait_timeout(guard, wait).unwrap();
         guard = g;
     }
@@ -200,9 +205,7 @@ fn hle_cancel(ctx: &HleContext, args: &[u64]) -> u64 {
     sem.count = set_count.clamp(0, sem.max_count);
     drop(sem);
     // Cancel wakes every waiter so they re-evaluate against the reset count.
-    let (lock, cvar) = &ctx.kernel.semaphore_signal;
-    let _guard = lock.lock().unwrap();
-    cvar.notify_all();
+    ctx.kernel.wake_semaphore_waiters();
     OK
 }
 
@@ -243,6 +246,61 @@ mod tests {
         assert_eq!(hle_signal(&ctx, &[h as u64, 3]), OK);
         assert_eq!(hle_wait(&ctx, &[h as u64, 2, 0]), OK);
         assert_eq!(kernel.kernel_semaphores.get(&h).unwrap().count, 1);
+    }
+
+    /// Every producer that changes semaphore state must **notify**, not leave
+    /// waiters to the internal 100 ms slice.
+    ///
+    /// `Delete` was the omission this pins: `Signal` and `Cancel` notified, so a
+    /// waiter observed those immediately, but a deleted semaphore was only
+    /// noticed when `hle_wait`'s slice next expired — up to 100 ms of pure lost
+    /// time per parked waiter, per delete. Asserted through the counted wake
+    /// funnel rather than by timing a real waiter: no clock, no threads, no
+    /// flake.
+    #[test]
+    fn every_state_change_notifies_waiters_instead_of_relying_on_the_slice() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let h = create(&ctx, 0, 4);
+        // Creation alone need not wake anyone: nothing can be waiting yet.
+        let after_create = kernel.semaphore_wake_count();
+
+        assert_eq!(hle_signal(&ctx, &[h as u64, 1]), OK);
+        assert_eq!(
+            kernel.semaphore_wake_count(),
+            after_create + 1,
+            "Signal must wake waiters"
+        );
+
+        assert_eq!(hle_cancel(&ctx, &[h as u64, 2, 0]), OK);
+        assert_eq!(
+            kernel.semaphore_wake_count(),
+            after_create + 2,
+            "Cancel must wake waiters"
+        );
+
+        assert_eq!(hle_delete(&ctx, &[h as u64]), OK);
+        assert_eq!(
+            kernel.semaphore_wake_count(),
+            after_create + 3,
+            "Delete must wake waiters — otherwise a parked WaitSema learns of \
+             the deletion only when its 100 ms internal slice expires"
+        );
+
+        // A failed producer changes nothing, so it must not spend a wake either:
+        // waking on ESRCH would be a spurious wakeup for every other waiter.
+        assert_eq!(hle_delete(&ctx, &[h as u64]), SCE_KERNEL_ERROR_ESRCH);
+        assert_eq!(
+            kernel.semaphore_wake_count(),
+            after_create + 3,
+            "a rejected Delete must not notify"
+        );
+        assert_eq!(hle_signal(&ctx, &[9999, 1]), SCE_KERNEL_ERROR_ESRCH);
+        assert_eq!(
+            kernel.semaphore_wake_count(),
+            after_create + 3,
+            "a rejected Signal must not notify"
+        );
     }
 
     #[test]

@@ -4007,8 +4007,100 @@ pub(crate) fn hle_error_addr(ctx: &HleContext, _args: &[u64]) -> u64 {
     }
 }
 
-/// `nanosleep(req, rem)`: honor the requested sleep (bounded like
-/// `sceKernelUsleep`), report zero time remaining.
+/// A guest `struct timespec` (`time_t tv_sec`, `long tv_nsec`) as a duration.
+///
+/// Nanosecond-exact on purpose. The previous reader collapsed the request to
+/// whole milliseconds (`nanos / 1_000_000`), so every sub-millisecond
+/// `nanosleep` — `500us` is the canonical worker backoff — truncated to **zero**
+/// and returned instantly. Sleeping less than requested is a correctness bug,
+/// and "zero" turns a backoff into a hot spin.
+///
+/// A negative `tv_nsec` (or one past a second) is out of range per POSIX; it is
+/// clamped rather than rejected, because the sibling readers in this file clamp
+/// and a bad timespec must not become an unbounded sleep.
+fn timespec_to_duration(tv_sec: i64, tv_nsec: i64) -> std::time::Duration {
+    std::time::Duration::new(
+        u64::try_from(tv_sec).unwrap_or(0),
+        u32::try_from(tv_nsec.clamp(0, 999_999_999)).unwrap_or(0),
+    )
+}
+
+/// Longest single host park inside one guest sleep.
+///
+/// A guest sleep must be escapable: `terminate_and_reap`'s join hangs on a
+/// thread parked for the whole interval, so a `sleep(3600)` during shutdown
+/// would pin a dying process open. Slicing costs nothing measurable — one slice
+/// for any request under 100 ms, and the host floor is ~0.3 % of a 100 ms park.
+const SLEEP_TEARDOWN_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Requests longer than this are honored but logged: a guest asking to sleep
+/// for a minute is usually a units bug in the *emulator*, and a silent
+/// multi-minute park looks exactly like a hang.
+const SLEEP_SUSPICIOUS_ABOVE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sleep `requested`, in [`SLEEP_TEARDOWN_SLICE`] slices, returning what was
+/// **not** slept — zero unless the guest process began terminating mid-sleep.
+///
+/// Never returns before `requested` has elapsed otherwise. The previous shape
+/// was a hard cap (`min(requested, 1s)` for `usleep`, `min(.., 100ms)` for
+/// `nanosleep`) that then reported success: a guest asking for one second got
+/// 100 ms and was told it slept the lot. Capping is the same class of bug as
+/// coarse granularity, in the more dangerous direction.
+pub(crate) fn sleep_interruptibly(
+    ctx: &HleContext,
+    requested: std::time::Duration,
+) -> std::time::Duration {
+    if requested > SLEEP_SUSPICIOUS_ABOVE {
+        warn!(
+            "guest sleep of {:.1}s — honored, but unusually long",
+            requested.as_secs_f64()
+        );
+    }
+    if requested.is_zero() {
+        // `usleep(0)`/`nanosleep(0)` is a YIELD request, not a no-op, and the
+        // host sleep primitive is where that is implemented. Falling out of the
+        // loop below without calling it would silently turn a cooperative yield
+        // into a busy caller that never gives up its quantum.
+        ctx.services.sleep(std::time::Duration::ZERO);
+        return std::time::Duration::ZERO;
+    }
+    let mut remaining = requested;
+    while let Some((park, rest)) = sleep_step(remaining, SLEEP_TEARDOWN_SLICE) {
+        if ctx.guest_threads.process_is_terminating() {
+            return remaining;
+        }
+        ctx.services.sleep(park);
+        remaining = rest;
+    }
+    std::time::Duration::ZERO
+}
+
+/// One step of a sliced guest sleep: the park to perform now, and what is left
+/// after it. `None` once the interval is fully slept.
+///
+/// Pure, and the loop above is written around it, so the property that matters
+/// is provable without a clock: the parks it yields sum to **exactly** the
+/// request. Sleeping less than requested is a correctness bug, and a slicing
+/// loop is precisely where an off-by-one drops the tail.
+fn sleep_step(
+    remaining: std::time::Duration,
+    max_slice: std::time::Duration,
+) -> Option<(std::time::Duration, std::time::Duration)> {
+    if remaining.is_zero() {
+        return None;
+    }
+    // A zero `max_slice` would never make progress; treat it as unsliced rather
+    // than spinning the loop forever on a misconfigured constant.
+    let park = if max_slice.is_zero() {
+        remaining
+    } else {
+        remaining.min(max_slice)
+    };
+    Some((park, remaining.saturating_sub(park)))
+}
+
+/// `nanosleep(req, rem)`: sleep the full requested interval and report what is
+/// left — zero unless teardown interrupted it, which POSIX spells `EINTR`.
 fn hle_nanosleep(ctx: &HleContext, args: &[u64]) -> u64 {
     let req = args.first().copied().unwrap_or(0);
     let rem = args.get(1).copied().unwrap_or(0);
@@ -4017,19 +4109,19 @@ fn hle_nanosleep(ctx: &HleContext, args: &[u64]) -> u64 {
     if req == 0 || !ctx.mem.read(req, &mut secs) || !ctx.mem.read(req + 8, &mut nanos) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    let secs = u64::from_le_bytes(secs);
-    let nanos = u64::from_le_bytes(nanos);
-    // Same guard as sceKernelUsleep: never let a wild guest value hang the
-    // host for minutes.
-    const MAX_SLEEP_MS: u64 = 100;
-    let ms = secs
-        .saturating_mul(1000)
-        .saturating_add(nanos / 1_000_000)
-        .min(MAX_SLEEP_MS);
-    debug!("nanosleep({secs}s + {nanos}ns) -> sleeping {ms}ms");
-    ctx.services.sleep(std::time::Duration::from_millis(ms));
+    let tv_sec = i64::from_le_bytes(secs);
+    let tv_nsec = i64::from_le_bytes(nanos);
+    let requested = timespec_to_duration(tv_sec, tv_nsec);
+    debug!(
+        "nanosleep({tv_sec}s + {tv_nsec}ns) -> {}us",
+        requested.as_micros()
+    );
+    let unslept = sleep_interruptibly(ctx, requested);
     if rem != 0 {
-        let _ = ctx.mem.write(rem, &[0u8; 16]);
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&i64::try_from(unslept.as_secs()).unwrap_or(0).to_le_bytes());
+        out[8..16].copy_from_slice(&i64::from(unslept.subsec_nanos()).to_le_bytes());
+        let _ = ctx.mem.write(rem, &out);
     }
     SCE_OK
 }
@@ -5489,16 +5581,17 @@ fn hle_read_tsc(ctx: &HleContext, _args: &[u64]) -> u64 {
     u64::try_from(nanos * u128::from(TSC_FREQ_HZ) / 1_000_000_000).unwrap_or(u64::MAX)
 }
 
-/// Upper bound on how long one `sceKernelUsleep` will actually block the
-/// host thread, so a wild/huge `usec` (or a guest bug) can't wedge the
-/// emulator. 1 second is far longer than any per-frame sleep a title
-/// issues; a larger request is honored up to this cap and logged.
-const USLEEP_MAX: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Real `sceKernelUsleep(usec)` (M1 hardening): actually sleeps the host
-/// thread for `usec` microseconds (capped by [`USLEEP_MAX`]). A no-op sleep
-/// makes timing-driven homebrew busy-spin and burn 100% CPU; a real sleep
-/// yields, matching what the title expects between frames.
+/// Real `sceKernelUsleep(usec)`: sleeps the host thread for the **full** `usec`
+/// microseconds. A no-op sleep makes timing-driven homebrew busy-spin and burn
+/// 100 % CPU; a real sleep yields, matching what the title expects between
+/// frames.
+///
+/// This used to clamp to a one-second `USLEEP_MAX` "so a wild value can't wedge
+/// the emulator", and then returned `SCE_OK` — so a guest asking for five
+/// seconds slept one and was told it had slept five. Under-sleeping is a
+/// correctness bug, not a safety valve. [`sleep_interruptibly`] gives the same
+/// protection honestly: the interval is honored in slices, and teardown breaks
+/// out of it, so nothing can wedge without also being escapable.
 pub(crate) fn hle_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
     let usec = args.first().copied().unwrap_or(0);
     debug!("sceKernelUsleep(usec={usec})");
@@ -5522,15 +5615,7 @@ pub(crate) fn hle_usleep(ctx: &HleContext, args: &[u64]) -> u64 {
             );
         }
     }
-    let requested = std::time::Duration::from_micros(usec);
-    let dur = requested.min(USLEEP_MAX);
-    if dur < requested {
-        warn!(
-            "sceKernelUsleep: {usec}us capped to {}us (USLEEP_MAX)",
-            dur.as_micros()
-        );
-    }
-    ctx.services.sleep(dur);
+    sleep_interruptibly(ctx, std::time::Duration::from_micros(usec));
     SCE_OK
 }
 
@@ -8112,6 +8197,120 @@ mod tests {
         assert!(c1 > c0, "process-time counter must advance");
         // Counter is nanoseconds, GetProcessTime is microseconds — same clock.
         assert!(c1 >= t1 * 1000, "counter (ns) must be ~1000× the time (us)");
+    }
+
+    /// A guest `timespec` must survive as a duration with nanosecond fidelity.
+    ///
+    /// The regression this pins: the old reader computed whole milliseconds
+    /// (`tv_nsec / 1_000_000`), so every request under 1 ms became **zero** and
+    /// `nanosleep` returned instantly. A guest backing off for 500 us instead
+    /// span as fast as the CPU allowed — the same failure mode as a no-op sleep,
+    /// reached by rounding. Deterministic: no clock is consulted.
+    #[test]
+    fn timespec_converts_without_truncating_sub_millisecond_requests() {
+        use std::time::Duration;
+
+        // The whole point: sub-millisecond requests are preserved, not floored.
+        assert_eq!(timespec_to_duration(0, 1), Duration::from_nanos(1));
+        assert_eq!(timespec_to_duration(0, 500_000), Duration::from_micros(500));
+        assert_eq!(
+            timespec_to_duration(0, 999_999),
+            Duration::from_nanos(999_999)
+        );
+        // And a 1.5 ms request keeps its half.
+        assert_eq!(
+            timespec_to_duration(0, 1_500_000),
+            Duration::from_micros(1_500)
+        );
+        // Seconds and nanoseconds combine.
+        assert_eq!(
+            timespec_to_duration(2, 250_000_000),
+            Duration::from_millis(2_250)
+        );
+        // A whole second is honored in full — it used to be clamped to 100 ms
+        // while still reporting zero remaining, i.e. a silent 10x under-sleep.
+        assert_eq!(timespec_to_duration(1, 0), Duration::from_secs(1));
+        assert_eq!(timespec_to_duration(5, 0), Duration::from_secs(5));
+        // Out-of-range values clamp instead of becoming an unbounded sleep.
+        assert_eq!(timespec_to_duration(-1, 0), Duration::ZERO);
+        assert_eq!(timespec_to_duration(0, -1), Duration::ZERO);
+        assert_eq!(
+            timespec_to_duration(0, 5_000_000_000),
+            Duration::from_nanos(999_999_999),
+            "tv_nsec past one second clamps to the maximum legal value"
+        );
+        assert_eq!(timespec_to_duration(0, 0), Duration::ZERO);
+    }
+
+    /// A sliced guest sleep must park for **exactly** the requested interval —
+    /// never less, however many slices it takes.
+    ///
+    /// This is the property the previous implementation broke by construction:
+    /// `usleep` clamped to one second and `nanosleep` to 100 ms, then both
+    /// returned success, so a five-second request slept one and a one-second
+    /// `nanosleep` slept a tenth. Walking the same step function production
+    /// uses proves the decomposition without consulting a clock.
+    #[test]
+    fn a_sliced_sleep_parks_for_exactly_the_requested_interval() {
+        use std::time::Duration;
+
+        /// Walk `sleep_step` to completion, collecting every park.
+        fn schedule(requested: Duration, slice: Duration) -> Vec<Duration> {
+            let mut parks = Vec::new();
+            let mut remaining = requested;
+            while let Some((park, rest)) = sleep_step(remaining, slice) {
+                assert!(!park.is_zero(), "a step must make progress");
+                parks.push(park);
+                remaining = rest;
+                assert!(parks.len() < 10_000, "slicing must terminate");
+            }
+            parks
+        }
+
+        let slice = SLEEP_TEARDOWN_SLICE;
+
+        // Zero: no parks at all. The caller handles the yield explicitly.
+        assert!(sleep_step(Duration::ZERO, slice).is_none());
+
+        // Below the slice: exactly one park, of the whole request. The common
+        // case — every per-frame sleep a title issues.
+        assert_eq!(
+            schedule(Duration::from_micros(1), slice),
+            vec![Duration::from_micros(1)]
+        );
+        assert_eq!(
+            schedule(Duration::from_millis(16), slice),
+            vec![Duration::from_millis(16)]
+        );
+        assert_eq!(schedule(slice, slice), vec![slice]);
+
+        // Above the slice: several parks that sum to exactly the request, each
+        // no longer than the slice so teardown stays observable throughout.
+        for micros in [100_001u64, 250_000, 1_000_000, 5_000_000, 60_000_000] {
+            let requested = Duration::from_micros(micros);
+            let parks = schedule(requested, slice);
+            let total: Duration = parks.iter().sum();
+            assert_eq!(
+                total, requested,
+                "parks must sum to exactly the request ({micros}us), got {total:?}"
+            );
+            assert!(
+                parks.iter().all(|park| *park <= slice),
+                "no single park may exceed the teardown slice ({micros}us)"
+            );
+            assert_eq!(
+                parks.len(),
+                usize::try_from(requested.as_nanos().div_ceil(slice.as_nanos())).unwrap(),
+                "park count is ceil(request / slice) ({micros}us)"
+            );
+        }
+
+        // A misconfigured zero slice degenerates to one unsliced park rather
+        // than looping forever.
+        assert_eq!(
+            schedule(Duration::from_secs(3), Duration::ZERO),
+            vec![Duration::from_secs(3)]
+        );
     }
 
     /// usleep sleeps a real (bounded) amount and returns OK.

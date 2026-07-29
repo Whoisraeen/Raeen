@@ -17,3 +17,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 bitflags = { workspace = true }
+
+# High-resolution waitable timers + multimedia timer period for `host_sleep`:
+# the guest sleep floor and condition-variable wait granularity are both Win32
+# concerns, and both are measured in that module's docs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

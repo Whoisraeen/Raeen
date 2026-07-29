@@ -299,12 +299,18 @@ fn hle_trigger_user_event_inner(ctx: &HleContext, args: &[u64]) -> u64 {
 ///
 /// Pure so the slice/deadline arithmetic is testable against a synthetic clock:
 /// the wall-clock version of this test raced under parallel load.
+///
+/// Now a thin alias for [`raeen_core::subsystems::park_slice`], which the event
+/// flag and semaphore waits share. Three private copies of one rule is three
+/// chances for them to drift, and a copy that disagrees is how a fabricated
+/// `ETIMEDOUT` reaches a title. Kept as a named local so this module's tests
+/// (and the reasoning in their comments) stay put.
 fn equeue_park_slice(
     deadline: Option<std::time::Instant>,
     now: std::time::Instant,
     slice: std::time::Duration,
 ) -> std::time::Duration {
-    deadline.map_or(slice, |dl| dl.saturating_duration_since(now).min(slice))
+    raeen_core::subsystems::park_slice(deadline, now, slice)
 }
 
 /// Whether a park that timed out is the **guest's** timeout, or merely an
@@ -319,7 +325,7 @@ fn equeue_park_slice(
 /// * finite timeout — a guest timeout only once the real deadline has arrived,
 ///   not at the first internal slice boundary.
 fn equeue_deadline_reached(deadline: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    deadline.is_some_and(|dl| now >= dl)
+    raeen_core::subsystems::guest_deadline_reached(deadline, now)
 }
 
 fn hle_wait(ctx: &HleContext, args: &[u64]) -> u64 {

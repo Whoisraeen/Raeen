@@ -660,6 +660,24 @@ Only licenses compatible with GPL-2.0-only are used.
   to AMD's implementation. FSR1 is spatial-only: no motion vectors, no vendor
   runtime, which is why it can ship in-tree at all where DLSS and XeSS cannot.
 
+- **Host sleep strategy (Windows timer precision)** — `raeen-core`'s
+  `host_sleep` module. The *mechanisms* of four reference emulators' guest-sleep
+  paths were read and compared before it was written, and none of their code was
+  copied: kytyps5 `src/common/threads.cpp` (thread-local
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` with a QPC spin below 1 ms, GPL-2.0),
+  shadPS4 `src/common/thread.cpp` `AccurateSleep` (per-call plain
+  `CreateWaitableTimer`, GPL-2.0-or-later with Dolphin/Citra lineage), SharpEmu
+  `src/SharpEmu.Libs/HostTiming.cs` (a four-tier sleep/yield/spin ladder with a
+  100 µs spin threshold, GPL-2.0-or-later), and Kyty
+  `source/lib/Core/src/Threads.cpp` (plain `sleep_for`, MIT). Raeen's
+  implementation diverges from all four on measured grounds — it uses a
+  `PAUSE`-only spin with an admission limit, where kytyps5 and SharpEmu yield
+  inside their spin, because a yielding spin measured 60–190 ms per sub-millisecond
+  request on an oversubscribed host. The thread-local cached-timer shape it
+  generalises already existed in-tree in `raeen-hle/src/libsce_video_out.rs`.
+  Licences are recorded here because the designs were *studied*; no lines were
+  taken from any of them.
+
 ---
 
 ## Not incorporated (ecosystem references only)

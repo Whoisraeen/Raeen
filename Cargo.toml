@@ -148,6 +148,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Kernel",
     "Win32_System_SystemInformation",
     "Win32_System_Time",
+    # timeBeginPeriod/timeEndPeriod for raeen-core::host_sleep — the only lever
+    # that improves condition-variable timed waits, which are otherwise
+    # quantised to the ~15.6 ms system tick.
+    "Win32_Media",
     # Added for the kyty-core Sys layer port (VirtualAlloc/VirtualProtect,
     # file IO, threading/sync). Additive — does not affect existing crates.
     "Win32_Storage_FileSystem",

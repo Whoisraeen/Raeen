@@ -520,11 +520,17 @@ pub struct OrbisKernel {
     /// registration churn.
     pub event_flag_signal: (std::sync::Mutex<()>, std::sync::Condvar),
     /// One shared (lock, condvar) signalled whenever any counting semaphore's
-    /// count changes (Signal/Cancel). A blocked `WaitSema` re-checks its own
-    /// count on wake. Same rationale as [`event_flag_signal`]: with real guest
-    /// threads a producer thread *can* signal, so a waiter must block until it
-    /// does rather than instantly time out.
+    /// state changes (Signal/Cancel/Delete). A blocked `WaitSema` re-checks its
+    /// own count on wake. Same rationale as [`event_flag_signal`]: with real
+    /// guest threads a producer thread *can* signal, so a waiter must block
+    /// until it does rather than instantly time out.
+    ///
+    /// Notify through [`Self::wake_semaphore_waiters`] rather than reaching in
+    /// here, so every producer is counted.
     pub semaphore_signal: (std::sync::Mutex<()>, std::sync::Condvar),
+    /// How many times semaphore waiters were woken — see
+    /// [`Self::wake_semaphore_waiters`].
+    semaphore_wakes: std::sync::atomic::AtomicU64,
     /// AMPR command-buffer write offsets, keyed by the command-buffer address
     /// (the current write cursor `sceAmprCommandBufferGetCurrentOffset` reads).
     pub ampr_write_offsets: DashMap<u64, u64>,
@@ -2017,6 +2023,7 @@ impl OrbisKernel {
             libc_mspace_allocations: DashMap::new(),
             event_flag_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             semaphore_signal: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+            semaphore_wakes: std::sync::atomic::AtomicU64::new(0),
             ampr_write_offsets: DashMap::new(),
             ampr_command_counts: DashMap::new(),
             ampr_gather_scatter: DashMap::new(),
@@ -2211,6 +2218,38 @@ impl OrbisKernel {
             },
         );
         handle
+    }
+
+    /// Wake every thread parked in `sceKernelWaitSema` so each re-checks its own
+    /// count, and count the wake.
+    ///
+    /// The single funnel for semaphore notifications. It exists because the
+    /// three producers had three copies of "lock, notify_all" and one of them —
+    /// `DeleteSema` — simply did not have it, leaving waiters to discover the
+    /// deletion when their internal 100 ms slice next expired. A counted funnel
+    /// makes that class of omission provable in a test rather than only
+    /// observable as latency.
+    ///
+    /// Notifying while holding the lock is what closes the check-then-sleep
+    /// race: `hle_wait` re-checks the count under this same lock, so a notify
+    /// can only land either before that check (seen) or after the waiter has
+    /// atomically released the lock into `wait_timeout` (delivered).
+    pub fn wake_semaphore_waiters(&self) {
+        let (lock, cvar) = &self.semaphore_signal;
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cvar.notify_all();
+        self.semaphore_wakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many semaphore wakes this process has issued.
+    ///
+    /// Diagnostic, and the deterministic seam the wait-slice audit tests use: a
+    /// producer that does not appear here leaves its waiters on the slice.
+    #[must_use]
+    pub fn semaphore_wake_count(&self) -> u64 {
+        self.semaphore_wakes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create an event queue with `attributes`, returning its handle. See the
@@ -2563,8 +2602,18 @@ impl raeen_core::subsystems::TimeSubsystem for OrbisKernel {
         std::time::SystemTime::now()
     }
 
+    /// Every guest `usleep`/`nanosleep`/`sleep` lands here, so the host
+    /// strategy is chosen in exactly one place.
+    ///
+    /// This was `std::thread::sleep`, whose Windows behaviour is unspecified and
+    /// has changed across toolchains (it was a plain `Sleep()`, i.e. the ~15.6 ms
+    /// system tick, before Rust ~1.79). `raeen_core::host_sleep` owns the
+    /// strategy instead — a bounded `PAUSE` spin below 100 µs, a high-resolution
+    /// waitable timer above it, and `std::thread::sleep` only where neither is
+    /// available — with a requested-vs-actual histogram behind
+    /// `RAEEN_TIME_SLEEP`. Never returns before `duration` has elapsed.
     fn sleep(&self, duration: std::time::Duration) {
-        std::thread::sleep(duration);
+        raeen_core::host_sleep::sleep(duration);
     }
 }
 
@@ -2578,6 +2627,17 @@ impl raeen_core::subsystems::WaitSubsystem for OrbisKernel {
     ) -> raeen_core::subsystems::WaitOutcome {
         use raeen_core::diagnostics::DiagnosticKind;
         use raeen_core::subsystems::WaitOutcome;
+
+        // The park below is `Condvar::wait_timeout`, whose timeout is rounded to
+        // the Windows system tick: measured, a 100 us wait costs 15 394 us and a
+        // 1 ms wait 15 564 us. That quantisation is the single largest source of
+        // lost time in the kernel wait paths, and raising the process timer
+        // resolution is the only lever for it — a waitable timer cannot help
+        // because this wait must stay notifiable. Armed here rather than at
+        // construction so an idle Shell leaves the system at its default; the
+        // request is process-wide and idempotent, so first waiter wins and every
+        // other condition-variable wait (semaphore, pthread cond) benefits too.
+        raeen_core::host_sleep::arm_high_resolution_timer();
 
         self.diagnostics.record(
             key.guest_thread,
