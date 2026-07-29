@@ -756,6 +756,13 @@ impl GuestThreadScheduler for GuestProcessHandle {
                     orbis_priority = priority,
                     "guest pthread started"
                 );
+                // Stamped where the worker actually BEGINS, not where it is
+                // reaped: `terminate_and_reap`'s join loop would place the
+                // phase at teardown, and a hard-killed stalled title — exactly
+                // the class this chain exists to diagnose — never reaches it.
+                raeen_core::frame_path::record_phase(
+                    raeen_core::frame_path::Phase::FirstGuestThread,
+                );
                 process.kernel.diagnostics.record(
                     handle,
                     DiagnosticKind::TaskOwned,

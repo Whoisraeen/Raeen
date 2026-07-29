@@ -911,6 +911,13 @@ fn run_module_initializers(
         match outcome {
             RunOutcome::Returned(rc) => {
                 tracing::info!("{}: module_start returned {rc:#x}", init.name);
+                // An initializer that RETURNED is the honest proof of this
+                // phase: one that faults or exits leaves the loop through the
+                // other arm, and the phase must not claim initializers ran when
+                // one of them killed the process.
+                raeen_core::frame_path::record_phase(
+                    raeen_core::frame_path::Phase::InitializersRan,
+                );
             }
             RunOutcome::Exited(code) => return Ok(Some(RunOutcome::Exited(code))),
         }
