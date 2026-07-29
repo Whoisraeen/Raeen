@@ -28,12 +28,36 @@ const VIDEO_OUT_ERROR_INVALID_OPTION: u64 = 0x8029_001A;
 /// SCE "memory fault" (`0x8002_0000 | EFAULT`) — SharpEmu returns this generic
 /// kernel error (not a VideoOut one) when an event/options block is unreadable.
 const SCE_ERROR_MEMORY_FAULT: u64 = 0x8002_000E;
+/// SCE "no such entry" (`0x8002_0000 | ENOENT`) — the generic *kernel* error
+/// KytyPS5's `KernelDeleteEvent` (`src/kernel/eventQueue.cpp:315`) returns when
+/// the `(ident, filter)` pair being deleted was never registered. The
+/// `sceVideoOutDelete*Event` family delegates to it, so it surfaces that error
+/// rather than a `libSceVideoOut` one.
+const SCE_KERNEL_ERROR_ENOENT: u64 = 0x8002_0002;
 /// Kernel-event `ident` of a VideoOut **flip** event (SharpEmu
 /// `SceVideoOutInternalEventFlip`).
 const VIDEO_OUT_EVENT_FLIP_ID: u64 = 0x6;
 /// Kernel-event `ident` of a VideoOut **vblank** event (SharpEmu
 /// `SceVideoOutInternalEventVblank`).
 const VIDEO_OUT_EVENT_VBLANK_ID: u64 = 0x40;
+/// Kernel-event `ident` of a VideoOut **pre-vblank-start** event — the leading
+/// edge of the same display refresh whose trailing edge is the vblank event
+/// (KytyPS5 fires them from `VblankBegin` / `VblankEnd`, videoOut.cpp:649-685).
+///
+/// No reference supplies an *internal* ident for it: SharpEmu has no pre-vblank
+/// path at all, and KytyPS5 keys its kevents by the **public** event id (0, 1,
+/// 2, 8) rather than by the internal idents this module inherited from SharpEmu
+/// (flip `0x6`, vblank `0x40`). So this value is Raeen-chosen — adjacent to the
+/// vblank ident because it is the same refresh, and deliberately not a small
+/// integer a guest is likely to pick for one of its own user events on the same
+/// queue. Only distinctness is guest-visible: a title classifies a delivered
+/// event through [`hle_get_event_id`], which maps this back to the public id 2
+/// (KytyPS5 `VIDEO_OUT_EVENT_PRE_VBLANK_START`).
+const VIDEO_OUT_EVENT_PRE_VBLANK_START_ID: u64 = 0x41;
+/// Kernel-event `ident` of a VideoOut **output-mode** event. Raeen-chosen on
+/// the same basis as [`VIDEO_OUT_EVENT_PRE_VBLANK_START_ID`]; maps to the public
+/// id 8 (KytyPS5 `VIDEO_OUT_EVENT_SET_MODE`).
+const VIDEO_OUT_EVENT_OUTPUT_MODE_ID: u64 = 0x42;
 /// `SceKernelEvent.filter` for VideoOut events.
 const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
 /// Size of the `SceVideoOutOutputOptions` block (SharpEmu
@@ -155,6 +179,39 @@ pub fn register(registry: &HleRegistry) {
         "sceVideoOutAddVblankEvent",
         hle_add_vblank_event,
     );
+    // The rest of the VideoOut event family (KytyPS5 implements seven entry
+    // points, Raeen previously implemented two — docs/silent-zero-frame-cluster.md
+    // section 3). Blasphemous II (PPSA13580) is the measured import: its
+    // `sceVideoOutDeleteFlipEvent` was unresolved in the baseline-1785285421268
+    // run. The other four are not observed as imports in any title measured so
+    // far; they are registered because a title that can *add* an event class it
+    // cannot *delete* leaks the registration, and because an unresolved NID in
+    // this family is a hard stop rather than a degraded frame.
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutDeleteFlipEvent",
+        hle_delete_flip_event,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutDeleteVblankEvent",
+        hle_delete_vblank_event,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutAddPreVblankStartEvent",
+        hle_add_pre_vblank_start_event,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutDeletePreVblankStartEvent",
+        hle_delete_pre_vblank_start_event,
+    );
+    registry.register(
+        "libSceVideoOut",
+        "sceVideoOutAddOutputModeEvent",
+        hle_add_output_mode_event,
+    );
     registry.register("libSceVideoOut", "sceVideoOutGetEventId", hle_get_event_id);
     registry.register(
         "libSceVideoOut",
@@ -219,7 +276,18 @@ fn hle_close(_ctx: &HleContext, args: &[u64]) -> u64 {
 /// event that is edge-triggered whenever a direct or AGC-embedded flip
 /// completes.
 fn hle_add_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
-    add_video_out_event(ctx, args, VIDEO_OUT_EVENT_FLIP_ID, "flip")
+    add_video_out_event(ctx, args, VIDEO_OUT_EVENT_FLIP_ID, "flip", None)
+}
+
+/// `sceVideoOutDeleteFlipEvent(equeue, handle)`: drop the flip registration
+/// this queue holds. Ported from KytyPS5 `VideoOutDeleteFlipEvent`
+/// (videoOut.cpp:1059, NID `-Ozn0F1AFRg`).
+///
+/// This is the one entry point in the missing set with **measured** evidence:
+/// Blasphemous II imports it and our loader reported it unresolved
+/// (`artifacts/compat/raw/baseline-1785285421268/PPSA13580-b5469945261a.stdout.log:322`).
+fn hle_delete_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    delete_video_out_event(ctx, args, VIDEO_OUT_EVENT_FLIP_ID, "flip")
 }
 
 /// `sceVideoOutAddVblankEvent(equeue, handle, udata)`: register a VideoOut
@@ -232,10 +300,86 @@ fn hle_add_flip_event(ctx: &HleContext, args: &[u64]) -> u64 {
 /// a display refresh), which keeps event-driven frame loops advancing without
 /// a host timer thread.
 fn hle_add_vblank_event(ctx: &HleContext, args: &[u64]) -> u64 {
-    add_video_out_event(ctx, args, VIDEO_OUT_EVENT_VBLANK_ID, "vblank")
+    add_video_out_event(ctx, args, VIDEO_OUT_EVENT_VBLANK_ID, "vblank", None)
 }
 
-fn add_video_out_event(ctx: &HleContext, args: &[u64], ident: u64, kind: &str) -> u64 {
+/// `sceVideoOutDeleteVblankEvent(equeue, handle)`: the mirror of
+/// [`hle_add_vblank_event`]. Ported from KytyPS5 `VideoOutDeleteVblankEvent`
+/// (videoOut.cpp:1069, NID `oNOQn3knW6s`).
+fn hle_delete_vblank_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    delete_video_out_event(ctx, args, VIDEO_OUT_EVENT_VBLANK_ID, "vblank")
+}
+
+/// `sceVideoOutAddPreVblankStartEvent(equeue, handle, udata)`: register for the
+/// *leading* edge of a display refresh. Ported from KytyPS5
+/// `VideoOutAddPreVblankStartEvent` (videoOut.cpp:1085, NID `keipklF0pMY`).
+///
+/// KytyPS5 splits the refresh in two — `VblankBegin` fires pre-vblank-start,
+/// `VblankEnd` fires vblank (videoOut.cpp:649-685). Raeen has a single vblank
+/// tick (see [`hle_add_vblank_event`]), so [`trigger_vblank_events`] fires both
+/// classes from it, each carrying the same sequence number. That collapses the
+/// intra-frame ordering KytyPS5 preserves, but it does deliver: registering an
+/// event class that nothing ever triggers is the exact "we ack, we never
+/// deliver" failure this work exists to close.
+fn hle_add_pre_vblank_start_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    add_video_out_event(
+        ctx,
+        args,
+        VIDEO_OUT_EVENT_PRE_VBLANK_START_ID,
+        "pre-vblank-start",
+        None,
+    )
+}
+
+/// `sceVideoOutDeletePreVblankStartEvent(equeue, handle)`: the mirror of
+/// [`hle_add_pre_vblank_start_event`]. Ported from KytyPS5
+/// `VideoOutDeletePreVblankStartEvent` (videoOut.cpp:1074, NID `elWQ9vERF-Q`).
+fn hle_delete_pre_vblank_start_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    delete_video_out_event(
+        ctx,
+        args,
+        VIDEO_OUT_EVENT_PRE_VBLANK_START_ID,
+        "pre-vblank-start",
+    )
+}
+
+/// `sceVideoOutAddOutputModeEvent(equeue, handle, udata)`: register for display
+/// output-mode changes. Ported from KytyPS5 `VideoOutAddOutputModeEvent`
+/// (videoOut.cpp:1091, NID `kmSe30JTs+E`).
+///
+/// KytyPS5 registers this class **already triggered**, with the handle's
+/// current output mode as the payload (`RegisterVideoOutEvent`,
+/// videoOut.cpp:366-376: `initially_triggered = kind == OutputMode`) — so a
+/// title that registers and then blocks for the current mode is answered
+/// immediately instead of waiting for a mode change that may never come. Raeen
+/// drives a fixed display and never changes mode after registration, which
+/// makes that initial delivery the *only* one; getting it wrong would park an
+/// output-mode-driven init path forever. The payload is
+/// [`OUTPUT_MODE_DEFAULT`], the mode `sceVideoOutIsOutputSupported` accepts.
+fn hle_add_output_mode_event(ctx: &HleContext, args: &[u64]) -> u64 {
+    add_video_out_event(
+        ctx,
+        args,
+        VIDEO_OUT_EVENT_OUTPUT_MODE_ID,
+        "output-mode",
+        Some(OUTPUT_MODE_DEFAULT),
+    )
+}
+
+/// Shared body of the `sceVideoOutAdd*Event` family.
+///
+/// `initial_trigger` is `Some(payload)` for a class that KytyPS5 registers
+/// pre-triggered (output-mode only); the payload is encoded into `data` with
+/// the same `ident | payload << 16` layout every trigger site in this file
+/// uses, so `sceVideoOutGetEventData` decodes it identically to a later
+/// delivery.
+fn add_video_out_event(
+    ctx: &HleContext,
+    args: &[u64],
+    ident: u64,
+    kind: &str,
+    initial_trigger: Option<u64>,
+) -> u64 {
     let equeue = args.first().copied().unwrap_or(0);
     let handle = args.get(1).copied().unwrap_or(0) as i32;
     let udata = args.get(2).copied().unwrap_or(0);
@@ -250,28 +394,72 @@ fn add_video_out_event(ctx: &HleContext, args: &[u64], ident: u64, kind: &str) -
         raeen_kernel::EqueueUserEvent {
             udata,
             filter: KERNEL_EVENT_FILTER_VIDEO_OUT,
-            ..Default::default()
+            triggered: initial_trigger.is_some(),
+            fflags: u32::from(initial_trigger.is_some()),
+            data: initial_trigger
+                .map(|payload| (ident | ((payload & 0x0000_ffff_ffff_ffff) << 16)) as i64)
+                .unwrap_or(0),
         },
     );
     debug!(equeue, handle, udata, "registered VideoOut {kind} event");
     SCE_OK
 }
 
-/// Trigger every registered VideoOut vblank event. `data` carries the vblank
-/// sequence in the upper bits over the ident, mirroring the flip-event
-/// encoding this file already uses (SharpEmu `GetEventData` decodes
-/// `data >> 16`).
+/// Shared body of the `sceVideoOutDelete*Event` family: the exact mirror of
+/// [`add_video_out_event`] — the same handle and equeue validation, then the
+/// `(equeue, ident)` key that Add inserted is removed.
+///
+/// Ported from KytyPS5 `DeleteVideoOutEvent` (videoOut.cpp:389). Deleting a
+/// registration that was never made is [`SCE_KERNEL_ERROR_ENOENT`], the generic
+/// kernel error KytyPS5 surfaces by delegating to `KernelDeleteEvent`
+/// (eventQueue.cpp:315) — not a `libSceVideoOut` error.
+fn delete_video_out_event(ctx: &HleContext, args: &[u64], ident: u64, kind: &str) -> u64 {
+    let equeue = args.first().copied().unwrap_or(0);
+    let handle = args.get(1).copied().unwrap_or(0) as i32;
+    if handle != 1 {
+        return VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    if !ctx.kernel.kernel_equeues.contains_key(&equeue) {
+        return VIDEO_OUT_ERROR_INVALID_OPTION;
+    }
+    if ctx
+        .kernel
+        .kernel_equeue_events
+        .remove(&(equeue, ident))
+        .is_none()
+    {
+        debug!(
+            equeue,
+            handle, "no VideoOut {kind} event registered to delete"
+        );
+        return SCE_KERNEL_ERROR_ENOENT;
+    }
+    debug!(equeue, handle, "deleted VideoOut {kind} event");
+    SCE_OK
+}
+
+/// Trigger every registered VideoOut vblank **and pre-vblank-start** event.
+/// `data` carries the vblank sequence in the upper bits over the ident,
+/// mirroring the flip-event encoding this file already uses (SharpEmu
+/// `GetEventData` decodes `data >> 16`).
+///
+/// KytyPS5 fires the two classes from opposite ends of one display refresh
+/// (`VblankBegin` / `VblankEnd`, videoOut.cpp:649-685) with independent
+/// counters. Raeen has a single tick point, so both fire here with the same
+/// sequence number — a registered pre-vblank-start event is delivered rather
+/// than parked forever, at the cost of the intra-frame ordering.
 fn trigger_vblank_events(ctx: &HleContext, count: u64) {
-    let event_hint = VIDEO_OUT_EVENT_VBLANK_ID | ((count & 0x0000_ffff_ffff_ffff) << 16);
+    let sequence = (count & 0x0000_ffff_ffff_ffff) << 16;
     let mut queues = Vec::new();
     for mut event in ctx.kernel.kernel_equeue_events.iter_mut() {
-        if event.key().1 == VIDEO_OUT_EVENT_VBLANK_ID
+        let ident = event.key().1;
+        if (ident == VIDEO_OUT_EVENT_VBLANK_ID || ident == VIDEO_OUT_EVENT_PRE_VBLANK_START_ID)
             && event.filter == KERNEL_EVENT_FILTER_VIDEO_OUT
         {
             let eq = event.key().0;
             event.triggered = true;
             event.fflags = event.fflags.saturating_add(1);
-            event.data = event_hint as i64;
+            event.data = (ident | sequence) as i64;
             if !queues.contains(&eq) {
                 queues.push(eq);
             }
@@ -1037,12 +1225,17 @@ fn hle_unregister_buffers(ctx: &HleContext, args: &[u64]) -> u64 {
 }
 
 /// `sceVideoOutGetEventId(const SceKernelEvent *event)`: classify a delivered
-/// VideoOut kernel event — returns **0 = flip, 1 = vblank** (positive return,
-/// not an out-param). Ported from SharpEmu `VideoOutGetEventId`
-/// (VideoOutExports.cs, NID `U2JJtSqNKZI`): reads `ident` (u64 @ +0x00) and
-/// `filter` (i16 @ +0x08) from the guest event struct; a non-VideoOut filter
-/// or unknown ident is `INVALID_EVENT`. The idents match what this module
-/// registers/triggers: flip = 0x6, vblank = 0x40.
+/// VideoOut kernel event — returns **0 = flip, 1 = vblank, 2 = pre-vblank-start,
+/// 8 = output-mode** (positive return, not an out-param). Ported from SharpEmu
+/// `VideoOutGetEventId` (VideoOutExports.cs, NID `U2JJtSqNKZI`) for the first
+/// two; the remaining public ids are KytyPS5's `VIDEO_OUT_EVENT_*`
+/// (videoOut.cpp:39-42). Reads `ident` (u64 @ +0x00) and `filter` (i16 @ +0x08)
+/// from the guest event struct; a non-VideoOut filter or unknown ident is
+/// `INVALID_EVENT`.
+///
+/// This is the only place the internal idents this module keys registrations by
+/// (flip `0x6`, vblank `0x40`, and the Raeen-chosen `0x41` / `0x42`) become
+/// guest-visible numbers, which is why their exact values are internal.
 fn hle_get_event_id(ctx: &HleContext, args: &[u64]) -> u64 {
     let event = args.first().copied().unwrap_or(0);
     if event == 0 {
@@ -1059,6 +1252,8 @@ fn hle_get_event_id(ctx: &HleContext, args: &[u64]) -> u64 {
     match u64::from_le_bytes(ident) {
         VIDEO_OUT_EVENT_FLIP_ID => 0,
         VIDEO_OUT_EVENT_VBLANK_ID => 1,
+        VIDEO_OUT_EVENT_PRE_VBLANK_START_ID => 2,
+        VIDEO_OUT_EVENT_OUTPUT_MODE_ID => 8,
         _ => VIDEO_OUT_ERROR_INVALID_EVENT,
     }
 }
@@ -1571,6 +1766,11 @@ mod tests {
         let registry = HleRegistry::new();
         for name in [
             "sceVideoOutIsOutputSupported",
+            "sceVideoOutDeleteFlipEvent",
+            "sceVideoOutDeleteVblankEvent",
+            "sceVideoOutAddPreVblankStartEvent",
+            "sceVideoOutDeletePreVblankStartEvent",
+            "sceVideoOutAddOutputModeEvent",
             "sceVideoOutConfigureOutput",
             "sceVideoOutInitializeOutputOptions",
             "sceVideoOutSetWindowModeMargins",
@@ -1584,6 +1784,268 @@ mod tests {
                 registry.is_implemented("libSceVideoOut", name),
                 "missing libSceVideoOut::{name}"
             );
+        }
+    }
+
+    /// `sceVideoOutDeleteFlipEvent` is the exact mirror of AddFlipEvent: same
+    /// handle/equeue validation, and the registration Add inserted is gone
+    /// afterwards — a later flip no longer triggers anything on that queue.
+    ///
+    /// This is the measured gap: Blasphemous II (PPSA13580) imports this NID
+    /// and our loader reported it unresolved.
+    #[test]
+    fn delete_flip_event_undoes_add_flip_event() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+
+        assert_eq!(hle_add_flip_event(&ctx, &[eq, 1, 0xCAFE]), SCE_OK);
+        assert!(
+            kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_FLIP_ID))
+        );
+
+        // Validation mirrors the Add path exactly, and rejects *before*
+        // removing anything.
+        assert_eq!(
+            hle_delete_flip_event(&ctx, &[eq, 9]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(
+            hle_delete_flip_event(&ctx, &[eq + 0x1000, 1]),
+            VIDEO_OUT_ERROR_INVALID_OPTION
+        );
+        assert!(
+            kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_FLIP_ID)),
+            "a rejected delete must not drop the registration"
+        );
+
+        assert_eq!(hle_delete_flip_event(&ctx, &[eq, 1]), SCE_OK);
+        assert!(
+            !kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_FLIP_ID))
+        );
+        // Deleting a registration that is not there is ENOENT, not success.
+        assert_eq!(
+            hle_delete_flip_event(&ctx, &[eq, 1]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+
+        // And the delete actually took effect where it matters: a completed
+        // flip no longer resurrects or triggers the event.
+        assert_eq!(submit_flip_from_agc(&ctx, 1, 0, 1, 0x1234), SCE_OK);
+        assert!(
+            !kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_FLIP_ID))
+        );
+    }
+
+    /// The vblank mirror, checked the same way — including that the vblank tick
+    /// (which fires from WaitVblank and from every flip) no longer reaches the
+    /// deleted registration.
+    #[test]
+    fn delete_vblank_event_undoes_add_vblank_event() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+
+        assert_eq!(hle_add_vblank_event(&ctx, &[eq, 1, 0xBEEF]), SCE_OK);
+        assert_eq!(
+            hle_delete_vblank_event(&ctx, &[eq, 9]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(hle_delete_vblank_event(&ctx, &[eq, 1]), SCE_OK);
+        assert_eq!(
+            hle_delete_vblank_event(&ctx, &[eq, 1]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+
+        assert_eq!(hle_wait_vblank(&ctx, &[1]), SCE_OK);
+        assert!(
+            !kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_VBLANK_ID)),
+            "a vblank tick must not resurrect a deleted registration"
+        );
+    }
+
+    /// Pre-vblank-start registers, is **delivered** by the vblank tick (Raeen
+    /// has one tick point where KytyPS5 has two), classifies as public id 2,
+    /// and deletes.
+    #[test]
+    fn pre_vblank_start_events_register_fire_and_delete() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+
+        assert_eq!(
+            hle_add_pre_vblank_start_event(&ctx, &[eq, 9, 0]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(
+            hle_add_pre_vblank_start_event(&ctx, &[eq, 1, 0xF00D]),
+            SCE_OK
+        );
+        {
+            let event = kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_PRE_VBLANK_START_ID))
+                .unwrap();
+            assert!(!event.triggered, "not triggered until a refresh");
+            assert_eq!(event.filter, KERNEL_EVENT_FILTER_VIDEO_OUT);
+            assert_eq!(event.udata, 0xF00D);
+        }
+
+        // The ident is distinct from flip and vblank — the three classes are
+        // separate registrations on one queue, not one key overwriting another.
+        assert_ne!(
+            VIDEO_OUT_EVENT_PRE_VBLANK_START_ID,
+            VIDEO_OUT_EVENT_VBLANK_ID
+        );
+        assert_ne!(VIDEO_OUT_EVENT_PRE_VBLANK_START_ID, VIDEO_OUT_EVENT_FLIP_ID);
+        assert_eq!(hle_add_vblank_event(&ctx, &[eq, 1, 0xBEEF]), SCE_OK);
+
+        // One vblank tick delivers both classes, each carrying its own ident
+        // with the shared sequence number above it.
+        assert_eq!(hle_wait_vblank(&ctx, &[1]), SCE_OK);
+        {
+            let pre = kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_PRE_VBLANK_START_ID))
+                .unwrap();
+            assert!(pre.triggered, "we must deliver, not merely acknowledge");
+            assert_eq!(
+                pre.data as u64,
+                VIDEO_OUT_EVENT_PRE_VBLANK_START_ID | (1 << 16)
+            );
+            assert_eq!(pre.udata, 0xF00D);
+            let vblank = kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+                .unwrap();
+            assert!(vblank.triggered);
+            assert_eq!(vblank.data as u64, VIDEO_OUT_EVENT_VBLANK_ID | (1 << 16));
+            assert_eq!(vblank.udata, 0xBEEF);
+        }
+
+        // GetEventId classifies the delivered event as the public id 2.
+        let mut event_struct = [0u8; 0x20];
+        event_struct[0..8].copy_from_slice(&VIDEO_OUT_EVENT_PRE_VBLANK_START_ID.to_le_bytes());
+        event_struct[8..10].copy_from_slice(&KERNEL_EVENT_FILTER_VIDEO_OUT.to_le_bytes());
+        assert!(mem.write(0x300, &event_struct));
+        assert_eq!(
+            hle_get_event_id(&ctx, &[0x300]),
+            2,
+            "pre-vblank-start event → 2"
+        );
+
+        assert_eq!(hle_delete_pre_vblank_start_event(&ctx, &[eq, 1]), SCE_OK);
+        assert!(
+            !kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_PRE_VBLANK_START_ID))
+        );
+        assert_eq!(
+            hle_delete_pre_vblank_start_event(&ctx, &[eq, 1]),
+            SCE_KERNEL_ERROR_ENOENT
+        );
+        // Deleting pre-vblank leaves the vblank registration alone.
+        assert!(
+            kernel
+                .kernel_equeue_events
+                .contains_key(&(eq, VIDEO_OUT_EVENT_VBLANK_ID))
+        );
+    }
+
+    /// An output-mode event registers **already triggered** with the current
+    /// mode as its payload (KytyPS5 `RegisterVideoOutEvent`,
+    /// videoOut.cpp:366-376). Raeen never changes output mode, so this initial
+    /// delivery is the only one a title will get — if it were not pending at
+    /// registration, an output-mode-driven init would park forever.
+    #[test]
+    fn output_mode_event_registers_already_triggered_with_the_current_mode() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+
+        assert_eq!(
+            hle_add_output_mode_event(&ctx, &[eq, 9, 0]),
+            VIDEO_OUT_ERROR_INVALID_HANDLE
+        );
+        assert_eq!(hle_add_output_mode_event(&ctx, &[eq, 1, 0xABBA]), SCE_OK);
+        let event = kernel
+            .kernel_equeue_events
+            .get(&(eq, VIDEO_OUT_EVENT_OUTPUT_MODE_ID))
+            .unwrap();
+        assert!(event.triggered, "registered pending, per KytyPS5");
+        assert_eq!(event.fflags, 1);
+        assert_eq!(event.filter, KERNEL_EVENT_FILTER_VIDEO_OUT);
+        assert_eq!(event.udata, 0xABBA);
+        assert_eq!(
+            event.data as u64,
+            VIDEO_OUT_EVENT_OUTPUT_MODE_ID | (OUTPUT_MODE_DEFAULT << 16),
+            "payload is the current output mode, in the shared data layout"
+        );
+        drop(event);
+
+        // A vblank tick must not disturb it — output-mode is its own class.
+        assert_eq!(hle_wait_vblank(&ctx, &[1]), SCE_OK);
+        assert_eq!(
+            kernel
+                .kernel_equeue_events
+                .get(&(eq, VIDEO_OUT_EVENT_OUTPUT_MODE_ID))
+                .unwrap()
+                .data as u64,
+            VIDEO_OUT_EVENT_OUTPUT_MODE_ID | (OUTPUT_MODE_DEFAULT << 16)
+        );
+
+        let mut event_struct = [0u8; 0x20];
+        event_struct[0..8].copy_from_slice(&VIDEO_OUT_EVENT_OUTPUT_MODE_ID.to_le_bytes());
+        event_struct[8..10].copy_from_slice(&KERNEL_EVENT_FILTER_VIDEO_OUT.to_le_bytes());
+        assert!(mem.write(0x300, &event_struct));
+        assert_eq!(hle_get_event_id(&ctx, &[0x300]), 8, "output-mode event → 8");
+    }
+
+    /// The Add path for the classes that are *not* pre-triggered must stay
+    /// un-triggered, so a title cannot mistake registration for a first
+    /// delivery. Guards the `initial_trigger` plumbing added for output-mode.
+    #[test]
+    fn only_output_mode_registers_pre_triggered() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let eq = kernel.create_equeue(0);
+
+        for (add, ident) in [
+            (
+                hle_add_flip_event as fn(&HleContext, &[u64]) -> u64,
+                VIDEO_OUT_EVENT_FLIP_ID,
+            ),
+            (hle_add_vblank_event, VIDEO_OUT_EVENT_VBLANK_ID),
+            (
+                hle_add_pre_vblank_start_event,
+                VIDEO_OUT_EVENT_PRE_VBLANK_START_ID,
+            ),
+        ] {
+            assert_eq!(add(&ctx, &[eq, 1, 0]), SCE_OK);
+            let event = kernel.kernel_equeue_events.get(&(eq, ident)).unwrap();
+            assert!(!event.triggered, "ident {ident:#x} must register idle");
+            assert_eq!(event.fflags, 0);
+            assert_eq!(event.data, 0);
         }
     }
 }

@@ -124,6 +124,58 @@ fn sce_user_service_get_age_level_resolves_from_the_libsceuserservice_provider()
     }
 }
 
+/// Blasphemous II (PPSA13580) imports `sceVideoOutDeleteFlipEvent` and our
+/// loader reported it **unresolved** — measured in that run's own log,
+/// `artifacts/compat/raw/baseline-1785285421268/PPSA13580-b5469945261a.stdout.log:322`:
+///
+/// ```text
+/// missing sceVideoOutDeleteFlipEvent — NID 0xfcece7d05d401518 (-Ozn0F1AFRg)
+///   wanted from library 'libSceVideoOut'
+/// ```
+///
+/// The title is one of the four in the silent zero-frame cluster
+/// (`docs/silent-zero-frame-cluster.md` section 3): it runs, presents nothing,
+/// and logs no error. This pins the spelling of the whole VideoOut event family
+/// registered alongside it — a NID is a hash of the *name*, so an
+/// implementation registered under a near-miss spelling resolves nothing and is
+/// indistinguishable, at the log level the compat harness runs at, from not
+/// having been written.
+#[test]
+fn video_out_delete_flip_event_resolves_the_nid_blasphemous_ii_asked_for() {
+    const DELETE_FLIP_EVENT_NID: u64 = 0xfcec_e7d0_5d40_1518;
+    assert_eq!(nid_of("sceVideoOutDeleteFlipEvent"), DELETE_FLIP_EVENT_NID);
+    assert_eq!(encode_nid(DELETE_FLIP_EVENT_NID), "-Ozn0F1AFRg");
+
+    let hle = HleRegistry::new();
+    let registry = ModuleRegistry::new(NidDatabase::from_hle(&hle));
+
+    match registry.resolve(&hle, "libSceVideoOut", DELETE_FLIP_EVENT_NID) {
+        Resolver::Hle { function, .. } => assert_eq!(function, "sceVideoOutDeleteFlipEvent"),
+        other => panic!(
+            "sceVideoOutDeleteFlipEvent imported from provider 'libSceVideoOut' must \
+             resolve to an HLE function; got {other:?}"
+        ),
+    }
+
+    // The rest of the event family KytyPS5 implements (videoOut.cpp:1059-1095).
+    // These are not observed as imports in any measured title yet — unlike the
+    // NID above — so this asserts registration under the correct spelling, not
+    // that a title needs them today.
+    for name in [
+        "sceVideoOutAddFlipEvent",
+        "sceVideoOutAddVblankEvent",
+        "sceVideoOutDeleteVblankEvent",
+        "sceVideoOutAddPreVblankStartEvent",
+        "sceVideoOutDeletePreVblankStartEvent",
+        "sceVideoOutAddOutputModeEvent",
+    ] {
+        match registry.resolve(&hle, "libSceVideoOut", nid_of(name)) {
+            Resolver::Hle { function, .. } => assert_eq!(function, name),
+            other => panic!("{name} must resolve from 'libSceVideoOut'; got {other:?}"),
+        }
+    }
+}
+
 /// The first `libSceAgc` import ASTRO.BOT actually calls once boot reaches GPU
 /// init. The NID was measured from the retail title; the name was recovered from
 /// SharpEmu's `aerolib` catalogue, so this also pins that our NID hash agrees
