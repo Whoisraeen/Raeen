@@ -13,6 +13,10 @@ use crate::{HleContext, HleRegistry};
 use raeen_kernel::PthreadAttr;
 use tracing::{debug, info, warn};
 
+/// A single-out-parameter attribute getter, for the invariant test's table.
+#[cfg(test)]
+type AttrGetter = fn(&HleContext, &[u64]) -> u64;
+
 const OK: u64 = 0;
 const EINVAL: u64 = 22;
 
@@ -66,6 +70,18 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libkernel", "scePthreadAttrGetstacksize", hle_get_stacksize);
     registry.register("libkernel", "scePthreadAttrSetstack", hle_set_stack);
     registry.register("libkernel", "scePthreadAttrGetstack", hle_get_stack);
+    // Both were `hle_ok_stub` in libkernel.rs: success with no write to the
+    // out-parameter, i.e. the guest reads its own uninitialized memory.
+    registry.register(
+        "libkernel",
+        "scePthreadAttrGetschedparam",
+        hle_get_schedparam_attr,
+    );
+    registry.register(
+        "libkernel",
+        "scePthreadAttrGetaffinity",
+        hle_get_affinity_attr,
+    );
     registry.register("libkernel", "scePthreadAttrGetstackaddr", hle_get_stackaddr);
     registry.register("libkernel", "scePthreadAttrGet", hle_attr_get);
     registry.register(
@@ -463,6 +479,59 @@ fn hle_set_solo_sched(ctx: &HleContext, args: &[u64]) -> u64 {
     })
 }
 
+/// `scePthreadAttrGetschedparam(attr, struct sched_param *out)`: the attribute
+/// object's scheduling priority.
+///
+/// FreeBSD's `struct sched_param` is a single `int sched_priority`, and
+/// [`PthreadAttr`] already stores that value, so this can report the truth.
+///
+/// It was `hle_ok_stub` — returning `SCE_OK` while writing **nothing**, leaving
+/// the guest to read its own uninitialized stack as a thread priority. That is
+/// the same defect class that cost four rounds of investigation on Blasphemous
+/// II, where `scePthreadAttrGet` returned success without filling in the stack
+/// base and Boehm GC accepted the garbage (it rejects only a zero) and then
+/// scanned from it until it walked off mapped memory. An ok-stub over an
+/// out-parameter is worse than an unimplemented NID, because an unimplemented
+/// NID is at least logged.
+fn hle_get_schedparam_attr(ctx: &HleContext, args: &[u64]) -> u64 {
+    let attr = args.first().copied().unwrap_or(0);
+    let out = args.get(1).copied().unwrap_or(0);
+    let Some(state) = read_attr(ctx, attr) else {
+        return EINVAL;
+    };
+    if out == 0 || !ctx.mem.write(out, &state.sched_priority.to_le_bytes()) {
+        return EINVAL;
+    }
+    OK
+}
+
+/// `scePthreadAttrGetaffinity(attr, SceKernelCpumask *out)`: the attribute
+/// object's CPU affinity mask.
+///
+/// Raeen does not constrain guest threads to cores, so the honest answer is
+/// "every core this console has" — the Zen 2 PS5 has 8, hence `0xff`. Also
+/// previously `hle_ok_stub`: the guest read uninitialized memory as a core mask,
+/// and a title that then intersected it with its own set could compute an empty
+/// mask and refuse to start a worker.
+///
+/// This does **not** round-trip `scePthreadAttrSetaffinity`, which remains a
+/// stub because nothing here honours an affinity request; a fixed full mask is
+/// nevertheless strictly better than an uninitialized read, and it is what a
+/// caller on a machine with no affinity restriction would see.
+fn hle_get_affinity_attr(ctx: &HleContext, args: &[u64]) -> u64 {
+    /// All eight Zen 2 cores.
+    const ALL_CORES: u64 = 0xff;
+    let attr = args.first().copied().unwrap_or(0);
+    let out = args.get(1).copied().unwrap_or(0);
+    if read_attr(ctx, attr).is_none() {
+        return EINVAL;
+    }
+    if out == 0 || !ctx.mem.write(out, &ALL_CORES.to_le_bytes()) {
+        return EINVAL;
+    }
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +546,51 @@ mod tests {
         let mem = crate::TestMemory::new(0x4000);
         let alloc = crate::TestAllocator::new(0x1000);
         (kernel, mem, alloc)
+    }
+
+    /// Every attribute *getter* must write its out-parameter. An `hle_ok_stub`
+    /// over an out-parameter returns success and writes nothing, so the guest
+    /// reads its own uninitialized stack and cannot tell.
+    ///
+    /// That is not hypothetical: `scePthreadAttrGet` was such a stub, and it
+    /// stalled Blasphemous II outright. Its Boehm GC seeds a thread's scan range
+    /// from the returned stack base and rejects only a ZERO, so it accepted
+    /// stack garbage and then walked off mapped memory. `Getschedparam` and
+    /// `Getaffinity` were the two remaining instances.
+    ///
+    /// The check is a poisoned destination: pre-fill the out-slot with a
+    /// recognizable pattern and require the call to overwrite it. A stub that
+    /// returns OK leaves the poison and fails.
+    #[test]
+    fn every_attr_getter_actually_writes_its_out_parameter() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let attr = 0x100;
+        assert_eq!(hle_attr_init(&ctx, &[attr]), OK);
+
+        const POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        let out = 0x300;
+        // (name, handler) for every getter that fills a single out-slot.
+        let getters: [(&str, AttrGetter); 5] = [
+            ("scePthreadAttrGetstacksize", hle_get_stacksize),
+            ("scePthreadAttrGetstackaddr", hle_get_stackaddr),
+            ("scePthreadAttrGetdetachstate", hle_get_detachstate),
+            ("scePthreadAttrGetschedparam", hle_get_schedparam_attr),
+            ("scePthreadAttrGetaffinity", hle_get_affinity_attr),
+        ];
+        for (name, handler) in getters {
+            assert!(mem.write(out, &POISON.to_le_bytes()), "{name}: poison");
+            assert_eq!(handler(&ctx, &[attr, out]), OK, "{name} must succeed");
+            let mut got = [0u8; 8];
+            assert!(mem.read(out, &mut got), "{name}: read back");
+            assert_ne!(
+                u64::from_le_bytes(got),
+                POISON,
+                "{name} returned SCE_OK without writing its out-parameter — the guest                  would read uninitialized memory and could not tell"
+            );
+            // A null out-pointer is an error, never a silent success.
+            assert_eq!(handler(&ctx, &[attr, 0]), EINVAL, "{name}(attr, NULL)");
+        }
     }
 
     #[test]

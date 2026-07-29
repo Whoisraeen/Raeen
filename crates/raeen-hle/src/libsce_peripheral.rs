@@ -27,7 +27,15 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceIme", "sceImeUpdate", hle_ok); // no pending events
     registry.register("libSceIme", "sceImeKeyboardOpen", hle_ok);
     registry.register("libSceIme", "sceImeKeyboardClose", hle_ok);
-    registry.register("libSceIme", "sceImeKeyboardGetResourceId", hle_ok);
+    // `sceImeKeyboardGetResourceId(userId, SceImeKeyboardResourceIdArray *out)`:
+    // the array is an output the caller reads back. Reporting success without
+    // filling it hands the caller its own uninitialized memory as resource ids.
+    registry.register_incomplete(
+        "libSceIme",
+        "sceImeKeyboardGetResourceId",
+        hle_ok,
+        "reports success without writing the caller's resource-id array out-struct",
+    );
     registry.register("libSceIme", "sceImeOpen", hle_ok);
     registry.register("libSceIme", "sceImeClose", hle_ok);
 

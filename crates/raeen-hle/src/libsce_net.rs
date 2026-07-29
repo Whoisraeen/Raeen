@@ -91,8 +91,23 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceNetCtl", "sceNetCtlGetState", hle_ctl_get_state);
     registry.register("libSceNetCtl", "sceNetCtlGetStateV6", hle_ctl_get_state);
     registry.register("libSceNetCtl", "sceNetCtlCheckCallback", hle_ok);
-    registry.register("libSceNetCtl", "sceNetCtlRegisterCallback", hle_ok);
-    registry.register("libSceNetCtl", "sceNetCtlRegisterCallbackV6", hle_ok);
+    // `sceNetCtlRegisterCallback(func, arg, int *cid)`: the third argument is an
+    // output — the callback id the title keeps so it can unregister later.
+    // Accepting the registration is honest offline behaviour (no transport, so
+    // no event ever fires), but leaving `cid` unwritten is not: the title
+    // unregisters with whatever was on its stack.
+    registry.register_incomplete(
+        "libSceNetCtl",
+        "sceNetCtlRegisterCallback",
+        hle_ok,
+        "reports success without writing the caller's callback-id out-parameter",
+    );
+    registry.register_incomplete(
+        "libSceNetCtl",
+        "sceNetCtlRegisterCallbackV6",
+        hle_ok,
+        "reports success without writing the caller's callback-id out-parameter",
+    );
     registry.register("libSceNetCtl", "sceNetCtlUnregisterCallback", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlGetResult", hle_ctl_get_result);
     registry.register("libSceNet", "sceNetEpollCreate", hle_epoll_create);

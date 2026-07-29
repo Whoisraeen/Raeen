@@ -49,11 +49,13 @@ pub fn register(registry: &HleRegistry) {
     );
     // Param initializer (zeroes the caller's SceSigninDialogParam). We ignore
     // the param on Open, so acknowledging is sufficient for the title to
-    // proceed.
-    registry.register(
+    // proceed — but the caller's struct is an output this shim never touches,
+    // so anything the title reads back out of it is its own leftover memory.
+    registry.register_incomplete(
         "libSceSigninDialog",
         "sceSigninDialogParamInitialize",
         hle_ok,
+        "reports success without initializing the caller's SceSigninDialogParam out-struct",
     );
     registry.register("libSceSigninDialog", "sceSigninDialogOpen", hle_open);
     registry.register("libSceSigninDialog", "sceSigninDialogGetStatus", hle_status);

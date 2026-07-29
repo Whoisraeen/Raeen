@@ -2534,13 +2534,11 @@ pub fn register(registry: &HleRegistry) {
         hle_pthread_getaffinity,
     );
     registry.register("libkernel", "scePthreadAttrSetaffinity", hle_ok_stub);
-    registry.register("libkernel", "scePthreadAttrGetaffinity", hle_ok_stub);
     // scePthreadAttrGet is registered by `pthread_attr` — it is FreeBSD's
     // `pthread_attr_get_np` and must report the LIVE thread's real stack, which
     // the old hle_ok_stub here did not: it returned success and wrote nothing,
     // leaving a collector to compute its scan bounds from the default base of 0.
     registry.register("libkernel", "scePthreadAttrSetschedparam", hle_ok_stub);
-    registry.register("libkernel", "scePthreadAttrGetschedparam", hle_ok_stub);
     registry.register("libkernel", "scePthreadAttrSetinheritsched", hle_ok_stub);
     registry.register("libkernel", "scePthreadGetname", hle_pthread_getname);
     registry.register("libkernel", "scePthreadOnce", hle_pthread_once);
@@ -6873,10 +6871,8 @@ mod tests {
             ("libkernel", "scePthreadSetprio"),
             ("libkernel", "scePthreadSetaffinity"),
             ("libkernel", "scePthreadAttrSetaffinity"),
-            ("libkernel", "scePthreadAttrGetaffinity"),
             ("libkernel", "scePthreadAttrGet"),
             ("libkernel", "scePthreadAttrSetschedparam"),
-            ("libkernel", "scePthreadAttrGetschedparam"),
             ("libkernel", "scePthreadAttrSetinheritsched"),
             ("libkernel", "scePthreadGetname"),
             ("libkernel", "scePthreadOnce"),

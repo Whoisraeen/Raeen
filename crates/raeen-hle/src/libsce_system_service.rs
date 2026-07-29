@@ -94,10 +94,11 @@ pub fn register(registry: &HleRegistry) {
     // so it is refused with the documented PARAMETER error — the title treats
     // the profile popup as unavailable and continues, rather than waiting on
     // an overlay that can never close.
-    registry.register(
+    registry.register_incomplete(
         "libSceSystemService",
         "sceSystemServiceInitializePlayerDialogParam",
         hle_ok,
+        "reports success without initializing the caller's player-dialog param out-struct",
     );
     registry.register_incomplete(
         "libSceSystemService",

@@ -28,11 +28,22 @@ pub fn register(registry: &HleRegistry) {
         "scePadSetLightBar",
         "scePadSetVolumeGain",
         "scePadSetProcessPrivilege",
-        "scePadDeviceClassParseData",
         "scePadSetButtonRemappingInfo",
     ] {
         registry.register("libScePad", f, hle_pad_ok);
     }
+    // Not a setter like the list above: `scePadDeviceClassParseData(handle,
+    // const ScePadData *in, ScePadDeviceClassData *out)` decodes the pad report
+    // into the caller's out-struct. The same acknowledge-and-write-nothing shim
+    // serves it, but a caller reading the decoded touchpad/motion fields back
+    // gets its own uninitialized memory, so it is classified rather than
+    // presented as working.
+    registry.register_incomplete(
+        "libScePad",
+        "scePadDeviceClassParseData",
+        hle_pad_ok,
+        "reports success without writing the caller's ScePadDeviceClassData out-struct",
+    );
     registry.register("libScePad", "scePadClose", hle_pad_close);
     registry.register(
         "libScePad",

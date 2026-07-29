@@ -21,7 +21,16 @@ const SKU_FLAG_FULL: i32 = 3;
 
 /// Register libSceAppContent HLE functions.
 pub fn register(registry: &HleRegistry) {
-    registry.register("libSceAppContent", "sceAppContentInitialize", hle_ok);
+    // `sceAppContentInitialize(const SceAppContentInitParam *initParam,
+    // SceAppContentBootParam *bootParam)`: the second argument is an output —
+    // the boot attribute the title reads to learn how it was launched. This
+    // shim reports success and leaves it untouched.
+    registry.register_incomplete(
+        "libSceAppContent",
+        "sceAppContentInitialize",
+        hle_ok,
+        "reports success without writing the caller's SceAppContentBootParam out-struct",
+    );
     registry.register(
         "libSceAppContent",
         "sceAppContentAppParamGetInt",

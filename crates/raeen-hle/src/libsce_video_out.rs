@@ -114,7 +114,19 @@ pub fn register(registry: &HleRegistry) {
         "sceVideoOutAddFlipEvent",
         hle_add_flip_event,
     );
-    registry.register("libSceVideoOut", "sceVideoOutSetBufferAttribute", hle_ok);
+    // `sceVideoOutSetBufferAttribute(SceVideoOutBufferAttribute *attr, format,
+    // tilingMode, aspectRatio, width, height, pitchInPixel)` reads as a setter
+    // but is really a *filler*: it zeroes the caller's attribute struct and
+    // writes all seven fields into it. This stub writes none of them, and the
+    // struct is what the title hands to `sceVideoOutRegisterBuffers` — which is
+    // implemented and does read the layout back. `SetBufferAttribute2` (below)
+    // is the path that actually records it.
+    registry.register_incomplete(
+        "libSceVideoOut",
+        "sceVideoOutSetBufferAttribute",
+        hle_ok,
+        "reports success without filling the caller's SceVideoOutBufferAttribute out-struct",
+    );
     registry.register(
         "libSceVideoOut",
         "sceVideoOutSetBufferAttribute2",

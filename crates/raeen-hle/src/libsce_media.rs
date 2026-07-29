@@ -120,8 +120,21 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libSceNgs2", "sceNgs2VoiceControl", hle_ok);
     registry.register("libSceNgs2", "sceNgs2VoiceRunCommands", hle_ok);
-    registry.register("libSceNgs2", "sceNgs2VoiceGetState", hle_ok);
-    registry.register("libSceNgs2", "sceNgs2VoiceGetStateFlags", hle_ok);
+    // Both report success and write nothing, so "reports idle" is aspirational:
+    // the caller reads back whatever was already in its own buffer. Classified
+    // so a crash report names them instead of presenting them as working.
+    registry.register_incomplete(
+        "libSceNgs2",
+        "sceNgs2VoiceGetState",
+        hle_ok,
+        "reports success without writing the caller's SceNgs2VoiceState out-struct",
+    );
+    registry.register_incomplete(
+        "libSceNgs2",
+        "sceNgs2VoiceGetStateFlags",
+        hle_ok,
+        "reports success without writing the caller's state-flags out-parameter",
+    );
 
     // libSceAvPlayer — video player (never becomes active; no frames).
     //

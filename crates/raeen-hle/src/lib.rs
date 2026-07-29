@@ -1552,6 +1552,124 @@ mod tests {
         );
     }
 
+    /// A success-returning shim over a function whose real ABI writes into
+    /// caller memory is the most expensive shape of wrong answer this crate
+    /// can give: the import resolves, the call returns `SCE_OK`, and the guest
+    /// reads its own uninitialized memory as the result. `scePthreadAttrGet`
+    /// cost four rounds of investigation exactly this way — Blasphemous II's
+    /// Boehm collector took the unwritten stack base as real and scanned from
+    /// it — and the crash report for that run said "Incomplete shims imported
+    /// by this title: <none recorded>", because an ok-stub is not an
+    /// incomplete registration unless someone says so.
+    ///
+    /// So every ok-stub sitting over an out-parameter must be
+    /// `register_incomplete`. This asserts the classification, not the
+    /// behaviour: these shims still return success and still write nothing.
+    /// The point is that a crash report names them.
+    #[test]
+    fn ok_stubs_over_out_parameters_are_classified_incomplete() {
+        let registry = HleRegistry::new();
+        let incomplete: std::collections::HashSet<(String, String)> = registry
+            .incomplete_registrations()
+            .into_iter()
+            .map(|(library, function, _)| (library, function))
+            .collect();
+
+        for (library, function) in [
+            // Fills the caller's attribute struct, which the (implemented)
+            // RegisterBuffers path then reads back.
+            ("libSceVideoOut", "sceVideoOutSetBufferAttribute"),
+            // Second argument is the boot-attribute output.
+            ("libSceAppContent", "sceAppContentInitialize"),
+            // Voice state / state flags out-parameters.
+            ("libSceNgs2", "sceNgs2VoiceGetState"),
+            ("libSceNgs2", "sceNgs2VoiceGetStateFlags"),
+            // `int *cid` — the id the title unregisters with later.
+            ("libSceNetCtl", "sceNetCtlRegisterCallback"),
+            ("libSceNetCtl", "sceNetCtlRegisterCallbackV6"),
+            // Resource-id array output.
+            ("libSceIme", "sceImeKeyboardGetResourceId"),
+            // ScePlayGoEta / ScePlayGoInstallSpeed outputs.
+            ("libScePlayGo", "scePlayGoGetEta"),
+            ("libScePlayGo", "scePlayGoGetInstallSpeed"),
+            // Param initializers: the caller's struct is the output.
+            (
+                "libSceSystemService",
+                "sceSystemServiceInitializePlayerDialogParam",
+            ),
+            ("libSceSigninDialog", "sceSigninDialogParamInitialize"),
+            // Decodes a pad report into the caller's device-class struct.
+            ("libScePad", "scePadDeviceClassParseData"),
+            // libSceFont: handles, counts and metrics handed back by pointer.
+            ("libSceFont", "sceFontCharacterGetBidiLevel"),
+            ("libSceFont", "sceFontCharacterGetTextFontCode"),
+            ("libSceFont", "sceFontCharacterGetTextOrder"),
+            ("libSceFont", "sceFontCreateString"),
+            ("libSceFont", "sceFontStringRefersRenderCharacters"),
+            ("libSceFont", "sceFontStringRefersTextCharacters"),
+            ("libSceFont", "sceFontTextSourceInit"),
+            ("libSceFont", "sceFontWritingGetRenderMetrics"),
+            ("libSceFont", "sceFontWritingInit"),
+            ("libSceFont", "sceFontWritingRefersRenderStepCharacter"),
+        ] {
+            assert!(
+                registry.is_implemented(library, function),
+                "{library}::{function} must stay resolvable — this test is about \
+                 classification, not removal"
+            );
+            assert!(
+                incomplete.contains(&(library.to_string(), function.to_string())),
+                "{library}::{function} returns success over an out-parameter it never \
+                 writes, so it must be register_incomplete — otherwise a crash report \
+                 presents it as a working import"
+            );
+        }
+    }
+
+    /// The other half of the rule: a stub whose real ABI has no output is
+    /// complete, and tagging it incomplete would bury the entries above in
+    /// noise. These are the "tell the kernel something" calls that sit
+    /// directly beside converted ones, so they are where mis-sweeping would
+    /// show up first.
+    #[test]
+    fn ok_stubs_without_outputs_stay_complete() {
+        let registry = HleRegistry::new();
+        let incomplete: std::collections::HashSet<(String, String)> = registry
+            .incomplete_registrations()
+            .into_iter()
+            .map(|(library, function, _)| (library, function))
+            .collect();
+
+        for (library, function) in [
+            // Hand a value to the kernel; nothing is read back from them.
+            ("libkernel", "scePthreadSetaffinity"),
+            ("libkernel", "scePthreadAttrSetaffinity"),
+            ("libkernel", "scePthreadAttrSetschedparam"),
+            ("libkernel", "scePthreadAttrSetinheritsched"),
+            // Lifecycle calls whose entire contract is the return code.
+            ("libScePlayGo", "scePlayGoSetInstallSpeed"),
+            ("libSceUserService", "sceUserServiceInitialize"),
+            ("libSceRtc", "sceRtcInit"),
+            // Pad setters that share the ok-stub with ParseData above.
+            ("libScePad", "scePadSetLightBar"),
+            ("libScePad", "scePadSetVibrationMode"),
+            // Font calls that return their answer in rax, not through a pointer.
+            ("libSceFont", "sceFontStringGetTerminateCode"),
+            ("libSceFont", "sceFontCharacterLooksWhiteSpace"),
+            ("libSceFont", "sceFontUnbindRenderer"),
+        ] {
+            assert!(
+                registry.is_implemented(library, function),
+                "{library}::{function} should be registered"
+            );
+            assert!(
+                !incomplete.contains(&(library.to_string(), function.to_string())),
+                "{library}::{function} has no output in its real ABI, so returning \
+                 success is the complete behaviour — do not classify it incomplete"
+            );
+        }
+    }
+
     #[test]
     fn explicit_equal_nids_remain_distinct_per_provider() {
         fn first(_ctx: &HleContext, _args: &[u64]) -> u64 {

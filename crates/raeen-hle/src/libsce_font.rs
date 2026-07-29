@@ -415,18 +415,15 @@ pub fn register(registry: &HleRegistry) {
     );
 
     // Everything else the title imports: a checked no-op returning ORBIS_OK.
-    // (Setup/effect/bind/render/writing/character/string/support/close/destroy.)
+    // (Setup/effect/bind/support/close/destroy — calls whose whole contract is
+    // the return code, so acknowledging them is the complete behaviour.)
     for func in [
         "sceFontAttachDeviceCacheBuffer",
         "sceFontBindRenderer",
         "sceFontUnbindRenderer",
-        "sceFontCharacterGetBidiLevel",
-        "sceFontCharacterGetTextFontCode",
-        "sceFontCharacterGetTextOrder",
         "sceFontCharacterLooksWhiteSpace",
         "sceFontCharacterRefersTextNext",
         "sceFontCloseFont",
-        "sceFontCreateString",
         "sceFontCreateWritingLine",
         "sceFontDeleteGlyph",
         "sceFontDestroyRenderer",
@@ -441,24 +438,70 @@ pub fn register(registry: &HleRegistry) {
         "sceFontSetupRenderScalePixel",
         "sceFontStringGetTerminateCode",
         "sceFontStringGetWritingForm",
-        "sceFontStringRefersRenderCharacters",
-        "sceFontStringRefersTextCharacters",
         "sceFontSupportExternalFonts",
         "sceFontSupportSystemFonts",
-        "sceFontTextSourceInit",
         "sceFontTextSourceSetDefaultFont",
         "sceFontTextSourceSetWritingForm",
-        "sceFontWritingGetRenderMetrics",
-        "sceFontWritingInit",
         "sceFontWritingLineClear",
         "sceFontWritingLineGetOrderingSpace",
         "sceFontWritingLineGetRenderMetrics",
         "sceFontWritingLineRefersRenderStep",
         "sceFontWritingLineWritesOrder",
         "sceFontWritingRefersRenderStep",
-        "sceFontWritingRefersRenderStepCharacter",
     ] {
         registry.register("libSceFont", func, hle_ok);
+    }
+
+    // The same no-op, but for calls whose real ABI hands a value *back* through
+    // a caller-provided pointer (signatures cross-checked against shadPS4's
+    // `core/libraries/font`, GPL-2.0). Returning ORBIS_OK while writing nothing
+    // leaves the caller reading its own uninitialized memory as a font handle,
+    // a character count, or a metrics struct — the failure mode that made
+    // `scePthreadAttrGet` cost four rounds of investigation. Behaviour is
+    // unchanged; the classification is so a crash report can name them.
+    for (func, reason) in [
+        (
+            "sceFontCharacterGetBidiLevel",
+            "reports success without writing the caller's bidi-level out-parameter",
+        ),
+        (
+            "sceFontCharacterGetTextFontCode",
+            "reports success without writing the caller's font-handle/text-code out-parameters",
+        ),
+        (
+            "sceFontCharacterGetTextOrder",
+            "reports success without writing the caller's text-order out-parameter",
+        ),
+        (
+            "sceFontCreateString",
+            "reports success without writing the caller's font-string handle out-parameter",
+        ),
+        (
+            "sceFontStringRefersRenderCharacters",
+            "reports success without writing the caller's character-count out-parameter",
+        ),
+        (
+            "sceFontStringRefersTextCharacters",
+            "reports success without writing the caller's character-count out-parameter",
+        ),
+        (
+            "sceFontTextSourceInit",
+            "reports success without initializing the caller's text-source out-struct",
+        ),
+        (
+            "sceFontWritingGetRenderMetrics",
+            "reports success without writing the caller's writing-metrics out-struct",
+        ),
+        (
+            "sceFontWritingInit",
+            "reports success without initializing the caller's writing out-struct",
+        ),
+        (
+            "sceFontWritingRefersRenderStepCharacter",
+            "reports success without writing the caller's letter-step out-parameter",
+        ),
+    ] {
+        registry.register_incomplete("libSceFont", func, hle_ok, reason);
     }
 }
 

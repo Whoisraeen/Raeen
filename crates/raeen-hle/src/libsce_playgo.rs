@@ -54,13 +54,29 @@ pub fn register(registry: &HleRegistry) {
     );
     registry.register("libScePlayGo", "scePlayGoGetProgress", hle_get_progress);
     registry.register("libScePlayGo", "scePlayGoGetToDoList", hle_get_todo_list);
-    registry.register("libScePlayGo", "scePlayGoGetEta", hle_ok);
+    // `scePlayGoGetEta(handle, chunkIds, numberOfEntries, ScePlayGoEta *outEta)`
+    // — fully-local content really does have a zero ETA, but this shim never
+    // writes the out-parameter, so the title reads its own stack instead.
+    registry.register_incomplete(
+        "libScePlayGo",
+        "scePlayGoGetEta",
+        hle_ok,
+        "reports success without writing the caller's ScePlayGoEta out-parameter",
+    );
     registry.register(
         "libScePlayGo",
         "scePlayGoGetLanguageMask",
         hle_get_language_mask,
     );
-    registry.register("libScePlayGo", "scePlayGoGetInstallSpeed", hle_ok);
+    // `scePlayGoGetInstallSpeed(handle, ScePlayGoInstallSpeed *outSpeed)` — same
+    // shape as GetEta above. `SetInstallSpeed` beside it has no output and stays
+    // a plain registration.
+    registry.register_incomplete(
+        "libScePlayGo",
+        "scePlayGoGetInstallSpeed",
+        hle_ok,
+        "reports success without writing the caller's ScePlayGoInstallSpeed out-parameter",
+    );
     registry.register("libScePlayGo", "scePlayGoSetInstallSpeed", hle_ok);
     registry.register("libScePlayGo", "scePlayGoSetTodoList", hle_ok);
     registry.register("libScePlayGo", "scePlayGoPrefetch", hle_ok);

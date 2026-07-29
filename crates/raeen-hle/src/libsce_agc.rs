@@ -363,13 +363,21 @@ pub fn register(registry: &HleRegistry) {
         hle_wait_reg_mem_patch_address,
     );
     // This Gen5 export patches the destination field of a WRITE_DATA packet.
-    // The retail identity (`fPSCdQxgpSw`) is newer than the named tables in
-    // the current references, but its ABI and field are established by the
-    // title's packet-copy relocation sequence.
-    registry.register_nid(
+    //
+    // It used to be bound by a hardcoded NID under the invented label
+    // `sceAgcWriteDataPatchAddress`, because the retail identity
+    // (`fPSCdQxgpSw`) was "newer than the named tables in the current
+    // references". The in-tree catalogue names it: NID 7cf482750c60a52c is
+    // `sceAgcWriteDataPatchSetAddressOrOffset`, which is also consistent with
+    // its `Async` sibling (`sceAgcAsyncWriteDataPatchSetAddressOrOffset`) and
+    // with the `PatchSet*` family this file already registers by name.
+    //
+    // Registering by the real name derives the NID instead of asserting it, so
+    // the binding is self-verifying and one magic constant is gone.
+    // `write_data_patch_address_binds_the_real_retail_nid` pins the derivation.
+    registry.register(
         "libSceAgc",
-        "sceAgcWriteDataPatchAddress",
-        0x7cf4_8275_0c60_a52c,
+        "sceAgcWriteDataPatchSetAddressOrOffset",
         hle_write_data_patch_address,
     );
     // The Cx/Sh/Uc patch-set NIDs are behaviorally identical (the register
@@ -2445,7 +2453,7 @@ fn hle_write_data_patch_address(ctx: &HleContext, args: &[u64]) -> u64 {
             // packet was never emitted (e.g. an emitter rejected the call) or
             // the caller handed a payload pointer instead of the header.
             warn!(
-                "sceAgcWriteDataPatchAddress: command {command:#x} is not a WRITE_DATA \
+                "sceAgcWriteDataPatchSetAddressOrOffset: command {command:#x} is not a WRITE_DATA \
                  packet (identity {identity:?}, patch address {address:#x}) — EINVAL"
             );
             return SCE_ERROR_INVALID_ARGUMENT;
@@ -3209,7 +3217,7 @@ fn hle_acb_dispatch_indirect(ctx: &HleContext, args: &[u64]) -> u64 {
 ///
 /// A **null `destinationAddress` is legal**: Minecraft (PPSA17221) builds
 /// WRITE_DATA template packets with a placeholder destination and binds the
-/// real address afterwards via `sceAgcWriteDataPatchAddress` (often after
+/// real address afterwards via `sceAgcWriteDataPatchSetAddressOrOffset` (often after
 /// memcpy'ing the packet into a submission ring). Rejecting the placeholder
 /// meant no packet was ever emitted, and the later patch then failed its
 /// header check with `EINVAL`. A null `dataAddress` zero-fills the payload,
@@ -7984,13 +7992,20 @@ mod tests {
 
         let registry = HleRegistry::new();
         register(&registry);
+        // The binding used to be a hardcoded NID override under the invented
+        // label `sceAgcWriteDataPatchAddress`; it is now derived from the real
+        // symbol name. That the derivation lands on the same retail NID the
+        // override asserted (7cf482750c60a52c) cannot be checked from this
+        // crate — `nid_of` lives in `raeen-firmware`, which depends on this one,
+        // not the reverse — so it is pinned by
+        // `raeen-firmware/tests/hle_nid_coverage.rs`, which hashes every
+        // registered HLE name against the catalogue. What this asserts is the
+        // half that is local: the export is bound under its real name at all.
         assert!(
             registry
-                .registered_nid_overrides()
-                .iter()
-                .any(|(nid, key)| {
-                    *nid == 0x7cf4_8275_0c60_a52c && key == "libSceAgc::sceAgcWriteDataPatchAddress"
-                })
+                .functions
+                .contains_key("libSceAgc::sceAgcWriteDataPatchSetAddressOrOffset"),
+            "the export must be registered under its real name"
         );
     }
 
