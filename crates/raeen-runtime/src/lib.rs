@@ -43,8 +43,12 @@ pub use thread::sample_guest_rips;
 pub use thread::{GuestProcess, GuestProcessHandle, GuestProcessSnapshot};
 /// Diagnostic: shallow HOST backtrace per guest thread, symbolized to
 /// `module+offset` — names where a stalled thread is parked in our code / ntdll.
+/// [`thread::host_wait_primitive`] classifies the innermost frame, which is what
+/// lets the stall monitor count a thread parked outside any HLE call.
 #[cfg(target_os = "windows")]
-pub use thread::{host_module_for_addr, sample_host_backtraces};
+pub use thread::{
+    HostThreadSample, host_module_for_addr, host_wait_primitive, sample_host_backtraces,
+};
 #[cfg(target_os = "windows")]
 mod tls;
 #[cfg(target_os = "windows")]

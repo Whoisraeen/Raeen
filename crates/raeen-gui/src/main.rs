@@ -15,6 +15,7 @@ mod launcher;
 mod library;
 mod shell;
 mod splash;
+mod stall_dump;
 mod theme;
 mod updater;
 
@@ -1503,55 +1504,69 @@ fn main() -> anyhow::Result<()> {
             ),
             None => info!("  PT_TLS: none"),
         }
-        // Stall diagnosis: with RAEEN_STALL_DUMP set (and RAEEN_TRACE_EINVAL to
-        // populate the ring), periodically log every guest thread's most recent
-        // HLE calls. A thread blocked at a boot gate shows its last call frozen
-        // or a tight spin — naming exactly what the game is waiting on.
+        // Stall diagnosis: with RAEEN_STALL_DUMP set, periodically log what every
+        // guest thread is doing. The thread inventory comes from the HOST thread
+        // sampler, so a thread is counted whether or not it has ever made an HLE
+        // call — see `stall_dump` for why that distinction cost a whole
+        // investigation. `RAEEN_STALL_DUMP` now also arms the per-call instruments
+        // this reads (`raeen_runtime::dispatch::stall_instruments_armed`), so the
+        // report can no longer print an unarmed field as an observation.
         if std::env::var_os("RAEEN_STALL_DUMP").is_some() {
             let kmon = std::sync::Arc::clone(&kernel);
             std::thread::spawn(move || {
+                let mut tracker = stall_dump::StallTracker::default();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(6));
-                    let mut lines: Vec<String> = kmon
-                        .recent_hle_calls
-                        .iter()
-                        .map(|entry| {
-                            let tid = *entry.key();
-                            let name = kmon
-                                .thread_names
-                                .get(&tid)
-                                .map_or_else(String::new, |n| n.clone());
-                            let ring = entry.value().lock();
-                            let recent: Vec<String> = ring.iter().rev().take(5).cloned().collect();
-                            format!("t{tid}({name}): {}", recent.join(" <- "))
-                        })
-                        .collect();
-                    lines.sort();
-                    // The call ring goes blank when a thread spins in GUEST code
-                    // (it calls nothing). RIP is the only thing that still says
-                    // where it is — resolve it against the loaded modules so it
-                    // reads as module+offset, which `--dump-vaddr` can decode.
-                    let mut rips: Vec<String> = raeen_runtime::sample_guest_rips(&kmon)
-                        .into_iter()
-                        .map(|(id, rip)| {
-                            let site = kmon.unwind_module_for_addr(rip).map_or_else(
-                                || format!("{rip:#x}"),
-                                |m| format!("{}+{:#x}", m.name, rip - m.start),
-                            );
-                            format!("t{id}@{site}")
-                        })
-                        .collect();
-                    rips.sort();
-                    // With RAEEN_TIME_HLE, name where each thread's wall-clock
-                    // actually went. A thread whose top entry accounts for most
-                    // of the run is parked in that one call — that is the thing
-                    // to fix, and it is invisible in the call ring above.
-                    // Per THREAD, not globally: every idle worker parks ~the
-                    // whole run in scePthreadCondWait, so a global top-N is 12
-                    // rows of "idle" and buries the one thread that matters.
-                    // Report each thread's own biggest sink plus its total, so a
-                    // busy thread (many short calls) is distinguishable at a
-                    // glance from a parked one (all its time in a single wait).
+                    // The guest RIP still says where a thread is when it spins in
+                    // GUEST code and calls nothing; resolve it against the loaded
+                    // modules so it reads as module+offset, which `--dump-vaddr`
+                    // can decode.
+                    let guest_sites: std::collections::HashMap<u64, String> =
+                        raeen_runtime::sample_guest_rips(&kmon)
+                            .into_iter()
+                            .map(|(id, rip)| {
+                                let site = kmon.unwind_module_for_addr(rip).map_or_else(
+                                    || format!("{rip:#x}"),
+                                    |m| format!("{}+{:#x}", m.name, rip - m.start),
+                                );
+                                (id, site)
+                            })
+                            .collect();
+                    // The host sample is the authoritative thread inventory AND
+                    // the only source of "is this thread parked".
+                    let mut samples: Vec<stall_dump::ThreadSample> =
+                        raeen_runtime::sample_host_backtraces(&kmon)
+                            .into_iter()
+                            .map(|host| stall_dump::ThreadSample {
+                                thread: host.thread,
+                                name: kmon
+                                    .thread_names
+                                    .get(&host.thread)
+                                    .map_or_else(String::new, |n| n.clone()),
+                                in_flight: kmon
+                                    .in_flight_hle
+                                    .get(&host.thread)
+                                    .map(|e| e.value().clone()),
+                                recent: kmon
+                                    .recent_hle_calls
+                                    .get(&host.thread)
+                                    .map(|ring| {
+                                        ring.value().lock().iter().rev().take(5).cloned().collect()
+                                    })
+                                    .unwrap_or_default(),
+                                guest_site: guest_sites.get(&host.thread).cloned(),
+                                parked_in: host.parked_in.map(str::to_owned),
+                                chain: host.chain,
+                            })
+                            .collect();
+                    samples.sort_unstable_by_key(|sample| sample.thread);
+                    let held = tracker.observe(&samples, std::time::Instant::now());
+                    // Name where each thread's wall-clock actually went. A thread
+                    // whose top entry accounts for most of the run is parked in
+                    // that one call — invisible in the call ring above. Per
+                    // THREAD, not globally: every idle worker parks ~the whole run
+                    // in scePthreadCondWait, so a global top-N is rows of "idle"
+                    // and buries the one thread that matters.
                     let mut per_thread: std::collections::HashMap<u64, (u128, u128, u64, String)> =
                         std::collections::HashMap::new();
                     for e in kmon.hle_call_time.iter() {
@@ -1581,23 +1596,6 @@ fn main() -> anyhow::Result<()> {
                         .collect();
                     spent.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                     let top: Vec<String> = spent.into_iter().map(|(_, s)| s).collect();
-                    // The HLE call each thread is CURRENTLY inside (empty = not in
-                    // one → blocked in guest code or runtime infra). Names exactly
-                    // which blocking call a frozen thread never returns from.
-                    let mut inflight: Vec<String> = kmon
-                        .in_flight_hle
-                        .iter()
-                        .map(|e| format!("t{}={}", e.key(), e.value()))
-                        .collect();
-                    inflight.sort();
-                    // Shallow host backtrace per thread (module+offset), so a
-                    // thread parked in a host wait OUTSIDE any HLE call is shown
-                    // with the call chain through our code that reached it.
-                    let mut bt: Vec<String> = raeen_runtime::sample_host_backtraces(&kmon)
-                        .into_iter()
-                        .map(|(id, chain)| format!("t{id}: {chain}"))
-                        .collect();
-                    bt.sort();
                     // The title's OWN log output (its `write`s to fd 1/2) is the
                     // single most informative thing during a stall — it says what
                     // the game thinks it is doing. It is otherwise only printed
@@ -1619,22 +1617,8 @@ fn main() -> anyhow::Result<()> {
                         format!("({} bytes, last 25 lines)\n{tail}", console.len())
                     };
                     info!(
-                        "STALL_DUMP ({} threads):\n{}\nIN-FLIGHT HLE: {}\nHOST BACKTRACES:\n{}\nRIPs: {}{}\nGUEST CONSOLE: {}",
-                        lines.len(),
-                        lines.join("\n"),
-                        if inflight.is_empty() {
-                            "<none — all threads between calls>".to_owned()
-                        } else {
-                            inflight.join("  ")
-                        },
-                        bt.join("\n"),
-                        rips.join(" "),
-                        if top.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\nTIME IN HLE (top):\n{}", top.join("\n"))
-                        },
-                        console_tail
+                        "{}",
+                        stall_dump::format_report(&samples, &held, &top, &console_tail)
                     );
                 }
             });

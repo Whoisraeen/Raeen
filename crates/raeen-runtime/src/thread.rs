@@ -264,8 +264,18 @@ pub fn symbolize_host_addr(addr: u64) -> Option<String> {
         SYMBOL_INFO, SymFromAddr, SymInitialize, SymSetOptions,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES.
-    const OPTS: u32 = 0x0000_0002 | 0x0000_0004 | 0x0000_0010;
+    // SYMOPT_UNDNAME | SYMOPT_LOAD_LINES.
+    //
+    // `SYMOPT_DEFERRED_LOADS` (0x4) is deliberately **absent**, and its absence
+    // is the whole reason this function returns anything for our own module.
+    // Measured against the Blasphemous II stall capture: with deferred loads on,
+    // `SymFromAddr` answered `ERROR_MOD_NOT_FOUND` (126) for every `raeen.exe`
+    // address while still naming `ntdll`/`KERNELBASE` frames — those resolve from
+    // the DLLs' export tables and need no PDB, so the failure looked like "our
+    // frames just have no symbols" instead of "the PDB was never loaded". Every
+    // host backtrace in that capture therefore printed our frames as bare
+    // `raeen.exe+0x84df7f` offsets, which is most of why they were unreadable.
+    const OPTS: u32 = 0x0000_0002 | 0x0000_0010;
     static INIT: Once = Once::new();
     INIT.call_once(|| unsafe {
         SymSetOptions(OPTS);
@@ -307,14 +317,77 @@ pub fn symbolize_host_addr(addr: u64) -> Option<String> {
     }
 }
 
+/// One sampled host thread: where its RIP is, whether that place is a kernel
+/// wait, and the shallow backtrace that reached it.
+#[derive(Debug, Clone)]
+pub struct HostThreadSample {
+    /// Guest thread id (the key `OrbisKernel` tracks host handles under).
+    pub thread: u64,
+    /// Host instruction pointer at the moment of sampling.
+    pub rip: u64,
+    /// `Some(primitive)` when the RIP is inside a Windows kernel wait — i.e. the
+    /// thread is **parked**, not running. `None` means either genuinely running
+    /// or unclassifiable (see [`host_wait_primitive`]).
+    pub parked_in: Option<&'static str>,
+    /// `frame <- frame <- …`, innermost first.
+    pub chain: String,
+}
+
+/// Classify a symbolized host frame as a Windows kernel wait, returning the
+/// primitive's normalized name.
+///
+/// This is how the stall monitor decides that a thread is *parked* rather than
+/// running, and it is deliberately a whitelist of syscall entry points rather
+/// than "the frame is in ntdll": a thread inside `RtlAllocateHeap` is also in
+/// ntdll and is very much running. `None` therefore means "not known to be
+/// waiting", never "known to be running" — a distinction the report keeps.
+///
+/// The names accepted cover both spellings ntdll exports for each syscall
+/// (`Nt*` and `Zw*` are the same code at the same address; which one a
+/// symbolizer picks is arbitrary), and the trailing `+0xdisp` that
+/// [`symbolize_host_addr`] appends.
+#[must_use]
+pub fn host_wait_primitive(symbol: &str) -> Option<&'static str> {
+    // `module+0xoff(Name+0xdisp)` or `Name+0xdisp` or `Name`.
+    let name = symbol
+        .rsplit('(')
+        .next()
+        .unwrap_or(symbol)
+        .trim_end_matches(')');
+    let name = name.split('+').next().unwrap_or(name).trim();
+    let bare = name
+        .strip_prefix("Zw")
+        .or_else(|| name.strip_prefix("Nt"))?;
+    Some(match bare {
+        // The `WaitOnAddress` futex. Every Rust `std::sync::Mutex`/`Condvar` on
+        // Windows and every `parking_lot` park lands here, which is exactly why
+        // seeing it is NOT evidence of one library over the other.
+        "WaitForAlertByThreadId" => "WaitOnAddress futex (std or parking_lot)",
+        "WaitForSingleObject" => "WaitForSingleObject",
+        "WaitForMultipleObjects" => "WaitForMultipleObjects",
+        "SignalAndWaitForSingleObject" => "SignalAndWaitForSingleObject",
+        "WaitForKeyedEvent" => "keyed-event wait",
+        "DelayExecution" => "Sleep",
+        "RemoveIoCompletion" | "RemoveIoCompletionEx" => "I/O completion wait",
+        "WaitForWorkViaWorkerFactory" => "thread-pool idle",
+        "WaitForDebugEvent" => "debug-event wait",
+        _ => return None,
+    })
+}
+
 /// Suspend each guest host-thread and walk a shallow HOST backtrace: the RIP
 /// plus stack qwords that resolve to a loaded module (return addresses), each
 /// symbolized to `module+offset` (plus `function` when a PDB symbol resolves).
 /// Names exactly where a stalled thread is parked — e.g. an ntdll wait reached
 /// through our dispatch/arena/GPU code. Diagnostic only.
+///
+/// The per-thread [`HostThreadSample::parked_in`] is what lets the stall monitor
+/// count a thread that is stuck in a host wait *outside* any HLE call. Before it
+/// existed the monitor's only notion of "stalled" was "currently inside an HLE
+/// call", so a run in which every thread was parked reported nothing at all.
 #[cfg(windows)]
 #[must_use]
-pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
+pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<HostThreadSample> {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         CONTEXT, GetThreadContext, ReadProcessMemory,
     };
@@ -348,14 +421,23 @@ pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
             continue;
         }
         // A frame label is `module+offset`, plus `(function)` when the PDB has a
-        // symbol — only computed for KEPT frames, so the per-qword scan stays cheap.
-        let label = |a: u64| -> Option<String> {
+        // symbol — only computed for KEPT frames, so the per-qword scan stays
+        // cheap. The bool is "this address is a function's first byte", which a
+        // *return* address never is: that is how the stack scan below rejects
+        // function pointers and vtable slots it would otherwise print as frames.
+        let label = |a: u64| -> Option<(String, bool)> {
             host_module_for_addr(a).map(|m| match symbolize_host_addr(a) {
-                Some(f) => format!("{m}({f})"),
-                None => m,
+                // `symbolize_host_addr` omits `+0xdisp` exactly when disp == 0.
+                Some(f) => {
+                    let entry = !f.contains("+0x");
+                    (format!("{m}({f})"), entry)
+                }
+                None => (m, false),
             })
         };
-        let mut frames = vec![label(rip).unwrap_or_else(|| format!("{rip:#x}"))];
+        let (rip_label, _) = label(rip).unwrap_or_else(|| (format!("{rip:#x}"), false));
+        let parked_in = host_wait_primitive(&rip_label);
+        let mut frames = vec![rip_label];
         // Poor-man's backtrace: scan up the stack for qwords that land inside a
         // loaded module (return addresses); skip non-code data.
         let mut sp = rsp;
@@ -377,20 +459,30 @@ pub fn sample_host_backtraces(kernel: &OrbisKernel) -> Vec<(u64, String)> {
             if read_ok == 0 || got != 8 {
                 break;
             }
-            if let Some(sym) = label(u64::from_le_bytes(word)) {
-                frames.push(sym);
+            if let Some((sym, entry)) = label(u64::from_le_bytes(word)) {
+                // A function entry is a taken address, not a return site; and a
+                // qword repeated in adjacent slots is one saved pointer, not two
+                // frames. Both were pure noise in the Blasphemous II capture.
+                if !entry && frames.last() != Some(&sym) {
+                    frames.push(sym);
+                }
             }
             sp = sp.wrapping_add(8);
             scanned += 1;
         }
-        out.push((id, frames.join(" <- ")));
+        out.push(HostThreadSample {
+            thread: id,
+            rip,
+            parked_in,
+            chain: frames.join(" <- "),
+        });
     }
     out
 }
 
 #[cfg(not(windows))]
 #[must_use]
-pub fn sample_host_backtraces(_kernel: &OrbisKernel) -> Vec<(u64, String)> {
+pub fn sample_host_backtraces(_kernel: &OrbisKernel) -> Vec<HostThreadSample> {
     Vec::new()
 }
 
@@ -913,8 +1005,70 @@ mod tests {
     use super::windows_thread_priority;
     use super::{
         GUEST_PTHREAD_MAX_STACK_SIZE, GUEST_PTHREAD_MIN_STACK_SIZE, GUEST_PTHREAD_RUNTIME_HEADROOM,
-        allocated_guest_stack_size,
+        allocated_guest_stack_size, host_wait_primitive,
     };
+
+    /// The exact frame label every thread in the Blasphemous II stall capture
+    /// carried. Classifying it is what turns "STALL_DUMP (0 threads)" into a
+    /// count, so it is pinned by test rather than left to the format's mercy.
+    #[test]
+    fn wait_on_address_frame_is_recognized_as_a_park() {
+        let frame = "ntdll.dll+0x163cb4(ZwWaitForAlertByThreadId+0x14)";
+        assert_eq!(
+            host_wait_primitive(frame),
+            Some("WaitOnAddress futex (std or parking_lot)")
+        );
+        // Both ntdll spellings are the same syscall at the same address, so the
+        // symbolizer's choice between them must not change the verdict.
+        assert_eq!(
+            host_wait_primitive("ntdll.dll+0x163cb4(NtWaitForAlertByThreadId+0x14)"),
+            host_wait_primitive(frame)
+        );
+    }
+
+    /// `None` must mean "not known to be waiting", and in particular a thread
+    /// inside the ntdll heap is running. The capture's stack scan surfaced
+    /// `RtlAllocateHeap` frames, so a module-based rule would have called a busy
+    /// allocator a park.
+    #[test]
+    fn running_and_unsymbolized_frames_are_not_parks() {
+        for frame in [
+            "ntdll.dll+0x3e732(RtlAllocateHeap+0xad2)",
+            "ntdll.dll+0x7a81d(RtlReAllocateHeap+0x4d)",
+            "KERNELBASE.dll+0xde558(WaitOnAddress+0x38)", // a caller, not the syscall
+            "raeen.exe+0x84df7f",
+            "0x7ff8c3dc3cb4",
+            "",
+        ] {
+            assert_eq!(
+                host_wait_primitive(frame),
+                None,
+                "must not claim a park for {frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_other_windows_wait_syscalls_are_classified() {
+        for (frame, expect) in [
+            (
+                "ntdll.dll+0x1(NtWaitForSingleObject+0x14)",
+                "WaitForSingleObject",
+            ),
+            ("ntdll.dll+0x1(ZwDelayExecution+0x14)", "Sleep"),
+            (
+                "ntdll.dll+0x1(NtWaitForMultipleObjects)",
+                "WaitForMultipleObjects",
+            ),
+            ("ntdll.dll+0x1(ZwWaitForKeyedEvent+0x2)", "keyed-event wait"),
+            (
+                "ntdll.dll+0x1(ZwWaitForWorkViaWorkerFactory+0x9)",
+                "thread-pool idle",
+            ),
+        ] {
+            assert_eq!(host_wait_primitive(frame), Some(expect), "for {frame:?}");
+        }
+    }
 
     #[test]
     fn runtime_owned_pthread_stack_adds_headroom_without_changing_requested_size() {
