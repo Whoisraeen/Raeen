@@ -23,6 +23,7 @@ use kyty_graphics::pm4;
 use kyty_graphics::run::{CommandProcessor, CpError, RunOutcome, SuspendedWait};
 use parking_lot::{Mutex, RwLock};
 use raeen_core::error::GpuError;
+use raeen_core::frame_path::{self, Stage};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
@@ -832,6 +833,9 @@ impl AgcGpuSession {
     }
 
     fn publish_completed_frame(&self, presented: Arc<RenderedImage>) {
+        // The last rung of the frame path, and the only one that means a pixel
+        // was actually produced. Every publish route funnels through here.
+        frame_path::record(Stage::FramePublished);
         if let Some(publisher) = &self.frame_publisher {
             publisher.publish(&presented, self.present_timing());
         }
@@ -2046,6 +2050,10 @@ impl AgcGpuSession {
         is_compute: bool,
     ) -> Result<Option<RenderedImage>, AgcExecError> {
         puffin::profile_function!();
+        // Frame path: this is where a guest GPU submission actually reaches the
+        // command processor. A title with buffers registered but zero DCBs here
+        // never asked the GPU for anything.
+        frame_path::record(Stage::DcbSubmitted);
         // RenderDoc capture bracket (RAEEN_RENDERDOC_CAPTURE + running under
         // RenderDoc): each remaining budgeted DCB execution becomes one
         // capture, swapchain or not.
@@ -2207,6 +2215,7 @@ impl AgcGpuSession {
             let suspended = suspended_of(run?);
             if drawn > 0 {
                 *self.draw_count.lock() += drawn;
+                frame_path::record_n(Stage::Draw, drawn);
             }
             debug!(
                 drawn,
@@ -2305,6 +2314,7 @@ impl AgcGpuSession {
                     let mut draws = self.draw_count.lock();
                     *draws += drawn;
                 }
+                frame_path::record_n(Stage::Draw, drawn);
                 warn_present_allocation_failed();
                 return Ok((Some(image), suspended));
             };
@@ -2321,6 +2331,7 @@ impl AgcGpuSession {
                 let mut draws = self.draw_count.lock();
                 *draws += drawn;
             }
+            frame_path::record_n(Stage::Draw, drawn);
             // Gate the dump on how many frames have been PRESENTED, not on the
             // cumulative draw count. A submission contributes its whole draw
             // total at once (`*draws += drawn`), so the draw counter jumps

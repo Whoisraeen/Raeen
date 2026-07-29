@@ -208,6 +208,15 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Frame-path progress counters, armed before ANY entry point runs — the
+    // `--run-eboot` CLI path used by the compatibility harness returns long
+    // before the Shell's config bridging below, and that path is exactly where
+    // silent zero-frame titles are measured. Off unless `RAEEN_FRAME_PATH` is
+    // set; when on, a reporter thread logs `frame path: reached=...` on an
+    // interval, so a title killed for timing out still leaves the chain state
+    // in its log (see `docs/silent-zero-frame-cluster.md`).
+    raeen_core::frame_path::init_from_env();
+
     // Host facts (CPU model, cores, RAM, OS build) at the top of every log —
     // the difference between a diagnosable user report and guesswork.
     {

@@ -429,6 +429,13 @@ fn run_one(
         // heavier diagnostic separately.
         .env("RAEEN_TIME_WORKER", "1")
         .env("RAEEN_COMPAT_RUN_ID", run_id)
+        // Frame-path progress. One INFO line every 15 s, and the only thing in
+        // the log that survives the hard `child.kill()` below with a record of
+        // how far a stalled title actually got. Without it a silent zero-frame
+        // title is indistinguishable from a healthy quiet one: the whole
+        // VideoOut HLE logs at DEBUG, so a run that presented 13,440 frames and
+        // a run that presented none both contain zero `sceVideoOut` lines.
+        .env("RAEEN_FRAME_PATH", "15")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     if profile == "max-fps" {
@@ -482,6 +489,13 @@ fn run_one(
         // presents; AGC's `total_flips` progress line is power-of-two sampled
         // and can otherwise under-report a long run by almost 2x.
         .max(max_metric(&text, "flips"))
+        // Exact, and the only source that is not sampled or DEBUG-gated. The
+        // worker window lands every 32 completed presents and
+        // `sceVideoOutSubmitFlip` logs at DEBUG (invisible at the harness's
+        // INFO level), so before this a report saying `flip_events: 0` really
+        // meant "somewhere between 0 and 31" — see
+        // `docs/silent-zero-frame-cluster.md`.
+        .max(max_metric(&text, "flips_submitted"))
         .max(count_any(&text, &["sceVideoOutSubmitFlip"]));
     let shader_errors = count_lines(&text, |line| {
         line.contains("shader") && (line.contains("ERROR") || line.contains("not supported"))
@@ -493,7 +507,14 @@ fn run_one(
         line.contains("audio") && line.contains("ERROR")
     });
     let input_events = count_any(&text, &["pad event", "controller connected"]);
-    let blocker = first_blocker(&text, &registry_roots_from_path(local_path));
+    // A louder line always wins. Only a run that produced no frames AND logged
+    // nothing diagnosable falls back to the frame-path summary — the case this
+    // whole mechanism exists for (`docs/silent-zero-frame-cluster.md`).
+    let blocker = first_blocker(&text, &registry_roots_from_path(local_path)).or_else(|| {
+        (flip_events == 0)
+            .then(|| frame_path_blocker(&text))
+            .flatten()
+    });
     let blocker_signature = blocker.as_ref().map(|value| sha1_bytes(value.as_bytes()));
     let unresolved_nids = baseline::parse_unresolved_nids(&text);
     let stage = baseline::classify_stage(
@@ -597,6 +618,38 @@ fn first_blocker(text: &str, roots: &[String]) -> Option<String> {
     text.lines()
         .find(|line| is_blocker_line(line))
         .map(|line| sanitize_line(line, roots))
+}
+
+/// Marker the emulator's frame-path reporter writes (see
+/// `raeen_core::frame_path::summary`).
+const FRAME_PATH_MARKER: &str = "frame path: reached=";
+
+/// Derive a blocker from the last frame-path summary in the log.
+///
+/// A stalled title that logs no error at all used to report `first_blocker:
+/// null` — true, and useless. The frame path is a strict prefix chain, so the
+/// last rung reached is itself the finding: everything before it worked and the
+/// next one is the suspect. Only consulted when nothing louder was found and
+/// the run produced no frames, so a real error line always wins.
+fn frame_path_blocker(text: &str) -> Option<String> {
+    let summary = text
+        .lines()
+        .rfind(|line| line.contains(FRAME_PATH_MARKER))?;
+    let stripped = strip_ansi(summary);
+    let tail = stripped.split_once(FRAME_PATH_MARKER)?.1.trim();
+    let reached = tail.split_whitespace().next()?;
+    let detail = tail.split_once('|').map_or("", |(_, rest)| rest.trim());
+    Some(if reached == "nothing" {
+        format!(
+            "silent zero-frame run: the guest reached NO frame-path stage — it never opened a \
+             video-out handle. Counters: {detail}"
+        )
+    } else {
+        format!(
+            "silent zero-frame run: the frame path stopped after '{reached}' and never published \
+             a frame. Counters: {detail}"
+        )
+    })
 }
 
 fn is_blocker_line(line: &str) -> bool {
@@ -1047,6 +1100,65 @@ mod tests {
             title_id(Path::new("ASTRO/PPSA21564-app/eboot.bin")).as_deref(),
             Some("PPSA21564")
         );
+    }
+
+    /// One measured 180-second Blasphemous II run, reduced to its shape: a
+    /// clean boot, no error, and total silence. Before the frame-path summary
+    /// the report for this said `first_blocker: null`.
+    const SILENT_LOG: &str = "\
+INFO raeen: entering guest _start via execute_process ...
+INFO raeen_runtime::thread: guest pthread started guest_thread=15
+INFO raeen_core::frame_path: frame path: reached=nothing | videoout_open=0 buffers_registered=0 \
+flip_rate_set=0 dcb_submitted=0 draws=0 dispatches=0 flips_submitted=0 frames_published=0
+";
+
+    #[test]
+    fn a_silent_run_reports_the_frame_path_instead_of_nothing() {
+        assert_eq!(first_blocker(SILENT_LOG, &[]), None, "no error line exists");
+        let blocker = frame_path_blocker(SILENT_LOG).expect("summary present");
+        assert!(blocker.contains("NO frame-path stage"), "{blocker}");
+        assert!(blocker.contains("videoout_open=0"), "{blocker}");
+    }
+
+    #[test]
+    fn a_partial_frame_path_names_the_last_rung_reached() {
+        let log = "INFO frame path: reached=dcb_submitted | videoout_open=1@812ms \
+buffers_registered=2@840ms flip_rate_set=1@840ms dcb_submitted=91@1204ms draws=0 dispatches=0 \
+flips_submitted=0 frames_published=0\n";
+        let blocker = frame_path_blocker(log).expect("summary present");
+        assert!(
+            blocker.contains("stopped after 'dcb_submitted'"),
+            "{blocker}"
+        );
+        // The exact metric a submitted-but-never-drawn title needs to show.
+        assert!(blocker.contains("draws=0"), "{blocker}");
+    }
+
+    #[test]
+    fn the_last_summary_wins_over_earlier_ones() {
+        let log = "INFO frame path: reached=nothing | videoout_open=0\n\
+INFO frame path: reached=videoout_open | videoout_open=1@900ms\n";
+        let blocker = frame_path_blocker(log).expect("summary present");
+        assert!(
+            blocker.contains("stopped after 'videoout_open'"),
+            "{blocker}"
+        );
+    }
+
+    #[test]
+    fn a_log_without_a_summary_yields_no_synthetic_blocker() {
+        assert_eq!(frame_path_blocker("INFO nothing to see here\n"), None);
+    }
+
+    #[test]
+    fn flip_counts_come_from_the_exact_summary_not_the_sampled_window() {
+        // Nine flips never reach the worker's 32-present telemetry window and
+        // `sceVideoOutSubmitFlip` logs at DEBUG, so both legacy sources read 0.
+        let log = "INFO frame path: reached=frames_published | videoout_open=1@10ms \
+buffers_registered=1@11ms flip_rate_set=1@11ms dcb_submitted=9@20ms draws=40@20ms dispatches=0 \
+flips_submitted=9@25ms frames_published=9@26ms\n";
+        assert_eq!(max_metric(log, "total_flips"), 0);
+        assert_eq!(max_metric(log, "flips_submitted"), 9);
     }
 
     #[test]
