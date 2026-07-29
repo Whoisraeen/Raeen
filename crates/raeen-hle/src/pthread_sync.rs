@@ -14,6 +14,7 @@
 //! holding the state lock, preventing a new arrival from barging ahead.
 
 use crate::{HleContext, HleFunction, HleRegistry};
+use raeen_core::blockers::{self, BlockerCategory};
 use raeen_kernel::{PthreadMutex, PthreadRwlock};
 use std::sync::Arc;
 use tracing::debug;
@@ -750,6 +751,27 @@ fn lock_core(
                     );
                 }
             }
+            // The two lines above are the only record that a title has stopped
+            // making progress, and a level filter can drop either before the
+            // console ring or a crash report sees it.
+            //
+            // The classification is the whole identity: subject stays 0 because
+            // neither the mutex address nor the owning thread is a bounded set
+            // over a session, and either in the intern identity would spend the
+            // `Stall` cap on one convoy. The first occurrence's owner, waiter
+            // and mutex are captured in the detail. This block is inside a >3 s
+            // wait, so the intern cost is not measurable.
+            let stall_key = match diagnostic {
+                MutexWaitDiagnostic::LongContention => "mutex-long-contention",
+                MutexWaitDiagnostic::ProbableDeadlock => "mutex-probable-deadlock",
+            };
+            blockers::record(BlockerCategory::Stall, stall_key, 0, || {
+                format!(
+                    "waiter {current} ('{self_name}') parked {} ms on mutex {key:#x} held by \
+                     {owner} ('{owner_name}'), acquired at {owner_acquired_at}",
+                    total_wait.as_millis()
+                )
+            });
         }
         // Bounded so process termination and deadlines are observed even if
         // no unlock ever notifies; a wake races are re-checked by the loop.

@@ -4,6 +4,7 @@
 //! Provides configuration management, logging infrastructure,
 //! error types, and shared constants used across all crates.
 
+pub mod blockers;
 pub mod config;
 pub mod diagnostics;
 pub mod error;

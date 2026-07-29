@@ -2037,6 +2037,48 @@ pub(crate) const fn placeholder_texture_fields() -> [u32; 8] {
     [0, 0, 0, (9u32 << 28) | 0xFAC, 0, 0, 0, 0]
 }
 
+/// Process-wide count of sampled T#s replaced by a 1x1 placeholder because the
+/// descriptor was UNRESOLVABLE — the all-ones runtime/SRT-bound poison, see
+/// [`texture_descriptor_is_unresolvable`].
+///
+/// A plain counter, the shape of [`super::spirv::vertex_input_pair_skips`],
+/// because this crate is a standalone port of Kyty's Graphics and takes no
+/// `raeen-core` dependency; `raeen-gpu` folds the total into its blocker table.
+///
+/// A non-zero value is NOT a translate failure: the shader compiles and the
+/// draw is issued, it just samples transparent black. That is exactly the
+/// failure mode that rendered Minecraft's terrain flat
+/// (`docs/diagnosis/minecraft-terrain-atlas-descriptor.md`), and it named
+/// nothing anywhere — the investigation had to hand-add tracing across five
+/// headless runs to learn the substitution was happening at all.
+static UNRESOLVABLE_TEXTURE_PLACEHOLDERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Same, for a sampled T# whose image TYPE this path does not serve (a 0..7
+/// forced through a `flags == 3` usage slot). Counted apart from the poison
+/// above because the follow-up is different: a type to add, not a descriptor to
+/// resolve.
+static UNHANDLED_TYPE_TEXTURE_PLACEHOLDERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total sampled T#s replaced by a 1x1 transparent-black placeholder in
+/// [`check_read_only_texture_type`], both causes.
+#[must_use]
+pub fn placeholder_texture_installs() -> u64 {
+    UNRESOLVABLE_TEXTURE_PLACEHOLDERS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(
+            UNHANDLED_TYPE_TEXTURE_PLACEHOLDERS.load(std::sync::atomic::Ordering::Relaxed),
+        )
+}
+
+/// The subset of [`placeholder_texture_installs`] whose descriptor was
+/// unresolvable rather than an unhandled image type.
+#[must_use]
+pub fn unresolvable_texture_placeholders() -> u64 {
+    UNRESOLVABLE_TEXTURE_PLACEHOLDERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Gate for a read-only sampled T#'s type. Non-fatal by construction: a valid
 /// type is admitted, an array/MSAA type is approximated as 2D, and an
 /// unresolvable/garbage descriptor is replaced in place with a placeholder so
@@ -2059,6 +2101,10 @@ fn check_read_only_texture_type(
     t: &mut super::resources::ShaderTextureResource,
 ) -> Result<(), ShaderAnalysisError> {
     if texture_descriptor_is_unresolvable(t) {
+        // Count before substituting: from here down the descriptor is
+        // indistinguishable from a legitimate 1x1 texture, so this is the last
+        // point in the process that knows the T# was unresolvable at all.
+        UNRESOLVABLE_TEXTURE_PLACEHOLDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         t.fields = placeholder_texture_fields();
         return Ok(());
     }
@@ -2073,6 +2119,7 @@ fn check_read_only_texture_type(
     }
     // Any other image type reaching here (e.g. a 0..7 forced through a
     // flags==3 usage slot): stand in the placeholder rather than abort.
+    UNHANDLED_TYPE_TEXTURE_PLACEHOLDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     t.fields = placeholder_texture_fields();
     Ok(())
 }

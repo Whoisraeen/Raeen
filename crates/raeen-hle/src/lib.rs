@@ -90,6 +90,7 @@ pub mod pthread_thread;
 pub mod pthread_tls;
 
 use dashmap::{DashMap, DashSet};
+use raeen_core::blockers::{self, BlockerCategory};
 use raeen_core::diagnostics::DiagnosticKind;
 use raeen_core::subsystems::{GpuSubmissionSubsystem, KernelSubsystems};
 use tracing::{debug, info, warn};
@@ -1073,6 +1074,17 @@ impl HleRegistry {
             Some(result)
         } else {
             warn!("HLE: unimplemented function {}", key);
+            // A genuine refusal: the guest gets `None`, which the dispatcher
+            // turns into a bare 0. Only THIS arm records. The success arm
+            // deliberately does not, because a `register_incomplete` entry that
+            // works well enough — `sceVideoOutLatencyControlWaitBeforeInput`
+            // runs per frame, the `libSceAgcDriver` block per command buffer —
+            // would put a lock and a hash on the hot path to report something
+            // derivable at report time from `incomplete_registrations()`
+            // intersected with the title's own import list, at no per-call cost.
+            blockers::record(BlockerCategory::UnimplementedStub, key, 0, || {
+                "no HLE registration — the call returned nothing to the guest".to_string()
+            });
             None
         }
     }

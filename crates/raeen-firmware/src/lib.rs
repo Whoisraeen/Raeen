@@ -36,7 +36,9 @@ pub use sprx::{
     proc_param_sdk_version, static_tls_total,
 };
 
+use raeen_core::blockers::{self, BlockerCategory};
 use raeen_core::error::FirmwareError;
+use raeen_core::frame_path::{self, Phase};
 
 /// The decoded static view of a module: its parsed `.sprx` structure plus the
 /// decoded dynamic tables (imports, exports, relocations, NEEDED names).
@@ -1098,6 +1100,16 @@ pub fn load_process(
                 dependencies = hit.process.dependencies.len(),
                 "linked-image cache hit"
             );
+            // A warm launch returns HERE and never reaches the cold path's
+            // stamp at the end of this function, so without these two a cached
+            // — i.e. the common — launch would report `phase=nothing` for a
+            // process that loaded perfectly, the exact ambiguity the phase
+            // chain exists to remove. `DepsLinked` is conditional because a
+            // cache hit for a title with no dependencies genuinely linked none.
+            frame_path::record_phase(Phase::ProcessLoaded);
+            if !hit.process.dependencies.is_empty() {
+                frame_path::record_phase(Phase::DepsLinked);
+            }
             return Ok(hit.process);
         }
         tracing::warn!("linked-image cache metadata was structurally stale; rebuilding");
@@ -1234,6 +1246,15 @@ pub fn load_process(
                     dir.display(),
                     module_index.entries.len()
                 );
+                // The literal category: a `DT_NEEDED` that resolves to nothing
+                // at all. Keyed by the canonical name so a library several
+                // modules ask for is one entry, not one per requirer.
+                blockers::record(BlockerCategory::MissingLibrary, stem.clone(), 0, || {
+                    format!(
+                        "no HLE library and no shipped file; required by {}",
+                        request.required_by
+                    )
+                });
             }
             continue;
         };
@@ -1264,6 +1285,12 @@ pub fn load_process(
                     "NEEDED {needed}: found at {} but unreadable: {e}",
                     path.display()
                 );
+                blockers::record(
+                    BlockerCategory::MissingLibrary,
+                    registry::canonical_module_name(needed),
+                    0,
+                    || format!("shipped at {} but unreadable: {e}", path.display()),
+                );
                 continue;
             }
         };
@@ -1277,6 +1304,16 @@ pub fn load_process(
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("NEEDED {needed}: failed to decode ({e}) — skipping");
+                // Almost always an encrypted retail SELF with no user key: the
+                // module is right there, and every import it would have
+                // provided goes missing anyway. Naming it as a missing library
+                // is what collapses the downstream NID storm into one cause.
+                blockers::record(
+                    BlockerCategory::MissingLibrary,
+                    registry::canonical_module_name(needed),
+                    0,
+                    || format!("shipped but failed to decode: {e}"),
+                );
                 continue;
             }
         };
@@ -1420,6 +1457,13 @@ pub fn load_process(
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("NEEDED {}: failed to link ({e}) — skipping", p.name);
+                // A dependency that is present but unlinkable leaves every
+                // import it was meant to provide unresolved, so what a reader
+                // eventually sees is dozens of missing NIDs with no stated
+                // cause. Keyed by module name: one entry per library.
+                blockers::record(BlockerCategory::MissingLibrary, p.name.clone(), 0, || {
+                    format!("link failed: {e}")
+                });
                 continue;
             }
         };
@@ -1428,6 +1472,7 @@ pub fn load_process(
             p.name,
             linked.unresolved.len()
         );
+        frame_path::record_phase(Phase::DepsLinked);
         dependencies.push(LoadedDependency {
             name: p.name.clone(),
             image_offset: p.offset,
@@ -1578,6 +1623,22 @@ pub fn load_process(
             stub.library.as_deref().unwrap_or("<unknown>"),
         );
     }
+    // ONE aggregate entry, deliberately not one per NID: a measured title
+    // carries 313 distinct missing NIDs, which would spend the whole 32-key
+    // `UnresolvedNid` category on symbols that were merely *linked* missing and
+    // leave no room for the ones the guest actually CALLED (recorded from the
+    // VEH in `raeen_runtime::dispatch`) — the far more explanatory event. The
+    // count is a per-load varying value, so it goes in the detail rather than
+    // in the intern subject; the full per-NID list is in the log lines above.
+    if !linked.unresolved_stubs.is_empty() {
+        let missing = linked.unresolved_stubs.len();
+        blockers::record(BlockerCategory::UnresolvedNid, "link-missing", 0, || {
+            format!(
+                "{missing} distinct NID(s) had no provider at link time — linked missing, NOT \
+                 necessarily called; see the 'missing …' lines for the full list"
+            )
+        });
+    }
 
     let process = LoadedProcess {
         linked,
@@ -1589,6 +1650,7 @@ pub fn load_process(
         elapsed_ms = load_started.elapsed().as_millis(),
         "cold process load complete"
     );
+    frame_path::record_phase(Phase::ProcessLoaded);
     Ok(process)
 }
 

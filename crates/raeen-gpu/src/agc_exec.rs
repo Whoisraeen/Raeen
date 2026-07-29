@@ -1698,6 +1698,23 @@ impl AgcGpuSession {
                      to scanout is missing or still pending)"
                 );
             }
+            // Outside the powers-of-two log limiter on purpose: the limiter
+            // exists so the log survives a whole session, and it is exactly what
+            // makes the log an unreliable place to read HOW OFTEN this
+            // happened. The blocker table is the counted answer — one warn, then
+            // a running total.
+            raeen_core::blockers::record(
+                raeen_core::blockers::BlockerCategory::GpuError,
+                "present-routing",
+                0,
+                || {
+                    format!(
+                        "flipped scanout {address:#x} was empty or a uniform clear; presented a \
+                         content-bearing intermediate target instead (the final copy/composite \
+                         to scanout is missing or still pending)"
+                    )
+                },
+            );
         }
         if !flip_address_hit && !guest_preferred && !fallback_hit {
             static BLACK_FRAME_WARNINGS: AtomicU64 = AtomicU64::new(0);
@@ -1732,6 +1749,20 @@ impl AgcGpuSession {
                      preceding draw/shader skip warnings (or a missing final GPU copy)"
                 );
             }
+            // Counted outside the limiter, same reasoning as PRESENT ROUTING
+            // above: "447 black frames" is the fact that classified Dead Cells,
+            // and the log's powers-of-two sampling cannot state it.
+            raeen_core::blockers::record(
+                raeen_core::blockers::BlockerCategory::GpuError,
+                "black-frame",
+                0,
+                || {
+                    format!(
+                        "scanout {address:#x}, the guest-memory scanout and every available GPU \
+                         render target contained no visible RGB colour"
+                    )
+                },
+            );
         }
         // Priority: a detailed target drawn at the flip address; then a
         // non-uniform guest scanout; then the detailed census fallback; then
@@ -2446,6 +2477,52 @@ impl AgcGpuSession {
         Ok((None, suspended))
     }
 
+    /// Fold `kyty-graphics`' placeholder-T# totals into the blocker table.
+    ///
+    /// `kyty-graphics` is a standalone port of Kyty's Graphics and takes no
+    /// `raeen-core` dependency, so it counts with a plain `AtomicU64` — exactly
+    /// the shape of `vertex_input_pair_skips`, already read below. This is the
+    /// seam that turns those totals into one counted blocker.
+    ///
+    /// A placeholder install is deliberately NOT a shader skip: the shader
+    /// translates and the draw is issued, it just samples a 1x1 transparent
+    /// black dummy. That is why this runs before [`Self::record_shader_skips`]'
+    /// own `shader_skips == 0` early return — the Minecraft flat-terrain run
+    /// had thousands of these and no shader skips to hang them off.
+    ///
+    /// Called once per DCB submission, so the fold is a delta against the last
+    /// one. If two submissions race the swap, the loser's `checked_sub` fails
+    /// and its delta is dropped rather than double-counted; the source totals
+    /// are monotonic, so that undercounts at worst and never invents an
+    /// occurrence.
+    fn fold_placeholder_textures(&self) {
+        static FOLDED: AtomicU64 = AtomicU64::new(0);
+        let total = kyty_graphics::shader::analysis::placeholder_texture_installs();
+        let seen = FOLDED.swap(total, Ordering::Relaxed);
+        let Some(delta) = total.checked_sub(seen).filter(|d| *d > 0) else {
+            return;
+        };
+        static SLOT: OnceLock<Option<raeen_core::blockers::Slot>> = OnceLock::new();
+        let slot = SLOT.get_or_init(|| {
+            raeen_core::blockers::intern(
+                raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
+                "shader-placeholder-texture",
+                0,
+                || {
+                    format!(
+                        "shader analysis replaced a sampled T# with a 1x1 transparent-black \
+                         placeholder; the draw is issued but samples nothing (unresolvable \
+                         descriptors so far: {})",
+                        kyty_graphics::shader::analysis::unresolvable_texture_placeholders()
+                    )
+                },
+            )
+        });
+        if let Some(slot) = slot {
+            raeen_core::blockers::bump_n(*slot, delta);
+        }
+    }
+
     /// Accumulate this submission's shader skips and warn with a process-wide
     /// rate limit (first occurrence, then powers of two).
     fn record_shader_skips(
@@ -2457,6 +2534,7 @@ impl AgcGpuSession {
         dispatch_skip_reason: Option<&str>,
         shader_state: &kyty_graphics::hw_regs::Shader,
     ) {
+        self.fold_placeholder_textures();
         if shader_skips == 0 {
             return;
         }

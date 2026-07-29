@@ -21,6 +21,7 @@
 //! which the runtime delivers to guest XMM0 on both dispatch paths).
 
 use crate::{HleContext, HleFunction, HleRegistry};
+use raeen_core::blockers::{self, BlockerCategory};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -1574,6 +1575,23 @@ fn hle_abort(ctx: &HleContext, _args: &[u64]) -> u64 {
         crate::ABORT_EXIT_CODE,
     );
     report_fatal_thread_diagnostics(ctx, thread, &name);
+    // `noreturn` on hardware, so this never surfaces as a `RuntimeError` the
+    // runtime could report — without a blocker entry the whole event is a log
+    // line a level filter can drop.
+    //
+    // Subject stays 0 and the varying facts (thread, name, return address) go
+    // in the detail closure, which is evaluated once. Neither the thread nor
+    // the calling frame is a bounded set: the measured shape is a worker pool
+    // where several threads abort (Minecraft's Streaming/REST/Watchdog), and
+    // putting either in the intern identity would spend the 32-key
+    // `GuestFault` cap — the rank-0 category a report leads with — restating
+    // one cause.
+    blockers::record(BlockerCategory::GuestFault, "abort", 0, || {
+        format!(
+            "guest called abort() on thread {thread} ('{name}'), guest ra={:#x}",
+            ctx.caller_return_addr
+        )
+    });
     if !ctx.guest_threads.request_exit(crate::ABORT_EXIT_CODE) {
         // No per-thread unwind available (should not happen on the runtime
         // dispatch path): escalate to process termination rather than hand
@@ -1637,6 +1655,16 @@ fn hle_stack_chk_fail(ctx: &HleContext, _args: &[u64]) -> u64 {
         crate::STACK_CHK_FAIL_EXIT_CODE,
     );
     report_fatal_thread_diagnostics(ctx, thread, &name);
+    // The GTA V post-fix and Until Dawn blocker. Same shape as `abort` above:
+    // `noreturn`, so nothing else records it, and the varying facts stay in the
+    // detail rather than in the intern identity.
+    blockers::record(BlockerCategory::GuestFault, "stack-chk-fail", 0, || {
+        format!(
+            "guest stack canary smashed on thread {thread} ('{name}'), guest ra={:#x} — the \
+             frame that called this is the one that overflowed",
+            ctx.caller_return_addr
+        )
+    });
     if !ctx
         .guest_threads
         .request_exit(crate::STACK_CHK_FAIL_EXIT_CODE)

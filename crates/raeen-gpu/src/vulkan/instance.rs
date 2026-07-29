@@ -784,7 +784,27 @@ impl VulkanDevice {
                         "GPU device #{requested} is out of range or unusable — using best-scored device"
                     );
                 }
-                let (_, pd, fam, name) = best.ok_or(GpuError::NoSuitableDevice)?;
+                // Recorded only when NO adapter survived selection. Rejecting
+                // one adapter is not a blocker: a machine with an iGPU beside a
+                // dGPU, or with a software adapter enumerated, rejects at least
+                // one in a perfectly healthy session, and recording each would
+                // put a t≈0 GPU blocker in the headline of every title forever.
+                let (_, pd, fam, name) = best.ok_or_else(|| {
+                    raeen_core::blockers::record(
+                        raeen_core::blockers::BlockerCategory::HostError,
+                        "no-suitable-gpu",
+                        0,
+                        || {
+                            format!(
+                                "{} Vulkan physical device(s) enumerated, none usable — see the \
+                                 preceding \"skipping <device>: …\" lines for the per-adapter \
+                                 reason",
+                                devices.len()
+                            )
+                        },
+                    );
+                    GpuError::NoSuitableDevice
+                })?;
                 (pd, fam, name)
             }
         };
@@ -1226,6 +1246,20 @@ fn persist_pipeline_cache(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
     std::fs::rename(temp, path)
 }
 
+/// The `VUID-…` token in a validation message.
+///
+/// The only stable part of one: everything after it names object handles and
+/// addresses that differ every run, so keying the blocker table on the whole
+/// message would spend the `gpu-error` category's 32 keys on a single
+/// recurring bug.
+fn validation_vuid(message: &str) -> Option<&str> {
+    let rest = &message[message.find("VUID-")?..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
 /// Routes validation-layer messages into `tracing`.
 ///
 /// # Safety
@@ -1256,5 +1290,24 @@ unsafe extern "system" fn vulkan_debug_callback(
     } else {
         warn!("[vulkan] {message}");
     }
+
+    // Also a blocker, not only a log line: what the driver's own validation
+    // says is the most direct evidence a frame is wrong, and a session that
+    // dies before anyone opens the log still carries it into the crash report.
+    // Keyed on the VUID so repeats of one bug collapse into a count; messages
+    // carrying no VUID (loader/general output) share one key per severity.
+    let key: std::borrow::Cow<'static, str> = match validation_vuid(&message) {
+        Some(vuid) => vuid.to_owned().into(),
+        None if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) => {
+            "vulkan-validation-error".into()
+        }
+        None => "vulkan-validation-warning".into(),
+    };
+    raeen_core::blockers::record(
+        raeen_core::blockers::BlockerCategory::GpuError,
+        key,
+        0,
+        || message.clone(),
+    );
     vk::FALSE
 }

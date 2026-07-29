@@ -63,6 +63,8 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 
+use raeen_core::blockers::{self, BlockerCategory};
+use raeen_core::frame_path::{self, Phase};
 use raeen_core::subsystems::GpuSubmissionSubsystem;
 use raeen_firmware::{HleTrampoline, UnresolvedStub};
 use raeen_hle::{
@@ -269,6 +271,14 @@ static TRACE_HLE: OnceLock<bool> = OnceLock::new();
 static TRACE_HLE_INDEX: OnceLock<Option<u64>> = OnceLock::new();
 static TRACE_HLE_FUNCTION: OnceLock<Option<String>> = OnceLock::new();
 static TRACE_EINVAL: OnceLock<bool> = OnceLock::new();
+/// `RAEEN_TRAP_CXA_THROW`, read once.
+///
+/// It sits as the last operand of an `||` chain whose earlier operands are
+/// false on a default run, so `||` never short-circuits it away: without this
+/// cache every HLE call — ~15k/second on the measured main thread — paid a
+/// Windows environment-block scan plus the `OsString` allocation `var_os`
+/// returns. Same treatment [`TRACE_EINVAL`] already has one line above.
+static TRAP_CXA: OnceLock<bool> = OnceLock::new();
 static WATCH_REQUEST: OnceLock<Option<GuestWatchRequest>> = OnceLock::new();
 static WATCH_CANARY_FRAME_DEPTH: OnceLock<usize> = OnceLock::new();
 
@@ -1328,6 +1338,13 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         LAST_HLE_INDEX.store(index, Ordering::Relaxed);
         HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
         HLE_DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        // The earliest thing this tree can observe that proves guest code is
+        // genuinely executing: nothing can see the guest's first *instruction*,
+        // but a trampoline call means it ran far enough to reach an import.
+        // After the first one this is a relaxed load of a shared-clean cache
+        // line and a not-taken branch — no `fetch_add` — which is what makes it
+        // safe on a ~15k-call/second path.
+        frame_path::record_phase(Phase::FirstHleCall);
         let _hle_yield = GuestGilYield::during_hle();
         let timed = stall_instruments_armed();
         let started = timed.then(std::time::Instant::now);
@@ -1384,7 +1401,7 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
         // measured owner of a title-wide streaming convoy.
         if *TRACE_EINVAL.get_or_init(|| std::env::var_os("RAEEN_TRACE_EINVAL").is_some())
             || stall_instruments_armed()
-            || std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some()
+            || *TRAP_CXA.get_or_init(|| std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some())
         {
             let tid = ctx.current_thread();
             let ring = kernel.recent_hle_calls.entry(tid).or_default();
@@ -1405,6 +1422,11 @@ pub(crate) extern "sysv64" fn direct_hle_gateway(
             .call(&hle_ctx, &t.library, &t.function, &args)
             .unwrap_or(0);
         ctx.direct_gateway_active.set(prev_direct_gateway);
+        // Two comparisons on a value already in a register; see
+        // `record_orbis_error` for why the error path itself is worth counting.
+        if is_orbis_error(result) {
+            record_orbis_error(index, trampolines.len(), &t.library, &t.function, result);
+        }
         if timed {
             kernel.in_flight_hle.remove(&ctx.current_thread());
             let micros = started.map_or(0, |s| s.elapsed().as_micros());
@@ -2444,6 +2466,63 @@ fn is_orbis_error(ret: u64) -> bool {
     ret <= u32::MAX as u64 && (ret as u32) & 0x8000_0000 != 0
 }
 
+/// One blocker slot per trampoline index, so a repeated error return never
+/// touches the blockers mutex, hashes, or allocates.
+///
+/// Sized from the live trampoline table the first time any HLE call returns an
+/// error. A later run in the same process with a *larger* table would index
+/// past the end; that case falls back to [`blockers::record`] rather than
+/// dropping the event. It only arises in test binaries — the Shell launches one
+/// process per title.
+static ORBIS_ERROR_SLOTS: OnceLock<Box<[OnceLock<Option<blockers::Slot>>]>> = OnceLock::new();
+
+/// Count one Orbis error return against `library::function`.
+///
+/// This is the site that makes the measured silent-zero-frame cluster
+/// diagnosable at all. Three of its four titles fail on an ordinary
+/// **registered** HLE function saying no — `sceKernelDlsym(handle=0,
+/// symbol='scriptingGetMem') ENOENT` for Blasphemous II and Subnautica BZ
+/// (`docs/silent-zero-frame-cluster.md`) — so no unimplemented-shim or
+/// unresolved-NID hook can ever fire for them, and a report carrying only those
+/// hooks prints a correct, useless `<none recorded>`.
+///
+/// An Orbis error code is one of the few values safe to put in the intern
+/// `subject`: it is a bounded enumeration, unlike an address. It pins the FIRST
+/// code an import returned, and a later different code from the same import is
+/// counted against that entry rather than interning a second one — which keeps
+/// the 32-key category cap spent on distinct *imports*, the axis a reader acts
+/// on, rather than on one chatty import's errno variety.
+#[inline]
+fn record_orbis_error(
+    index: u64,
+    trampoline_count: usize,
+    library: &str,
+    function: &str,
+    ret: u64,
+) {
+    let slots =
+        ORBIS_ERROR_SLOTS.get_or_init(|| (0..trampoline_count).map(|_| OnceLock::new()).collect());
+    let Some(cell) = slots.get(index as usize) else {
+        blockers::record(
+            BlockerCategory::OrbisError,
+            format!("{library}::{function}"),
+            ret,
+            || format!("returned {ret:#x} (first observed code)"),
+        );
+        return;
+    };
+    if let Some(slot) = *cell.get_or_init(|| {
+        blockers::intern(
+            BlockerCategory::OrbisError,
+            format!("{library}::{function}"),
+            ret,
+            || format!("returned {ret:#x} (first observed code)"),
+        )
+    }) {
+        blockers::bump(slot);
+    }
+}
+
 /// Whose code was running when an access violation arrived, once the fast
 /// paths (HLE trampoline dispatch, FS-base re-arm, demand-commit) have all
 /// declined it.
@@ -3324,6 +3403,20 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             let function = raeen_firmware::dynlib::nid_names::describe(s.nid);
             let (first_occurrence, count) =
                 kernel.record_unresolved_nid_call(s.nid, &function, library, &calling_module);
+            // The kernel inventory above is process-local and reachable only
+            // from a live `OrbisKernel`; the blocker table is what a crash
+            // report, the console and the IPC digest read. Counting on every
+            // occurrence rather than gating on `first_occurrence` keeps the
+            // reported ×N honest, and `record`'s lock is nothing beside the
+            // hardware exception, `describe`, and the three `String`s this path
+            // already pays per call. The NID is safe as the intern subject: a
+            // title's import table is fixed, so the key set is bounded.
+            blockers::record(
+                BlockerCategory::UnresolvedNid,
+                function.clone(),
+                s.nid,
+                || format!("library={library} caller={calling_module}"),
+            );
             let strict =
                 *STRICT_NIDS.get_or_init(|| std::env::var_os("RAEEN_STRICT_NIDS").is_some());
             if first_occurrence {
@@ -3440,6 +3533,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             LAST_HLE_INDEX.store(idx, Ordering::Relaxed);
             HLE_ENTERS.fetch_add(1, Ordering::Relaxed);
             HLE_VEH_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            // Twin of the direct gateway's stamp: whichever dispatch path a
+            // title's first import happens to take, `phase=first_hle_call` has
+            // to mean the same thing. See the direct site for the cost argument.
+            frame_path::record_phase(Phase::FirstHleCall);
             // Yield the diagnostic guest GIL for the duration of this HLE call so
             // a blocking wait (semaphore/mutex/cond) lets another guest thread
             // run; re-acquired when `_hle_yield` drops at the end of this arm,
@@ -3696,7 +3793,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             // pooled; the guest thread id is stable). Gated to the trap run.
             if *TRACE_EINVAL.get_or_init(|| std::env::var_os("RAEEN_TRACE_EINVAL").is_some())
                 || stall_instruments_armed()
-                || std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some()
+                || *TRAP_CXA.get_or_init(|| std::env::var_os("RAEEN_TRAP_CXA_THROW").is_some())
             {
                 let tid = ctx.current_thread();
                 let ring = kernel.recent_hle_calls.entry(tid).or_default();
@@ -3739,6 +3836,13 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
             let ret = hle
                 .call(&hle_ctx, &t.library, &t.function, &args)
                 .unwrap_or(0);
+            // Twin of the direct gateway's site — see `record_orbis_error`.
+            // Deliberately independent of the `RAEEN_TRACE_EINVAL` warning
+            // further down: that one is opt-in and prints, this one is always
+            // on and counts.
+            if is_orbis_error(ret) {
+                record_orbis_error(idx, trampolines.len(), &t.library, &t.function, ret);
+            }
             if timed {
                 kernel.in_flight_hle.remove(&ctx.current_thread());
                 let micros = started.map_or(0, |s| s.elapsed().as_micros());
