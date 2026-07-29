@@ -13,6 +13,17 @@ const IT_DRAW_INDEX_OFFSET_2: u32 = 0x35;
 const IT_DISPATCH_DIRECT: u32 = 0x15;
 const IT_DISPATCH_INDIRECT: u32 = 0x16;
 const IT_DRAW_INDEX_INDIRECT: u32 = 0x25;
+/// The NON-indexed indirect draws, `IT_DRAW_INDIRECT` / `IT_DRAW_INDIRECT_MULTI`.
+///
+/// Their indexed twins (0x25 / 0x38) were counted here from the start and these
+/// two were not, even though `CommandProcessor::dispatch` routes all four to the
+/// same `cp_op_draw_indirect` and issues a real `DrawSink` draw for each. Found
+/// by the reverse-direction half of `tests/pm4_decoder_agreement.rs` while
+/// closing the `IT_DISPATCH_DRAW_PREAMBLE` gap — the same under-count, and
+/// invisible for exactly the same reason: nothing compared the two decoders'
+/// opcode sets.
+const IT_DRAW_INDIRECT: u32 = 0x24;
+const IT_DRAW_INDIRECT_MULTI: u32 = 0x2c;
 const R_DRAW_INDEX_AUTO: u32 = 0x04;
 const R_DRAW_INDEX: u32 = 0x03;
 const R_FLIP: u32 = 0x17;
@@ -21,6 +32,14 @@ const R_WRITE_DATA: u32 = 0x15;
 const R_RELEASE_MEM: u32 = 0x18;
 const R_WAIT_MEM_32: u32 = 0x0a;
 const IT_DRAW_INDEX_MULTI_AUTO: u32 = 0x30;
+/// The AGC multi-instanced indexed draw (KytyPS5 `pm4.h` L44,
+/// `kyty_graphics::pm4::IT_DISPATCH_DRAW_PREAMBLE`).
+///
+/// Raeen's own `sceAgcDcbDrawIndexMultiInstanced` emits this, so leaving it out
+/// of the draw match UNDER-reported `draw_packets` for any title that calls it —
+/// the mirror image of the 0x30/0x8d over-report, and the reason
+/// `raeen-gpu/tests/pm4_decoder_agreement.rs` now checks both directions.
+const IT_DISPATCH_DRAW_PREAMBLE: u32 = 0x3a;
 const IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
 const IT_DISPATCH_DRAW: u32 = 0x8d;
 const IT_EVENT_WRITE: u32 = 0x46;
@@ -193,11 +212,14 @@ pub fn decode_submission(words: &[u32]) -> Result<AgcSubmission, AgcDecodeError>
         if matches!(
             opcode,
             IT_DRAW_INDEX_INDIRECT
+                | IT_DRAW_INDIRECT
+                | IT_DRAW_INDIRECT_MULTI
                 | IT_DRAW_INDEX_2
                 | IT_DRAW_INDEX_AUTO
                 | IT_DRAW_INDEX_MULTI_AUTO
                 | IT_DRAW_INDEX_OFFSET_2
                 | IT_DRAW_INDEX_INDIRECT_MULTI
+                | IT_DISPATCH_DRAW_PREAMBLE
                 | IT_DISPATCH_DRAW
         ) || (opcode == IT_NOP && matches!(register, R_DRAW_INDEX | R_DRAW_INDEX_AUTO))
         {

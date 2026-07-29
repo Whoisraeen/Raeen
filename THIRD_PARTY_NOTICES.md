@@ -107,8 +107,28 @@ SOFTWARE.
   `crates/kyty-graphics/src/run.rs` additionally re-implements
   `CpOpDispatchIndirect` (both the base+offset and absolute-address argument
   forms, `pm4Handlers.cpp`/`graphicsRun.cpp`) and `CpOpSetBase`'s shader-type
-  split between the indirect-draw and indirect-dispatch argument bases. No
-  C++ is vendored or compiled into Raeen.
+  split between the indirect-draw and indirect-dispatch argument bases. The
+  PM4 decoder-agreement batch (2026-07-29) takes the `IT_DISPATCH_DRAW`
+  opcode NUMBER (`0x8D`) from `src/graphics/guest_gpu/pm4.h` L71, plus the
+  factual observation that `MakeOpcodeDispatchTable` (`pm4Dispatch.cpp` L212)
+  wires only `IT_DISPATCH_DRAW_PREAMBLE` (`0x3A`) and never `0x8D` — that
+  absence is why Raeen refuses the opcode by name instead of guessing a body
+  layout. No handler logic was ported for `0x8D`.
+
+  The follow-up batch the same day DOES port `0x3A`:
+  `CommandProcessor::cp_op_draw_index_multi_instanced`
+  (`crates/kyty-graphics/src/run.rs`) re-implements the `0xC0073A00` branch of
+  `CpOpDrawIndex` (`pm4Handlers.cpp` L2276-2297) in Rust — the field order
+  `[index_count, addr_lo, addr_hi, max_instance_count, obj_lo, obj_hi,
+  instance_count, flags]` and the 8-body-dword length, matching the opcode
+  number from `pm4.h` L44. Raeen deviates in three ways: KytyPS5 `EXIT`s on any
+  other `cmd_id` where Raeen issues a counted, named refusal (resilience
+  policy); Raeen's `IndexedDraw` carries no instance count or object-id buffer,
+  so the multi-instanced part degrades to one instance with a rate-limited warn;
+  and all tests are Raeen's own. The matching emitter,
+  `raeen-hle::hle_dcb_draw_index_multi_instanced`, was already attributed to
+  `GraphicsDcbDrawIndexMultiInstanced` above. No C++ is vendored or compiled
+  into Raeen.
   the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. The GTA V
   `libSceAmpr` Tier-C batch (`crates/raeen-hle/src/libsce_ampr.rs`,
   2026-07-27) behaviorally re-implements `src/libs/libAmpr.cpp`: the
@@ -543,6 +563,12 @@ re-implementations are license-compatible; this notice preserves attribution.
   CLEAR_WORD splat is Raeen's own simplification (shadPS4 unpacks per format
   for `vkCmdClearColorImage`); no C++ is copied.
 
+  The 2026-07-29 PM4 decoder-agreement batch cites `pm4_opcodes.h` L33
+  (`DrawIndexMultiAuto = 0x30`) in `crates/kyty-graphics/src/pm4.rs` as one
+  source for the opcode number, together with the factual observation that
+  `src/video_core/amdgpu/liverpool.cpp`'s packet `switch` has no case for it —
+  shadPS4 names the opcode but does not walk its body. No C++ is copied.
+
   The 2026-07-28 Orbis exception-delivery work in
   `crates/raeen-hle/src/exception.rs` is a Rust re-implementation informed by
   shadPS4's `core/libraries/kernel/threads/exception.cpp`/`.h`: the handler ABI
@@ -645,6 +671,12 @@ attribution as that license requires.
   `PKT3_PRIME_UTCL2`, `PKT3_MEM_SEMAPHORE`) and the 9-DWORD ATOMIC_MEM shape
   from `ac_cmdbuf_cp.c` — cited in `crates/raeen-hle/src/libsce_agc.rs` doc
   comments; these are hardware-interface facts, and no Mesa code was copied.
+  The PM4 decoder-agreement batch (2026-07-29) cites the same file for
+  `PKT3_DRAW_INDEX_MULTI_AUTO` (`sid.h` L70) in
+  `crates/kyty-graphics/src/pm4.rs`, and records the *negative* finding that
+  `ac_gather_context_rolls.c` only classifies that opcode as context-busy
+  without decoding a body — no layout was transcribed, because none exists to
+  transcribe.
 
 ---
 

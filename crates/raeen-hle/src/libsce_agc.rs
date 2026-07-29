@@ -9148,6 +9148,109 @@ mod tests {
         );
     }
 
+    /// The third edge of the PM4 decoder-agreement invariant, from the side
+    /// neither decoder can see: a draw Raeen's own HLE **emits** must be counted
+    /// by `decode_submission` AND translated by the `CommandProcessor`.
+    ///
+    /// `raeen-gpu/tests/pm4_decoder_agreement.rs` compares the two decoders to
+    /// each other, so an opcode neither one knows passes both directions. That
+    /// is exactly what `IT_DISPATCH_DRAW_PREAMBLE` (0x3A) did:
+    /// `sceAgcDcbDrawIndexMultiInstanced` emitted a well-formed 9-DWORD draw,
+    /// `decode_submission` did not count it (the submission UNDER-reported its
+    /// draws), and the command processor had no arm, so the packet fell to the
+    /// anonymous unknown-opcode skip. Every such draw vanished with no counter
+    /// and no named reason anywhere — the Dead Cells `draws=0` shape again.
+    ///
+    /// `draw_index_multi_instanced_emits_nine_dwords` above pins the bytes. This
+    /// pins that the bytes are consumed: walk the ACTUAL emitted DWORDs with
+    /// both decoders.
+    #[test]
+    fn multi_instanced_draw_emission_reaches_the_command_processor() {
+        use kyty_graphics::run::{CommandProcessor, DrawError, DrawSink, IndexedDraw};
+
+        /// Refuses degraded auto draws, so losing the index buffer cannot pass.
+        #[derive(Default)]
+        struct IndexSink {
+            indexed: Vec<IndexedDraw>,
+        }
+        impl DrawSink for IndexSink {
+            fn draw_index_auto(
+                &mut self,
+                _ctx: &kyty_graphics::hw_regs::Context,
+                _ucfg: &kyty_graphics::hw_regs::UserConfig,
+                _sh: &kyty_graphics::hw_regs::Shader,
+                _index_count: u32,
+                _flags: u32,
+            ) -> Result<(), DrawError> {
+                Err(DrawError(
+                    "this sink only accepts indexed draws — a degraded auto draw \
+                     means the index buffer never reached it"
+                        .to_owned(),
+                ))
+            }
+
+            fn draw_index(
+                &mut self,
+                _ctx: &kyty_graphics::hw_regs::Context,
+                _ucfg: &kyty_graphics::hw_regs::UserConfig,
+                _sh: &kyty_graphics::hw_regs::Shader,
+                draw: &IndexedDraw,
+            ) -> Result<(), DrawError> {
+                self.indexed.push(*draw);
+                Ok(())
+            }
+        }
+
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let index_addr = 0x0000_0012_0000_4000u64;
+        let object_ids = 0x0000_0034_0000_8000u64;
+        assert_eq!(
+            hle_dcb_draw_index_multi_instanced(&ctx, &[cb, 6, index_addr, object_ids, 3, 0x100]),
+            0x400
+        );
+        // Exactly what the guest would submit.
+        let emitted_dwords = (read_u64(&ctx, cb + CB_CURSOR_UP) - 0x400) / 4;
+        let dcb: Vec<u32> = (0..emitted_dwords)
+            .map(|i| read_u32(&ctx, 0x400 + i * 4))
+            .collect();
+
+        // Decoder 1: the eager structural pass that feeds
+        // ctx.kernel.agc_draw_packet_count.
+        let decoded = raeen_gpu::agc::decode_submission(&dcb)
+            .expect("the emitted DCB must decode structurally");
+        assert_eq!(
+            decoded.draw_packets, 1,
+            "the emitted draw must be COUNTED — an emitter whose draws the eager \
+             decoder ignores under-reports every frame that uses it"
+        );
+
+        // Decoder 2: the executing pass.
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexSink::default();
+        cp.run(&dcb, &mut sink)
+            .expect("the emitted DCB must walk cleanly");
+        assert_eq!(cp.refused_draws(), 0, "no draw may be refused");
+        assert_eq!(
+            sink.indexed.len(),
+            1,
+            "the emitted draw must REACH the sink — before the 0x3A handler existed \
+             this was 0, with no counter anywhere to say so"
+        );
+        assert_eq!(
+            sink.indexed[0].index_addr, index_addr,
+            "the command processor must receive the index buffer the guest passed"
+        );
+        assert_eq!(sink.indexed[0].index_count, 6);
+        assert_eq!(
+            sink.indexed[0].flags,
+            0x20 | 0x80,
+            "body[7] is the initiator | 0x80 the emitter wrote"
+        );
+    }
+
     /// UCONFIG register writers mirror the SH family with the UCONFIG opcode:
     /// one range packet, and run-coalesced direct packets.
     #[test]
