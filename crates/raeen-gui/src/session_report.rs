@@ -77,6 +77,33 @@ pub struct SessionInputs {
     pub incomplete_imports: Vec<String>,
 }
 
+/// What a session looked like when the report was written — every input to
+/// [`classify`] other than the run's own ending.
+///
+/// These are read from six different places at the one production call site
+/// (`frame_path::snapshot()`, the process CPU clock, the session's start
+/// instant), so grouping them buys type-checked field names in place of seven
+/// same-typed positional arguments: `frames_published`, `cpu_ms`, `wall_ms` and
+/// `elapsed_secs` are all `u64`-shaped, and `reached_label`/`phase_label`/
+/// `counters` are all `&str`. Transposing any pair used to compile silently.
+#[derive(Debug, Clone, Copy)]
+pub struct RunObservation<'a> {
+    /// `frame_path`'s `FramePublished` count.
+    pub frames_published: u64,
+    /// Furthest frame-path stage reached, as a label.
+    pub reached_label: &'a str,
+    /// Furthest frame-path phase reached, as a label.
+    pub phase_label: &'a str,
+    /// The rendered frame-path counter line.
+    pub counters: &'a str,
+    /// Guest-process CPU time, `None` if the host would not report it.
+    pub cpu_ms: Option<u64>,
+    /// Guest-process wall-clock time, `None` if unknown.
+    pub wall_ms: Option<u64>,
+    /// Seconds since the session started.
+    pub elapsed_secs: u64,
+}
+
 /// Decide the outcome and the one-sentence verdict for a session.
 ///
 /// Pure over its inputs so every ending — fault, clean exit, heartbeat,
@@ -84,24 +111,25 @@ pub struct SessionInputs {
 /// call site happened to write the report.
 ///
 /// `outcome` is `None` for a heartbeat (the session is still running).
+///
+/// Everything except `outcome` is an observation of the *same* run, so it
+/// travels as one [`RunObservation`] rather than as seven positional arguments.
+/// `outcome` stays separate because it is the discriminant this function
+/// switches on, not another measurement.
 #[must_use]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each argument is an independently sourced observation about the run \
-              (outcome, frame count, two labels, and the counters); bundling them into \
-              a struct would only move the same eight values to the call site, which \
-              already reads them from eight different places"
-)]
 pub fn classify(
     outcome: Option<&Result<raeen_runtime::RunOutcome, raeen_runtime::RuntimeError>>,
-    frames_published: u64,
-    reached_label: &str,
-    phase_label: &str,
-    counters: &str,
-    cpu_ms: Option<u64>,
-    wall_ms: Option<u64>,
-    elapsed_secs: u64,
+    observed: &RunObservation<'_>,
 ) -> (Stage, String) {
+    let &RunObservation {
+        frames_published,
+        reached_label,
+        phase_label,
+        counters,
+        cpu_ms,
+        wall_ms,
+        elapsed_secs,
+    } = observed;
     let (stage, mut verdict) = match outcome {
         Some(Err(error)) => (Stage::Crashed, describe_runtime_error(error)),
         Some(Ok(run)) if frames_published > 0 => (
@@ -454,15 +482,18 @@ impl SessionReportWriter {
         let cpu_ms = crash_report::process_cpu_ms();
         let wall_ms = Some(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
 
+        let counters = snapshot.counters();
         let (stage, verdict) = classify(
             outcome,
-            frames_published,
-            snapshot.reached_label(),
-            snapshot.phase_label(),
-            &snapshot.counters(),
-            cpu_ms,
-            wall_ms,
-            self.started.elapsed().as_secs(),
+            &RunObservation {
+                frames_published,
+                reached_label: snapshot.reached_label(),
+                phase_label: snapshot.phase_label(),
+                counters: &counters,
+                cpu_ms,
+                wall_ms,
+                elapsed_secs: self.started.elapsed().as_secs(),
+            },
         );
 
         let fault = match outcome {
@@ -559,39 +590,38 @@ mod tests {
 
     const COUNTERS: &str = "videoout_open=1@812ms dcb_submitted=91@1204ms";
 
+    /// The baseline observation these cases vary from: a run that submitted
+    /// DCBs, published nothing, and reports no CPU shape. Each case overrides
+    /// only the fields it is actually about (`..observed()`), so what a test is
+    /// exercising is visible instead of being the third or sixth positional
+    /// argument among seven same-typed ones.
+    fn observed() -> RunObservation<'static> {
+        RunObservation {
+            frames_published: 0,
+            reached_label: "dcb_submitted",
+            phase_label: "first_guest_thread",
+            counters: COUNTERS,
+            cpu_ms: None,
+            wall_ms: None,
+            elapsed_secs: 0,
+        }
+    }
+
     #[test]
     fn classify_maps_every_ending_to_a_stage_and_a_verdict() {
         // A fault.
         let faulted = Err(raeen_runtime::RuntimeError::Faulted {
-            addr: 0x2_00a1_03c6,
-            access: 0x300_0000_0010,
+            addr: 0x0002_00a1_03c6,
+            access: 0x0300_0000_0010,
             kind: raeen_runtime::FaultKind::Read,
         });
-        let (stage, verdict) = classify(
-            Some(&faulted),
-            0,
-            "dcb_submitted",
-            "first_guest_thread",
-            COUNTERS,
-            None,
-            None,
-            0,
-        );
+        let (stage, verdict) = classify(Some(&faulted), &observed());
         assert_eq!(stage, Stage::Crashed);
         assert!(verdict.contains("Guest fault at 0x200a103c6"), "{verdict}");
 
         // A clean exit that never presented — the silent zero-frame class.
         let exited = Ok(raeen_runtime::RunOutcome::Exited(0));
-        let (stage, verdict) = classify(
-            Some(&exited),
-            0,
-            "dcb_submitted",
-            "first_guest_thread",
-            COUNTERS,
-            None,
-            None,
-            0,
-        );
+        let (stage, verdict) = classify(Some(&exited), &observed());
         assert_eq!(stage, Stage::Exited);
         assert!(verdict.contains("silent zero-frame run"), "{verdict}");
         // The verdict is the SHARED definition, so the compat harness and this
@@ -608,19 +638,24 @@ mod tests {
         // A clean exit that did present.
         let (stage, _) = classify(
             Some(&exited),
-            900,
-            "frames_published",
-            "first_guest_thread",
-            COUNTERS,
-            None,
-            None,
-            0,
+            &RunObservation {
+                frames_published: 900,
+                reached_label: "frames_published",
+                ..observed()
+            },
         );
         assert_eq!(stage, Stage::Rendering);
 
         // A heartbeat: still running, and it says so instead of guessing.
-        let (stage, verdict) =
-            classify(None, 0, "nothing", "deps_linked", COUNTERS, None, None, 40);
+        let (stage, verdict) = classify(
+            None,
+            &RunObservation {
+                reached_label: "nothing",
+                phase_label: "deps_linked",
+                elapsed_secs: 40,
+                ..observed()
+            },
+        );
         assert_eq!(stage, Stage::Launching);
         assert!(verdict.contains("No outcome yet"), "{verdict}");
         assert!(verdict.contains("+40 s"), "{verdict}");
@@ -634,13 +669,13 @@ mod tests {
     fn a_parked_stall_and_a_spinning_stall_are_told_apart() {
         let parked = classify(
             None,
-            0,
-            "nothing",
-            "first_guest_thread",
-            COUNTERS,
-            Some(3_200),
-            Some(180_000),
-            180,
+            &RunObservation {
+                reached_label: "nothing",
+                cpu_ms: Some(3_200),
+                wall_ms: Some(180_000),
+                elapsed_secs: 180,
+                ..observed()
+            },
         )
         .1;
         assert!(parked.contains("parked"), "{parked}");
@@ -648,13 +683,13 @@ mod tests {
 
         let spinning = classify(
             None,
-            0,
-            "nothing",
-            "first_guest_thread",
-            COUNTERS,
-            Some(179_600),
-            Some(180_000),
-            180,
+            &RunObservation {
+                reached_label: "nothing",
+                cpu_ms: Some(179_600),
+                wall_ms: Some(180_000),
+                elapsed_secs: 180,
+                ..observed()
+            },
         )
         .1;
         assert!(
