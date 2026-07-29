@@ -990,17 +990,29 @@ pub(crate) fn vblank_period() -> Option<std::time::Duration> {
 /// Wait until the next vblank edge on the process-wide schedule.
 ///
 /// Edges are anchored to a fixed epoch (`epoch + n·period`), not to "now +
-/// period": per-call relative sleeps drift and quantize. The wait itself is
-/// drift-compensated accurate sleep (concept from shadPS4's
-/// `AccurateSleep`/`Timer`, GPL-2.0 — reimplemented): an absolute deadline, a
-/// high-resolution OS wait for the bulk, and a bounded final spin so a late
-/// signal never overshoots a full edge. Windows' default timer resolution
-/// (~15.6 ms) rounds ANY shorter `thread::sleep` up to a full tick — the
-/// stage-C measurement saw exactly that signature (20.2 ms intervals from a
-/// 16.7 ms sleep) — so the bulk wait goes through a high-resolution waitable
-/// timer (~0.5 ms) instead of `Sleep`, and only the last millisecond spins.
-/// That removes up to a whole tick of yield-spin per wait from the guest core
-/// the title parks here. At 120 Hz the whole 8.3 ms wait is one timer signal.
+/// period": per-call relative sleeps drift and quantize. That anchoring is this
+/// module's job. The *waiting* is `raeen_core::host_sleep`'s, which owns the one
+/// measured host sleep strategy for the process — including the never-early
+/// guarantee this schedule depends on, since a wait that returned before its
+/// edge would hand the guest a frame that has not been scanned out yet.
+///
+/// This path used to carry its own copy of the thread-local
+/// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` wait, which `host_sleep` was later
+/// generalised from. Two copies of a timer primitive is two chances to drift,
+/// and the copy here had a due time that truncated instead of rounding up.
+///
+/// Two claims from the original stage-C note did not survive `host_sleep`'s
+/// measurements and are not repeated here. The 20.2 ms intervals seen from a
+/// 16.7 ms sleep were real, but `std::thread::sleep` is not what quantises to
+/// the ~15.6 ms tick — Rust already parks it on a high-resolution timer, and a
+/// 10 ms sleep measures 10.2 ms. The tick is paid by condition-variable timed
+/// waits, and the yield-spin this path used for its final millisecond measured
+/// 60–190 ms under the emulator's own thread load, which is the likelier source
+/// of an overshot edge. `host_sleep` parks that millisecond instead.
+///
+/// The trait exists so the edge arithmetic can be tested against a deterministic
+/// clock: host scheduling load cannot turn a schedule unit test into a false
+/// failure.
 pub(crate) trait VblankClock {
     fn elapsed(&self) -> std::time::Duration;
     fn wait_until(&self, deadline: std::time::Duration);
@@ -1016,33 +1028,19 @@ impl VblankClock for HostVblankClock {
     }
 
     fn wait_until(&self, deadline: std::time::Duration) {
-        /// The final slice of every wait is a spin: an OS signal can arrive
-        /// early, and overshooting an edge is worse than spinning a
-        /// millisecond.
-        const SPIN_REMAINDER: std::time::Duration = std::time::Duration::from_millis(1);
-        /// Coarse-sleep granularity of the no-high-res-timer fallback.
-        const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(17);
-        loop {
-            let now = self.elapsed();
-            if now >= deadline {
-                return;
-            }
-            let remaining = deadline - now;
-            if remaining <= SPIN_REMAINDER {
-                std::thread::yield_now();
-                continue;
-            }
-            #[cfg(windows)]
-            let served = precise_wait::wait(remaining - SPIN_REMAINDER);
-            #[cfg(not(windows))]
-            let served = false;
-            if !served {
-                // Fallback without a high-resolution timer: coarse-sleep,
-                // never past the spin window, and re-derive the remaining time
-                // each lap.
-                std::thread::sleep((remaining - SPIN_REMAINDER).min(TIMER_TICK));
-            }
-        }
+        // Hand `host_sleep` the absolute edge, not a remaining duration.
+        // Subtracting here and letting `host_sleep::sleep` re-read the clock
+        // would push every wait past its edge by the gap between the two
+        // reads — reintroducing exactly the per-call drift the epoch-anchored
+        // grid exists to remove.
+        let Some(deadline) = self.epoch.checked_add(deadline) else {
+            // Unreachable with a real schedule: `wait_next_vblank_edge_with_clock`
+            // never picks an edge more than one period past now, and
+            // `configured_vblank_period` bounds the period to 24-480 Hz. With
+            // no representable edge to wait for, do not wait.
+            return;
+        };
+        raeen_core::host_sleep::sleep_until(deadline);
     }
 }
 
@@ -1107,81 +1105,6 @@ impl VblankClock for ManualVblankClock {
         assert!(deadline >= self.now.get());
         self.deadlines.borrow_mut().push(deadline);
         self.now.set(deadline);
-    }
-}
-
-/// High-resolution waitable-timer sleep (Windows 10 1803+). One unnamed
-/// manual-reset timer per waiting thread, created lazily; thread exit closes
-/// it. A process may park several guest threads in `sceVideoOutWaitVblank` /
-/// kernel waits, so the handle is thread-local, never shared.
-#[cfg(windows)]
-mod precise_wait {
-    use std::time::Duration;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::{
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CREATE_WAITABLE_TIMER_MANUAL_RESET,
-        CreateWaitableTimerExW, SetWaitableTimer, TIMER_MODIFY_STATE, WaitForSingleObject,
-    };
-
-    /// Wait indefinitely for one object; not exported by windows-sys 0.59.
-    const INFINITE: u32 = 0xFFFF_FFFF;
-
-    /// Object-access right to wait on a handle; not exported by windows-sys 0.59.
-    const SYNCHRONIZATION: u32 = 0x0010_0000;
-
-    thread_local! {
-        static HIGH_RES_TIMER: Option<HighResTimer> = HighResTimer::new();
-    }
-
-    struct HighResTimer(HANDLE);
-
-    impl HighResTimer {
-        fn new() -> Option<Self> {
-            // SAFETY: creating an unnamed manual-reset timer; null attributes
-            // and name are valid. The high-resolution flag is ignored on
-            // Windows builds that predate it, degrading to a normal timer.
-            let handle = unsafe {
-                CreateWaitableTimerExW(
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                    TIMER_MODIFY_STATE | SYNCHRONIZATION,
-                )
-            };
-            (!handle.is_null()).then_some(Self(handle))
-        }
-
-        fn wait(&self, remaining: Duration) {
-            // Negative due time = relative, in 100 ns units.
-            let due = -((remaining.as_nanos() / 100).min(i64::MAX as u128) as i64);
-            // SAFETY: `self.0` is a live timer owned by this thread; the
-            // due-time pointer is valid; no APC completion routine is used.
-            let ok = unsafe { SetWaitableTimer(self.0, &due, 0, None, std::ptr::null(), 0) };
-            if ok != 0 {
-                // SAFETY: waiting on this thread's own timer; it signals at
-                // the due time, so INFINITE cannot hang.
-                unsafe { WaitForSingleObject(self.0, INFINITE) };
-            }
-        }
-    }
-
-    impl Drop for HighResTimer {
-        fn drop(&mut self) {
-            // SAFETY: closing a handle this thread created and owns.
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    /// Sleep for `remaining` at sub-millisecond precision. Returns `false`
-    /// when no high-resolution timer could be created (caller falls back).
-    pub fn wait(remaining: Duration) -> bool {
-        HIGH_RES_TIMER.with(|timer| {
-            let Some(timer) = timer else {
-                return false;
-            };
-            timer.wait(remaining);
-            true
-        })
     }
 }
 

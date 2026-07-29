@@ -112,8 +112,13 @@ commit if green; its report is authoritative over this doc for those items.
   (recipe in astro-bot memory).
 - Known flake: parallel two-device ash tests (shader_fetch / debug-utils) —
   rerun solo before believing a failure.
-- Windows sleep quantization (~15.6 ms) breaks naive frame pacing — the
-  vblank waiter's coarse-sleep+yield-spin pattern is the template.
+- Host sleep precision: use `raeen_core::host_sleep` (`sleep` for a duration,
+  `sleep_until` for an absolute deadline). Do NOT copy the vblank waiter's old
+  coarse-sleep+yield-spin pattern — it has been collapsed into that module, and
+  its measurements say the yield-spin cost 60–190 ms under our own thread load.
+  The ~15.6 ms quantization is real but belongs to *condition-variable* timed
+  waits, not `thread::sleep`; `arm_high_resolution_timer` is the only lever on
+  those.
 - `scratch/` holds captured shader dumps + disasm (`shader_probe` example);
   `RAEEN_DUMP_SHADERS` + `enumerate_dumps` for fresh captures.
 

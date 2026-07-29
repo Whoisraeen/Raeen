@@ -58,7 +58,9 @@
 //! `reference/shadps4` (`src/common/thread.cpp` `AccurateSleep`) and
 //! `reference/sharpemu` (`src/SharpEmu.Libs/HostTiming.cs` tiered ladder). The
 //! thread-local cached-timer shape already existed in-tree at
-//! `raeen-hle/src/libsce_video_out.rs`; this module generalises it.
+//! `raeen-hle/src/libsce_video_out.rs`; this module generalises it, and that
+//! copy has since been collapsed into [`sleep_until`] so there is one timer
+//! primitive rather than two that can drift apart.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -151,6 +153,20 @@ pub fn plan(requested: Duration, caps: HostCapabilities) -> SleepPlan {
         return SleepPlan::HighResolutionTimer;
     }
     SleepPlan::Fallback
+}
+
+/// Choose the strategy for a wait to an absolute deadline. `None` means the
+/// deadline has already passed and the caller must return immediately.
+///
+/// That `None` is the one input on which a deadline wait and a duration wait
+/// must disagree. [`plan`] maps a zero request to [`SleepPlan::Yield`] because
+/// `usleep(0)` *is* a yield request. A deadline that has already passed is not
+/// a request for anything — it is a wait that is merely late, and a thread
+/// pacing to a fixed grid that surrenders its quantum on the way out of a late
+/// wait misses the next edge too.
+#[must_use]
+pub fn plan_until(remaining: Duration, caps: HostCapabilities) -> Option<SleepPlan> {
+    (!remaining.is_zero()).then(|| plan(remaining, caps))
 }
 
 /// A waitable timer's relative due time in 100 ns units, **negative** as the
@@ -294,13 +310,24 @@ impl Bucket {
 /// title pays depends entirely on what it requests — which only a histogram of
 /// a real run can say.
 ///
-/// One caveat when reading a real run: this records **host parks**, not guest
-/// calls. `libkernel`'s sleep handlers slice any request longer than 100 ms so
-/// teardown stays observable, so a guest `usleep(500000)` appears as five 100 ms
-/// samples rather than one 500 ms sample. Every request at or below 100 ms — the
-/// entire interesting range, and every per-frame sleep a title issues — is
-/// exactly one park, so only the top bucket is affected, and its multiplier is
-/// ~1.0 in any case.
+/// Two caveats when reading a real run.
+///
+/// It records **host parks**, not guest calls. `libkernel`'s sleep handlers
+/// slice any request longer than 100 ms so teardown stays observable, so a guest
+/// `usleep(500000)` appears as five 100 ms samples rather than one 500 ms
+/// sample. Every request at or below 100 ms — the entire interesting range, and
+/// every per-frame sleep a title issues — is exactly one park, so only the top
+/// bucket is affected, and its multiplier is ~1.0 in any case.
+///
+/// It also records [`sleep`] only, never [`sleep_until`]. The deadline entry
+/// point's callers are internal frame pacing, not guest sleep requests: a
+/// `sceVideoOutWaitVblank` wait is anywhere from 0 to a full 16.6 ms period
+/// depending only on where in the frame the guest called it, so its
+/// actual-over-requested ratio measures the title's frame time and not the
+/// host's sleep precision. Including it would also swamp the instrument — at
+/// 60 Hz it alone produces ~60 samples a second, enough to trip the report
+/// threshold on its own and to bury a title's real millisecond-scale sleeps
+/// under pacing waits in the same buckets.
 ///
 /// Constructible standalone so tests can feed synthetic samples; the process
 /// instance is [`global`].
@@ -513,19 +540,15 @@ fn park_until(deadline: Instant, use_timer: bool) {
     }
 }
 
-/// Sleep the calling thread for at least `requested`.
+/// Carry out an already-chosen plan against `deadline`.
 ///
-/// This is the single host sleep primitive; `TimeSubsystem::sleep` forwards to
-/// it, so every guest `usleep`/`nanosleep`/`sleep` shares one measured
-/// strategy. Never returns before `requested` has elapsed on the monotonic
-/// clock.
-pub fn sleep(requested: Duration) {
-    let start = Instant::now();
-    let chosen = plan(requested, capabilities());
+/// The deadline is the authority, not the duration the plan was chosen from:
+/// every arm below aims at the same absolute instant, so no strategy can drift
+/// by re-reading the clock on its way in.
+fn execute(chosen: SleepPlan, deadline: Instant) {
     match chosen {
         SleepPlan::Yield => std::thread::yield_now(),
         SleepPlan::Spin => {
-            let deadline = start + requested;
             // The slot may have been taken between `capabilities()` and here;
             // parking is always a correct answer, so fall through rather than
             // waiting for a slot.
@@ -534,9 +557,42 @@ pub fn sleep(requested: Duration) {
                 None => park_until(deadline, high_resolution_timer_supported()),
             }
         }
-        SleepPlan::HighResolutionTimer => park_until(start + requested, true),
-        SleepPlan::Fallback => park_until(start + requested, false),
+        SleepPlan::HighResolutionTimer => park_until(deadline, true),
+        SleepPlan::Fallback => park_until(deadline, false),
     }
+}
+
+/// Block until `deadline`, then return. Never returns early; returns at once if
+/// the deadline has already passed.
+///
+/// The deadline-shaped entry point, for a caller pacing to a fixed grid rather
+/// than sleeping for a length of time — `sceVideoOutWaitVblank` waiting for
+/// edge *n* of the vblank schedule, say. Such a caller must not be made to
+/// subtract and call [`sleep`]: the gap between the caller reading the clock
+/// and [`sleep`] reading it again lands *past* the deadline, so every wait
+/// overshoots by that gap and an epoch-anchored grid drifts by exactly as much
+/// as the per-call relative sleeps it exists to avoid.
+///
+/// **Not recorded in the [`SleepHistogram`]**, unlike [`sleep`] — see that
+/// type's documentation for why.
+pub fn sleep_until(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let Some(chosen) = plan_until(remaining, capabilities()) else {
+        return;
+    };
+    execute(chosen, deadline);
+}
+
+/// Sleep the calling thread for at least `requested`.
+///
+/// The guest-facing entry point: `TimeSubsystem::sleep` forwards to it, so every
+/// guest `usleep`/`nanosleep`/`sleep` shares one measured strategy. Never
+/// returns before `requested` has elapsed on the monotonic clock. A caller
+/// pacing to an absolute deadline wants [`sleep_until`] instead — both run the
+/// same strategy table, and only this one is recorded in the histogram.
+pub fn sleep(requested: Duration) {
+    let start = Instant::now();
+    execute(plan(requested, capabilities()), start + requested);
     if histogram_armed() {
         let count = global().record(requested, start.elapsed());
         if count.is_multiple_of(REPORT_EVERY) {
@@ -846,6 +902,59 @@ mod tests {
         let saturated = timer_due_time_100ns(Duration::from_secs(u64::MAX));
         assert!(saturated < 0, "due time must stay negative (relative)");
         assert_eq!(saturated, -i64::MAX);
+    }
+
+    /// A deadline wait and a duration wait must agree on every input but one.
+    ///
+    /// Zero is that input: `usleep(0)` is a yield request, but a deadline that
+    /// has already passed is a wait that is merely late, and yielding there
+    /// would cost a frame-pacing caller the *next* edge as well. Everywhere
+    /// else the two entry points must resolve to the same strategy, or the
+    /// vblank path and the guest sleep path would drift back apart — which is
+    /// the whole reason there is one module here rather than two.
+    #[test]
+    fn plan_until_matches_plan_except_on_a_passed_deadline() {
+        let full = HostCapabilities {
+            high_resolution_timer: true,
+            spin_ceiling: DEFAULT_SPIN_CEILING,
+            spin_slot_available: true,
+        };
+
+        assert_eq!(plan(Duration::ZERO, full), SleepPlan::Yield);
+        assert_eq!(plan_until(Duration::ZERO, full), None);
+        assert_eq!(
+            plan_until(Duration::ZERO, HostCapabilities::degraded()),
+            None
+        );
+
+        let no_slot = HostCapabilities {
+            spin_slot_available: false,
+            ..full
+        };
+        for remaining in [
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_micros(100),
+            Duration::from_micros(101),
+            // A 60 Hz vblank period: the request the collapsed video_out path
+            // actually issues, and it must park on the timer.
+            Duration::from_nanos(1_000_000_000 / 60),
+            Duration::from_millis(100),
+        ] {
+            for caps in [full, no_slot, HostCapabilities::degraded()] {
+                assert_eq!(
+                    plan_until(remaining, caps),
+                    Some(plan(remaining, caps)),
+                    "deadline and duration waits must choose alike for {remaining:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            plan_until(Duration::from_nanos(1_000_000_000 / 60), full),
+            Some(SleepPlan::HighResolutionTimer),
+            "a vblank-length wait parks rather than spinning a core for 16.6ms"
+        );
     }
 
     /// The admission rule, as arithmetic. Guards ~30 guest threads from
