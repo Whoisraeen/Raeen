@@ -61,6 +61,20 @@ pub struct RenderedImage {
     pub bytes_per_pixel: u32,
 }
 
+/// Offer the frame's buffer to [`crate::frame_pool`] so the next full-frame
+/// readback (or IPC copy-out) reuses this allocation instead of faulting in a
+/// fresh multi-megabyte mapping. Sub-threshold buffers — every small image the
+/// test suite builds — are declined and freed exactly as before.
+///
+/// This is where recycling has to happen: the frame crosses an `Arc` and, in
+/// the isolated runner, a process boundary, so no single call site knows when
+/// the last reader is finished. `Drop` does.
+impl Drop for RenderedImage {
+    fn drop(&mut self) {
+        crate::frame_pool::give(mem::take(&mut self.pixels));
+    }
+}
+
 impl RenderedImage {
     /// The first-4-bytes-as-RGBA at `(x, y)`, or `None` if out of bounds. Only
     /// meaningful for the 4-byte display formats; HDR targets are re-sampled as
@@ -849,8 +863,10 @@ unsafe fn readback_to_vec_fallible(
     size: usize,
     what: &str,
 ) -> Result<Vec<u8>, GpuError> {
-    let mut pixels: Vec<u8> = Vec::new();
-    if pixels.try_reserve_exact(size).is_err() {
+    // A recycled destination costs no allocation and no page faults; the copy
+    // below fills all `size` bytes either way, so the pixels are identical.
+    let mut pixels: Vec<u8> = crate::frame_pool::take(size).unwrap_or_default();
+    if pixels.capacity() < size && pixels.try_reserve_exact(size).is_err() {
         // SAFETY: the caller mapped `memory`; unmap it before bailing.
         unsafe { device.unmap_memory(memory) };
         return Err(GpuError::VulkanInitFailed(format!(

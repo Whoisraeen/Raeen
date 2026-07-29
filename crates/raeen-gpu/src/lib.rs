@@ -30,6 +30,7 @@ pub mod contracts;
 mod diagnostics;
 pub(crate) mod draw_translate;
 pub mod frame_ipc;
+pub mod frame_pool;
 pub mod gnm;
 pub mod gpu_clock;
 mod guest_mem;
@@ -50,6 +51,7 @@ pub use agc_exec::{
 };
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
+pub use frame_pool::FramePoolStats;
 pub use guest_mem::GpuGuestMemory;
 pub use present_plugin::{
     Capabilities, PluginFrame, PluginInfo, PluginOutput, PresentContext, PresentFrame,
