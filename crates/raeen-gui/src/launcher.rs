@@ -686,7 +686,9 @@ impl FirmwareLauncher {
             Err(err) => return SessionOutcome::Faulted(err.to_string()),
         };
 
-        let resolved = linked.hle_trampolines.len();
+        // Reservations for dlsym-only exports share the trampoline table but
+        // are not imports — counting them would report phantom resolutions.
+        let resolved = linked.imported_hle_trampoline_count();
         let unresolved = linked.unresolved.len();
 
         // M1-D: the main module joins the kernel's module table, so a guest

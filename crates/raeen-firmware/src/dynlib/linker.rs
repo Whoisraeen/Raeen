@@ -297,6 +297,45 @@ pub struct LinkedModule {
     pub unwind_modules: Vec<LinkedUnwindModule>,
 }
 
+impl LinkedModule {
+    /// How many of [`Self::hle_trampolines`] stand for a genuine **import**.
+    ///
+    /// `load_process` also appends slots for the HLE functions the guest can
+    /// only reach through `sceKernelDlsym`
+    /// ([`raeen_hle::libkernel::DLSYM_RESERVED_EXPORTS`], reserved via
+    /// [`ProcessTables::reserve_hle_export`]). Those share the table because the
+    /// runtime must be able to invert *any* trampoline address, but nothing
+    /// imported them — so `hle_trampolines.len()` is the wrong number for any
+    /// message of the form "N imports resolved", and reporting it would give
+    /// every title a couple of phantom resolutions.
+    ///
+    /// Identified by name rather than by a stored count so the answer survives
+    /// the linked-process cache without a new serialized field. A module that
+    /// genuinely imported one of those names would be undercounted by one —
+    /// harmless, since the reservation and the import dedupe to the same slot
+    /// either way, and no known module imports them at all.
+    #[must_use]
+    pub fn imported_hle_trampoline_count(&self) -> usize {
+        self.hle_trampolines
+            .iter()
+            .filter(|trampoline| {
+                !raeen_hle::libkernel::DLSYM_RESERVED_EXPORTS
+                    .iter()
+                    .any(|(library, function)| {
+                        *library == trampoline.library && *function == trampoline.function
+                    })
+            })
+            .count()
+    }
+
+    /// The complement of [`Self::imported_hle_trampoline_count`]: how many
+    /// trampolines exist only so `sceKernelDlsym` has an address to return.
+    #[must_use]
+    pub fn reserved_hle_trampoline_count(&self) -> usize {
+        self.hle_trampolines.len() - self.imported_hle_trampoline_count()
+    }
+}
+
 /// The marker-address tables shared by every module in one process.
 ///
 /// # Why this must be shared
@@ -336,6 +375,22 @@ impl ProcessTables {
     /// owns `UNRESOLVED_STUB_BASE + i*8`.
     pub fn unresolved_stubs(&self) -> &[UnresolvedStub] {
         &self.unresolved_stubs
+    }
+
+    /// Reserve a trampoline for an HLE function **no module imported**,
+    /// returning its guest-callable address.
+    ///
+    /// Every other entry in this table is created because a relocation asked
+    /// for it. This is for the one caller that has no relocation to offer:
+    /// `sceKernelDlsym`, which turns a *name* into a callable address at run
+    /// time. A function the guest only ever reaches through `dlsym` (the Unity
+    /// scripting allocator hooks) has no import slot anywhere in the process,
+    /// so without a reservation there is simply no address to hand back.
+    ///
+    /// Idempotent, and shares one index space with the import-driven entries —
+    /// reserving a function a module *does* import returns that same address.
+    pub fn reserve_hle_export(&mut self, library: &str, function: &str) -> u64 {
+        self.hle_addr(library.to_string(), function.to_string())
     }
 
     /// The address for `nid`'s HLE trampoline, allocating one if this is the
@@ -1293,6 +1348,52 @@ mod tests {
         assert_eq!(linked.hle_trampolines.len(), 2);
         assert_eq!(linked.hle_trampolines[0].library, "libkernel");
         assert_eq!(linked.hle_trampolines[1].library, "libScePosix");
+    }
+
+    /// `sceKernelDlsym` can only hand back an address that already exists, so
+    /// functions nothing imports (the Unity scripting allocator hooks) need an
+    /// explicit reservation. It must share one index space with the
+    /// import-driven entries — a second address for the same function would
+    /// mean two rows dispatching from one name.
+    #[test]
+    fn reserve_hle_export_allocates_once_and_shares_the_import_index_space() {
+        let mut tables = ProcessTables::new();
+
+        let first = tables.reserve_hle_export("libkernel", "scriptingGetMem");
+        assert_eq!(first, HLE_TRAMPOLINE_BASE);
+        assert_eq!(
+            tables.reserve_hle_export("libkernel", "scriptingGetMem"),
+            first,
+            "reserving twice must not mint a second address"
+        );
+
+        let second = tables.reserve_hle_export("libkernel", "scriptingFreeMem");
+        assert_eq!(second, HLE_TRAMPOLINE_BASE + 8);
+
+        let trampolines = tables.hle_trampolines();
+        assert_eq!(trampolines.len(), 2);
+        assert_eq!(trampolines[0].function, "scriptingGetMem");
+        assert_eq!(trampolines[1].function, "scriptingFreeMem");
+        assert_eq!(trampolines[0].library, "libkernel");
+    }
+
+    /// Every dlsym-only export the HLE names must be reservable, and each must
+    /// land at its own address.
+    #[test]
+    fn every_dlsym_reserved_export_gets_a_distinct_address() {
+        let mut tables = ProcessTables::new();
+        let addrs: Vec<u64> = raeen_hle::libkernel::DLSYM_RESERVED_EXPORTS
+            .iter()
+            .map(|(library, function)| tables.reserve_hle_export(library, function))
+            .collect();
+        let mut unique = addrs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), addrs.len(), "addresses must not collide");
+        assert_eq!(
+            tables.hle_trampolines().len(),
+            raeen_hle::libkernel::DLSYM_RESERVED_EXPORTS.len()
+        );
     }
 
     #[test]

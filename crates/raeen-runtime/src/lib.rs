@@ -259,6 +259,31 @@ fn register_main_thread_stack(kernel: &OrbisKernel, arena: &arena::GuestArena) {
         .insert(MAIN_GUEST_THREAD, (base, top));
 }
 
+/// Publish this process's HLE trampoline table to the kernel, keyed by function
+/// name, so `sceKernelDlsym` can answer with a guest-callable address.
+///
+/// Imports never need this — the linker already wrote each import's trampoline
+/// address into its relocation slot. `dlsym` is the sole caller that has to turn
+/// a *name* into an address at run time, with no relocation to consult, and the
+/// trampoline table is the only place a name-to-address mapping exists.
+///
+/// Must run before guest code does. It is cheap (one map insert per distinct
+/// import) and idempotent, so every process entry point calls it unconditionally
+/// rather than trying to decide whether this title uses `dlsym`.
+#[cfg(target_os = "windows")]
+fn publish_hle_exports_for_dlsym(
+    kernel: &OrbisKernel,
+    trampolines: &[raeen_firmware::HleTrampoline],
+) {
+    for trampoline in trampolines {
+        kernel.register_hle_export_addr(&trampoline.function, trampoline.addr);
+    }
+    tracing::debug!(
+        "published {} HLE trampoline(s) to sceKernelDlsym",
+        kernel.hle_export_addr_count()
+    );
+}
+
 /// How a faulting guest instruction was touching the address it faulted on —
 /// decoded from `EXCEPTION_RECORD.ExceptionInformation[0]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,6 +566,7 @@ pub fn execute_linked(
             .map_or(0, |off| GUEST_ARENA_BASE + off),
     );
     let entry_ptr = arena.entry_ptr(entry_offset)?;
+    publish_hle_exports_for_dlsym(kernel, &module.hle_trampolines);
     let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines, |t| {
         hle.returns_float(&t.library, &t.function)
     })?;
@@ -685,6 +711,7 @@ pub fn execute_process(
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
+    publish_hle_exports_for_dlsym(kernel, &module.hle_trampolines);
     let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines, |t| {
         hle.returns_float(&t.library, &t.function)
     })?;
@@ -748,6 +775,7 @@ fn execute_process_shared_inner(
     let _call_lock = dispatch::call_lock();
     let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
+    publish_hle_exports_for_dlsym(&kernel, &module.hle_trampolines);
     let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
         &module.hle_trampolines,
         |t| hle.returns_float(&t.library, &t.function),

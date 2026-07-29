@@ -1664,58 +1664,260 @@ fn hle_stop_unload_module(ctx: &HleContext, args: &[u64]) -> u64 {
     }
 }
 
-/// `sceKernelDlsym(handle, symbol, addrOut)`: resolve exports from a real,
-/// preplaced LLE module. Such exports are already directly executable guest
-/// addresses and do not need a newly minted HLE trampoline.
+/// The `SCE_NID_SALT` every Orbis export name is hashed with: `NID =
+/// LE_u64(SHA1(name || salt)[..8])`. A module's export table stores NIDs, not
+/// names, so a name-keyed `dlsym` has to hash before it can look anything up.
+const SCE_NID_SALT: [u8; 16] = [
+    0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30,
+];
+
+/// Hash an export name to its NID.
+fn nid_of_symbol(name: &[u8]) -> u64 {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(name);
+    hasher.update(SCE_NID_SALT);
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("SHA-1 has 20 bytes"))
+}
+
+/// Where a `sceKernelDlsym` hit came from — for the resolution log line, so a
+/// pointer handed to the guest can always be traced back to who supplied it.
+enum DlsymHit {
+    /// An export of the module the caller named (or of the main program, for
+    /// handle 0).
+    Module(u32),
+    /// An export of some *other* loaded module, found by the load-order sweep.
+    OtherModule(u32),
+    /// An HLE trampoline: Raeen implements this system function itself.
+    Hle,
+}
+
+/// `sceKernelDlsym(handle, symbol, addrOut)` — resolve an export name to a
+/// guest-callable address.
+///
+/// # Handle 0 is the main program, not "search everywhere"
+///
+/// This is the bug this function was rewritten to fix. Handle 0 was treated as
+/// an ordinary module id, matched nothing (ids start at 1), and returned an
+/// error — which is what stopped Unity/IL2CPP titles dead, because IL2CPP asks
+/// for its scripting allocator through `sceKernelDlsym(0, "scriptingGetMem")`
+/// during startup.
+///
+/// The POSIX reflex is to read a null handle as `RTLD_DEFAULT` (global scope).
+/// **Orbis does not.** KytyPS5's `RuntimeLinker::FindProgramById`
+/// (`src/loader/runtimeLinker.cpp:1532`) reserves id 0 for the main program and
+/// returns `m_programs.front()`; `unique_id` is handed out from 1. Our module
+/// ids follow the same rule, so handle 0 maps to
+/// [`OrbisKernel::main_lle_module_handle`].
+///
+/// # Resolution order
+///
+/// 1. The named module (handle 0 = main program).
+/// 2. Every other loaded module, in load order. Not Kyty behaviour — this
+///    follows SharpEmu's `DispatchKernelDynlibDlsym`, which tries the handle
+///    and then falls back to a process-wide symbol sweep. Logged distinctly
+///    when it hits, because a symbol found *outside* the module the guest
+///    named means our handle bookkeeping disagrees with the title's.
+/// 3. Raeen's own HLE trampolines by name. `dlsym` is the only caller that has
+///    to turn a name into an address at run time; imports were already
+///    relocated. Both references do the equivalent — Kyty returns emulator
+///    functions from `KernelDlsym`, SharpEmu calls it a "runtime symbol".
+///
+/// # Failure
+///
+/// `SCE_KERNEL_ERROR_ESRCH`, matching KytyPS5's `KernelDlsym`
+/// (`src/libs/libKernel.cpp:226`), which returns `ESRCH` both for an unknown
+/// handle and for a symbol absent from a known module. The out-pointer is left
+/// untouched and every miss is logged with module, NID, and name — never a
+/// fabricated address, because the guest calls straight through whatever this
+/// writes.
 fn hle_dlsym(ctx: &HleContext, args: &[u64]) -> u64 {
-    let handle = args.first().copied().unwrap_or(0);
+    let raw_handle = args.first().copied().unwrap_or(0);
     let sym_ptr = args.get(1).copied().unwrap_or(0);
     let addr_out = args.get(2).copied().unwrap_or(0);
+    // Both null guards are explicit, matching KytyPS5's `KernelDlsym`, rather
+    // than left to `read_cstr` happening to fail on guest address 0 — that only
+    // holds while nothing maps the zero page, which is not a property this
+    // function should depend on.
+    if addr_out == 0 || sym_ptr == 0 {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
     let Some(symbol_bytes) = crate::fmt::read_cstr(ctx.mem, sym_ptr) else {
         return SCE_KERNEL_ERROR_EFAULT;
     };
-    if addr_out == 0 {
-        return SCE_KERNEL_ERROR_EFAULT;
-    }
-    let Ok(handle) = u32::try_from(handle) else {
+    let Ok(raw_handle) = u32::try_from(raw_handle) else {
+        warn!("sceKernelDlsym(handle={raw_handle}): handle does not fit a module id — ESRCH");
+        return SCE_KERNEL_ERROR_ESRCH;
+    };
+    let symbol = String::from_utf8_lossy(&symbol_bytes).into_owned();
+    let nid = nid_of_symbol(&symbol_bytes);
+
+    // Handle 0 names the executable. Resolving it to `None` here is not the
+    // "unknown handle" case — it means no module registered an export table at
+    // all, which the miss diagnostics below report separately.
+    let scope = if raw_handle == 0 {
+        ctx.kernel.main_lle_module_handle()
+    } else {
+        Some(raw_handle)
+    };
+
+    let hit = scope
+        .and_then(|handle| {
+            ctx.kernel
+                .resolve_lle_export(handle, nid)
+                .map(|addr| (addr, DlsymHit::Module(handle)))
+        })
+        .or_else(|| {
+            ctx.kernel
+                .resolve_lle_export_anywhere(nid)
+                .map(|(handle, addr)| (addr, DlsymHit::OtherModule(handle)))
+        })
+        .or_else(|| {
+            ctx.kernel
+                .resolve_hle_export_addr(&symbol)
+                .map(|addr| (addr, DlsymHit::Hle))
+        });
+
+    let Some((addr, source)) = hit else {
+        dlsym_miss(ctx, raw_handle, scope, &symbol, nid);
         return SCE_KERNEL_ERROR_ESRCH;
     };
 
-    use sha1::{Digest, Sha1};
-    const SCE_NID_SALT: [u8; 16] = [
-        0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1, 0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52,
-        0x30,
-    ];
-    let mut hasher = Sha1::new();
-    hasher.update(&symbol_bytes);
-    hasher.update(SCE_NID_SALT);
-    let digest = hasher.finalize();
-    let nid = u64::from_le_bytes(digest[..8].try_into().expect("SHA-1 has 20 bytes"));
-    let symbol = String::from_utf8_lossy(&symbol_bytes);
-    let Some(addr) = ctx.kernel.resolve_lle_export(handle, nid) else {
-        // Say which of the two very different bugs this is. A handle with no
-        // exports at all was never wired up; a handle with many means the symbol
-        // genuinely is not in that module's export table — and an ENOENT alone
-        // cannot tell them apart, which is exactly how this failure was misread
-        // as a memory bug for two sessions.
-        match ctx.kernel.lle_export_count(handle) {
-            Some(count) => warn!(
-                "sceKernelDlsym(handle={handle}, symbol='{symbol}', nid={nid:#018x}): not among \
-                 that module's {count} export(s) — ENOENT"
-            ),
-            None => warn!(
-                "sceKernelDlsym(handle={handle}, symbol='{symbol}'): handle names NO registered \
-                 module — ENOENT"
-            ),
-        }
-        return SCE_KERNEL_ERROR_ENOENT;
-    };
     if !ctx.mem.write(addr_out, &addr.to_le_bytes()) {
         return SCE_KERNEL_ERROR_EFAULT;
     }
-    debug!("sceKernelDlsym(handle={handle}, symbol='{symbol}') -> {addr:#x}");
+    match source {
+        DlsymHit::Module(handle) => debug!(
+            "sceKernelDlsym(handle={raw_handle}, symbol='{symbol}') -> {addr:#x} (module {handle})"
+        ),
+        DlsymHit::OtherModule(handle) => warn!(
+            "sceKernelDlsym(handle={raw_handle}, symbol='{symbol}') -> {addr:#x} found in module \
+             {handle}, NOT the module the guest named — resolved, but our module handles disagree \
+             with the title's"
+        ),
+        DlsymHit::Hle => debug!(
+            "sceKernelDlsym(handle={raw_handle}, symbol='{symbol}') -> {addr:#x} (Raeen HLE \
+             trampoline)"
+        ),
+    }
     SCE_OK
 }
+
+/// Report a `sceKernelDlsym` miss precisely enough to act on.
+///
+/// The three failures below need three different fixes, and a bare `ESRCH`
+/// cannot tell them apart — which is exactly how the handle-0 bug survived
+/// several sessions being read as a memory fault.
+fn dlsym_miss(ctx: &HleContext, raw_handle: u32, scope: Option<u32>, symbol: &str, nid: u64) {
+    let hle_published = ctx.kernel.hle_export_addr_count();
+    match scope {
+        // No module has an export table: the loader never registered one, so
+        // nothing could ever resolve here.
+        None => warn!(
+            "sceKernelDlsym(handle={raw_handle}, symbol='{symbol}', nid={nid:#018x}): NO module \
+             has a registered export table ({hle_published} HLE trampoline(s) published) — ESRCH"
+        ),
+        Some(handle) => match ctx.kernel.lle_export_count(handle) {
+            Some(count) => warn!(
+                "sceKernelDlsym(handle={raw_handle}, symbol='{symbol}', nid={nid:#018x}): not \
+                 among module {handle}'s {count} export(s), nor any other loaded module, nor the \
+                 {hle_published} published HLE trampoline(s) — ESRCH"
+            ),
+            None => warn!(
+                "sceKernelDlsym(handle={raw_handle}, symbol='{symbol}', nid={nid:#018x}): handle \
+                 names NO registered module — ESRCH"
+            ),
+        },
+    }
+}
+
+/// `scriptingGetMem(alignment, size)` — the aligned allocator Unity's IL2CPP
+/// scripting backend fetches from libkernel via
+/// `sceKernelDlsym(0, "scriptingGetMem", &fn)` during startup.
+///
+/// # Why this exists at all
+///
+/// It is **not** an export of any guest module, and no amount of module-table
+/// searching will find it: it is a hook the runtime is expected to supply. Both
+/// references that boot Unity titles special-case exactly this name —
+/// KytyPS5 returns its own `KernelApplicationHeapGetMem`
+/// (`src/libs/libKernel.cpp:203`), and SharpEmu aliases the name in
+/// `TryResolveRuntimeSymbolAlias` (`DirectExecutionBackend.Imports.cs:2098`).
+///
+/// # Signature
+///
+/// `(alignment, size)`, from KytyPS5 — which boots Blasphemous II in-game, and
+/// whose implementation clamps `alignment` up to `0x10` and rejects a
+/// non-power-of-two, a guard only worth writing against observed arguments.
+/// SharpEmu instead aliases the name to plain `malloc(size)`; that disagrees,
+/// and the reference that actually runs the title wins.
+///
+/// The power-of-two check is kept for the same reason KytyPS5 has it: it is a
+/// **self-test on the signature**. If the real first argument were a size
+/// rather than an alignment it would almost never be a power of two, so a
+/// mis-read ABI shows up as a loud null return instead of a plausible-looking
+/// pointer the guest then writes `size` bytes through.
+fn hle_scripting_get_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let requested_alignment = args.first().copied().unwrap_or(0);
+    let size = args.get(1).copied().unwrap_or(0);
+    let alignment = requested_alignment.max(0x10);
+
+    if !alignment.is_power_of_two() {
+        warn!(
+            "scriptingGetMem(alignment={requested_alignment:#x}, size={size:#x}): alignment is \
+             not a power of two — refusing to allocate. Either the guest passed a bad alignment \
+             or this function's (alignment, size) signature is wrong for this title"
+        );
+        return 0;
+    }
+
+    match ctx.alloc.alloc(size.max(1), alignment) {
+        Some(addr) => {
+            // Same live-block table the malloc family keeps, so
+            // `malloc_usable_size` does not report a scripting block as dead.
+            crate::libc::track_alloc(ctx, addr, size);
+            debug!("scriptingGetMem(alignment={alignment:#x}, size={size:#x}) -> {addr:#x}");
+            addr
+        }
+        None => {
+            warn!(
+                "scriptingGetMem(alignment={alignment:#x}, size={size:#x}): guest heap exhausted \
+                 — returning null"
+            );
+            0
+        }
+    }
+}
+
+/// `scriptingFreeMem(ptr)` — the release half of the Unity scripting allocator
+/// pair. Unambiguous whatever the rest of the family's shape turns out to be:
+/// one pointer argument, no return.
+///
+/// Deliberately paired with [`hle_scripting_get_mem`]: handing IL2CPP an
+/// allocator with no matching deallocator makes every scripting free leak.
+fn hle_scripting_free_mem(ctx: &HleContext, args: &[u64]) -> u64 {
+    let ptr = args.first().copied().unwrap_or(0);
+    if ptr != 0 {
+        crate::libc::track_free(ctx, ptr);
+        ctx.alloc.free(ptr);
+    }
+    SCE_OK
+}
+
+/// HLE functions that must get a trampoline address even though **no module
+/// imports them** — the process loader reserves one for each
+/// (`ProcessTables::reserve_hle_export`).
+///
+/// A normal HLE function earns its trampoline from a relocation: some module
+/// imported it, so the linker minted an address and wrote it into the import
+/// slot. These have no importer anywhere in the process. The guest reaches them
+/// only by asking `sceKernelDlsym` for the name, and `dlsym` can only answer
+/// with an address that already exists.
+pub const DLSYM_RESERVED_EXPORTS: &[(&str, &str)] = &[
+    ("libkernel", "scriptingGetMem"),
+    ("libkernel", "scriptingFreeMem"),
+];
 
 /// Register libkernel HLE functions.
 pub fn register(registry: &HleRegistry) {
@@ -1906,6 +2108,19 @@ pub fn register(registry: &HleRegistry) {
         hle_stop_unload_module,
     );
     registry.register("libkernel", "sceKernelDlsym", hle_dlsym);
+    // The Unity/IL2CPP scripting allocator hooks. Registered under `libkernel`
+    // because that is the library IL2CPP fetches them from, and registered at
+    // all so `load_process` can reserve trampolines for them — `dlsym` needs a
+    // guest-callable address to hand back, and only a reserved trampoline has
+    // one. See `hle_scripting_get_mem` for the signature's provenance.
+    //
+    // `scriptingRealloc` / `scriptingCalloc` are deliberately NOT registered.
+    // SharpEmu aliases them to libc `realloc`/`calloc`, but if `scriptingGetMem`
+    // really is `(alignment, size)` then this family does not use libc argument
+    // order, and guessing wrong on a *resize* corrupts the heap. An honest
+    // `ESRCH` naming the symbol is the correct answer until one is measured.
+    registry.register("libkernel", "scriptingGetMem", hle_scripting_get_mem);
+    registry.register("libkernel", "scriptingFreeMem", hle_scripting_free_mem);
     registry.register(
         "libkernel",
         "sceKernelGetDirectMemorySize",
@@ -5853,6 +6068,264 @@ mod tests {
         assert_eq!(u64::from_le_bytes(out), 0x1000_4321);
     }
 
+    /// The Unity/IL2CPP blocker. `sceKernelDlsym(0, ...)` must resolve against
+    /// the **main program**, per KytyPS5's `RuntimeLinker::FindProgramById`
+    /// ("Id 0 is reserved for main program"). Handle 0 used to be treated as an
+    /// ordinary module id, which matches nothing because ids start at 1.
+    #[test]
+    fn dlsym_null_handle_resolves_against_the_main_program() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let main = kernel.register_lle_module(
+            "eboot.bin".to_string(),
+            0x1000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid_of_symbol(b"MainOnlySymbol"), 0x1000_1111)],
+        );
+        // A second module, registered later, must not be what handle 0 names.
+        let plugin = kernel.register_lle_module(
+            "plugin.prx".to_string(),
+            0x2000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid_of_symbol(b"PluginOnlySymbol"), 0x2000_2222)],
+        );
+        assert!(main < plugin, "the executable is registered first");
+        assert_eq!(kernel.main_lle_module_handle(), Some(main));
+
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"MainOnlySymbol\0"));
+
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0x200]), SCE_OK);
+        let mut out = [0u8; 8];
+        assert!(mem.read(0x200, &mut out));
+        assert_eq!(u64::from_le_bytes(out), 0x1000_1111);
+    }
+
+    /// SharpEmu's `DispatchKernelDynlibDlsym` falls back to a process-wide
+    /// symbol sweep when the named handle misses. The sweep is load-ordered so
+    /// two modules exporting one NID always resolve the same way.
+    #[test]
+    fn dlsym_falls_back_to_other_loaded_modules_in_load_order() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let nid = nid_of_symbol(b"SharedSymbol");
+        let first = kernel.register_lle_module(
+            "eboot.bin".to_string(),
+            0x1000_0000,
+            0x10000,
+            None,
+            true,
+            [],
+        );
+        let second = kernel.register_lle_module(
+            "a.prx".to_string(),
+            0x2000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid, 0x2000_2222)],
+        );
+        let third = kernel.register_lle_module(
+            "b.prx".to_string(),
+            0x3000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid, 0x3000_3333)],
+        );
+        assert!(first < second && second < third);
+
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"SharedSymbol\0"));
+
+        // Handle 0 -> main program (no exports) -> sweep finds `a.prx`, the
+        // earlier-loaded of the two exporters, not `b.prx`.
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0x200]), SCE_OK);
+        let mut out = [0u8; 8];
+        assert!(mem.read(0x200, &mut out));
+        assert_eq!(u64::from_le_bytes(out), 0x2000_2222);
+        assert_eq!(
+            kernel.resolve_lle_export_anywhere(nid),
+            Some((second, 0x2000_2222))
+        );
+    }
+
+    /// A symbol that exists nowhere must still fail, loudly and without
+    /// touching the out-pointer — the guest calls straight through whatever
+    /// `dlsym` writes there, so a fabricated address is worse than an error.
+    #[test]
+    fn dlsym_null_handle_still_fails_for_a_genuinely_absent_symbol() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        kernel.register_lle_module(
+            "eboot.bin".to_string(),
+            0x1000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid_of_symbol(b"SomethingElse"), 0x1000_1111)],
+        );
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"NoSuchSymbolAnywhere\0"));
+        assert!(mem.write(0x200, &0xDEAD_BEEF_u64.to_le_bytes()));
+
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0x200]), SCE_KERNEL_ERROR_ESRCH);
+        let mut out = [0u8; 8];
+        assert!(mem.read(0x200, &mut out));
+        assert_eq!(
+            u64::from_le_bytes(out),
+            0xDEAD_BEEF,
+            "the out-pointer must be untouched on a miss"
+        );
+    }
+
+    /// With no module registered at all there is no main program, so handle 0
+    /// resolves to nothing — and that is a *different* diagnosis from "the
+    /// symbol is missing", which is why the miss path reports it separately.
+    #[test]
+    fn dlsym_null_handle_with_no_modules_is_esrch_not_a_panic() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"scriptingGetMem\0"));
+        assert_eq!(kernel.main_lle_module_handle(), None);
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0x200]), SCE_KERNEL_ERROR_ESRCH);
+    }
+
+    /// `dlsym` must also see Raeen's own HLE trampolines: they are how a
+    /// symbol the *emulator* implements becomes a guest-callable address.
+    /// This is the path `scriptingGetMem` resolves through — it is not an
+    /// export of any guest module and never will be.
+    #[test]
+    fn dlsym_resolves_scripting_get_mem_through_the_published_hle_trampoline() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        kernel.register_lle_module(
+            "eboot.bin".to_string(),
+            0x1000_0000,
+            0x10000,
+            None,
+            true,
+            [],
+        );
+        // Stands in for `publish_hle_exports_for_dlsym`, which the runtime
+        // calls with the process-wide trampoline table before guest entry.
+        const TRAMPOLINE: u64 = 0x0000_4000_0000_00A8;
+        kernel.register_hle_export_addr("scriptingGetMem", TRAMPOLINE);
+
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"scriptingGetMem\0"));
+
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0x200]), SCE_OK);
+        let mut out = [0u8; 8];
+        assert!(mem.read(0x200, &mut out));
+        assert_eq!(u64::from_le_bytes(out), TRAMPOLINE);
+    }
+
+    /// A guest export of the same name must win over the HLE trampoline: the
+    /// title's own implementation is the authoritative one, and the HLE entry
+    /// is only a fallback for names nothing exports.
+    #[test]
+    fn dlsym_prefers_a_guest_module_export_over_the_hle_trampoline() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        kernel.register_lle_module(
+            "eboot.bin".to_string(),
+            0x1000_0000,
+            0x10000,
+            None,
+            true,
+            [(nid_of_symbol(b"scriptingGetMem"), 0x1000_7777)],
+        );
+        kernel.register_hle_export_addr("scriptingGetMem", 0x0000_4000_0000_00A8);
+
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"scriptingGetMem\0"));
+
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0x200]), SCE_OK);
+        let mut out = [0u8; 8];
+        assert!(mem.read(0x200, &mut out));
+        assert_eq!(u64::from_le_bytes(out), 0x1000_7777);
+    }
+
+    /// A null out-pointer is EFAULT before anything else, matching KytyPS5's
+    /// `addr == nullptr` guard.
+    #[test]
+    fn dlsym_rejects_a_null_out_pointer_and_an_unreadable_symbol() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert!(mem.write(0x100, b"anything\0"));
+        assert_eq!(hle_dlsym(&ctx, &[0, 0x100, 0]), SCE_KERNEL_ERROR_EFAULT);
+        assert_eq!(hle_dlsym(&ctx, &[0, 0, 0x200]), SCE_KERNEL_ERROR_EFAULT);
+        assert_eq!(
+            hle_dlsym(&ctx, &[0, 0xDEAD_0000, 0x200]),
+            SCE_KERNEL_ERROR_EFAULT
+        );
+    }
+
+    /// `scriptingGetMem(alignment, size)` returns an aligned guest block.
+    /// The signature is KytyPS5's `KernelApplicationHeapGetMem`.
+    #[test]
+    fn scripting_get_mem_allocates_aligned_guest_memory() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+
+        let addr = hle_scripting_get_mem(&ctx, &[0x40, 0x200]);
+        assert_ne!(addr, 0, "a healthy heap must satisfy the request");
+        assert_eq!(addr % 0x40, 0, "the requested alignment must be honored");
+
+        // Alignment below 0x10 is clamped up, exactly as KytyPS5 does.
+        let small = hle_scripting_get_mem(&ctx, &[1, 0x10]);
+        assert_ne!(small, 0);
+        assert_eq!(small % 0x10, 0);
+
+        assert_eq!(hle_scripting_free_mem(&ctx, &[addr]), SCE_OK);
+        assert_eq!(
+            hle_scripting_free_mem(&ctx, &[0]),
+            SCE_OK,
+            "freeing null is a no-op, not a fault"
+        );
+    }
+
+    /// The signature self-test: a non-power-of-two first argument means our
+    /// `(alignment, size)` reading is wrong for this title, so return null
+    /// rather than a pointer the guest would write `size` bytes through.
+    #[test]
+    fn scripting_get_mem_refuses_a_non_power_of_two_alignment() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_scripting_get_mem(&ctx, &[0x30, 0x200]), 0);
+    }
+
+    /// The dlsym-only exports must be registered, or `load_process` would
+    /// reserve trampolines for functions no dispatch could service.
+    #[test]
+    fn dlsym_reserved_exports_are_all_registered() {
+        let registry = HleRegistry::new();
+        for (library, function) in DLSYM_RESERVED_EXPORTS {
+            assert!(
+                registry.is_implemented(library, function),
+                "{library}::{function} is reserved for dlsym but not implemented"
+            );
+        }
+    }
+
     /// libc.prx's `module_start` registers its per-thread destructor hooks
     /// with the rtld before doing anything else — a missing
     /// `_sceKernelSetThreadDtors` was the exact wall a real title (Minecraft)
@@ -6207,7 +6680,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_unload_validates_the_handle_and_dlsym_is_honest_enoent() {
+    fn stop_unload_validates_the_handle_and_dlsym_is_honest_esrch() {
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
         let alloc = crate::TestAllocator::new(0);
@@ -6221,10 +6694,19 @@ mod tests {
             SCE_KERNEL_ERROR_ESRCH
         );
 
+        // KytyPS5's `KernelDlsym` answers ESRCH for a symbol absent from a
+        // known module, not ENOENT.
         assert!(mem.write(0x200, b"sceSomeFunction\0"));
         assert_eq!(
             hle_dlsym(&ctx, &[handle, 0x200, 0x400]),
-            SCE_KERNEL_ERROR_ENOENT
+            SCE_KERNEL_ERROR_ESRCH
+        );
+        let mut untouched = [0u8; 8];
+        assert!(mem.read(0x400, &mut untouched));
+        assert_eq!(
+            u64::from_le_bytes(untouched),
+            0,
+            "a miss must leave the out-pointer alone — the guest calls through whatever is there"
         );
     }
 

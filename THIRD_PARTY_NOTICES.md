@@ -148,6 +148,21 @@ SOFTWARE.
   bits (`align_components`), with the dword index taken as `address >> 2`.
   Raeen's three-operand instruction format, the analysis-side soffset
   resolution, the honesty flag on the raw EUD window, and all tests are its
+  own. The **`sceKernelDlsym` semantics** batch
+  (`crates/raeen-hle/src/libkernel.rs`, 2026-07-28) uses
+  `src/loader/runtimeLinker.cpp`'s `RuntimeLinker::FindProgramById` (L1532 —
+  "Id 0 is reserved for main program", `unique_id` handed out from 1) and
+  `src/libs/libKernel.cpp`'s `KernelDlsym` (L226) as **contract evidence**:
+  handle 0 names the executable rather than a POSIX `RTLD_DEFAULT` global
+  scope, a miss is `ESRCH` (not `ENOENT`), and `scriptingGetMem` is answered by
+  an emulator-supplied aligned allocator rather than any guest export — its
+  `(alignment, size)` signature, the clamp of alignment up to `0x10`, and the
+  power-of-two rejection come from `KernelApplicationHeapGetMem` (L203). The
+  same file's `AddLibkernelUnityFunc` (L2998, L3081-3088) is the evidence that
+  the entire `libkernel_unity` surface is three functions
+  (`Qhv5ARAoOEc`/`WkwEd3N7w0Y`/`il03nluKfMk` = Remove/Install/RaiseException),
+  all three already registered by Raeen. Raeen's load-ordered module sweep, the
+  trampoline-reservation mechanism, the miss diagnostics, and all tests are its
   own. No C++ is vendored or compiled into Raeen.
 
 ---
@@ -409,6 +424,20 @@ SOFTWARE.
   HLE data page from the same generator that backs `_Getpctype`
   (`crates/raeen-hle/src/libc.rs`). SharpEmu has no `_Ctype` export; the flag
   layout was already independently present in Raeen.
+- **`sceKernelDlsym` fallback sweep 2026-07-28**
+  (`crates/raeen-hle/src/libkernel.rs`): `DispatchKernelDynlibDlsym`
+  (`src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Imports.cs:2024`) is the
+  evidence for falling back past the named module handle to a process-wide
+  symbol sweep and then to emulator-provided ("runtime") symbols;
+  `TryResolveRuntimeSymbolAlias` (same file, L2092) independently confirms that
+  `scriptingGetMem`/`scriptingFreeMem` are allocator hooks the *runtime*
+  supplies rather than guest-module exports. SharpEmu aliases them to libc
+  `malloc`/`free`; Raeen follows KytyPS5's `(alignment, size)` signature
+  instead, since that is the reference measured to boot the affected title.
+  SharpEmu's `scriptingRealloc`/`scriptingCalloc` aliases are deliberately
+  **not** adopted — their argument order is unverified and a wrong guess on a
+  resize corrupts the guest heap. Raeen's load-ordered sweep and all tests are
+  its own.
   Patterns and behavior are **re-implemented in idiomatic Rust with reference to
   SharpEmu's C# source**; no C# is transliterated or vendored. SharpEmu's tree
   is cloned locally into the git-ignored `reference/` directory for study only;
