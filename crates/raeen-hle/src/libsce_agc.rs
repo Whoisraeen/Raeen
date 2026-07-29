@@ -4302,7 +4302,26 @@ fn hle_dcb_set_index_buffer(ctx: &HleContext, args: &[u64]) -> u64 {
 
 /// `sceAgcDcbDrawIndex(dcb, indexCount, indexAddress, modifier)`: emit an
 /// INDEX_BASE + INDEX_BUFFER_SIZE packet (5 DWORDs) then a DRAW_INDEX_2 packet
-/// (5 DWORDs). Returns the first (base) command address.
+/// (6 DWORDs). Returns the first (base) command address.
+///
+/// `DRAW_INDEX_2`'s AMD body is
+/// `{MAX_SIZE, INDEX_BASE_LO, INDEX_BASE_HI, INDEX_COUNT, DRAW_INITIATOR}` —
+/// five body DWORDs, so a six-DWORD packet, and **the 64-bit index base lives
+/// inside the draw packet**. The command processor
+/// (`kyty_graphics::run::CommandProcessor::cp_op_draw_index`) reads the base
+/// from there; the `IT_INDEX_BASE` preamble only feeds `DRAW_INDEX_OFFSET_2`.
+///
+/// This function previously emitted a five-DWORD packet whose body was
+/// `[index_count, 0, 0, 0]` — the base zeroed. Every draw then reached the sink
+/// with `index_addr == 0` and was refused ("indexed draw with no index buffer:
+/// addr=0x0"), which is exactly why Dead Cells submitted 1558 draw packets and
+/// completed zero draws while `draws=0 draw_skips=0` named no reason (a refusal
+/// is counted in `CommandProcessor::refused_draws`, not in the sink's own
+/// counters). SharpEmu hit the identical bug on Unity titles and documents the
+/// same fix in `DcbDrawIndex` (AgcExports.cs L1567-1610): "The former
+/// five-dword packet omitted both the real base and the count field, so every
+/// call made by Unity looked like a zero-count draw to the submitted-command
+/// parser and the complete scene was discarded."
 fn hle_dcb_draw_index(ctx: &HleContext, args: &[u64]) -> u64 {
     let cb = args.first().copied().unwrap_or(0);
     let index_count = args.get(1).copied().unwrap_or(0) as u32;
@@ -4329,14 +4348,23 @@ fn hle_dcb_draw_index(ctx: &HleContext, args: &[u64]) -> u64 {
     if !base_ok {
         return 0;
     }
-    let Some(draw) = alloc_command_dwords(ctx, cb, 5) else {
+    let Some(draw) = alloc_command_dwords(ctx, cb, 6) else {
         return 0;
     };
     let draw_ok = ctx
         .mem
-        .write(draw, &pm4(5, IT_DRAW_INDEX_2, R_ZERO).to_le_bytes())
+        .write(draw, &pm4(6, IT_DRAW_INDEX_2, R_ZERO).to_le_bytes())
+        // MAX_SIZE: the index buffer bound above holds exactly index_count
+        // elements, so it also bounds this draw.
         && ctx.mem.write(draw + 4, &index_count.to_le_bytes())
-        && (2..=4).all(|i| ctx.mem.write(draw + i * 4, &0u32.to_le_bytes()));
+        // INDEX_BASE_LO / INDEX_BASE_HI — what the walker actually reads.
+        && ctx.mem.write(draw + 8, &(index_addr as u32).to_le_bytes())
+        && ctx
+            .mem
+            .write(draw + 12, &((index_addr >> 32) as u32).to_le_bytes())
+        // INDEX_COUNT, then DRAW_INITIATOR (0 = DI_SRC_SEL_DMA, no auto-index).
+        && ctx.mem.write(draw + 16, &index_count.to_le_bytes())
+        && ctx.mem.write(draw + 20, &0u32.to_le_bytes());
     if !draw_ok {
         return 0;
     }
@@ -6191,12 +6219,113 @@ mod tests {
         );
         let ret = hle_dcb_draw_index(&ctx, &[cb, 6, ib, DRAW_AUTO_MODIFIER]);
         assert_eq!(ret, 0x400);
-        // Base packet (5 dw) then draw packet (5 dw) = 10 dw total.
+        // Base packet (5 dw) then draw packet (6 dw) = 11 dw total.
         assert_eq!(read_u32(&ctx, 0x400), pm4(3, IT_INDEX_BASE, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x404), ib as u32);
+        assert_eq!(read_u32(&ctx, 0x408), (ib >> 32) as u32);
         assert_eq!(read_u32(&ctx, 0x40C), pm4(2, IT_INDEX_BUFFER_SIZE, R_ZERO));
-        assert_eq!(read_u32(&ctx, 0x414), pm4(5, IT_DRAW_INDEX_2, R_ZERO)); // draw at 0x400+20
-        assert_eq!(read_u32(&ctx, 0x418), 6, "index count in draw packet");
-        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 40);
+        assert_eq!(read_u32(&ctx, 0x410), 6);
+        // The DRAW_INDEX_2 packet, at 0x400 + 20. AMD's body is
+        // {MAX_SIZE, BASE_LO, BASE_HI, INDEX_COUNT, DRAW_INITIATOR} — five body
+        // DWORDs, so the packet is SIX DWORDs, and the 64-bit index base lives
+        // INSIDE it. A five-DWORD packet with a zero base is what made every
+        // Dead Cells draw refusable ("indexed draw with no index buffer:
+        // addr=0x0"): the command processor reads the base from this packet, not
+        // from the INDEX_BASE preamble above.
+        assert_eq!(read_u32(&ctx, 0x414), pm4(6, IT_DRAW_INDEX_2, R_ZERO));
+        assert_eq!(read_u32(&ctx, 0x418), 6, "MAX_SIZE");
+        assert_eq!(
+            read_u32(&ctx, 0x41C),
+            ib as u32,
+            "index base LO must be in the draw packet, not only the preamble"
+        );
+        assert_eq!(
+            read_u32(&ctx, 0x420),
+            (ib >> 32) as u32,
+            "index base HI must be in the draw packet, not only the preamble"
+        );
+        assert_eq!(read_u32(&ctx, 0x424), 6, "INDEX_COUNT");
+        assert_eq!(read_u32(&ctx, 0x428), 0, "DRAW_INITIATOR");
+        assert_eq!(read_u64(&ctx, cb + CB_CURSOR_UP), 0x400 + 44);
+    }
+
+    /// End-to-end emitter → command-processor contract for
+    /// `sceAgcDcbDrawIndex`.
+    ///
+    /// This is the test that would have caught the Dead Cells black frame. The
+    /// emitter and the PM4 walker each looked correct in isolation: the emitter
+    /// programmed the index base with an `IT_INDEX_BASE` preamble, and
+    /// `cp_op_draw_index` correctly read the base out of the `DRAW_INDEX_2`
+    /// body — but nothing checked that the two agreed. They did not: the
+    /// emitted body carried zeros where the base belongs, so every draw was
+    /// refused with `indexed draw with no index buffer: addr=0x0`, and because
+    /// a refusal is counted in `CommandProcessor::refused_draws` (not in the
+    /// sink's own `draws`/`draw_skips`) the frame path reported
+    /// `draws=0 draw_skips=0` — a draw dropped with no visible reason.
+    ///
+    /// Walk the ACTUAL emitted DWORDs with a real `CommandProcessor`.
+    #[test]
+    fn draw_index_emission_reaches_the_command_processor_with_the_real_base() {
+        use kyty_graphics::run::{CommandProcessor, DrawError, DrawSink, IndexedDraw};
+
+        #[derive(Default)]
+        struct IndexSink {
+            indexed: Vec<IndexedDraw>,
+        }
+        impl DrawSink for IndexSink {
+            fn draw_index_auto(
+                &mut self,
+                _ctx: &kyty_graphics::hw_regs::Context,
+                _ucfg: &kyty_graphics::hw_regs::UserConfig,
+                _sh: &kyty_graphics::hw_regs::Shader,
+                _index_count: u32,
+                _flags: u32,
+            ) -> Result<(), DrawError> {
+                Err(DrawError(
+                    "this sink only accepts indexed draws — a degraded auto draw \
+                     means the index base never reached it"
+                        .to_owned(),
+                ))
+            }
+
+            fn draw_index(
+                &mut self,
+                _ctx: &kyty_graphics::hw_regs::Context,
+                _ucfg: &kyty_graphics::hw_regs::UserConfig,
+                _sh: &kyty_graphics::hw_regs::Shader,
+                draw: &IndexedDraw,
+            ) -> Result<(), DrawError> {
+                self.indexed.push(*draw);
+                Ok(())
+            }
+        }
+
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let cb = 0x40;
+        setup_cb(&ctx, cb, 0x400, 0x800);
+        let ib = 0x00AB_CDEF_1234_5678u64;
+        assert_eq!(
+            hle_dcb_draw_index(&ctx, &[cb, 6, ib, DRAW_AUTO_MODIFIER]),
+            0x400
+        );
+        // Read back exactly what the guest would submit: the 11 emitted DWORDs.
+        let emitted_dwords = (read_u64(&ctx, cb + CB_CURSOR_UP) - 0x400) / 4;
+        let dcb: Vec<u32> = (0..emitted_dwords)
+            .map(|i| read_u32(&ctx, 0x400 + i * 4))
+            .collect();
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexSink::default();
+        cp.run(&dcb, &mut sink)
+            .expect("the emitted DCB must walk cleanly");
+        assert_eq!(cp.refused_draws(), 0, "no draw may be refused");
+        assert_eq!(sink.indexed.len(), 1, "exactly one indexed draw must land");
+        assert_eq!(
+            sink.indexed[0].index_addr, ib,
+            "the command processor must receive the index buffer the guest passed"
+        );
+        assert_eq!(sink.indexed[0].index_count, 6);
     }
 
     #[test]

@@ -518,6 +518,16 @@ pub struct CommandProcessor {
     /// per-frame reset must not zero the honest count of refused work. See the
     /// skip-and-continue arm in [`CommandProcessor::run_resumable`].
     refused_draws: u64,
+    /// The MOST RECENT refusal reason ([`DrawError`] text) behind
+    /// [`Self::refused_draws`]. The warn at the skip-and-continue arm is
+    /// rate-limited to once per processor, so without this the 2nd..Nth refusals
+    /// — and every refusal on a processor that already warned — carried no
+    /// recoverable reason at all. The embedder reads it
+    /// ([`Self::last_refusal`]) so a black-frame diagnostic can NAME why the
+    /// draws did not land instead of reporting a bare `draws=0`.
+    ///
+    /// Cumulative across queue resets, like `refused_draws`.
+    last_refusal: Option<String>,
     /// Set by the wait-packet handlers when the watched label does not satisfy
     /// the condition; consumed by the walker immediately after the packet, so
     /// [`CommandProcessor::run_resumable`] can suspend the stream there.
@@ -611,6 +621,20 @@ impl CommandProcessor {
         self.refused_draws
     }
 
+    /// Why the most recent refused draw/dispatch was refused — see
+    /// [`Self::last_refusal`].
+    ///
+    /// `Some` exactly when [`Self::refused_draws`] is non-zero. Pair the two in
+    /// any "nothing was drawn" diagnostic: a non-zero count with this reason is
+    /// the difference between "the GPU dropped work and here is why" and a bare
+    /// `draws=0` that names nothing (the state Dead Cells presented in, where
+    /// every draw was refused for `indexed draw with no index buffer: addr=0x0`
+    /// but the frame path reported only `draws=0 draw_skips=0`).
+    #[must_use]
+    pub fn last_refusal(&self) -> Option<&str> {
+        self.last_refusal.as_deref()
+    }
+
     /// Kyty: `CommandProcessor::Reset` (L519) — clears register and index
     /// state. The warn rate-limit set deliberately survives (deviation; a
     /// reset must not re-arm log spam).
@@ -618,6 +642,7 @@ impl CommandProcessor {
         let warned = std::mem::take(&mut self.warned);
         let shader_bind_trace_count = self.shader_bind_trace_count;
         let refused_draws = self.refused_draws;
+        let last_refusal = self.last_refusal.take();
         // Producer labels written before an in-stream queue reset must survive
         // it: the embedder still needs to latch waiters against them, and a
         // per-frame `R_DRAW_RESET` between the producer packet and the drain
@@ -631,6 +656,7 @@ impl CommandProcessor {
         self.warned = warned;
         self.shader_bind_trace_count = shader_bind_trace_count;
         self.refused_draws = refused_draws;
+        self.last_refusal = last_refusal;
         self.produced_labels = produced_labels;
         self.side_effects = side_effects;
         self.timestamp_source = timestamp_source;
@@ -825,14 +851,20 @@ impl CommandProcessor {
                 // boundary is unknowable.
                 Err(CpError::Draw { offset, source }) => {
                     self.refused_draws = self.refused_draws.saturating_add(1);
+                    // Record the reason on EVERY refusal, not only the one that
+                    // logs. The warn below is rate-limited to once per
+                    // processor, so a title whose every draw is refused used to
+                    // leave the embedder with a bare `draws=0` and nothing to
+                    // name — see `last_refusal`.
+                    self.last_refusal = Some(source.0.clone());
                     if self.first(SkipKey::Note("draw_refused_skip_and_continue")) {
                         warn!(
                             offset,
                             reason = %source,
                             "refused draw/dispatch skipped — continuing the walk so the \
                              completion packets after it still run (never-silent; later \
-                             refusals on this processor are counted via refused_draws, \
-                             not re-logged)"
+                             refusals on this processor are counted via refused_draws \
+                             and named via last_refusal, not re-logged)"
                         );
                     }
                     pm4::body_dw(cmd_id)
@@ -3769,6 +3801,119 @@ mod tests {
             "the packet after a refused draw must still execute (completion invariant)"
         );
         assert_eq!(cp.refused_draws(), 1, "the refusal must be counted");
+    }
+
+    /// A counted refusal must also be a NAMED one, for every refusal — not only
+    /// the first.
+    ///
+    /// The Dead Cells black frame was diagnosable in principle and undiagnosable
+    /// in practice: every draw was refused for `indexed draw with no index
+    /// buffer: addr=0x0`, but the walk's warn is rate-limited to once per
+    /// processor and the reason was then dropped on the floor. The embedder saw
+    /// `draws=0` with `draw_skips=0` (the sink's own counter — a refusal never
+    /// touches it) and concluded the command processor "reports neither a draw
+    /// nor a reason". [`CommandProcessor::last_refusal`] closes that: the reason
+    /// survives past the one log line, and past a queue reset.
+    #[test]
+    fn every_refused_draw_leaves_a_recoverable_reason() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink {
+            fail: Some("indexed draw with no index buffer: addr=0x0 count=6".into()),
+            ..Default::default()
+        };
+        assert_eq!(cp.refused_draws(), 0);
+        assert_eq!(cp.last_refusal(), None, "no refusal yet → nothing to name");
+
+        // Three draws, all refused. Only the FIRST emits a log line.
+        let one_draw = [header(3, pm4::IT_NOP, pm4::R_DRAW_INDEX_AUTO), 3, 0];
+        let dcb: Vec<u32> = one_draw
+            .iter()
+            .chain(one_draw.iter())
+            .chain(one_draw.iter())
+            .copied()
+            .collect();
+        cp.run(&dcb, &mut sink)
+            .expect("refusals are skipped, not stream faults");
+
+        assert_eq!(cp.refused_draws(), 3, "every refusal counts");
+        assert_eq!(
+            cp.last_refusal(),
+            Some("indexed draw with no index buffer: addr=0x0 count=6"),
+            "the reason must outlive the rate-limited warn"
+        );
+        // A per-frame queue reset must not erase the evidence, exactly as it
+        // does not erase `refused_draws`.
+        cp.reset();
+        assert_eq!(cp.refused_draws(), 3, "reset must not zero the count");
+        assert_eq!(
+            cp.last_refusal(),
+            Some("indexed draw with no index buffer: addr=0x0 count=6"),
+            "reset must not erase the reason"
+        );
+    }
+
+    /// The emitter/walker contract for `sceAgcDcbDrawIndex`, from the walker's
+    /// side: a `DRAW_INDEX_2` whose body carries a zero base is REFUSABLE, and
+    /// the same packet with the real base is not. `raeen-hle`'s
+    /// `draw_index_emission_reaches_the_command_processor_with_the_real_base`
+    /// asserts the emitter produces the second shape; this asserts the walker
+    /// distinguishes them, so neither side can drift back alone.
+    ///
+    /// The zero-base body is what `hle_dcb_draw_index` emitted before the fix.
+    /// The `IT_INDEX_BASE` preamble does NOT rescue it: `DRAW_INDEX_2` carries
+    /// its own base per AMD PM4, and only `DRAW_INDEX_OFFSET_2` reads the bound
+    /// one.
+    #[test]
+    fn draw_index_2_takes_its_base_from_its_own_body_not_the_index_base_preamble() {
+        let base = 0x00AB_CDEF_1234_5678u64;
+        // The exact shape hle_dcb_draw_index emits: INDEX_BASE, then
+        // INDEX_BUFFER_SIZE, then DRAW_INDEX_2.
+        let preamble = [
+            header(3, pm4::IT_INDEX_BASE, pm4::R_ZERO),
+            base as u32,
+            (base >> 32) as u32,
+            header(2, pm4::IT_INDEX_BUFFER_SIZE, pm4::R_ZERO),
+            6,
+        ];
+
+        // Pre-fix body: base zeroed. The preamble is present and ignored.
+        let mut zero_base = preamble.to_vec();
+        zero_base.extend_from_slice(&[
+            header(6, pm4::IT_DRAW_INDEX_2, pm4::R_ZERO),
+            6, // MAX_SIZE
+            0, // BASE_LO — the bug
+            0, // BASE_HI — the bug
+            6, // INDEX_COUNT
+            0, // DRAW_INITIATOR
+        ]);
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        cp.run(&zero_base, &mut sink).expect("well-formed stream");
+        assert_eq!(
+            sink.indexed[0].index_addr, 0,
+            "a zero-base DRAW_INDEX_2 must NOT silently inherit the bound \
+             INDEX_BASE — a real sink refuses it, which is the Dead Cells \
+             draws=0 signature"
+        );
+
+        // Post-fix body: the real base rides in the packet.
+        let mut real_base = preamble.to_vec();
+        real_base.extend_from_slice(&[
+            header(6, pm4::IT_DRAW_INDEX_2, pm4::R_ZERO),
+            6,
+            base as u32,
+            (base >> 32) as u32,
+            6,
+            0,
+        ]);
+        let mut cp = CommandProcessor::new();
+        let mut sink = IndexedSink::default();
+        cp.run(&real_base, &mut sink).expect("well-formed stream");
+        assert_eq!(
+            sink.indexed[0].index_addr, base,
+            "the walker must deliver the packet's own base"
+        );
+        assert_eq!(sink.indexed[0].index_count, 6);
     }
 
     /// Kyty's `dw -= s + 1` wraps on an over-long packet and reads past the end

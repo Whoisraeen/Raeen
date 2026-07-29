@@ -216,6 +216,16 @@ SOFTWARE.
   (global) memory + 3D-texture shader support (`Shader/*`, PSSL SEG-field
   FLAT-address decode → SPIR-V global-memory access). Ports cite the
   originating SharpEmu `file:line` in doc comments.
+- **`DRAW_INDEX_2` packet layout 2026-07-29**: `hle_dcb_draw_index` in
+  `crates/raeen-hle/src/libsce_agc.rs` emitted a five-DWORD `IT_DRAW_INDEX_2`
+  whose body zeroed the 64-bit index-buffer base, so the PM4 walker refused
+  every indexed draw ("indexed draw with no index buffer: addr=0x0"). SharpEmu
+  hit the identical defect on Unity titles and its `DcbDrawIndex`
+  (`src/SharpEmu.Libs/Agc/AgcExports.cs` L1567-1610) both documents the cause and
+  carries the corrected six-DWORD AMD body
+  `{MAX_SIZE, INDEX_BASE_LO, INDEX_BASE_HI, INDEX_COUNT, DRAW_INITIATOR}`.
+  Raeen's emitter now matches that layout; the diagnosis is credited to that
+  in-source comment.
 - **Gen5 shader batch 2026-07-28** (`docs/sharpemu-port/gen5-shader-agc.md`):
   the **VOP3P** (packed 16-bit math) decode and lowering is a behavioral
   re-implementation of `Gen5ShaderTranslator.cs` (`DecodeVop3p`, the

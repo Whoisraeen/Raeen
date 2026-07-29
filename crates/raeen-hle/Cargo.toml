@@ -24,6 +24,13 @@ sha1 = { workspace = true }
 # Real JSON parsing for libSceJson2 Parser::parse (host-side value model).
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# The PM4 command processor, so an AGC packet-emitter test can walk its OWN
+# emitted DWORDs the way the GPU will. Emitter and walker each looked correct in
+# isolation while disagreeing on the DRAW_INDEX_2 body layout; only an
+# end-to-end test catches that class of bug. Dev-only — no production coupling.
+kyty-graphics = { workspace = true }
+
 # GetTimeZoneInformation for libSceRtc's UTC→local conversion (Windows-only).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
