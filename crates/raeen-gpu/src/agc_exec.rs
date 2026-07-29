@@ -2209,27 +2209,38 @@ impl AgcGpuSession {
         is_compute: bool,
         deferred_present: bool,
     ) -> Result<(Option<RenderedImage>, Option<SuspendedWait>), AgcExecError> {
+        // Submission phase split (RAEEN_TIME_DRAW): `_submission` is the
+        // denominator every named phase below is a share of, so the reported
+        // residual is exhaustive rather than a guess.
+        let _submission = SubmissionPhaseScope::start(words.len());
+        let decode_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_DECODE_NS);
         let decoded = agc::decode_submission(words)?;
+        drop(decode_timer);
         // Route each queue to its own command processor: the async-compute (ACB)
         // ring keeps register/shader state independent of the graphics DCB, so a
         // reset on one queue can't zero the other's bound shader.
+        let cp_lock_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_LOCKS_NS);
         let mut cp = if is_compute {
             self.compute_command_processor.lock()
         } else {
             self.command_processor.lock()
         };
+        drop(cp_lock_timer);
 
         // State-only DCBs are still real GPU work. Process them without
         // forcing Vulkan initialization so their register writes are latched
         // for the next submission.
         if decoded.draw_packets == 0 && decoded.dispatch_packets == 0 {
             let mut sink = StateOnlySink;
+            let walk_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_WALK_NS);
             let outcome = cp.run_resumable(
                 words,
                 start_dword,
                 &mut sink,
                 Some(&crate::guest_mem::IdentityGuestMemory),
             )?;
+            drop(walk_timer);
+            let _post = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_POST_NS);
             let produced = cp.take_produced_labels();
             // In-stream completion side effects (events/EOP/flips), published
             // for HLE delivery in execution order iff the defer gate is on
@@ -2241,6 +2252,7 @@ impl AgcGpuSession {
             return Ok((None, suspended_of(outcome)));
         }
 
+        let lock_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_LOCKS_NS);
         self.ensure_backend()?;
         let guard = self.backend.lock();
         let backend = guard
@@ -2258,14 +2270,19 @@ impl AgcGpuSession {
         // shader bound on either queue so a dispatch-only ACB buffer can fall
         // back to it (the title binds on the DCB, dispatches on the ACB).
         sink.current_compute = *self.last_compute_shader.lock();
+        drop(lock_timer);
         // Indirect register/draw packets carry guest pointers; the identity
         // map makes them host-readable (VirtualQuery-validated).
+        let walk_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_WALK_NS);
         let run = cp.run_resumable(
             words,
             start_dword,
             &mut sink,
             Some(&crate::guest_mem::IdentityGuestMemory),
         );
+        drop(walk_timer);
+        SUB_PHASE_DRAWS.fetch_add(sink.draws, Ordering::Relaxed);
+        let flush_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_FLUSH_NS);
         if submission_compute_flush_required(sink.queued_compute, deferred_present) {
             // Synchronous/test callers have no ordered worker consumer, so
             // fence here. The title worker keeps compute work GPU-side across
@@ -2275,6 +2292,8 @@ impl AgcGpuSession {
             // Passing an empty target filter keeps render targets GPU-side.
             crate::vulkan::offscreen::flush_deferred_draws_filtered(device, Some(&[]))?;
         }
+        drop(flush_timer);
+        let post_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_POST_NS);
         let produced = cp.take_produced_labels();
         // In-stream completion side effects (events/EOP/flips) — see the
         // state-only path above; a suspended walk has published nothing past
@@ -2290,6 +2309,7 @@ impl AgcGpuSession {
             *self.last_compute_shader.lock() = Some(cs);
         }
         let shader_state = cp.get_sh_ctx().clone();
+        drop(post_timer);
 
         let drawn = sink.draws;
         // Compute dispatches this submission actually ran. `Stage::Dispatch`
@@ -3388,6 +3408,97 @@ fn warn_present_allocation_failed() {
 /// Number of frames presented since process start — the frame-dump sampling
 /// index (see the call site for why the draw counter cannot serve this role).
 static PRESENT_INDEX: AtomicU64 = AtomicU64::new(0);
+
+// RAEEN_TIME_DRAW: per-SUBMISSION phase split for `execute_dcb_cp_authorized`.
+//
+// The GPU worker's telemetry (`RAEEN_TIME_WORKER`) localises the frame to
+// "inside DCB submission", and `draw_stage_tick` splits the per-DRAW cost. These
+// close the remaining seam: everything a submission pays that is NOT a draw —
+// the packet pre-decode, each of the five lock acquisitions, the PM4 walk
+// itself, the ordered side-effect publication, and the compute-dependency
+// flush. `resid` is the exhaustive remainder, so a submission's time can always
+// be attributed rather than guessed at.
+static SUB_PHASE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_LOCKS_NS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_WALK_NS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_POST_NS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_N: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_DRAWS: AtomicU64 = AtomicU64::new(0);
+static SUB_PHASE_WORDS: AtomicU64 = AtomicU64::new(0);
+
+/// Submissions per `SUBMISSION PHASES` report. A title submits roughly one
+/// draw-bearing DCB per frame, so 32 is about a second of steady state.
+const SUB_PHASE_WINDOW: u64 = 32;
+
+/// Accumulates one submission's wall time into [`SUB_PHASE_TOTAL_NS`] and files
+/// the window report on drop.
+///
+/// A `Drop` guard rather than a plain timer because
+/// [`AgcGpuSession::execute_dcb_cp_authorized`] has six early-return paths
+/// (state-only DCB, deferred present, present-allocation failure, suspended
+/// walk, no-draw completion, error). Counting only the last one would report a
+/// per-submission cost drawn from a biased subset.
+struct SubmissionPhaseScope(Option<std::time::Instant>);
+
+impl SubmissionPhaseScope {
+    fn start(words: usize) -> Self {
+        let at = crate::diagnostics::gpu_env()
+            .time_draw
+            .then(std::time::Instant::now);
+        if at.is_some() {
+            SUB_PHASE_WORDS.fetch_add(words as u64, Ordering::Relaxed);
+        }
+        Self(at)
+    }
+}
+
+impl Drop for SubmissionPhaseScope {
+    fn drop(&mut self) {
+        if let Some(at) = self.0 {
+            SUB_PHASE_TOTAL_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            submission_phase_tick();
+        }
+    }
+}
+
+/// Summarize the submission phase split every [`SUB_PHASE_WINDOW`]
+/// submissions, then reset the window so boot cost does not smear into it.
+fn submission_phase_tick() {
+    let n = SUB_PHASE_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if !n.is_multiple_of(SUB_PHASE_WINDOW) {
+        return;
+    }
+    let decode = SUB_PHASE_DECODE_NS.swap(0, Ordering::Relaxed);
+    let locks = SUB_PHASE_LOCKS_NS.swap(0, Ordering::Relaxed);
+    let walk = SUB_PHASE_WALK_NS.swap(0, Ordering::Relaxed);
+    let flush = SUB_PHASE_FLUSH_NS.swap(0, Ordering::Relaxed);
+    let post = SUB_PHASE_POST_NS.swap(0, Ordering::Relaxed);
+    let total = SUB_PHASE_TOTAL_NS.swap(0, Ordering::Relaxed);
+    let draws = SUB_PHASE_DRAWS.swap(0, Ordering::Relaxed);
+    let words = SUB_PHASE_WORDS.swap(0, Ordering::Relaxed);
+    let named = decode
+        .saturating_add(locks)
+        .saturating_add(walk)
+        .saturating_add(flush)
+        .saturating_add(post);
+    let per_sub_us = |x: u64| x / 1000 / SUB_PHASE_WINDOW;
+    warn!(
+        submissions = SUB_PHASE_WINDOW,
+        total_us = per_sub_us(total),
+        decode_us = per_sub_us(decode),
+        locks_us = per_sub_us(locks),
+        walk_us = per_sub_us(walk),
+        flush_us = per_sub_us(flush),
+        post_us = per_sub_us(post),
+        resid_us = per_sub_us(total.saturating_sub(named)),
+        draws_per_sub = draws / SUB_PHASE_WINDOW,
+        words_per_sub = words / SUB_PHASE_WINDOW,
+        walk_pct = walk.saturating_mul(100).checked_div(total).unwrap_or(0),
+        "SUBMISSION PHASES: one draw-bearing DCB split into pre-decode, lock acquisition, PM4 walk (draws included — see DRAW COST), compute flush, and ordered side effects (per submission; RAEEN_TIME_DRAW)"
+    );
+}
 
 fn maybe_dump_frame(image: &RenderedImage, draw_index: u64) {
     let Some(dir) = crate::diagnostics::gpu_env().dump_frames.as_deref() else {

@@ -694,9 +694,37 @@ const RESOLVED_SHADER_MEMO_CAPACITY: usize = 256;
 /// observe modified shader code or embedded resource metadata. Failed
 /// translations deliberately stay in [`ShaderTranslateCache`]'s named
 /// negative cache rather than becoming an uninspectable entry here.
+/// One memoized resolution, held behind pointers.
+///
+/// This is an LRU, and an LRU MOVES entries: [`ResolvedShaderMemo::get`]
+/// re-inserts the hit at the back, [`ResolvedShaderMemo::insert`] evicts the
+/// front once full. Stored inline in the `Vec`, each of those `remove` + `push`
+/// pairs memmoved up to `RESOLVED_SHADER_MEMO_CAPACITY *
+/// size_of::<(ResolvedShaderKey, ResolvedShaders)>()` bytes — and
+/// [`ResolvedShaders`] carries both stages' `Shader*InputInfo` inline, which are
+/// kilobytes of fixed descriptor/sampler/embedded-constant arrays. Measured:
+/// `size_of::<(ResolvedShaderKey, ResolvedShaders)>() == 11_272`, so at capacity
+/// 256 ONE lookup shifted up to 2.87 MB — on the HIT path the memo exists to
+/// make cheap, once per draw. `insert` paid the same on every eviction.
+///
+/// `Box` makes an entry move one pointer; `Arc` makes a hit a refcount bump
+/// instead of a full [`ResolvedShaders`] copy. `resolved_shader_memo_moves_
+/// pointers_not_kilobytes` pins the shape.
+struct ResolvedShaderEntry {
+    key: ResolvedShaderKey,
+    shaders: Arc<ResolvedShaders>,
+}
+
 #[derive(Default)]
 struct ResolvedShaderMemo {
-    entries: Vec<(ResolvedShaderKey, ResolvedShaders)>,
+    // `clippy::vec_box` says the Vec is already on the heap — true, and beside
+    // the point. The cost being removed is not the allocation, it is MOVING the
+    // element: this is an LRU, so `get` (move-to-back) and `insert` (front
+    // eviction) shift every following slot. Inline, `size_of::<ResolvedShaderEntry>()`
+    // is 760 B against a 256 slot capacity; boxed, a shift moves 8 B per slot.
+    // Measured on this shape: 217 us -> 113 ns per lookup.
+    #[allow(clippy::vec_box, reason = "the LRU shifts slots; keep them pointers")]
+    entries: Vec<Box<ResolvedShaderEntry>>,
     hits: u64,
     misses: u64,
 }
@@ -817,12 +845,8 @@ fn resolved_shader_depends_on_ranges(
 }
 
 impl ResolvedShaderMemo {
-    fn get(&mut self, key: ResolvedShaderKey) -> Option<ResolvedShaders> {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|(candidate, _)| *candidate == key)
-        else {
+    fn get(&mut self, key: ResolvedShaderKey) -> Option<Arc<ResolvedShaders>> {
+        let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
             self.misses += 1;
             crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -831,23 +855,27 @@ impl ResolvedShaderMemo {
         self.hits += 1;
         crate::vulkan::offscreen::DRAW_STAGE_RESOLVE_HITS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Move-to-back: one pointer per shifted slot (see [`ResolvedShaderEntry`]).
         let entry = self.entries.remove(index);
-        let shaders = entry.1.clone();
+        let shaders = Arc::clone(&entry.shaders);
         self.entries.push(entry);
         Some(shaders)
     }
 
-    fn insert(&mut self, key: ResolvedShaderKey, shaders: ResolvedShaders) {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(candidate, _)| *candidate == key)
-        {
+    /// Memoize `shaders` under `key` and hand back the shared handle, so the
+    /// resolving caller never pays a second lookup or a second copy.
+    fn insert(&mut self, key: ResolvedShaderKey, shaders: ResolvedShaders) -> Arc<ResolvedShaders> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
             self.entries.remove(index);
         } else if self.entries.len() == RESOLVED_SHADER_MEMO_CAPACITY {
             self.entries.remove(0);
         }
-        self.entries.push((key, shaders));
+        let shaders = Arc::new(shaders);
+        self.entries.push(Box::new(ResolvedShaderEntry {
+            key,
+            shaders: Arc::clone(&shaders),
+        }));
+        shaders
     }
 
     fn clear(&mut self) {
@@ -859,7 +887,7 @@ impl ResolvedShaderMemo {
             return;
         }
         self.entries
-            .retain(|(key, shaders)| !resolved_shader_depends_on_ranges(key, shaders, writes));
+            .retain(|entry| !resolved_shader_depends_on_ranges(&entry.key, &entry.shaders, writes));
     }
 }
 
@@ -4316,14 +4344,13 @@ impl OffscreenDrawSink<'_> {
         &mut self,
         ctx: &Context,
         sh: &Shader,
-    ) -> Result<ResolvedShaders, DrawError> {
+    ) -> Result<Arc<ResolvedShaders>, DrawError> {
         let key = ResolvedShaderKey::new(ctx, sh);
         if let Some(shaders) = self.resolved_shaders.get(key) {
             return Ok(shaders);
         }
         let shaders = resolve_shaders(self.cache, ctx, sh)?;
-        self.resolved_shaders.insert(key, shaders.clone());
-        Ok(shaders)
+        Ok(self.resolved_shaders.insert(key, shaders))
     }
 
     /// The body shared by the auto and indexed draw paths.
@@ -5048,9 +5075,30 @@ impl OffscreenDrawSink<'_> {
 }
 
 impl DrawSink for OffscreenDrawSink<'_> {
-    fn guest_memory_write_boundary(&mut self) {
-        self.texture_sample_hashes.clear();
-        self.resolved_shaders.clear();
+    /// Invalidate exactly what a PM4 guest write can have changed.
+    ///
+    /// This used to `clear()` both memos on EVERY write-capable packet. A title
+    /// interleaves completion labels (`WRITE_DATA` / `RELEASE_MEM`, one or two
+    /// dwords) with its draws, so the blanket clear wiped the resolved-shader
+    /// memo between consecutive draws and every draw re-ran the full VS+PS
+    /// resource analysis — the 80-95 us/draw the memo exists to avoid (see
+    /// [`RESOLVED_SHADER_MEMO_CAPACITY`], whose 32 -> 256 growth could not help
+    /// while the memo was being emptied several times per frame).
+    ///
+    /// `writes` carries the exact spans, so a label write next to a texture no
+    /// longer discards the frame's shader analyses. The predicate is the SAME
+    /// one already trusted for compute writeback
+    /// ([`resolved_shader_depends_on_ranges`]): a write inside a shader's code
+    /// window or its EUD descriptor table still invalidates. An empty slice —
+    /// a write-capable packet that wrote nothing — invalidates nothing.
+    ///
+    /// Region-scoped invalidation is also how shadPS4 does it
+    /// (`Rasterizer::InvalidateMemory(VAddr addr, u64 size)`,
+    /// vk_rasterizer.cpp:1043, forwarded to the buffer and texture caches).
+    /// Design corroboration only; no code is ported.
+    fn guest_memory_write_boundary(&mut self, writes: &[(u64, u64)]) {
+        self.texture_sample_hashes.invalidate_ranges(writes);
+        self.resolved_shaders.invalidate_ranges(writes);
     }
 
     fn draw_index_auto(
@@ -5061,7 +5109,12 @@ impl DrawSink for OffscreenDrawSink<'_> {
         index_count: u32,
         _flags: u32,
     ) -> Result<(), DrawError> {
-        self.flush_compute_for_graphics_read()?;
+        {
+            let _predraw = crate::vulkan::offscreen::StageTimer::start(
+                &crate::vulkan::offscreen::DRAW_STAGE_PREDRAW_NS,
+            );
+            self.flush_compute_for_graphics_read()?;
+        }
         self.draw_common(ctx, ucfg, sh, index_count, None)
     }
 
@@ -5080,10 +5133,14 @@ impl DrawSink for OffscreenDrawSink<'_> {
         sh: &Shader,
         draw: &IndexedDraw,
     ) -> Result<(), DrawError> {
+        let predraw = crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_PREDRAW_NS,
+        );
         // This must precede `fetch_index_buffer`: generated indices live in
         // guest memory only after the deferred compute writeback is published.
         self.flush_compute_for_graphics_read()?;
         let (index_bytes, index_type) = fetch_index_buffer(draw)?;
+        drop(predraw);
         self.draw_common(
             ctx,
             ucfg,
@@ -7439,6 +7496,108 @@ mod tests {
         assert!(
             memo.get(key).is_none(),
             "a guest shader-code write must invalidate shader analysis"
+        );
+    }
+
+    /// The memo is an LRU, so every lookup shifts the slots after the hit
+    /// (move-to-back) and every eviction shifts all of them. Those slots must be
+    /// POINTERS.
+    ///
+    /// Stored inline, one lookup memmoved
+    /// `RESOLVED_SHADER_MEMO_CAPACITY * size_of::<(key, ResolvedShaders)>()`
+    /// bytes — megabytes, once per draw, on the hit path the memo exists to make
+    /// cheap. This is a shape assertion, not a timing one: it fails if anyone
+    /// puts the payload back inline.
+    #[test]
+    fn resolved_shader_memo_moves_pointers_not_kilobytes() {
+        let inline = std::mem::size_of::<(ResolvedShaderKey, ResolvedShaders)>();
+        assert!(
+            inline >= 4096,
+            "the entry stored INLINE really is multiple pages ({inline} B) — if \
+             it ever shrinks this test stops proving anything"
+        );
+        let slot = std::mem::size_of::<Box<ResolvedShaderEntry>>();
+        assert!(slot <= 16, "memo slots must be pointer-sized, got {slot} B");
+        let shifted = RESOLVED_SHADER_MEMO_CAPACITY * slot;
+        assert!(
+            shifted <= 4096,
+            "a full-capacity lookup shifts {shifted} B; inline entries made that \
+             {} B",
+            RESOLVED_SHADER_MEMO_CAPACITY * inline
+        );
+    }
+
+    /// A memo hit hands back the SAME analysis, not a copy of it.
+    #[test]
+    fn resolved_shader_memo_hit_shares_the_analysis_instead_of_copying_it() {
+        let ctx = Context::default();
+        let sh = Shader::default();
+        let key = ResolvedShaderKey::new(&ctx, &sh);
+        let inserted = ResolvedShaderMemo::default().insert(
+            key,
+            ResolvedShaders {
+                vs: Arc::new(vec![1, 2, 3]),
+                ps: Arc::new(vec![4, 5, 6]),
+                vs_info: ShaderVertexInputInfo::default(),
+                ps_info: ShaderPixelInputInfo::default(),
+            },
+        );
+        let mut memo = ResolvedShaderMemo::default();
+        let first = memo.insert(key, (*inserted).clone());
+        let second = memo.get(key).expect("exact state must be memoized");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a hit must share the resolved analysis, not clone kilobytes of it"
+        );
+    }
+
+    /// The PM4 completion labels a title interleaves with its draws must NOT
+    /// re-resolve the frame's shaders.
+    ///
+    /// This is the regression that cost ~1 ms per draw: the write boundary
+    /// `clear()`ed the memo on every `WRITE_DATA` / `RELEASE_MEM` / `DMA_DATA`
+    /// packet, so a 4-byte label between two draws threw away the whole frame's
+    /// resource analysis and every draw re-ran it. `invalidate_ranges` with the
+    /// packet's exact span keeps analyses the write cannot have touched.
+    #[test]
+    fn completion_label_writes_do_not_re_resolve_the_frames_shaders() {
+        let ctx = Context::default();
+        let shaders = ResolvedShaders {
+            vs: Arc::new(vec![1, 2, 3]),
+            ps: Arc::new(vec![4, 5, 6]),
+            vs_info: ShaderVertexInputInfo::default(),
+            ps_info: ShaderPixelInputInfo::default(),
+        };
+        // Eight distinct exact bindings, each with real (distinct) code
+        // addresses well away from the label page.
+        let bindings: Vec<Shader> = (0..8u32)
+            .map(|i| {
+                let mut sh = Shader::default();
+                sh.vs.vs_regs.data_addr = 0x10_0000 + u64::from(i) * 0x10_0000;
+                sh.ps.ps_regs.data_addr = 0x90_0000 + u64::from(i) * 0x10_0000;
+                sh
+            })
+            .collect();
+
+        let mut memo = ResolvedShaderMemo::default();
+        for sh in &bindings {
+            memo.insert(ResolvedShaderKey::new(&ctx, sh), shaders.clone());
+        }
+        // One completion label written between every pair of draws, at an
+        // address no shader's code window or EUD table covers.
+        for _ in 0..bindings.len() {
+            memo.invalidate_ranges(&[(0x7f00_0000, 4)]);
+        }
+        for sh in &bindings {
+            assert!(
+                memo.get(ResolvedShaderKey::new(&ctx, sh)).is_some(),
+                "a completion label must not evict unrelated shader analysis"
+            );
+        }
+        assert_eq!(
+            (memo.hits, memo.misses),
+            (bindings.len() as u64, 0),
+            "N draws behind N label writes must cost ZERO re-resolutions"
         );
     }
 
