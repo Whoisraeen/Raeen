@@ -140,6 +140,22 @@ impl GuestMemory for IdentityGuestMemory {
         read_dwords_checked(addr, count)
     }
 
+    /// Chained command buffer read (`IT_INDIRECT_BUFFER` target): validated
+    /// exactly like [`Self::read_dwords`] but under the RESOURCE cap, not the
+    /// out-of-band POINTER cap. A chain target's length comes from the packet's
+    /// own 20-bit `IB_SIZE` field, so a legal one runs to 0xF_FFFF dwords
+    /// (4 MiB) — `MAX_READ_DWORDS` (0x1_0000) would refuse a valid frame's
+    /// command stream as if it were a mis-decoded pointer.
+    /// Chained command buffer read (`IT_INDIRECT_BUFFER` target): validated
+    /// exactly like [`Self::read_dwords`] but under the RESOURCE cap, not the
+    /// out-of-band POINTER cap. A chain target's length comes from the packet's
+    /// own 20-bit `IB_SIZE` field, so a legal one runs to 0xF_FFFF dwords
+    /// (4 MiB) — `MAX_READ_DWORDS` (0x1_0000) would refuse a valid frame's
+    /// command stream as if it were a mis-decoded pointer.
+    fn read_command_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+        read_dwords_validated(addr, count)
+    }
+
     /// DMA payload read: dword-granular under the RESOURCE cap (a DMA fill of
     /// a 1080p scanout buffer is ~8 MiB — far beyond the pointer-read cap but
     /// a legitimate resource-sized transfer).
@@ -528,6 +544,48 @@ mod tests {
                 IdentityGuestMemory.read_dwords(addr, MAX_READ_DWORDS + 1),
                 None,
                 "over the cap"
+            );
+        });
+    }
+
+    /// A chained command buffer is resource-sized, not pointer-sized: the PM4
+    /// `IB_SIZE` field is 20 bits, so a legal chain target can be far larger
+    /// than [`MAX_READ_DWORDS`]. Reading one through the pointer cap would
+    /// refuse a valid frame's command stream as a mis-decode.
+    #[test]
+    fn a_command_buffer_read_uses_the_resource_cap_not_the_pointer_cap() {
+        let oversized = MAX_READ_DWORDS as usize + 16;
+        let mut data: Vec<u32> = (0..oversized as u32).collect();
+        let addr = data.as_ptr() as u64;
+        let memory = memory_for(&mut data);
+        with_guest_memory(&memory, || {
+            assert_eq!(
+                IdentityGuestMemory.read_dwords(addr, oversized as u32),
+                None,
+                "the out-of-band POINTER read stays capped — a pointer that big is a mis-decode"
+            );
+            let got = IdentityGuestMemory.read_command_dwords(addr, oversized as u32);
+            assert_eq!(
+                got.as_ref().map(Vec::len),
+                Some(oversized),
+                "a command buffer past the pointer cap must still be readable in full"
+            );
+            // The same address/alignment/authority contract still applies.
+            assert_eq!(IdentityGuestMemory.read_command_dwords(0, 4), None, "null");
+            assert_eq!(
+                IdentityGuestMemory.read_command_dwords(addr + 2, 4),
+                None,
+                "unaligned"
+            );
+            assert_eq!(
+                IdentityGuestMemory.read_command_dwords(addr, 0),
+                None,
+                "zero length"
+            );
+            assert_eq!(
+                IdentityGuestMemory.read_command_dwords(addr, MAX_RESOURCE_READ_DWORDS + 1),
+                None,
+                "past the resource cap"
             );
         });
     }

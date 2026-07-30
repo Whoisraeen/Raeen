@@ -1672,6 +1672,13 @@ fn hle_driver_query_resource_memory(ctx: &HleContext, args: &[u64]) -> u64 {
 /// Count of ACB (async-compute) submissions that carried dispatch packets —
 /// diagnostic for the shared-CommandProcessor question (see `hle_driver_submit_acb`).
 static ACB_DISPATCH_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cumulative `IT_INDIRECT_BUFFER` family packets seen across all submissions.
+///
+/// Reported next to `total_draws` in `AGC submission progress`, because those two
+/// numbers must be read together: `total_draws` sums
+/// `AgcSubmission::draw_packets`, which counts only packets in the SUBMITTED
+/// buffer. Any draw living inside a chain target is absent from it.
+static CHAIN_PACKETS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn submit_validate(ctx: &HleContext, packet: u64, queue: &'static str) -> u64 {
     if packet == 0 {
@@ -2024,6 +2031,12 @@ fn submit_command_buffer(
         .kernel
         .agc_flip_packet_count
         .fetch_add(decoded.flips.len() as u64, Ordering::Relaxed);
+    // Cumulative chain-packet total, reported alongside `total_draws` below. That
+    // pairing is the point: `total_draws` counts draw packets in SUBMITTED
+    // buffers only, so reading it as "the draws this title asked for" is only
+    // sound while `total_chains` is zero.
+    let prior_chains =
+        CHAIN_PACKETS_SEEN.fetch_add(decoded.indirect_buffers.len() as u64, Ordering::Relaxed);
 
     // Diagnostic: how much compute lands on the ACB (async-compute ring) vs the
     // DCB. If dispatches arrive on the ACB, the shared-CommandProcessor model is
@@ -2052,6 +2065,12 @@ fn submit_command_buffer(
             packets = decoded.packets.len(),
             draws = decoded.draw_packets,
             dispatches = decoded.dispatch_packets,
+            // `draws`/`dispatches` count only THIS buffer. A non-zero `chains`
+            // means the frame continues in command buffers whose draws are not
+            // in those numbers — see `AgcSubmission::indirect_buffers` and the
+            // GPU crate's `CHAIN CENSUS`.
+            chains = decoded.indirect_buffers.len(),
+            chain_targets = ?decoded.indirect_buffers,
             flips = decoded.flips.len(),
             packet_layout = ?decoded.packets,
             flip_layout = ?decoded.flips,
@@ -2060,14 +2079,20 @@ fn submit_command_buffer(
             events = ?decoded.events,
             "captured AGC submission"
         );
-    } else if (prior_submissions + 1).is_power_of_two() {
+    } else if (prior_submissions + 1).is_power_of_two()
+        || (prior_chains == 0 && !decoded.indirect_buffers.is_empty())
+    {
         tracing::info!(
             queue,
             submissions = prior_submissions + 1,
             total_draws = ctx.kernel.agc_draw_packet_count.load(Ordering::Relaxed),
             total_dispatches = ctx.kernel.agc_dispatch_packet_count.load(Ordering::Relaxed),
             total_flips = ctx.kernel.agc_flip_packet_count.load(Ordering::Relaxed),
-            "AGC submission progress"
+            total_chains = CHAIN_PACKETS_SEEN.load(Ordering::Relaxed),
+            chains_this_submission = decoded.indirect_buffers.len(),
+            "AGC submission progress — `total_draws`/`total_dispatches` count packets in \
+             SUBMITTED buffers only; while `total_chains` is non-zero they are a LOWER BOUND on \
+             what the title asked for, because chain targets are separate buffers"
         );
     }
 
