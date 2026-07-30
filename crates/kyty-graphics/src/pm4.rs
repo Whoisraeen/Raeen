@@ -279,6 +279,12 @@ pub const DB_DEPTH_CONTROL: u32 = 0x200;
 pub const CB_COLOR_CONTROL: u32 = 0x202;
 pub const PA_SU_SC_MODE_CNTL: u32 = 0x205;
 pub const PA_SC_MODE_CNTL_0: u32 = 0x292;
+/// Clip/cull control. Not modelled; decoded only to report its kill bits.
+pub const PA_CL_CLIP_CNTL: u32 = 0x204;
+/// EQAA sample mask, pixels X0Y0/X1Y0. Not modelled; a zero value is reported.
+pub const PA_SC_AA_MASK_X0Y0_X1Y0: u32 = 0x30E;
+/// EQAA sample mask, pixels X0Y1/X1Y1. Not modelled; a zero value is reported.
+pub const PA_SC_AA_MASK_X0Y1_X1Y1: u32 = 0x30F;
 
 /// Slot stride for the `CB_COLOR{n}_BASE` / `_INFO` register blocks.
 /// Proof: `CB_COLOR7_BASE (0x381) - CB_COLOR0_BASE (0x318) == 7 * 15`.
@@ -612,6 +618,100 @@ pub mod pa_sc_offset_scissor {
     field!(WINDOW_OFFSET_DISABLE, 31, 0x1);
     field!(BR_X, 0, 0x7FFF);
     field!(BR_Y, 16, 0x7FFF);
+}
+
+/// `PA_CL_CLIP_CNTL` field layout (Mesa `gfx103.json`, mm `0x28810`, context
+/// offset 0x0204).
+///
+/// Only the bits that can suppress rasterization outright are named. They are
+/// **decoded for diagnostics, not emulated** — see
+/// [`crate::run`]'s clip-control handling.
+pub mod pa_cl_clip_cntl {
+    field!(CLIP_DISABLE, 16, 0x1);
+    field!(DX_CLIP_SPACE_DEF, 19, 0x1);
+    field!(VTX_KILL_OR, 21, 0x1);
+    field!(DX_RASTERIZATION_KILL, 22, 0x1);
+    field!(ZCLIP_NEAR_DISABLE, 26, 0x1);
+    field!(ZCLIP_FAR_DISABLE, 27, 0x1);
+}
+
+/// Human-readable names for the context registers this decoder does not model.
+///
+/// A bare `reg=0x0292` in the log is a dead end: it costs an agent a Mesa
+/// register-database lookup to learn whether the skip matters, and the previous
+/// two investigations of a flat frame each spent that cost from scratch. Naming
+/// the skip turns "unknown context register" into a *named* refusal, so a log
+/// line says whether the ignored write was raster-backend tile plumbing or a
+/// rasterization gate.
+///
+/// Names come from Mesa's `src/amd/registers/gfx103.json` (context register
+/// base mm `0x28000`, so `mm = 0x28000 + offset * 4`), cross-checked against
+/// the AGC Gen5 register-defaults table in `raeen-hle`. This table is
+/// diagnostics only — it never changes what is or is not applied.
+#[must_use]
+pub const fn context_reg_name(reg: u32) -> Option<&'static str> {
+    Some(match reg {
+        0x008f => "CB_SHADER_MASK",
+        0x00b4 => "PA_SC_VPORT_ZMIN_0",
+        0x00b5 => "PA_SC_VPORT_ZMAX_0",
+        0x01b8 => "SPI_BARYC_CNTL",
+        0x01c2 => "SPI_SHADER_IDX_FORMAT",
+        0x01c3 => "SPI_SHADER_POS_FORMAT",
+        0x01c4 => "SPI_SHADER_Z_FORMAT",
+        0x01ff => "GE_MAX_OUTPUT_PER_SUBGROUP",
+        0x0201 => "DB_EQAA",
+        0x0204 => "PA_CL_CLIP_CNTL",
+        0x0207 => "PA_CL_VS_OUT_CNTL",
+        0x0291 => "VGT_GS_ONCHIP_CNTL",
+        0x029b => "VGT_GS_OUT_PRIM_TYPE",
+        0x02ab => "VGT_ESGS_RING_ITEMSIZE",
+        0x02ce => "VGT_GS_MAX_VERT_OUT",
+        0x02d3 => "GE_NGG_SUBGRP_CNTL",
+        0x02d5 => "VGT_SHADER_STAGES_EN",
+        0x02dc => "DB_ALPHA_TO_MASK",
+        0x02df => "PA_SU_POLY_OFFSET_CLAMP",
+        0x02e0 => "PA_SU_POLY_OFFSET_FRONT_SCALE",
+        0x02e1 => "PA_SU_POLY_OFFSET_FRONT_OFFSET",
+        0x02e2 => "PA_SU_POLY_OFFSET_BACK_SCALE",
+        0x02e3 => "PA_SU_POLY_OFFSET_BACK_OFFSET",
+        0x02e4 => "VGT_GS_INSTANCE_CNT",
+        0x02f5 => "PA_SC_CENTROID_PRIORITY_0",
+        0x02f6 => "PA_SC_CENTROID_PRIORITY_1",
+        0x02f8 => "PA_SC_AA_CONFIG",
+        0x02fe..=0x030d => "PA_SC_AA_SAMPLE_LOCS_PIXEL_*",
+        0x030e => "PA_SC_AA_MASK_X0Y0_X1Y0",
+        0x030f => "PA_SC_AA_MASK_X0Y1_X1Y1",
+        0x0310 => "PA_SC_SHADER_CONTROL",
+        _ => return None,
+    })
+}
+
+/// Human-readable names for the user-config registers this decoder skips.
+///
+/// Same rationale and same source as [`context_reg_name`]; the user-config
+/// register base is mm `0x30000`.
+#[must_use]
+pub const fn user_config_reg_name(reg: u32) -> Option<&'static str> {
+    Some(match reg {
+        0x024a => "GE_INDX_OFFSET",
+        0x025b => "GE_CNTL",
+        0x0262 => "GE_USER_VGPR_EN",
+        _ => return None,
+    })
+}
+
+/// `PA_SC_MODE_CNTL_0` field layout, per Mesa's `gfx103.json` register database
+/// (`PA_SC_MODE_CNTL_0` at mm `0x28a48`, i.e. context offset 0x0292).
+///
+/// Only the three bits Kyty models in [`crate::hw_regs::ScanModeControl`] are
+/// named here. The rest of the register — SEND_UNLIT_STILES_TO_PKR (3),
+/// ALTERNATE_RBS_PER_TILE (5), COARSE_TILE_STARTS_ON_EVEN_RB (6) — selects
+/// raster-backend tile distribution on real hardware and has no Vulkan
+/// analogue, so it is deliberately not decoded rather than guessed at.
+pub mod pa_sc_mode_cntl_0 {
+    field!(MSAA_ENABLE, 0, 0x1);
+    field!(VPORT_SCISSOR_ENABLE, 1, 0x1);
+    field!(LINE_STIPPLE_ENABLE, 2, 0x1);
 }
 
 /// Read a `(shift, mask)` field pair out of a register value.
