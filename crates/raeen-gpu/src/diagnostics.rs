@@ -15,6 +15,7 @@ pub(crate) struct GpuEnv {
     pub dump_gpu_resources: Option<String>,
     pub follow_ib_chains: bool,
     pub force_clear: bool,
+    pub init_undefined_sampled_target: bool,
     pub no_cull: bool,
     pub no_defer: bool,
     pub no_defer_compute: bool,
@@ -57,6 +58,12 @@ impl GpuEnv {
             // `kyty_graphics::run::ChainCensus`.
             follow_ib_chains: on("RAEEN_FOLLOW_IB_CHAINS"),
             force_clear: on("RAEEN_FORCE_CLEAR"),
+            // SharpEmu PR #689 initializes a colour image that is sampled
+            // before any upload or render-target write instead of binding it
+            // in VK_IMAGE_LAYOUT_UNDEFINED. Keep this graphics-policy change
+            // opt-in until ASTRO.BOT, Minecraft, and an unrelated title pass
+            // the retail A/B gate.
+            init_undefined_sampled_target: on("RAEEN_INIT_UNDEFINED_SAMPLED_TARGET"),
             no_cull: on("RAEEN_NO_CULL"),
             no_defer: on("RAEEN_NO_DEFER"),
             no_defer_compute: on("RAEEN_NO_DEFER_COMPUTE"),

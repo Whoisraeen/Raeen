@@ -219,8 +219,8 @@ fn dw(buffer: &[u32], index: u32, pc: u32) -> Result<u32, ShaderParseError> {
 
 /// Kyty: ShaderParse.cpp `operand_parse` (L32) — the canonical operand-code
 /// map: 0-103 SGPR, 106/107 VCC_LO/HI, 124 M0, 125 NULL, 126/127 EXEC_LO/HI,
-/// 128-208 inline ints, 240-247 inline floats, 252 EXECZ, 255 literal (in
-/// next dword), >=256 VGPR. Unknown codes return an error (Kyty EXITs).
+/// 128-208 inline ints, 240-248 inline floats, 252 EXECZ, 253 SCC, 255 literal
+/// (in next dword), >=256 VGPR. Unknown codes return an error (Kyty EXITs).
 pub fn operand_parse(code: u32) -> Result<ShaderOperand, ShaderParseError> {
     let mut ret = ShaderOperand {
         size: 1,
@@ -270,6 +270,11 @@ pub fn operand_parse(code: u32) -> Result<ShaderOperand, ShaderParseError> {
             126 => ret.type_ = O::ExecLo,
             127 => ret.type_ = O::ExecHi,
             252 => ret.type_ = O::ExecZ,
+            // AMD GCN3/RDNA source-operand table: 253 reads the scalar
+            // condition-code bit as a zero-extended 32-bit value. SharpEmu's
+            // Gen5 decoder uses the same mapping. Measured: four ASTRO.BOT
+            // compute shaders were rejected solely on this operand code.
+            253 => ret.type_ = O::Scc,
             255 => {
                 ret.type_ = O::LiteralConstant;
                 ret.size = 0;
@@ -5295,6 +5300,7 @@ mod tests {
         assert_eq!(operand_parse(126).unwrap().type_, O::ExecLo);
         assert_eq!(operand_parse(127).unwrap().type_, O::ExecHi);
         assert_eq!(operand_parse(252).unwrap().type_, O::ExecZ);
+        assert_eq!(operand_parse(253).unwrap().type_, O::Scc);
         assert_eq!(operand_parse(106).unwrap().size, 1);
     }
 

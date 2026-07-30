@@ -2289,6 +2289,66 @@ struct ImageTransition {
     dst_stage: vk::PipelineStageFlags,
 }
 
+/// Recording plan for a persistent colour target that a graphics shader
+/// samples. A previously written target needs one visibility/layout barrier.
+/// An undefined target has no contents to preserve, so SharpEmu PR #689's
+/// portable rule is to define it as transparent black before shader access.
+struct SampledTargetPreparation {
+    to_transfer: Option<ImageTransition>,
+    to_shader_read: ImageTransition,
+    clear_black: bool,
+}
+
+fn sampled_target_preparation(layout: TargetLayout) -> SampledTargetPreparation {
+    let shader_stages =
+        vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER;
+    match layout {
+        TargetLayout::Undefined => SampledTargetPreparation {
+            to_transfer: Some(ImageTransition {
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                src_access: vk::AccessFlags::empty(),
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            }),
+            to_shader_read: ImageTransition {
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::SHADER_READ,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: shader_stages,
+            },
+            clear_black: true,
+        },
+        TargetLayout::TransferSrc => SampledTargetPreparation {
+            to_transfer: None,
+            to_shader_read: ImageTransition {
+                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_READ,
+                dst_access: vk::AccessFlags::SHADER_READ,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: shader_stages,
+            },
+            clear_black: false,
+        },
+        TargetLayout::ColorAttachment => SampledTargetPreparation {
+            to_transfer: None,
+            to_shader_read: ImageTransition {
+                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access: vk::AccessFlags::SHADER_READ,
+                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage: shader_stages,
+            },
+            clear_black: false,
+        },
+    }
+}
+
 fn colour_target_attachment_transition(layout: TargetLayout) -> ImageTransition {
     match layout {
         TargetLayout::Undefined => ImageTransition {
@@ -4586,37 +4646,60 @@ impl<'a> Resources<'a> {
         // after rendering (below) to keep the invariant. The layout
         // transition itself publishes the prior draw's attachment writes
         // (already made available by that draw's tail barrier).
-        for &(_, image, layout) in &self.sampled_targets {
-            let (old_layout, src_access, src_stage) = match layout {
-                TargetLayout::TransferSrc => (
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ,
-                    vk::PipelineStageFlags::TRANSFER,
-                ),
-                TargetLayout::ColorAttachment => (
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                ),
-                TargetLayout::Undefined => {
-                    return Err(GpuError::PipelineCreationFailed(
-                        "sampled persistent target has an undefined layout".to_owned(),
-                    ));
+        for &(key, image, layout) in &self.sampled_targets {
+            if layout == TargetLayout::Undefined
+                && !crate::diagnostics::gpu_env().init_undefined_sampled_target
+            {
+                return Err(GpuError::PipelineCreationFailed(
+                    "sampled persistent target has an undefined layout; \
+                     set RAEEN_INIT_UNDEFINED_SAMPLED_TARGET=1 to initialize it \
+                     to transparent black"
+                        .to_owned(),
+                ));
+            }
+            let preparation = sampled_target_preparation(layout);
+            if let Some(to_transfer) = preparation.to_transfer {
+                self.image_barrier_layers(vk::ImageAspectFlags::COLOR, image, 1, to_transfer);
+            }
+            if preparation.clear_black {
+                let clear = vk::ClearColorValue { float32: [0.0; 4] };
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                // SAFETY: the image is live, was created with TRANSFER_DST
+                // usage, and the immediately preceding barrier moved its only
+                // subresource into TRANSFER_DST_OPTIMAL.
+                unsafe {
+                    self.device().cmd_clear_color_image(
+                        self.command_buffer,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &clear,
+                        &[range],
+                    );
                 }
-            };
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
+                let occurrence = INITIALIZATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                if occurrence == 1 || occurrence.is_power_of_two() {
+                    tracing::warn!(
+                        occurrence,
+                        base = format_args!("{:#x}", key.base),
+                        width = key.width,
+                        height = key.height,
+                        "initialized undefined sampled render target to transparent black"
+                    );
+                }
+            }
             self.image_barrier_layers(
                 vk::ImageAspectFlags::COLOR,
                 image,
                 1,
-                ImageTransition {
-                    old_layout,
-                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    src_access,
-                    dst_access: vk::AccessFlags::SHADER_READ,
-                    src_stage,
-                    dst_stage: vk::PipelineStageFlags::VERTEX_SHADER
-                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                },
+                preparation.to_shader_read,
             );
         }
 
@@ -6109,6 +6192,65 @@ mod tests {
             transition
                 .dst_access
                 .contains(vk::AccessFlags::COLOR_ATTACHMENT_READ)
+        );
+    }
+
+    #[test]
+    fn undefined_sampled_target_initializes_black_before_shader_read() {
+        let preparation = sampled_target_preparation(TargetLayout::Undefined);
+        let to_transfer = preparation
+            .to_transfer
+            .expect("undefined sampled target needs an initialization transition");
+        assert!(preparation.clear_black);
+        assert_eq!(to_transfer.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(
+            to_transfer.new_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        );
+        assert_eq!(to_transfer.src_stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+        assert_eq!(to_transfer.dst_access, vk::AccessFlags::TRANSFER_WRITE);
+        assert_eq!(
+            preparation.to_shader_read.old_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        );
+        assert_eq!(
+            preparation.to_shader_read.new_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+        assert_eq!(
+            preparation.to_shader_read.src_access,
+            vk::AccessFlags::TRANSFER_WRITE
+        );
+        assert_eq!(
+            preparation.to_shader_read.dst_access,
+            vk::AccessFlags::SHADER_READ
+        );
+    }
+
+    #[test]
+    fn initialized_sampled_targets_preserve_contents_without_a_clear() {
+        let transfer = sampled_target_preparation(TargetLayout::TransferSrc);
+        assert!(transfer.to_transfer.is_none());
+        assert!(!transfer.clear_black);
+        assert_eq!(
+            transfer.to_shader_read.old_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        );
+        assert_eq!(
+            transfer.to_shader_read.src_access,
+            vk::AccessFlags::TRANSFER_READ
+        );
+
+        let attachment = sampled_target_preparation(TargetLayout::ColorAttachment);
+        assert!(attachment.to_transfer.is_none());
+        assert!(!attachment.clear_black);
+        assert_eq!(
+            attachment.to_shader_read.old_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(
+            attachment.to_shader_read.src_access,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
         );
     }
 
