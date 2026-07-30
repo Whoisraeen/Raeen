@@ -181,6 +181,8 @@ pub enum ShaderInstructionType {
     SAddcU32,
     SAddI32,
     SAddU32,
+    /// RDNA2 SOP2 0x2c: absolute signed difference; SCC iff nonzero.
+    SAbsDiffI32,
     SAndB32,
     SAndB64,
     /// RDNA2 (`next_gen`) SOP1 0x37: `sdst = exec; exec = ~ssrc0 & exec`
@@ -189,16 +191,36 @@ pub enum ShaderInstructionType {
     /// (0x27) negates the second operand instead. Measured in ASTRO.BOT's
     /// scene-composite compute shader (0x555f4f500, divergent-flow prologue).
     SAndn1SaveexecB64,
+    /// RDNA2 SOP2 0x14: `sdst = ssrc0 & ~ssrc1`; SCC is set iff nonzero.
+    SAndn2B32,
     SAndn2B64,
     SAndSaveexecB64,
+    /// RDNA2 SOP2 0x22: signed arithmetic right shift; SCC iff nonzero.
+    SAshrI32,
     /// SOPP 0x0a: workgroup execution + LDS memory barrier. Kyty leaves it
     /// `KYTY_NI`; required by the `ds_write_b32`/`ds_read_b32` LDS pairs.
     SBarrier,
+    /// RDNA2 SOPC 0x0c: SCC is set iff the indexed 32-bit source bit is zero.
+    SBitcmp0B32,
+    /// RDNA2 SOPC 0x0d: SCC is set iff the indexed 32-bit source bit is one.
+    SBitcmp1B32,
     SBfeU32,
     SBfeU64,
+    /// RDNA2 SOP2 0x28: signed 32-bit bitfield extract; SCC iff nonzero.
+    SBfeI32,
     SBfmB32,
     SBranch,
+    /// RDNA2 SOP1 0x0d: count zero bits in a 32-bit scalar; SCC iff nonzero.
+    SBcnt0I32B32,
+    /// RDNA2 SOP1 0x0f: count one bits in a 32-bit scalar; SCC iff nonzero.
+    SBcnt1I32B32,
     SBrevB32,
+    /// RDNA2 SOP1 0x0c: reverse all 64 source bits into the destination pair.
+    SBrevB64,
+    /// RDNA2 SOP1 0x11: least-significant zero-bit index, or -1 when none.
+    SFF0I32B32,
+    /// RDNA2 SOP1 0x13: least-significant one-bit index, or -1 when none.
+    SFF1I32B32,
     SBufferLoadDword,
     SBufferLoadDwordx16,
     SBufferLoadDwordx2,
@@ -209,6 +231,10 @@ pub enum ShaderInstructionType {
     SCbranchScc1,
     SCbranchVccz,
     SCbranchVccnz,
+    /// RDNA2 SOP1 0x05: write the 32-bit source only when SCC is set.
+    SCmovB32,
+    /// RDNA2 SOP1 0x06: write the 64-bit source pair only when SCC is set.
+    SCmovB64,
     SCmpEqI32,
     SCmpEqU32,
     SCmpGeI32,
@@ -232,6 +258,14 @@ pub enum ShaderInstructionType {
     SLoadDwordx4,
     SLoadDwordx8,
     SLoadDwordx16,
+    /// RDNA2 SOP2 0x08: signed scalar max; SCC is set iff source zero wins.
+    SMaxI32,
+    /// RDNA2 SOP2 0x09: unsigned scalar max; SCC is set iff source zero wins.
+    SMaxU32,
+    /// RDNA2 SOP2 0x06: signed scalar min; SCC is set iff source zero wins.
+    SMinI32,
+    /// RDNA2 SOP2 0x07: unsigned scalar min; SCC is set iff source zero wins.
+    SMinU32,
     /// SOP2 0x2e: `sdst = (ssrc0 << 1) + ssrc1; scc = 33-bit carry-out`.
     SLshl1AddU32,
     /// SOP2 0x2f: `sdst = (ssrc0 << 2) + ssrc1; scc = 33-bit carry-out`.
@@ -249,30 +283,56 @@ pub enum ShaderInstructionType {
     SMovB64,
     SMovkI32,
     SMulHiU32,
+    /// RDNA2 SOP2 0x36: high 32 bits of a signed 32x32-bit scalar product.
+    SMulHiI32,
     SMulI32,
     SMulkI32,
+    /// RDNA2 SOP2 0x18: `sdst = ~(ssrc0 & ssrc1)`; SCC is set iff nonzero.
+    SNandB32,
     SNandB64,
     SNop,
+    /// RDNA2 SOP2 0x1a: `sdst = ~(ssrc0 | ssrc1)`; SCC is set iff nonzero.
+    SNorB32,
     SNorB64,
+    /// RDNA2 SOP1 0x07: 32-bit bitwise negation; SCC is set iff nonzero.
+    SNotB32,
     SNotB64,
     SOrB32,
     SOrB64,
+    /// RDNA2 SOP2 0x16: `sdst = ssrc0 | ~ssrc1`; SCC is set iff nonzero.
+    SOrn2B32,
     SOrn2B64,
     /// SOP1 0x28: `sdst = exec; exec = ssrc0 | ~exec; scc = (exec != 0)`. The
     /// ORN2 sibling of `SAndSaveexecB64`; measured in ASTRO.BOT scene compute.
     SOrn2SaveexecB64,
     /// SOP2 0x32: pack the low 16 bits of each source into one dword.
     SPackLlB32B16,
+    /// SOP2 0x33: pack source zero's low half and source one's high half.
+    SPackLhB32B16,
+    /// SOP2 0x34: pack the high 16 bits of both sources.
+    SPackHhB32B16,
     SSendmsg,
+    /// RDNA2 SOP1 0x1a: sign-extend the low signed 16-bit source field.
+    SSextI32I16,
+    /// RDNA2 SOP1 0x19: sign-extend the low signed 8-bit source field.
+    SSextI32I8,
     /// RDNA2 SOPK opcode 1: code-object version marker; no execution effect.
     SVersion,
     SSetpcB64,
     SSwappcB64,
     SSubI32,
+    /// RDNA2 SOP2 0x05: subtract with SCC borrow-in and borrow-out.
+    SSubbU32,
     SSubU32,
     SWaitcnt,
+    /// RDNA2 SOP1 0x09: expand every active bit to its complete four-bit quad.
+    SWqmB32,
     SWqmB64,
+    /// RDNA2 SOP2 0x1c: `sdst = ~(ssrc0 ^ ssrc1)`; SCC is set iff nonzero.
+    SXnorB32,
     SXnorB64,
+    /// RDNA2 SOP2 0x12: scalar 32-bit XOR; SCC is set iff nonzero.
+    SXorB32,
     SXorB64,
     TBufferLoadFormatX,
     /// Beyond Kyty (`KYTY_NI` upstream): MTBUF opcode 1, the two-channel typed
@@ -300,6 +360,8 @@ pub enum ShaderInstructionType {
     /// RDNA2 (`next_gen`) VOP2 0x25: carry-less `vdst = vsrc0 + vsrc1`
     /// (replaces GCN's carry-writing v_add_i32 in the same encoding slot).
     VAddNcU32,
+    VAlignbitB32,
+    VAlignbyteB32,
     VAndB32,
     VAshrI32,
     VAshrrevI32,
@@ -450,9 +512,12 @@ pub enum ShaderInstructionType {
     VLshlrevB32,
     VLshrB32,
     VLshrrevB32,
+    VLerpU8,
     VMacF32,
     VMadakF32,
     VMadF32,
+    /// RDNA2 VOP3A 0x142: signed 24-bit multiply plus signed 32-bit add.
+    VMadI32I24,
     VMadmkF32,
     VMadU32U24,
     /// RDNA2 (`next_gen`) VOP3B 0x176 `v_mad_u64_u32`: widening
@@ -465,6 +530,8 @@ pub enum ShaderInstructionType {
     /// remaining parse wall on that shader after the op_sel gate landed.
     VMadU64U32,
     VMax3F32,
+    VMax3I32,
+    VMax3U32,
     VMaxF32,
     /// RDNA2 VOP2 0x12 `v_max_i32` — signed integer max (`GLSL SMax`).
     VMaxI32,
@@ -473,7 +540,11 @@ pub enum ShaderInstructionType {
     VMbcntHiU32B32,
     VMbcntLoU32B32,
     VMed3F32,
+    VMed3I32,
+    VMed3U32,
     VMin3F32,
+    VMin3I32,
+    VMin3U32,
     VMinF32,
     /// RDNA2 VOP2 0x11 `v_min_i32` — signed integer min (`GLSL SMin`).
     VMinI32,
@@ -486,6 +557,13 @@ pub enum ShaderInstructionType {
     /// first reaches it in compute shader 0x148d47200.
     VReadfirstlaneB32,
     VMulF32,
+    VMulHiI32,
+    /// RDNA2 VOP2 9: low 32 bits of a signed 24x24-bit product.
+    VMulI32I24,
+    /// RDNA2 VOP2 10: high 32 bits of a signed 24x24-bit product.
+    VMulHiI32I24,
+    /// RDNA2 VOP2 12: high 32 bits of an unsigned 24x24-bit product.
+    VMulHiU32U24,
     VMulHiU32,
     VMulLoI32,
     VMulLoU32,
@@ -513,6 +591,9 @@ pub enum ShaderInstructionType {
     VRcpIflagF32,
     VRndneF32,
     VRsqF32,
+    VSadHiU8,
+    VSadU8,
+    VSadU16,
     VSadU32,
     VSinF32,
     VSqrtF32,

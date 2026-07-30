@@ -11,11 +11,10 @@
 //!   `ShaderRecompileVS` L2361, `ShaderRecompilePS` L2461,
 //!   `ShaderRecompileCS` L2545.
 //!
-//! C1 scope: the dispatch table is complete (every Kyty row is present as
-//! data), but only the minimal VS/PS subset of `Recompile_*` functions is
-//! ported; the rest are [`RecompileFn::NotImplemented`] markers carrying the
-//! Kyty function name + line anchor so C2 can fill them in mechanically and
-//! coverage stays measurable (see `dispatch_table_counts` test).
+//! The dispatch table is complete and every current row is wired.
+//! [`RecompileFn::NotImplemented`] remains a diagnostic type for future table
+//! growth so a newly decoded instruction can fail by name until its lowering
+//! is added.
 //!
 //! Deviations:
 //! - Kyty `EXIT`/`EXIT_NOT_IMPLEMENTED` aborts become
@@ -595,6 +594,35 @@ fn recompile_buffer_store_dwordx2(
     )
 }
 
+/// RDNA2 `buffer_store_format_xyz`: three consecutive 32-bit channels with
+/// descriptor-driven format conversion.
+///
+/// The only layouts this body accepts are `32_32_32_UINT` and
+/// `32_32_32_FLOAT`. Each component already occupies one complete dword, so the
+/// numeric class changes interpretation but not the bits written. Packed or
+/// normalized formats remain a named refusal instead of being approximated.
+fn recompile_buffer_store_format_xyz(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferStoreFormatXyz_Vdata3VaddrSvSoffsIdxen";
+    let inst = inst_at(code, index, FUNC)?;
+    let Some(bind_info) = spirv.get_bind_info() else {
+        return Ok(false);
+    };
+    if bind_info.storage_buffers.buffers_num == 0 {
+        // A null V# has NUM_RECORDS=0; RDNA drops stores through it.
+        return Ok(true);
+    }
+    let _ =
+        mubuf_descriptor_packed_format(&inst, bind_info, spirv, FUNC, &[&TBUF_STORE_FORMAT_XYZ])?;
+    buffer_store_dwordxn(index, code, dst_source, spirv, 3, FUNC)
+}
+
 fn buffer_store_dwordxn(
     index: u32,
     code: &ShaderCode,
@@ -623,14 +651,15 @@ fn buffer_store_dwordxn(
         return Err(not_supported(func, "unexpected operand types"));
     }
 
-    // The helper is width-agnostic (`n` dwords), so it accepts the Vdata2 and
-    // Vdata4 addressing-quartet formats alike.
+    // The helper is width-agnostic (`n` dwords), so it accepts the Vdata2,
+    // Vdata3, and Vdata4 addressing formats alike.
     let idxen = matches!(
         inst.format,
         Format::Vdata4VaddrSvSoffsIdxen
             | Format::Vdata4Vaddr2SvSoffsOffenIdxen
             | Format::Vdata2VaddrSvSoffsIdxen
             | Format::Vdata2Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata3VaddrSvSoffsIdxen
     );
     let offen = matches!(
         inst.format,
@@ -787,6 +816,16 @@ const TBUF_STORE_FORMAT_XY: TypedBufferHelper = TypedBufferHelper {
     channels: 2,
     is_store: true,
     takes_format_arg: true,
+};
+
+/// `buffer_store_format_xyz`: 32-bit three-channel UINT/FLOAT layouts. The
+/// recompiler emits three raw dword stores after this translate-time guard.
+const TBUF_STORE_FORMAT_XYZ: TypedBufferHelper = TypedBufferHelper {
+    name: "buffer_store_format_xyz",
+    accepted: &[(108, "32_32_32_UINT"), (111, "32_32_32_FLOAT")],
+    channels: 3,
+    is_store: true,
+    takes_format_arg: false,
 };
 
 /// `%tbuffer_load_format_xyzw`: "dfmt = 14, nfmt = 4 or 7"
@@ -2617,6 +2656,174 @@ fn recompile_smov_b32(
     Ok(true)
 }
 
+/// Shared scalar-unary 32-bit lowering. Unlike the vector unary helper this
+/// writes unconditionally and has no EXEC lane selection.
+fn recompile_s_xxx_b32_svdst_svsrc0(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_S_XXX_B32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "32-bit exec destination"));
+    }
+
+    let mut load0 = String::new();
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <param0>
+        <param1>
+        <param2>
+               OpStore %<dst> %t_<index>
+        <scc>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<param0>", param[0].unwrap_or(""))
+        .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<param2>", param[2].unwrap_or(""))
+        .replace("<scc>", get_scc_check(scc_check, 1))
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// RDNA2 `s_ff0_i32_b32` / `s_ff1_i32_b32`. For a search word `x`,
+/// `bit_count((x - 1) & ~x)` is its trailing-zero count. The only out-of-range
+/// result is 32 for `x == 0`; spreading bit 5 into an all-ones mask maps that
+/// case to AMD's documented `-1` sentinel without control flow.
+fn recompile_s_ff_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SFF_I32_B32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "32-bit exec destination"));
+    }
+
+    let mut load0 = String::new();
+    if !operand_load_uint(spirv, inst.src[0], "t0_<index>", &index_str, &mut load0, -1)? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <search>
+        %tm1_<index> = OpISub %uint %tsearch_<index> %uint_1
+        %tn_<index> = OpNot %uint %tsearch_<index>
+        %tbelow_<index> = OpBitwiseAnd %uint %tm1_<index> %tn_<index>
+        %tcount_<index> = OpBitCount %uint %tbelow_<index>
+        %tsentinel_<index> = OpShiftRightLogical %uint %tcount_<index> %uint_5
+        %tmask_<index> = OpISub %uint %uint_0 %tsentinel_<index>
+        %t_<index> = OpBitwiseOr %uint %tcount_<index> %tmask_<index>
+               OpStore %<dst> %t_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<search>", param[0].unwrap_or(""))
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// RDNA2 `s_cmov_b32`: conditionally replace the destination when SCC is
+/// nonzero; the false arm must preserve the old destination value.
+fn recompile_s_cmov_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SCmovB32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+    if operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "32-bit exec destination"));
+    }
+
+    let mut load_src = String::new();
+    let mut load_dst = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "scmov_src_<index>",
+        &index_str,
+        &mut load_src,
+        -1,
+    )? {
+        return Ok(false);
+    }
+    if !operand_load_uint(
+        spirv,
+        inst.dst,
+        "scmov_old_<index>",
+        &index_str,
+        &mut load_dst,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load_src>
+        <load_dst>
+        %scmov_scc_<index> = OpLoad %uint %scc
+        %scmov_pred_<index> = OpINotEqual %bool %scmov_scc_<index> %uint_0
+        %scmov_value_<index> = OpSelect %uint %scmov_pred_<index> %scmov_src_<index> %scmov_old_<index>
+               OpStore %<dst> %scmov_value_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load_src>", &load_src)
+        .replace("<load_dst>", &load_dst)
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
 /// Kyty: `Recompile_SMovB64_Sdst2Ssrc02` (ShaderSpirv.cpp L4509).
 fn recompile_smov_b64(
     index: u32,
@@ -2668,6 +2875,93 @@ fn recompile_smov_b64(
             "<execz>",
             if operand_is_exec(inst.dst) { EXECZ } else { "" },
         )
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// RDNA2 `s_cmov_b64`: the paired form of [`recompile_s_cmov_b32`].
+fn recompile_s_cmov_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SCmovB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst1 = operand_variable_to_str_shift(inst.dst, 1);
+    if dst0.type_ != SpirvType::Uint || dst1.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst pair is not uint"));
+    }
+
+    let mut load_src0 = String::new();
+    let mut load_src1 = String::new();
+    let mut load_dst0 = String::new();
+    let mut load_dst1 = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "scmov_src0_<index>",
+        &index_str,
+        &mut load_src0,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "scmov_src1_<index>",
+        &index_str,
+        &mut load_src1,
+        1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.dst,
+        "scmov_old0_<index>",
+        &index_str,
+        &mut load_dst0,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.dst,
+        "scmov_old1_<index>",
+        &index_str,
+        &mut load_dst1,
+        1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load_src0>
+        <load_src1>
+        <load_dst0>
+        <load_dst1>
+        %scmov_scc_<index> = OpLoad %uint %scc
+        %scmov_pred_<index> = OpINotEqual %bool %scmov_scc_<index> %uint_0
+        %scmov_value0_<index> = OpSelect %uint %scmov_pred_<index> %scmov_src0_<index> %scmov_old0_<index>
+        %scmov_value1_<index> = OpSelect %uint %scmov_pred_<index> %scmov_src1_<index> %scmov_old1_<index>
+               OpStore %<dst0> %scmov_value0_<index>
+               OpStore %<dst1> %scmov_value1_<index>
+        <execz>
+"#;
+    *dst_source += &TEXT
+        .replace("<load_src0>", &load_src0)
+        .replace("<load_src1>", &load_src1)
+        .replace("<load_dst0>", &load_dst0)
+        .replace("<load_dst1>", &load_dst1)
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<dst0>", &dst0.value)
+        .replace("<dst1>", &dst1.value)
         .replace("<index>", &index_str);
 
     Ok(true)
@@ -2892,7 +3186,9 @@ fn recompile_tbuffer_load_format_x_float1(
 }
 
 /// Beyond Kyty (`tbuffer_load_format_xy` is `KYTY_NI` upstream): the
-/// two-channel typed fetch, structured exactly like the x1 and xyzw rows.
+/// two-channel typed fetch, structured exactly like the x1 and xyzw rows. Both
+/// idxen-only and idxen+offen forms land here; the latter adds its per-lane
+/// byte offset to the immediate/SOFFSET term.
 ///
 /// `%temp_int_2` is the byte offset (SOFFSET plus the folded 12-bit immediate —
 /// see `shader_parse_mtbuf`), `%temp_int_3` the V#'s stride, `%temp_int_4` the
@@ -2920,6 +3216,8 @@ fn recompile_tbuffer_load_format_xy_float2(
             let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
             let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
             let src0_value = operand_variable_to_str(inst.src[0]);
+            let offen = inst.format == Format::Vdata2Vaddr2SvSoffsOffenIdxenFloat2;
+            let src0_offset = offen.then(|| operand_variable_to_str_shift(inst.src[0], 1));
             let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
             let src1_value1 = operand_variable_to_str_shift(inst.src[1], 1);
             let offset = spirv.get_constant(inst.src[2]);
@@ -2927,6 +3225,9 @@ fn recompile_tbuffer_load_format_xy_float2(
             if dst_value0.type_ != SpirvType::Float
                 || dst_value1.type_ != SpirvType::Float
                 || src0_value.type_ != SpirvType::Float
+                || src0_offset
+                    .as_ref()
+                    .is_some_and(|value| value.type_ != SpirvType::Float)
                 || src1_value0.type_ != SpirvType::Uint
                 || src1_value1.type_ != SpirvType::Uint
             {
@@ -2945,18 +3246,36 @@ fn recompile_tbuffer_load_format_xy_float2(
         %t155_<index> = OpLoad %uint %<src1_value0>
         %t156_<index> = OpBitcast %int %t155_<index>
                OpStore %temp_int_4 %t156_<index>
-               OpStore %temp_int_2 %<offset>
+        <offset_load>
+               OpStore %temp_int_2 %<effective_offset>
                OpStore %temp_int_5 %int_95
         %t110_<index> = OpFunctionCall %void %tbuffer_load_format_xy %<p0> %<p1> %temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4 %temp_int_5
 "#;
+            let (offset_load, effective_offset) = src0_offset.map_or_else(
+                || (String::new(), offset.clone()),
+                |value| {
+                    (
+                        format!(
+                            "        %tfo0_<index> = OpLoad %float %{}\n\
+                             %tfo1_<index> = OpBitcast %int %tfo0_<index>\n\
+                             %tfo2_<index> = OpIAdd %int %tfo1_<index> %{}\n",
+                            value.value, offset
+                        ),
+                        "tfo2_<index>".to_owned(),
+                    )
+                },
+            );
             *dst_source += &TEXT
-                .replace("<index>", &format!("{index}"))
                 .replace("<src0>", &src0_value.value)
-                .replace("<offset>", &offset)
+                .replace("<offset_load>", &offset_load)
+                .replace("<effective_offset>", &effective_offset)
                 .replace("<src1_value0>", &src1_value0.value)
                 .replace("<src1_value1>", &src1_value1.value)
                 .replace("<p0>", &dst_value0.value)
-                .replace("<p1>", &dst_value1.value);
+                .replace("<p1>", &dst_value1.value)
+                // Replace last: the two injected offset fragments deliberately
+                // carry the same per-instruction placeholder as the template.
+                .replace("<index>", &format!("{index}"));
 
             return Ok(true);
         }
@@ -4596,16 +4915,26 @@ fn recompile_buffer_store_format_x_flexible(
 /// base pair (`src[1]`) to the 32-bit VGPR offset. `src[2]` is the instruction
 /// immediate offset. Loads past the bound length yield 0; stores past it drop
 /// (RDNA out-of-bounds behaviour).
+struct FlatMemSpec {
+    func: &'static str,
+    dwords: i32,
+    is_store: bool,
+    load_ubyte: bool,
+}
+
 fn flat_mem(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
     spirv: &Spirv<'_>,
-    func: &'static str,
-    dwords: i32,
-    is_store: bool,
-    load_ubyte: bool,
+    spec: FlatMemSpec,
 ) -> Result<bool, ShaderRecompileError> {
+    let FlatMemSpec {
+        func,
+        dwords,
+        is_store,
+        load_ubyte,
+    } = spec;
     let inst = inst_at(code, index, func)?;
 
     let Some(bind) = spirv.get_bind_info() else {
@@ -4742,7 +5071,16 @@ macro_rules! flat_mem_recompiler {
             _scc_check: SccCheck,
         ) -> Result<bool, ShaderRecompileError> {
             flat_mem(
-                index, code, dst_source, spirv, $func, $dwords, $is_store, false,
+                index,
+                code,
+                dst_source,
+                spirv,
+                FlatMemSpec {
+                    func: $func,
+                    dwords: $dwords,
+                    is_store: $is_store,
+                    load_ubyte: false,
+                },
             )
         }
     };
@@ -4761,10 +5099,12 @@ fn recompile_flat_load_ubyte(
         code,
         dst_source,
         spirv,
-        "Recompile_FlatLoadUbyte",
-        1,
-        false,
-        true,
+        FlatMemSpec {
+            func: "Recompile_FlatLoadUbyte",
+            dwords: 1,
+            is_store: false,
+            load_ubyte: true,
+        },
     )
 }
 
@@ -8109,7 +8449,6 @@ fn recompile_image_store_dmask_f(
 
 /// Kyty: `Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF` (ShaderSpirv.cpp
 /// L3173).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_image_store_mip_dmask_f(
     index: u32,
     code: &ShaderCode,
@@ -9313,6 +9652,59 @@ fn recompile_scmp_xxx_u32(
     Ok(true)
 }
 
+/// RDNA2 `s_bitcmp{0,1}_b32`: select one source bit with a masked five-bit
+/// index and write only the scalar condition code.
+fn recompile_s_bitcmp_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SBitcmpB32_Ssrc0Ssrc1";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "bitcmp_data_<index>",
+        &index_str,
+        &mut load0,
+        -1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "bitcmp_index_raw_<index>",
+        &index_str,
+        &mut load1,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %bitcmp_index_<index> = OpBitwiseAnd %uint %bitcmp_index_raw_<index> %uint_31
+        %bitcmp_shifted_<index> = OpShiftRightLogical %uint %bitcmp_data_<index> %bitcmp_index_<index>
+        %bitcmp_bit_<index> = OpBitwiseAnd %uint %bitcmp_shifted_<index> %uint_1
+        %bitcmp_test_<index> = <predicate> %bool %bitcmp_bit_<index> %uint_0
+        %bitcmp_scc_<index> = OpSelect %uint %bitcmp_test_<index> %uint_1 %uint_0
+               OpStore %scc %bitcmp_scc_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<predicate>", param[0].unwrap_or("OpINotEqual"))
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
 /// Kyty: `Recompile_SMulkI32_SVdstSVsrc0` (ShaderSpirv.cpp L4437).
 fn recompile_smulk_i32(
     index: u32,
@@ -9470,6 +9862,140 @@ fn recompile_sbrev_b32(
     *dst_source += &TEXT
         .replace("<load0>", &load0)
         .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// RDNA2 `s_brev_b64`: reverse the complete 64-bit scalar value. Reversing
+/// the whole pair swaps the dword order as well as reversing each dword.
+fn recompile_sbrev_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SBrevB64_Sdst2Ssrc02";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst0 = operand_variable_to_str_shift(inst.dst, 0);
+    let dst1 = operand_variable_to_str_shift(inst.dst, 1);
+    if dst0.type_ != SpirvType::Uint || dst1.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst pair is not uint"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "brev_src0_<index>",
+        &index_str,
+        &mut load0,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "brev_src1_<index>",
+        &index_str,
+        &mut load1,
+        1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        %brev_lo_<index> = OpBitReverse %uint %brev_src1_<index>
+        %brev_hi_<index> = OpBitReverse %uint %brev_src0_<index>
+               OpStore %<dst0> %brev_lo_<index>
+               OpStore %<dst1> %brev_hi_<index>
+        <execz>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<dst0>", &dst0.value)
+        .replace("<dst1>", &dst1.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
+/// RDNA2 `s_wqm_b32`: each four-bit quad becomes all ones when any source bit
+/// in that quad is set. The helper emits one masked quad at a time.
+fn recompile_swqm_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SWqmB32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load0 = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "wqm_src_<index>",
+        &index_str,
+        &mut load0,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        %wqm0_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_0 %uint_15
+        %wqm1_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_4 %uint_240
+        %wqm01_<index> = OpBitwiseOr %uint %wqm0_<index> %wqm1_<index>
+        %wqm2_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_8 %uint_0x00000f00
+        %wqm012_<index> = OpBitwiseOr %uint %wqm01_<index> %wqm2_<index>
+        %wqm3_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_12 %uint_0x0000f000
+        %wqm0123_<index> = OpBitwiseOr %uint %wqm012_<index> %wqm3_<index>
+        %wqm4_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_16 %uint_0x000f0000
+        %wqm01234_<index> = OpBitwiseOr %uint %wqm0123_<index> %wqm4_<index>
+        %wqm5_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_20 %uint_0x00f00000
+        %wqm012345_<index> = OpBitwiseOr %uint %wqm01234_<index> %wqm5_<index>
+        %wqm6_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_24 %uint_0x0f000000
+        %wqm0123456_<index> = OpBitwiseOr %uint %wqm012345_<index> %wqm6_<index>
+        %wqm7_<index> = OpFunctionCall %uint %wqm %wqm_src_<index> %uint_28 %uint_0xf0000000
+        %t_<index> = OpBitwiseOr %uint %wqm0123456_<index> %wqm7_<index>
+               OpStore %<dst> %t_<index>
+        <execz>
+        <scc>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<scc>", get_scc_check(scc_check, 1))
+        .replace("<dst>", &dst.value)
         .replace("<index>", &index_str);
 
     Ok(true)
@@ -9636,7 +10162,6 @@ fn recompile_sbuffer_load_dwordx16(
 
 /// Kyty: `Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4`
 /// (ShaderSpirv.cpp L4824).
-#[allow(dead_code)] // C2: staged recompiler, not yet wired into G_RECOMP_FUNC
 fn recompile_tbuffer_load_format_xyzw_offen_float4(
     index: u32,
     code: &ShaderCode,
@@ -10917,7 +11442,6 @@ fn recompile_v_xxx_i32_svdst_svsrc01(
               <param0>
               <param1>
               %tf_<index> = OpBitcast %float %t_<index>
-              OpStore %<dst> %tf_<index>
         %exec_lo_u_<index> = OpLoad %uint %exec_lo
         %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
         %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
@@ -10933,6 +11457,333 @@ fn recompile_v_xxx_i32_svdst_svsrc01(
         .replace("<param1>", param[1].unwrap_or(""))
         .replace("<index>", &index_str);
 
+    Ok(true)
+}
+
+/// RDNA2 signed/unsigned 24-bit multiply family.
+///
+/// AMD ISA doc 70648 defines signed inputs as sign-extended bits [23:0] and
+/// unsigned inputs as zero-extended bits [23:0]. Keeping that truncation
+/// explicit is essential: using a normal 32-bit multiply silently changes any
+/// shader whose high input byte is nonzero.
+fn recompile_v_i24_math(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VI24Math";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut load0 = String::new();
+    let mut load1 = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "ti24_0_<index>",
+        &index_str,
+        &mut load0,
+        -1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "ti24_1_<index>",
+        &index_str,
+        &mut load1,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    let math = match inst.type_ {
+        ShaderInstructionType::VMulI32I24 => r#"
+        %ti24_0_i_<index> = OpBitcast %int %ti24_0_<index>
+        %ti24_1_i_<index> = OpBitcast %int %ti24_1_<index>
+        %ti24_0_s_<index> = OpBitFieldSExtract %int %ti24_0_i_<index> %int_0 %int_24
+        %ti24_1_s_<index> = OpBitFieldSExtract %int %ti24_1_i_<index> %int_0 %int_24
+        %ti24_result_i_<index> = OpIMul %int %ti24_0_s_<index> %ti24_1_s_<index>
+        %ti24_result_u_<index> = OpBitcast %uint %ti24_result_i_<index>
+"#
+        .to_owned(),
+        ShaderInstructionType::VMulHiI32I24 => r#"
+        %ti24_0_i_<index> = OpBitcast %int %ti24_0_<index>
+        %ti24_1_i_<index> = OpBitcast %int %ti24_1_<index>
+        %ti24_0_s_<index> = OpBitFieldSExtract %int %ti24_0_i_<index> %int_0 %int_24
+        %ti24_1_s_<index> = OpBitFieldSExtract %int %ti24_1_i_<index> %int_0 %int_24
+        %ti24_result_i_<index> = OpFunctionCall %int %mul_hi_int %ti24_0_s_<index> %ti24_1_s_<index>
+        %ti24_result_u_<index> = OpBitcast %uint %ti24_result_i_<index>
+"#
+        .to_owned(),
+        ShaderInstructionType::VMulHiU32U24 => r#"
+        %ti24_0_z_<index> = OpBitwiseAnd %uint %ti24_0_<index> %uint_0x00ffffff
+        %ti24_1_z_<index> = OpBitwiseAnd %uint %ti24_1_<index> %uint_0x00ffffff
+        %ti24_result_u_<index> = OpFunctionCall %uint %mul_hi_uint %ti24_0_z_<index> %ti24_1_z_<index>
+"#
+        .to_owned(),
+        ShaderInstructionType::VMadI32I24 => {
+            let mut load2 = String::new();
+            if !operand_load_uint(
+                spirv,
+                inst.src[2],
+                "ti24_2_<index>",
+                &index_str,
+                &mut load2,
+                -1,
+            )? {
+                return Ok(false);
+            }
+            format!(
+                r#"
+        {load2}
+        %ti24_0_i_<index> = OpBitcast %int %ti24_0_<index>
+        %ti24_1_i_<index> = OpBitcast %int %ti24_1_<index>
+        %ti24_2_i_<index> = OpBitcast %int %ti24_2_<index>
+        %ti24_0_s_<index> = OpBitFieldSExtract %int %ti24_0_i_<index> %int_0 %int_24
+        %ti24_1_s_<index> = OpBitFieldSExtract %int %ti24_1_i_<index> %int_0 %int_24
+        %ti24_product_<index> = OpIMul %int %ti24_0_s_<index> %ti24_1_s_<index>
+        %ti24_result_i_<index> = OpIAdd %int %ti24_product_<index> %ti24_2_i_<index>
+        %ti24_result_u_<index> = OpBitcast %uint %ti24_result_i_<index>
+"#
+            )
+        }
+        other => {
+            return Err(not_supported(
+                FUNC,
+                format!("unexpected instruction {other:?}"),
+            ));
+        }
+    };
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        <math>
+        %ti24_result_f_<index> = OpBitcast %float %ti24_result_u_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %ti24_old_<index> = OpLoad %float %<dst>
+        %ti24_selected_<index> = OpSelect %float %exec_lo_b_<index> %ti24_result_f_<index> %ti24_old_<index>
+               OpStore %<dst> %ti24_selected_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &load0)
+        .replace("<load1>", &load1)
+        .replace("<math>", &math)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
+    Ok(true)
+}
+
+/// AMD packed sum-of-absolute-differences family.
+///
+/// U8 consumes four byte lanes; U16 consumes two halfword lanes. `SAD_HI_U8`
+/// shifts the four-lane difference sum left by 16 before adding the accumulator.
+fn recompile_v_packed_sad(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VPackedSad";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut loads = [String::new(), String::new(), String::new()];
+    for ((src, result), load) in inst
+        .src
+        .iter()
+        .take(3)
+        .copied()
+        .zip(["sad_0_<index>", "sad_1_<index>", "sad_2_<index>"])
+        .zip(loads.iter_mut())
+    {
+        if !operand_load_uint(spirv, src, result, &index_str, load, -1)? {
+            return Ok(false);
+        }
+    }
+
+    let (shifts, mask, high_accumulate): (&[u32], &str, bool) = match inst.type_ {
+        ShaderInstructionType::VSadU8 => (&[0, 8, 16, 24], "uint_255", false),
+        ShaderInstructionType::VSadHiU8 => (&[0, 8, 16, 24], "uint_255", true),
+        ShaderInstructionType::VSadU16 => (&[0, 16], "uint_0x0000ffff", false),
+        other => {
+            return Err(not_supported(
+                FUNC,
+                format!("unexpected instruction {other:?}"),
+            ));
+        }
+    };
+
+    let mut math = String::new();
+    for (lane, shift) in shifts.iter().copied().enumerate() {
+        math += &format!(
+            "        %sad_a_shift_{index}_{lane} = OpShiftRightLogical %uint %sad_0_{index} %uint_{shift}\n\
+             %sad_b_shift_{index}_{lane} = OpShiftRightLogical %uint %sad_1_{index} %uint_{shift}\n\
+             %sad_a_lane_{index}_{lane} = OpBitwiseAnd %uint %sad_a_shift_{index}_{lane} %{mask}\n\
+             %sad_b_lane_{index}_{lane} = OpBitwiseAnd %uint %sad_b_shift_{index}_{lane} %{mask}\n\
+             %sad_diff_{index}_{lane} = OpFunctionCall %uint %abs_diff %sad_a_lane_{index}_{lane} %sad_b_lane_{index}_{lane}\n"
+        );
+        let previous = if lane == 0 {
+            if high_accumulate {
+                "uint_0".to_owned()
+            } else {
+                format!("sad_2_{index}")
+            }
+        } else {
+            format!("sad_acc_{index}_{}", lane - 1)
+        };
+        math += &format!(
+            "        %sad_acc_{index}_{lane} = OpIAdd %uint %{previous} %sad_diff_{index}_{lane}\n"
+        );
+    }
+    let last = shifts.len() - 1;
+    if high_accumulate {
+        math += &format!(
+            "        %sad_hi_{index} = OpShiftLeftLogical %uint %sad_acc_{index}_{last} %uint_16\n\
+             %sad_result_{index} = OpIAdd %uint %sad_hi_{index} %sad_2_{index}\n"
+        );
+    } else {
+        math += &format!(
+            "        %sad_result_{index} = OpBitwiseOr %uint %sad_acc_{index}_{last} %uint_0\n"
+        );
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        <load2>
+        <math>
+        %sad_result_f_<index> = OpBitcast %float %sad_result_<index>
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %sad_old_<index> = OpLoad %float %<dst>
+        %sad_selected_<index> = OpSelect %float %exec_lo_b_<index> %sad_result_f_<index> %sad_old_<index>
+               OpStore %<dst> %sad_selected_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &loads[0])
+        .replace("<load1>", &loads[1])
+        .replace("<load2>", &loads[2])
+        .replace("<math>", &math)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
+    Ok(true)
+}
+
+/// AMD `V_LERP_U8`: average four packed byte pairs, using one corresponding
+/// bit of src2 per lane to choose whether an exact 0.5 rounds up.
+fn recompile_v_lerp_u8(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VLerpU8";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    if inst.dst.clamp || inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "destination modifier"));
+    }
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "dst is not float"));
+    }
+
+    let mut loads = [String::new(), String::new(), String::new()];
+    for ((src, result), load) in inst
+        .src
+        .iter()
+        .take(3)
+        .copied()
+        .zip(["lerp_0_<index>", "lerp_1_<index>", "lerp_2_<index>"])
+        .zip(loads.iter_mut())
+    {
+        if !operand_load_uint(spirv, src, result, &index_str, load, -1)? {
+            return Ok(false);
+        }
+    }
+
+    let mut math = String::new();
+    for (lane, shift) in [0u32, 8, 16, 24].into_iter().enumerate() {
+        math += &format!(
+            "        %lerp_a_shift_{index}_{lane} = OpShiftRightLogical %uint %lerp_0_{index} %uint_{shift}\n\
+             %lerp_b_shift_{index}_{lane} = OpShiftRightLogical %uint %lerp_1_{index} %uint_{shift}\n\
+             %lerp_r_shift_{index}_{lane} = OpShiftRightLogical %uint %lerp_2_{index} %uint_{shift}\n\
+             %lerp_a_{index}_{lane} = OpBitwiseAnd %uint %lerp_a_shift_{index}_{lane} %uint_255\n\
+             %lerp_b_{index}_{lane} = OpBitwiseAnd %uint %lerp_b_shift_{index}_{lane} %uint_255\n\
+             %lerp_round_{index}_{lane} = OpBitwiseAnd %uint %lerp_r_shift_{index}_{lane} %uint_1\n\
+             %lerp_sum0_{index}_{lane} = OpIAdd %uint %lerp_a_{index}_{lane} %lerp_b_{index}_{lane}\n\
+             %lerp_sum1_{index}_{lane} = OpIAdd %uint %lerp_sum0_{index}_{lane} %lerp_round_{index}_{lane}\n\
+             %lerp_avg_{index}_{lane} = OpShiftRightLogical %uint %lerp_sum1_{index}_{lane} %uint_1\n\
+             %lerp_packed_{index}_{lane} = OpShiftLeftLogical %uint %lerp_avg_{index}_{lane} %uint_{shift}\n"
+        );
+        let previous = if lane == 0 {
+            "uint_0".to_owned()
+        } else {
+            format!("lerp_acc_{index}_{}", lane - 1)
+        };
+        math += &format!(
+            "        %lerp_acc_{index}_{lane} = OpBitwiseOr %uint %{previous} %lerp_packed_{index}_{lane}\n"
+        );
+    }
+
+    const TEXT: &str = r#"
+        <load0>
+        <load1>
+        <load2>
+        <math>
+        %lerp_result_f_<index> = OpBitcast %float %lerp_acc_<index>_3
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %lerp_old_<index> = OpLoad %float %<dst>
+        %lerp_selected_<index> = OpSelect %float %exec_lo_b_<index> %lerp_result_f_<index> %lerp_old_<index>
+               OpStore %<dst> %lerp_selected_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load0>", &loads[0])
+        .replace("<load1>", &loads[1])
+        .replace("<load2>", &loads[2])
+        .replace("<math>", &math)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
     Ok(true)
 }
 
@@ -11017,7 +11868,7 @@ fn recompile_v_xxx_u32_vdst_vsrc012(
 
 /// Kyty: `Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1` (ShaderSpirv.cpp L6005).
 /// XXX: Add, Sub, Subrev (via `param`; carry-out goes to `dst2`).
-#[allow(dead_code)] // Sub/Subrev remain staged; Add uses the validator-clean body below.
+#[allow(dead_code)] // Generic extended-result fallback; live add/sub rows use validator-clean bodies.
 fn recompile_v_xxx_u32_vdst_sdst2_vsrc01(
     index: u32,
     code: &ShaderCode,
@@ -11088,6 +11939,112 @@ fn recompile_v_xxx_u32_vdst_sdst2_vsrc01(
         .replace("<index>", &index_str);
 
     Ok(true)
+}
+
+/// Validator-clean RDNA2 subtract-with-carry-out family.
+///
+/// AMD defines the carry output of subtraction as an unsigned borrow:
+/// `src1 > src0` for the ordinary form and `src0 > src1` for the reverse form.
+/// SPIR-V's `OpISubBorrow` expresses this directly but is rejected by naga's
+/// frontend, so emit the equivalent `OpISub` plus `OpULessThan` sequence.
+fn recompile_v_sub_co_u32_impl(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    reverse: bool,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VSubCoU32_VdstSdst2Vsrc0Vsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) || !operand_is_variable(inst.dst2) {
+        return Err(not_supported(FUNC, "destinations are not variables"));
+    }
+    if inst.dst.clamp {
+        return Err(not_supported(FUNC, "clamp"));
+    }
+    if inst.dst.multiplier != 1.0 {
+        return Err(not_supported(FUNC, "multiplier"));
+    }
+    if operand_is_exec(inst.dst2) {
+        return Err(not_supported(FUNC, "exec carry-out"));
+    }
+
+    let dst = operand_variable_to_str(inst.dst);
+    let carry0 = operand_variable_to_str_shift(inst.dst2, 0);
+    let carry1 = operand_variable_to_str_shift(inst.dst2, 1);
+    if dst.type_ != SpirvType::Float || carry0.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "unexpected destination types"));
+    }
+
+    let (left, right) = if reverse {
+        (inst.src[1], inst.src[0])
+    } else {
+        (inst.src[0], inst.src[1])
+    };
+    let mut load_left = String::new();
+    let mut load_right = String::new();
+    if !operand_load_uint(spirv, left, "tleft_<index>", &index_str, &mut load_left, -1)? {
+        return Ok(false);
+    }
+    if !operand_load_uint(
+        spirv,
+        right,
+        "tright_<index>",
+        &index_str,
+        &mut load_right,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load_left>
+        <load_right>
+        %tdiff_<index> = OpISub %uint %tleft_<index> %tright_<index>
+        %tborrow_<index> = OpULessThan %bool %tleft_<index> %tright_<index>
+        %tborrow_u_<index> = OpSelect %uint %tborrow_<index> %uint_1 %uint_0
+        %exec_lo_u_<index> = OpLoad %uint %exec_lo
+        %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
+        %tborrow_mask_<index> = OpSelect %uint %exec_lo_b_<index> %tborrow_u_<index> %uint_0
+               OpStore %<carry0> %tborrow_mask_<index>
+               OpStore %<carry1> %uint_0
+        %tdiff_f_<index> = OpBitcast %float %tdiff_<index>
+        %tdst_old_<index> = OpLoad %float %<dst>
+        %tdst_new_<index> = OpSelect %float %exec_lo_b_<index> %tdiff_f_<index> %tdst_old_<index>
+               OpStore %<dst> %tdst_new_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load_left>", &load_left)
+        .replace("<load_right>", &load_right)
+        .replace("<carry0>", &carry0.value)
+        .replace("<carry1>", &carry1.value)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
+    Ok(true)
+}
+
+fn recompile_v_sub_co_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    recompile_v_sub_co_u32_impl(index, code, dst_source, spirv, false)
+}
+
+fn recompile_v_subrev_co_u32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    recompile_v_sub_co_u32_impl(index, code, dst_source, spirv, true)
 }
 
 /// Validator-clean RDNA2 `v_add_co_u32`: add two dwords, write the sum to the
@@ -11299,6 +12256,7 @@ const fn fs(
 }
 
 /// Table row whose Kyty function is not ported yet (scc_check = None).
+#[allow(dead_code)] // Retained so future parser growth can add named placeholders.
 const fn ni(
     kyty_func: &'static str,
     line: u32,
@@ -11405,7 +12363,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4Vaddr2SvSoffsOffenIdxen, p1("")),
     f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4SvSoffs,                 p1("")),
     f(recompile_buffer_store_format_xyzw, T::BufferStoreFormatXyzw, F::Vdata4VaddrSvSoffsOffen,       p1("")),
-    ni("Recompile_BufferStoreFormatXyz_Vdata3VaddrSvSoffsIdxen (no Kyty upstream; needs a float3 store helper)", 0, T::BufferStoreFormatXyz, F::Vdata3VaddrSvSoffsIdxen, p1("")),
+    f(recompile_buffer_store_format_xyz, T::BufferStoreFormatXyz, F::Vdata3VaddrSvSoffsIdxen, p1("")),
     // Beyond Kyty (`buffer_store_dwordx4` is KYTY_NI upstream): raw
     // four-dword store, measured on ASTRO.BOT scene compute (MUBUF 0x1e,
     // raw 0xe0780000). Shared body `buffer_store_dwordxn`.
@@ -11534,7 +12492,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_store_dmask1,        T::ImageStore,     F::Vdata1Vaddr3StDmask1,   p1("")),
     f(recompile_image_store_dmask3,        T::ImageStore,     F::Vdata2Vaddr3StDmask3,   p1("")),
     f(recompile_image_store_dmask_f,       T::ImageStore,     F::Vdata4Vaddr3StDmaskF,   p1("")),
-    ni("Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF",    3173, T::ImageStoreMip,  F::Vdata4Vaddr4StDmaskF,   p1("")),
+    f(recompile_image_store_mip_dmask_f, T::ImageStoreMip, F::Vdata4Vaddr4StDmaskF, p1("")),
 
     f(recompile_sbuffer_load_dword,   T::SBufferLoadDword,   F::SdstSvSoffset,  p1("")),
     f(recompile_sbuffer_load_dwordx2, T::SBufferLoadDwordx2, F::Sdst2SvSoffset, p1("")),
@@ -11615,6 +12573,14 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_lshr_b64, T::SLshrB64, F::Sdst2Ssrc02Ssrc1, p2("", ""), S::NonZero),
 
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SAndB32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>"), S::NonZero),
+    // AMD RDNA2 SOP2 0x12/14/16/18/1a/1c. All six set SCC from the
+    // completed 32-bit result, matching their existing 64-bit siblings.
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SXorB32,  F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SAndn2B32, F::SVdstSVsrc0SVsrc1, p2("%tn_<index> = OpNot %uint %t1_<index>", "%t_<index> = OpBitwiseAnd %uint %t0_<index> %tn_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SOrn2B32, F::SVdstSVsrc0SVsrc1, p2("%tn_<index> = OpNot %uint %t1_<index>", "%t_<index> = OpBitwiseOr %uint %t0_<index> %tn_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SNandB32, F::SVdstSVsrc0SVsrc1, p2("%tb_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>", "%t_<index> = OpNot %uint %tb_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SNorB32, F::SVdstSVsrc0SVsrc1, p2("%tb_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>", "%t_<index> = OpNot %uint %tb_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc01, T::SXnorB32, F::SVdstSVsrc0SVsrc1, p2("%tb_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>", "%t_<index> = OpNot %uint %tb_<index>"), S::NonZero),
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SBfmB32, F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>"), S::None),
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SCselectB32, F::SVdstSVsrc0SVsrc1, p3("%t22_<index> = OpLoad %uint %scc", "%t2_<index> = OpINotEqual %bool %t22_<index> %uint_0", "%t_<index> = OpSelect %uint %t2_<index> %t0_<index> %t1_<index>"), S::None),
     fs(recompile_s_xxx_b32_svdst_svsrc01, T::SLshlB32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpShiftLeftLogical %uint %t0_<index> %ts_<index>"), S::NonZero),
@@ -11625,10 +12591,47 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     // user-SGPR layout resolves. Kyty had the recompiler staged; the SCC
     // overflow templates were already in the SCC machinery.
     fs(recompile_s_xxx_i32_svdst_svsrc01, T::SAddI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIAdd %int %t0_<index> %t1_<index>"), S::OverflowAdd),
+    // RDNA2 scalar min/max set SCC from the strict source comparison, not
+    // from whether the selected result is nonzero. `CarryOut` is the generic
+    // table hook that stores the explicitly materialized `%carry_<index>`.
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SMinI32, F::SVdstSVsrc0SVsrc1, p1(
+        "%tcmp_<index> = OpSLessThan %bool %t0_<index> %t1_<index>\n              %t_<index> = OpSelect %int %tcmp_<index> %t0_<index> %t1_<index>\n              %carry_<index> = OpSelect %uint %tcmp_<index> %uint_1 %uint_0"
+    ), S::CarryOut),
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SMaxI32, F::SVdstSVsrc0SVsrc1, p1(
+        "%tcmp_<index> = OpSGreaterThan %bool %t0_<index> %t1_<index>\n              %t_<index> = OpSelect %int %tcmp_<index> %t0_<index> %t1_<index>\n              %carry_<index> = OpSelect %uint %tcmp_<index> %uint_1 %uint_0"
+    ), S::CarryOut),
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SAshrI32, F::SVdstSVsrc0SVsrc1, p1(
+        "%tshift_<index> = OpBitwiseAnd %int %t1_<index> %int_31\n              %t_<index> = OpShiftRightArithmetic %int %t0_<index> %tshift_<index>"
+    ), S::NonZero),
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SBfeI32, F::SVdstSVsrc0SVsrc1, p1(
+        "%toffset_<index> = OpBitFieldUExtract %int %t1_<index> %int_0 %int_5\n              %twidth_<index> = OpBitFieldUExtract %int %t1_<index> %int_16 %int_7\n              %t_<index> = OpBitFieldSExtract %int %t0_<index> %toffset_<index> %twidth_<index>"
+    ), S::NonZero),
+    // Compute signed absolute difference with unsigned subtractions selected
+    // by a signed comparison, avoiding signed-overflow undefined behavior.
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SAbsDiffI32, F::SVdstSVsrc0SVsrc1, p1(
+        "%tu0_<index> = OpBitcast %uint %t0_<index>\n              %tu1_<index> = OpBitcast %uint %t1_<index>\n              %tlt_<index> = OpSLessThan %bool %t0_<index> %t1_<index>\n              %td01_<index> = OpISub %uint %tu0_<index> %tu1_<index>\n              %td10_<index> = OpISub %uint %tu1_<index> %tu0_<index>\n              %tabs_u_<index> = OpSelect %uint %tlt_<index> %td10_<index> %td01_<index>\n              %t_<index> = OpBitcast %int %tabs_u_<index>"
+    ), S::NonZero),
     fs(recompile_s_xxx_i32_svdst_svsrc01, T::SMulI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpIMul %int %t0_<index> %t1_<index>"), S::None),
+    fs(recompile_s_xxx_i32_svdst_svsrc01, T::SMulHiI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %int %mul_hi_int %t0_<index> %t1_<index>"), S::None),
     fs(recompile_s_xxx_i32_svdst_svsrc01, T::SSubI32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpISub %int %t0_<index> %t1_<index>"), S::OverflowSub),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddcU32, F::SVdstSVsrc0SVsrc1, p4("%tscc_<index> = OpLoad %uint %scc", "%ts_<index> = OpFunctionCall %v2uint %addc %t0_<index> %t1_<index> %tscc_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SAddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpIAddCarry %ResTypeU %t0_<index> %t1_<index>", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SSubbU32, F::SVdstSVsrc0SVsrc1, p4(
+        "%tscc_<index> = OpLoad %uint %scc",
+        "%tdiff_<index> = OpISub %uint %t0_<index> %t1_<index>\n              %t_<index> = OpISub %uint %tdiff_<index> %tscc_<index>",
+        "%tborrow0_<index> = OpULessThan %bool %t0_<index> %t1_<index>\n              %tborrow1_<index> = OpULessThan %bool %tdiff_<index> %tscc_<index>",
+        "%tborrow_<index> = OpLogicalOr %bool %tborrow0_<index> %tborrow1_<index>\n              %carry_<index> = OpSelect %uint %tborrow_<index> %uint_1 %uint_0"
+    ), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SMinU32, F::SVdstSVsrc0SVsrc1, p3(
+        "%tcmp_<index> = OpULessThan %bool %t0_<index> %t1_<index>",
+        "%t_<index> = OpSelect %uint %tcmp_<index> %t0_<index> %t1_<index>",
+        "%carry_<index> = OpSelect %uint %tcmp_<index> %uint_1 %uint_0"
+    ), S::CarryOut),
+    fs(recompile_s_xxx_u32_svdst_svsrc01, T::SMaxU32, F::SVdstSVsrc0SVsrc1, p3(
+        "%tcmp_<index> = OpUGreaterThan %bool %t0_<index> %t1_<index>",
+        "%t_<index> = OpSelect %uint %tcmp_<index> %t0_<index> %t1_<index>",
+        "%carry_<index> = OpSelect %uint %tcmp_<index> %uint_1 %uint_0"
+    ), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SSubU32, F::SVdstSVsrc0SVsrc1, p4("%t_<index> = OpISub %uint %t0_<index> %t1_<index>", "%nb_<index> = OpUGreaterThanEqual %bool %t0_<index> %t1_<index>", "%carry_<index> = OpSelect %uint %nb_<index> %uint_1 %uint_0", ""), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SBfeU32, F::SVdstSVsrc0SVsrc1, p3("%to_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_0  %uint_5", "%ts_<index> = OpBitFieldUExtract %uint %t1_<index> %uint_16 %uint_7", "%t_<index> = OpBitFieldUExtract %uint %t0_<index> %to_<index> %ts_<index>"), S::NonZero),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl1AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_1", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
@@ -11637,6 +12640,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SLshl4AddU32, F::SVdstSVsrc0SVsrc1, p3("%ts_<index> = OpFunctionCall %v2uint %lshl_add %t0_<index> %t1_<index> %uint_4", "%t_<index> = OpCompositeExtract %uint %ts_<index> 0", "%carry_<index> = OpCompositeExtract %uint %ts_<index> 1"), S::CarryOut),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SMulHiU32, F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>"), S::None),
     fs(recompile_s_xxx_u32_svdst_svsrc01, T::SPackLlB32B16, F::SVdstSVsrc0SVsrc1, p3("%tlo_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x0000ffff", "%thi_<index> = OpShiftLeftLogical %uint %t1_<index> %uint_16", "%t_<index> = OpBitwiseOr %uint %tlo_<index> %thi_<index>"), S::None),
+    f(recompile_s_xxx_u32_svdst_svsrc01, T::SPackLhB32B16, F::SVdstSVsrc0SVsrc1, p2("%thi_<index> = OpShiftRightLogical %uint %t1_<index> %uint_16", "%t_<index> = OpBitFieldInsert %uint %t0_<index> %thi_<index> %uint_16 %uint_16")),
+    f(recompile_s_xxx_u32_svdst_svsrc01, T::SPackHhB32B16, F::SVdstSVsrc0SVsrc1, p3("%tlo_<index> = OpShiftRightLogical %uint %t0_<index> %uint_16", "%thi_<index> = OpShiftRightLogical %uint %t1_<index> %uint_16", "%t_<index> = OpBitFieldInsert %uint %tlo_<index> %thi_<index> %uint_16 %uint_16")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VAndB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VBcntU32B32, F::SVdstSVsrc0SVsrc1, p3("%tb_<index> = OpBitCount %int %t0_<index>", "%tbu_<index> = OpBitcast %uint %tb_<index>", "%t_<index> = OpIAdd %uint %tbu_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VBfmB32,     F::SVdstSVsrc0SVsrc1, p3("%tcount_<index> = OpBitwiseAnd %uint %t0_<index> %uint_31", "%toffset_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31", "%t_<index> = OpBitFieldInsert %uint %uint_0 %uint_0xffffffff %toffset_<index> %tcount_<index>")),
@@ -11647,6 +12652,11 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulHiU32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_hi_uint %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulLoU32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %uint %mul_lo_uint %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VMulU32U24,  F::SVdstSVsrc0SVsrc1, p3("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff", "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff", "%t_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>")),
+    // AMD RDNA2 VOP2 9/10/12: explicit signed/unsigned 24-bit input
+    // extension, with low or high product selection as named by the opcode.
+    f(recompile_v_i24_math, T::VMulI32I24,   F::SVdstSVsrc0SVsrc1, p1("")),
+    f(recompile_v_i24_math, T::VMulHiI32I24, F::SVdstSVsrc0SVsrc1, p1("")),
+    f(recompile_v_i24_math, T::VMulHiU32U24, F::SVdstSVsrc0SVsrc1, p1("")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VOrB32,      F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseOr %uint %t0_<index> %t1_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc01, T::VXorB32,     F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpBitwiseXor %uint %t0_<index> %t1_<index>")),
     // RDNA2 VOP2 0x1e v_xnor_b32 = ~(src0 ^ src1). Measured in ASTRO.BOT scene
@@ -11690,6 +12700,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_i32_svdst_svsrc01, T::VAshrI32,    F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t1_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t0_<index> %ts_<index>")),
     f(recompile_v_xxx_i32_svdst_svsrc01, T::VAshrrevI32, F::SVdstSVsrc0SVsrc1, p2("%ts_<index> = OpBitwiseAnd %int %t0_<index> %int_31", "%t_<index> = OpShiftRightArithmetic %int %t1_<index> %ts_<index>")),
     f(recompile_v_xxx_i32_svdst_svsrc01, T::VMulLoI32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %int %mul_lo_int %t0_<index> %t1_<index>")),
+    f(recompile_v_xxx_i32_svdst_svsrc01, T::VMulHiI32,   F::SVdstSVsrc0SVsrc1, p1("%t_<index> = OpFunctionCall %int %mul_hi_int %t0_<index> %t1_<index>")),
     f(recompile_vcvt_pkrtz_f16_f32, T::VCvtPkrtzF16F32, F::SVdstSVsrc0SVsrc1, p1("")),
     // Wired for ASTRO.BOT scene CS (VOP3 0x365/0x366 lane-index idiom).
     // Kyty's single-lane model: mbcnt(mask, src1) = src1 when exec is on
@@ -11699,6 +12710,15 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
 
     f(recompile_smov_b32, T::SMovB32,  F::SVdstSVsrc0, p1("")),
     f(recompile_smov_b32, T::SMovkI32, F::SVdstSVsrc0, p1("")),
+    f(recompile_s_cmov_b32, T::SCmovB32, F::SVdstSVsrc0, p1("")),
+    f(recompile_s_cmov_b64, T::SCmovB64, F::Sdst2Ssrc02, p1("")),
+    fs(recompile_s_xxx_b32_svdst_svsrc0, T::SNotB32, F::SVdstSVsrc0, p1("%t_<index> = OpNot %uint %t0_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc0, T::SBcnt0I32B32, F::SVdstSVsrc0, p2("%tn_<index> = OpNot %uint %t0_<index>", "%t_<index> = OpBitCount %uint %tn_<index>"), S::NonZero),
+    fs(recompile_s_xxx_b32_svdst_svsrc0, T::SBcnt1I32B32, F::SVdstSVsrc0, p1("%t_<index> = OpBitCount %uint %t0_<index>"), S::NonZero),
+    f(recompile_s_ff_b32, T::SFF0I32B32, F::SVdstSVsrc0, p1("%tsearch_<index> = OpNot %uint %t0_<index>")),
+    f(recompile_s_ff_b32, T::SFF1I32B32, F::SVdstSVsrc0, p1("%tsearch_<index> = OpBitwiseOr %uint %t0_<index> %uint_0")),
+    f(recompile_s_xxx_b32_svdst_svsrc0, T::SSextI32I8, F::SVdstSVsrc0, p3("%ti_<index> = OpBitcast %int %t0_<index>", "%tse_<index> = OpBitFieldSExtract %int %ti_<index> %int_0 %int_8", "%t_<index> = OpBitcast %uint %tse_<index>")),
+    f(recompile_s_xxx_b32_svdst_svsrc0, T::SSextI32I16, F::SVdstSVsrc0, p3("%ti_<index> = OpBitcast %int %t0_<index>", "%tse_<index> = OpBitFieldSExtract %int %ti_<index> %int_0 %int_16", "%t_<index> = OpBitcast %uint %tse_<index>")),
     f(recompile_smulk_i32, T::SMulkI32, F::SVdstSVsrc0, p1("")),
     f(recompile_v_xxx_b32_svdst_svsrc0, T::VBfrevB32, F::SVdstSVsrc0, p1("%t_<index> = OpBitReverse %uint %t0_<index>")),
     f(recompile_v_xxx_b32_svdst_svsrc0, T::VNotB32,   F::SVdstSVsrc0, p1("%t_<index> = OpNot %uint %t0_<index>")),
@@ -11735,6 +12755,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_andn1_saveexec_b64, T::SAndn1SaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     f(recompile_smov_b64,    T::SMovB64,    F::Sdst2Ssrc02, p1("")),
     f(recompile_sswappc_b64, T::SSwappcB64, F::Sdst2Ssrc02, p1("")),
+    fs(recompile_swqm_b32, T::SWqmB32, F::SVdstSVsrc0, p1(""), S::NonZero),
     fs(recompile_swqm_b64, T::SWqmB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     fs(recompile_snot_b64, T::SNotB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     // s_brev_b32 does not write SCC.
@@ -11745,6 +12766,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         p1(""),
         S::None,
     ),
+    f(recompile_sbrev_b64, T::SBrevB64, F::Sdst2Ssrc02, p1("")),
 
     f(recompile_skip, T::SInstPrefetch, F::Imm, p1("")),
     f(recompile_skip, T::SNop,          F::Imm, p1("")),
@@ -11753,18 +12775,16 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_skip, T::SVersion,      F::Imm, p1("")),
 
     f(recompile_tbuffer_load_format_x_float1, T::TBufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxenFloat1, p1("")),
-    ni("Recompile_TBufferLoadFormatXyzw_Vdata4Vaddr2SvSoffsOffenIdxenFloat4", 4824, T::TBufferLoadFormatXyzw, F::Vdata4Vaddr2SvSoffsOffenIdxenFloat4, p1("")),
+    f(recompile_tbuffer_load_format_xyzw_offen_float4, T::TBufferLoadFormatXyzw, F::Vdata4Vaddr2SvSoffsOffenIdxenFloat4, p1("")),
     f(recompile_tbuffer_load_format_xyzw_float4, T::TBufferLoadFormatXyzw, F::Vdata4VaddrSvSoffsIdxenFloat4, p1("")),
-    // Beyond Kyty: the two-channel typed fetch. The offen variant carries a
-    // per-thread voffset the float2 body does not add, so it is a named
-    // refusal rather than a silently dropped address term (same shape as the
-    // xyzw offen row above).
+    // Beyond Kyty: two-channel typed fetch, including the per-thread voffset
+    // form.
     f(recompile_tbuffer_load_format_xy_float2, T::TBufferLoadFormatXy, F::Vdata2VaddrSvSoffsIdxenFloat2, p1("")),
-    ni("Recompile_TBufferLoadFormatXy_Vdata2Vaddr2SvSoffsOffenIdxenFloat2 (no Kyty upstream; the float2 body has no voffset term)", 0, T::TBufferLoadFormatXy, F::Vdata2Vaddr2SvSoffsOffenIdxenFloat2, p1("")),
+    f(recompile_tbuffer_load_format_xy_float2, T::TBufferLoadFormatXy, F::Vdata2Vaddr2SvSoffsOffenIdxenFloat2, p1("")),
 
     f(recompile_v_add_co_u32, T::VAddI32, F::VdstSdst2Vsrc0Vsrc1, p1("")),
-    ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VSubI32,    F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpISubBorrow %ResTypeU %t0_<index> %t1_<index>")),
-    ni("Recompile_V_XXX_U32_VdstSdst2Vsrc0Vsrc1", 6005, T::VSubrevI32, F::VdstSdst2Vsrc0Vsrc1, p1("%t_<index> = OpISubBorrow %ResTypeU %t1_<index> %t0_<index>")),
+    f(recompile_v_sub_co_u32,    T::VSubI32,    F::VdstSdst2Vsrc0Vsrc1, p1("")),
+    f(recompile_v_subrev_co_u32, T::VSubrevI32, F::VdstSdst2Vsrc0Vsrc1, p1("")),
 
     // Wired for Minecraft's menu VS (`v_cmp_lt_f32 s2, |v2|, c` — SDWA
     // src0_abs now parses into the operand modifier operand_load_float
@@ -11852,6 +12872,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_scmp_xxx_u32, T::SCmpLeU32, F::Ssrc0Ssrc1, p1("OpULessThanEqual")),
     f(recompile_scmp_xxx_u32, T::SCmpLtU32, F::Ssrc0Ssrc1, p1("OpULessThan")),
     f(recompile_scmp_xxx_u32, T::SCmpLgU32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
+    f(recompile_s_bitcmp_b32, T::SBitcmp0B32, F::Ssrc0Ssrc1, p1("OpIEqual")),
+    f(recompile_s_bitcmp_b32, T::SBitcmp1B32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
 
     f(recompile_vcndmask_b32, T::VCndmaskB32, F::VdstVsrc0Vsrc1Smask2, p1("")),
 
@@ -11882,13 +12904,59 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         "%t4_<index> = OpExtInst %float %GLSL_std_450 FMax %t0_<index> %t1_<index>",
         "%t5_<index> = OpExtInst %float %GLSL_std_450 FMin %t4_<index> %t2_<index>",
         "%t_<index> = OpExtInst %float %GLSL_std_450 FMax %t3_<index> %t5_<index>")),
+    // AMD RDNA2 VOP3A 0x152..0x159: integer min3/max3/median3. Signed
+    // variants bitcast before GLSL SMin/SMax; unsigned variants remain uint.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMin3I32, F::VdstVsrc0Vsrc1Vsrc2, p4(
+        "%ti0_<index> = OpBitcast %int %t0_<index>\n         %ti1_<index> = OpBitcast %int %t1_<index>\n         %ti2_<index> = OpBitcast %int %t2_<index>",
+        "%tim_<index> = OpExtInst %int %GLSL_std_450 SMin %ti0_<index> %ti1_<index>",
+        "%tir_<index> = OpExtInst %int %GLSL_std_450 SMin %tim_<index> %ti2_<index>",
+        "%t_<index> = OpBitcast %uint %tir_<index>")),
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMin3U32, F::VdstVsrc0Vsrc1Vsrc2, p2(
+        "%tm_<index> = OpExtInst %uint %GLSL_std_450 UMin %t0_<index> %t1_<index>",
+        "%t_<index> = OpExtInst %uint %GLSL_std_450 UMin %tm_<index> %t2_<index>")),
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMax3I32, F::VdstVsrc0Vsrc1Vsrc2, p4(
+        "%ti0_<index> = OpBitcast %int %t0_<index>\n         %ti1_<index> = OpBitcast %int %t1_<index>\n         %ti2_<index> = OpBitcast %int %t2_<index>",
+        "%tim_<index> = OpExtInst %int %GLSL_std_450 SMax %ti0_<index> %ti1_<index>",
+        "%tir_<index> = OpExtInst %int %GLSL_std_450 SMax %tim_<index> %ti2_<index>",
+        "%t_<index> = OpBitcast %uint %tir_<index>")),
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMax3U32, F::VdstVsrc0Vsrc1Vsrc2, p2(
+        "%tm_<index> = OpExtInst %uint %GLSL_std_450 UMax %t0_<index> %t1_<index>",
+        "%t_<index> = OpExtInst %uint %GLSL_std_450 UMax %tm_<index> %t2_<index>")),
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMed3I32, F::VdstVsrc0Vsrc1Vsrc2, p4(
+        "%ti0_<index> = OpBitcast %int %t0_<index>\n         %ti1_<index> = OpBitcast %int %t1_<index>\n         %ti2_<index> = OpBitcast %int %t2_<index>",
+        "%tmin_<index> = OpExtInst %int %GLSL_std_450 SMin %ti0_<index> %ti1_<index>\n         %tmax_<index> = OpExtInst %int %GLSL_std_450 SMax %ti0_<index> %ti1_<index>",
+        "%tcap_<index> = OpExtInst %int %GLSL_std_450 SMin %tmax_<index> %ti2_<index>",
+        "%tir_<index> = OpExtInst %int %GLSL_std_450 SMax %tmin_<index> %tcap_<index>\n         %t_<index> = OpBitcast %uint %tir_<index>")),
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMed3U32, F::VdstVsrc0Vsrc1Vsrc2, p4(
+        "%tmin_<index> = OpExtInst %uint %GLSL_std_450 UMin %t0_<index> %t1_<index>",
+        "%tmax_<index> = OpExtInst %uint %GLSL_std_450 UMax %t0_<index> %t1_<index>",
+        "%tcap_<index> = OpExtInst %uint %GLSL_std_450 UMin %tmax_<index> %t2_<index>",
+        "%t_<index> = OpExtInst %uint %GLSL_std_450 UMax %tmin_<index> %tcap_<index>")),
     // Cubemap coordinate helpers (VOP3 0x144-0x147). Shared recompiler picks
     // the major axis; the param slots are unused (its own match keys on type).
     f(recompile_v_cube_f32, T::VCubeIdF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_v_cube_f32, T::VCubeScF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_v_cube_f32, T::VCubeTcF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     f(recompile_v_cube_f32, T::VCubeMaF32, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
-    ni("Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2", 5940, T::VSadU32,    F::VdstVsrc0Vsrc1Vsrc2, p2("%td_<index> = OpFunctionCall %uint %abs_diff %t0_<index> %t1_<index>",
+    f(recompile_v_lerp_u8, T::VLerpU8, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    // `{src0,src1}` means src0 is the high dword and src1 the low dword.
+    // Select around the complementary shift avoids an invalid shift-by-32.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VAlignbitB32, F::VdstVsrc0Vsrc1Vsrc2, p4(
+        "%ta_s_<index> = OpBitwiseAnd %uint %t2_<index> %uint_31\n         %ta_r_<index> = OpShiftRightLogical %uint %t1_<index> %ta_s_<index>",
+        "%ta_inv0_<index> = OpISub %uint %uint_32 %ta_s_<index>\n         %ta_inv_<index> = OpBitwiseAnd %uint %ta_inv0_<index> %uint_31\n         %ta_l_<index> = OpShiftLeftLogical %uint %t0_<index> %ta_inv_<index>",
+        "%ta_merge_<index> = OpBitwiseOr %uint %ta_l_<index> %ta_r_<index>",
+        "%ta_nz_<index> = OpINotEqual %bool %ta_s_<index> %uint_0\n         %t_<index> = OpSelect %uint %ta_nz_<index> %ta_merge_<index> %t1_<index>")),
+    // Byte positions 0..3 straddle src1/src0, 4..7 shift within src0, and
+    // positions >=8 are beyond the 64-bit concatenation and therefore zero.
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VAlignbyteB32, F::VdstVsrc0Vsrc1Vsrc2, p4(
+        "%tab_byte_<index> = OpBitwiseAnd %uint %t2_<index> %uint_31\n         %tab_lane_<index> = OpBitwiseAnd %uint %tab_byte_<index> %uint_3\n         %tab_shift_<index> = OpShiftLeftLogical %uint %tab_lane_<index> %uint_3",
+        "%tab_r_<index> = OpShiftRightLogical %uint %t1_<index> %tab_shift_<index>\n         %tab_inv0_<index> = OpISub %uint %uint_32 %tab_shift_<index>\n         %tab_inv_<index> = OpBitwiseAnd %uint %tab_inv0_<index> %uint_31\n         %tab_l_<index> = OpShiftLeftLogical %uint %t0_<index> %tab_inv_<index>\n         %tab_merge_<index> = OpBitwiseOr %uint %tab_l_<index> %tab_r_<index>",
+        "%tab_nz_<index> = OpINotEqual %bool %tab_shift_<index> %uint_0\n         %tab_lower_<index> = OpSelect %uint %tab_nz_<index> %tab_merge_<index> %t1_<index>\n         %tab_upper_<index> = OpShiftRightLogical %uint %t0_<index> %tab_shift_<index>",
+        "%tab_is_lower_<index> = OpULessThan %bool %tab_byte_<index> %uint_4\n         %tab_candidate_<index> = OpSelect %uint %tab_is_lower_<index> %tab_lower_<index> %tab_upper_<index>\n         %tab_in_range_<index> = OpULessThan %bool %tab_byte_<index> %uint_8\n         %t_<index> = OpSelect %uint %tab_in_range_<index> %tab_candidate_<index> %uint_0")),
+    f(recompile_v_packed_sad, T::VSadU8,   F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_v_packed_sad, T::VSadHiU8, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_v_packed_sad, T::VSadU16,  F::VdstVsrc0Vsrc1Vsrc2, p1("")),
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VSadU32, F::VdstVsrc0Vsrc1Vsrc2, p2("%td_<index> = OpFunctionCall %uint %abs_diff %t0_<index> %t1_<index>",
         "%t_<index> = OpIAdd %uint %td_<index> %t2_<index>")),
     // `v_bfe_u32` (VOP3 0x148): unsigned bitfield extract —
     // dst = (src0 >> src1[4:0]) & ((1 << src2[4:0]) - 1). Offset = src1[4:0],
@@ -11912,10 +12980,11 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_v_xxx_u32_vdst_vsrc012, T::VBfiB32, F::VdstVsrc0Vsrc1Vsrc2, p3("%ta_<index> = OpBitwiseAnd %uint %t0_<index> %t1_<index>",
         "%tn_<index> = OpNot %uint %t0_<index>\n         %tc_<index> = OpBitwiseAnd %uint %tn_<index> %t2_<index>",
         "%t_<index> = OpBitwiseOr %uint %ta_<index> %tc_<index>")),
-    ni("Recompile_V_XXX_U32_VdstVsrc0Vsrc1Vsrc2", 5940, T::VMadU32U24, F::VdstVsrc0Vsrc1Vsrc2, p4("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff",
+    f(recompile_v_xxx_u32_vdst_vsrc012, T::VMadU32U24, F::VdstVsrc0Vsrc1Vsrc2, p4("%tu0_<index> = OpBitwiseAnd %uint %t0_<index> %uint_0x00ffffff",
         "%tu1_<index> = OpBitwiseAnd %uint %t1_<index> %uint_0x00ffffff",
         "%tm_<index> = OpFunctionCall %uint %mul_lo_uint %tu0_<index> %tu1_<index>",
         "%t_<index> = OpIAdd %uint %tm_<index> %t2_<index>")),
+    f(recompile_v_i24_math, T::VMadI32I24, F::VdstVsrc0Vsrc1Vsrc2, p1("")),
     // RDNA2-only (no Kyty upstream row): v_lshl_add_u32 — the first
     // next-gen instruction Minecraft's menu CS needs.
     f(recompile_v_xxx_u32_vdst_vsrc012, T::VLshlAddU32, F::VdstVsrc0Vsrc1Vsrc2, p3("%ts_<index> = OpBitwiseAnd %uint %t1_<index> %uint_31",
@@ -12266,7 +13335,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            400,
+            447,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -12282,7 +13351,7 @@ mod tests {
              v_cmpx_*_i32 block: VCmpxLtI32/GeI32/GtI32/LeI32/EqI32/NeI32), the \
              beyond-Kyty BufferLoadDwordX4 (+Offen and address-only) rows, the \
              twelve flexible-addressing MUBUF Vdata1 rows, the four \
-             BufferStoreFormatXyzw rows (+1 staged Xyz), the exp pos1..pos3 \
+             BufferStoreFormatXyzw rows (+1 wired Xyz), the exp pos1..pos3 \
              rows, ImageGetResinfo, SGetpcB64, SPackLlB32B16, the seven \
              ImageSampleCLz dmask rows, \
              and the four cubemap helpers VCubeId/Sc/Tc/MaF32, plus SNotB64, SBrevB32 and \
@@ -12307,11 +13376,11 @@ mod tests {
              and the V#-buffer-load batch: the five \
              Sdst/2/4/8/16-SvSoffsetOffset rows (the same combined addressing \
              through a V# base, ASTRO.BOT) plus BufferLoadFormatXyzw \
-             [Vdata4VaddrSvSoffsIdxen] (Avatar: Frontiers of Pandora), \n             and the Blasphemous II decoder-gap batch (+30): the 27 exp \n             param5..param31 rows (RDNA2 EXP targets 0x25..0x3f), the two \n             TBufferLoadFormatXy rows (one wired, one refused offen variant), \n             and ImageSample dmask 0xb, plus ImageSampleLz dmask 0x8"
+             [Vdata4VaddrSvSoffsIdxen] (Avatar: Frontiers of Pandora), \n             and the Blasphemous II decoder-gap batch (+30): the 27 exp \n             param5..param31 rows (RDNA2 EXP targets 0x25..0x3f), both \n             TBufferLoadFormatXy address forms, ImageSample dmask 0xb, plus \n             ImageSampleLz dmask 0x8"
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 392,
+            implemented, 447,
             "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
@@ -12322,7 +13391,9 @@ mod tests {
              nine ImageSample dmask recompilers, the VCmp \
               F32/I32/U32 families, address-only BufferLoadDwordX4, the wired \
               BufferStoreFormatX/Xy rows, the twelve flexible-addressing MUBUF \
-              rows, the four BufferStoreFormatXyzw rows, the exp pos1..pos3 \
+              rows, the four BufferStoreFormatXyzw rows, BufferStoreFormatXyz, \
+              ImageStoreMip, both remaining MTBUF offen rows, VSub/VSubrev with \
+              carry-out, VSadU32, and VMadU32U24, the exp pos1..pos3 \
               rows, VAdd3U32, ImageGetResinfo, SGetpcB64, SPackLlB32B16, the seven \
               ImageSampleCLz dmask rows, and the four VCube*F32 \
               cubemap-coordinate helpers, the four BufferLoadDwordX2 rows, ImageStore \
@@ -12347,12 +13418,7 @@ mod tests {
               rows and BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen], \
               and the exp-null row: EXP target 9 accepted and dropped, \n              and the Blasphemous II decoder-gap batch: 27 exp param5..param31 \n              rows, TBufferLoadFormatXy, ImageSample dmask 0xb, and ImageSampleLz \n              dmask 0x8)"
         );
-        assert_eq!(
-            ni, 8,
-            "C2 remainder (BufferStoreFormatX/Xy wired out; BufferStoreFormatXyz staged in; \
-             the mbcnt pair wired for the RDNA2 VOP3 lane-index idiom; VBfeU32 wired out \
-             of the staged VdstVsrc0Vsrc1Vsrc2 U32 set; plus TBufferLoadFormatXy's offen variant, \n             refused because the float2 body has no voffset term)"
-        );
+        assert_eq!(ni, 0, "every current dispatch row has a tested lowering");
 
         // Kyty EXIT_IF(map->Contains(p)) — (type, format) keys are unique.
         let mut seen = std::collections::HashSet::new();
@@ -12588,15 +13654,9 @@ mod tests {
         let e = recomp_func(T::ImageSample, F::Vdata4Vaddr3StSsDmaskF).expect("ImageSample");
         assert!(matches!(e.func, RecompileFn::Func(_)));
 
-        // NI entry carries the Kyty function name + line anchor.
+        // The last MIMG placeholder is wired.
         let e = recomp_func(T::ImageStoreMip, F::Vdata4Vaddr4StDmaskF).expect("ImageStoreMip");
-        match e.func {
-            RecompileFn::NotImplemented { kyty_func, line } => {
-                assert_eq!(kyty_func, "Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF");
-                assert_eq!(line, 3173);
-            }
-            RecompileFn::Func(_) => panic!("ImageStoreMip must be NI in C1"),
-        }
+        assert!(matches!(e.func, RecompileFn::Func(_)));
 
         // SccCheck rides along as table data (application is C2).
         let e = recomp_func(T::SAddU32, F::SVdstSVsrc0SVsrc1).expect("SAddU32");
@@ -14598,11 +15658,17 @@ mod tests {
     fn scalar_b32_family_is_wired_with_kyty_scc_semantics() {
         let cases = [
             (T::SAndB32, SccCheck::NonZero),
+            (T::SAndn2B32, SccCheck::NonZero),
             (T::SBfmB32, SccCheck::None),
             (T::SCselectB32, SccCheck::None),
+            (T::SNandB32, SccCheck::NonZero),
+            (T::SNorB32, SccCheck::NonZero),
             (T::SLshlB32, SccCheck::NonZero),
             (T::SLshrB32, SccCheck::NonZero),
             (T::SOrB32, SccCheck::NonZero),
+            (T::SOrn2B32, SccCheck::NonZero),
+            (T::SXnorB32, SccCheck::NonZero),
+            (T::SXorB32, SccCheck::NonZero),
         ];
 
         for (ty, scc) in cases {
@@ -14611,6 +15677,523 @@ mod tests {
             assert!(matches!(entry.func, RecompileFn::Func(_)), "{ty:?}");
             assert_eq!(entry.scc_check, scc, "{ty:?}");
         }
+    }
+
+    /// AMD defines scalar min/max SCC as the strict comparison selecting
+    /// source zero. Equal operands therefore select source one and clear SCC;
+    /// testing the result for nonzero would be observably wrong.
+    #[test]
+    fn rdna2_scalar_minmax_preserves_strict_scc_semantics() {
+        let sop2 = |opcode: u32, sdst: u32| 0x8000_0000 | (opcode << 23) | (sdst << 16) | (1 << 8);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                sop2(0x06, 2),
+                sop2(0x07, 3),
+                sop2(0x08, 4),
+                sop2(0x09, 5),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse the RDNA2 scalar min/max quartet");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(4)
+                .map(|inst| inst.type_)
+                .collect::<Vec<_>>(),
+            [T::SMinI32, T::SMinU32, T::SMaxI32, T::SMaxU32]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile the RDNA2 scalar min/max quartet");
+        for (index, comparison) in [
+            (0, "OpSLessThan"),
+            (1, "OpULessThan"),
+            (2, "OpSGreaterThan"),
+            (3, "OpUGreaterThan"),
+        ] {
+            assert!(
+                source.contains(&format!("%tcmp_{index} = {comparison} %bool")),
+                "missing strict comparison {comparison}:\n{source}"
+            );
+            assert!(
+                source.contains(&format!(
+                    "%carry_{index} = OpSelect %uint %tcmp_{index} %uint_1 %uint_0"
+                )),
+                "SCC must be derived from the source comparison:\n{source}"
+            );
+            assert!(
+                source.contains(&format!("OpStore %scc %carry_{index}")),
+                "the comparison result must reach SCC:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble scalar min/max quartet");
+        naga_parse_and_validate(&words, "scalar min/max quartet");
+    }
+
+    /// Arithmetic shift/extract, borrow chaining and the two remaining
+    /// 16-bit scalar pack arrangements are direct RDNA2 SOP2 definitions.
+    #[test]
+    fn rdna2_scalar_shift_borrow_extract_and_pack_validate() {
+        let sop2 = |opcode: u32, sdst: u32| 0x8000_0000 | (opcode << 23) | (sdst << 16) | (1 << 8);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                sop2(0x05, 2),
+                sop2(0x22, 3),
+                sop2(0x28, 4),
+                sop2(0x33, 5),
+                sop2(0x34, 6),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse scalar shift/borrow/extract/pack family");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(5)
+                .map(|inst| inst.type_)
+                .collect::<Vec<_>>(),
+            [
+                T::SSubbU32,
+                T::SAshrI32,
+                T::SBfeI32,
+                T::SPackLhB32B16,
+                T::SPackHhB32B16,
+            ]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile scalar shift/borrow/extract/pack family");
+        assert!(
+            source.contains("%tscc_0 = OpLoad %uint %scc")
+                && source.contains("%tdiff_0 = OpISub %uint %t0_0 %t1_0")
+                && source.contains("%t_0 = OpISub %uint %tdiff_0 %tscc_0")
+                && source.contains("%tborrow_0 = OpLogicalOr %bool %tborrow0_0 %tborrow1_0")
+                && source.contains("OpStore %scc %carry_0"),
+            "SUBB must consume and replace SCC with the combined borrow:\n{source}"
+        );
+        assert!(
+            source.contains("%tshift_1 = OpBitwiseAnd %int %t1_1 %int_31")
+                && source.contains("%t_1 = OpShiftRightArithmetic %int %t0_1 %tshift_1"),
+            "ASHR must mask the shift to five bits and preserve sign:\n{source}"
+        );
+        assert!(
+            source.contains("%toffset_2 = OpBitFieldUExtract %int %t1_2 %int_0 %int_5")
+                && source.contains("%twidth_2 = OpBitFieldUExtract %int %t1_2 %int_16 %int_7")
+                && source.contains("%t_2 = OpBitFieldSExtract %int %t0_2 %toffset_2 %twidth_2"),
+            "BFE_I32 must use the documented packed offset/width fields:\n{source}"
+        );
+        assert!(
+            source.contains("%t_3 = OpBitFieldInsert %uint %t0_3 %thi_3 %uint_16 %uint_16")
+                && source.contains("%t_4 = OpBitFieldInsert %uint %tlo_4 %thi_4 %uint_16 %uint_16"),
+            "LH/HH must select the documented source halves:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble scalar shift/borrow/extract/pack family");
+        naga_parse_and_validate(&words, "scalar shift/borrow/extract/pack family");
+    }
+
+    /// The signed scalar arithmetic siblings use overflow-safe absolute
+    /// difference and SPIR-V's signed extended multiply for the high product.
+    #[test]
+    fn rdna2_scalar_absdiff_and_mul_hi_i32_recompile_exactly() {
+        let sop2 = |opcode: u32, sdst: u32| 0x8000_0000 | (opcode << 23) | (sdst << 16) | (1 << 8);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[sop2(0x2c, 2), sop2(0x36, 3), S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse scalar absdiff/mul-hi pair");
+        assert_eq!(code.get_instructions()[0].type_, T::SAbsDiffI32);
+        assert_eq!(code.get_instructions()[1].type_, T::SMulHiI32);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile scalar absdiff/mul-hi pair");
+        assert!(
+            source.contains("%tlt_0 = OpSLessThan %bool %t0_0 %t1_0")
+                && source.contains("%td01_0 = OpISub %uint %tu0_0 %tu1_0")
+                && source.contains("%td10_0 = OpISub %uint %tu1_0 %tu0_0")
+                && source.contains("%tabs_u_0 = OpSelect %uint %tlt_0 %td10_0 %td01_0"),
+            "ABSDIFF must avoid signed-overflow arithmetic:\n{source}"
+        );
+        assert!(
+            source.contains("%t_1 = OpFunctionCall %int %mul_hi_int %t0_1 %t1_1")
+                && source.contains("OpSMulExtended %ResTypeI"),
+            "signed high multiply must select the high extended-product word:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble scalar absdiff/mul-hi pair");
+
+        let mut absdiff_only = ShaderCode::new();
+        absdiff_only.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[sop2(0x2c, 2), 0xbf80_0000, 0xbf80_0000, S_ENDPGM],
+            &mut absdiff_only,
+            true,
+        )
+        .expect("parse scalar absdiff");
+        let validated = spirv_generate_source(&absdiff_only, None, None, Some(&input_info))
+            .expect("recompile scalar absdiff");
+        let binary = spirv_run(&validated).expect("assemble scalar absdiff");
+        naga_parse_and_validate(&binary, "scalar absdiff");
+    }
+
+    /// SOPK supplies one sign-extended SIMM16 and reuses SDST as an operand.
+    /// Its conditional move, comparison matrix and add are semantic aliases of
+    /// already validated scalar operations rather than separate ALU bodies.
+    #[test]
+    fn rdna2_sopk_immediate_family_reuses_validated_scalar_lowerings() {
+        let sopk = |opcode: u32, sdst: u32, simm16: u16| {
+            0xb000_0000 | (opcode << 23) | (sdst << 16) | u32::from(simm16)
+        };
+        let mut words = vec![sopk(0x02, 2, 0xfffe)];
+        for opcode in 0x03..=0x0e {
+            words.push(sopk(opcode, opcode, 0xfffe));
+        }
+        words.push(sopk(0x0f, 20, 0xfffe));
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &words, &mut code, true).expect("parse the RDNA2 SOPK immediate family");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(14)
+                .map(|inst| inst.type_)
+                .collect::<Vec<_>>(),
+            [
+                T::SCmovB32,
+                T::SCmpEqI32,
+                T::SCmpLgI32,
+                T::SCmpGtI32,
+                T::SCmpGeI32,
+                T::SCmpLtI32,
+                T::SCmpLeI32,
+                T::SCmpEqU32,
+                T::SCmpLgU32,
+                T::SCmpGtU32,
+                T::SCmpGeU32,
+                T::SCmpLtU32,
+                T::SCmpLeU32,
+                T::SAddI32,
+            ]
+        );
+        for inst in code.get_instructions().iter().take(14) {
+            assert!(
+                inst.src
+                    .iter()
+                    .take(usize::try_from(inst.src_num).expect("nonnegative source count"))
+                    .any(|src| {
+                        src.type_ == ShaderOperandType::IntegerInlineConstant
+                            && src.constant.u == 0xffff_fffe
+                    }),
+                "SOPK SIMM16 must be sign-extended for {:?}",
+                inst.type_
+            );
+        }
+        let add = &code.get_instructions()[13];
+        assert_eq!(add.dst.register_id, 20);
+        assert_eq!(
+            add.src[0], add.dst,
+            "S_ADDK reads and writes the encoded SDST"
+        );
+        assert_eq!(add.format, F::SVdstSVsrc0SVsrc1);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile the RDNA2 SOPK immediate family");
+        for operation in [
+            "OpIEqual",
+            "OpINotEqual",
+            "OpSGreaterThan",
+            "OpSGreaterThanEqual",
+            "OpSLessThan",
+            "OpSLessThanEqual",
+            "OpUGreaterThan",
+            "OpUGreaterThanEqual",
+            "OpULessThan",
+            "OpULessThanEqual",
+        ] {
+            assert!(source.contains(operation), "missing {operation}:\n{source}");
+        }
+        assert!(
+            source.contains("%scmov_value_0 = OpSelect %uint %scmov_pred_0")
+                && source.contains("%t_13 = OpIAdd %int %t0_13 %t1_13")
+                && source.contains("OpStore %scc %so1_142_13"),
+            "CMOVK and ADDK must preserve conditional/overflow semantics:\n{source}"
+        );
+        let binary = spirv_run(&source).expect("assemble SOPK immediate family");
+        naga_parse_and_validate(&binary, "SOPK immediate family");
+    }
+
+    /// SOPC bit tests mask the bit index to five bits and write SCC according
+    /// to whether the selected bit is zero or one.
+    #[test]
+    fn rdna2_scalar_bitcmp_b32_pair_decodes_and_validates() {
+        let sopc = |opcode: u32| 0xbf00_0000 | (opcode << 16) | (1 << 8); // s0, index s1
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &[sopc(0x0c), sopc(0x0d), S_ENDPGM], &mut code, true)
+            .expect("parse the scalar B32 bit-compare pair");
+        assert_eq!(code.get_instructions()[0].type_, T::SBitcmp0B32);
+        assert_eq!(code.get_instructions()[1].type_, T::SBitcmp1B32);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile the scalar B32 bit-compare pair");
+        for (index, predicate) in [(0, "OpIEqual"), (1, "OpINotEqual")] {
+            assert!(
+                source.contains(&format!(
+                    "%bitcmp_index_{index} = OpBitwiseAnd %uint %bitcmp_index_raw_{index} %uint_31"
+                )) && source.contains(&format!(
+                    "%bitcmp_test_{index} = {predicate} %bool %bitcmp_bit_{index} %uint_0"
+                )) && source.contains(&format!("OpStore %scc %bitcmp_scc_{index}")),
+                "missing B32 bit-test semantics for instruction {index}:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble scalar B32 bit-compare pair");
+        naga_parse_and_validate(&words, "scalar B32 bit-compare pair");
+    }
+
+    /// AMD RDNA2 SOP2 0x12/14/16/18/1a/1c are the complete 32-bit bitwise
+    /// sibling set. Before this batch each one was a parser-level NI even
+    /// though the corresponding 64-bit operation already translated.
+    #[test]
+    fn rdna2_scalar_b32_bitwise_siblings_decode_and_validate() {
+        let sop2 = |opcode: u32, sdst: u32| 0x8000_0000 | (opcode << 23) | (sdst << 16) | (1 << 8);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                sop2(0x12, 2),
+                sop2(0x14, 3),
+                sop2(0x16, 4),
+                sop2(0x18, 5),
+                sop2(0x1a, 6),
+                sop2(0x1c, 7),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse all RDNA2 scalar B32 bitwise siblings");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(6)
+                .map(|inst| inst.type_)
+                .collect::<Vec<_>>(),
+            [
+                T::SXorB32,
+                T::SAndn2B32,
+                T::SOrn2B32,
+                T::SNandB32,
+                T::SNorB32,
+                T::SXnorB32,
+            ]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile all RDNA2 scalar B32 bitwise siblings");
+        for fragment in [
+            "%t_0 = OpBitwiseXor %uint %t0_0 %t1_0",
+            "%tn_1 = OpNot %uint %t1_1",
+            "%t_1 = OpBitwiseAnd %uint %t0_1 %tn_1",
+            "%t_2 = OpBitwiseOr %uint %t0_2 %tn_2",
+            "%t_3 = OpNot %uint %tb_3",
+            "%t_4 = OpNot %uint %tb_4",
+            "%t_5 = OpNot %uint %tb_5",
+        ] {
+            assert!(source.contains(fragment), "missing {fragment}:\n{source}");
+        }
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.trim_start().starts_with("OpStore %scc %snz1_"))
+                .count(),
+            6,
+            "every sibling must update SCC from its result:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble scalar B32 bitwise family");
+        naga_parse_and_validate(&words, "scalar B32 bitwise family");
+    }
+
+    /// SOP1 conditional move preserves the old destination when SCC is zero;
+    /// `s_not_b32` updates SCC from the complemented result. These details are
+    /// easy to lose if all three are treated as unconditional scalar moves.
+    #[test]
+    fn rdna2_scalar_cmov_and_not_decode_and_validate() {
+        let sop1 =
+            |opcode: u32, sdst: u32, ssrc0: u32| 0xbe80_0000 | (sdst << 16) | (opcode << 8) | ssrc0;
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                sop1(0x05, 2, 0),
+                sop1(0x06, 4, 0),
+                sop1(0x07, 6, 1),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse RDNA2 scalar cmov/not SOP1 instructions");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(3)
+                .map(|inst| (inst.type_, inst.format))
+                .collect::<Vec<_>>(),
+            [
+                (T::SCmovB32, F::SVdstSVsrc0),
+                (T::SCmovB64, F::Sdst2Ssrc02),
+                (T::SNotB32, F::SVdstSVsrc0),
+            ]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile RDNA2 scalar cmov/not SOP1 instructions");
+        assert!(
+            source.contains(
+                "%scmov_value_0 = OpSelect %uint %scmov_pred_0 %scmov_src_0 %scmov_old_0"
+            ),
+            "B32 false arm must preserve the old destination:\n{source}"
+        );
+        assert!(
+            source.contains(
+                "%scmov_value0_1 = OpSelect %uint %scmov_pred_1 %scmov_src0_1 %scmov_old0_1"
+            ) && source.contains(
+                "%scmov_value1_1 = OpSelect %uint %scmov_pred_1 %scmov_src1_1 %scmov_old1_1"
+            ),
+            "both B64 halves must share SCC and preserve their old values:\n{source}"
+        );
+        assert!(
+            source.contains("%t_2 = OpNot %uint %t0_2")
+                && source
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("OpStore %scc %snz1_")),
+            "s_not_b32 must complement and then update SCC:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble scalar cmov/not SOP1 instructions");
+        naga_parse_and_validate(&words, "scalar cmov/not SOP1 instructions");
+    }
+
+    /// Direct SOP1 coverage for AMD's quad-mask, bit-count, bit-reverse and
+    /// sign-extension definitions.
+    #[test]
+    fn rdna2_scalar_unary_bit_family_decodes_and_validates() {
+        let sop1 =
+            |opcode: u32, sdst: u32, ssrc0: u32| 0xbe80_0000 | (sdst << 16) | (opcode << 8) | ssrc0;
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                sop1(0x09, 2, 0),
+                sop1(0x0c, 4, 0),
+                sop1(0x0d, 6, 0),
+                sop1(0x0f, 7, 0),
+                sop1(0x11, 8, 0),
+                sop1(0x13, 9, 0),
+                sop1(0x19, 10, 0),
+                sop1(0x1a, 11, 0),
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse RDNA2 scalar unary bit family");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(8)
+                .map(|inst| inst.type_)
+                .collect::<Vec<_>>(),
+            [
+                T::SWqmB32,
+                T::SBrevB64,
+                T::SBcnt0I32B32,
+                T::SBcnt1I32B32,
+                T::SFF0I32B32,
+                T::SFF1I32B32,
+                T::SSextI32I8,
+                T::SSextI32I16,
+            ]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile RDNA2 scalar unary bit family");
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.contains("OpFunctionCall %uint %wqm %wqm_src_0"))
+                .count(),
+            8,
+            "WQM32 must test and fill all eight quads:\n{source}"
+        );
+        assert!(
+            source.contains("%brev_lo_1 = OpBitReverse %uint %brev_src1_1")
+                && source.contains("%brev_hi_1 = OpBitReverse %uint %brev_src0_1"),
+            "B64 reversal must swap the reversed dword halves:\n{source}"
+        );
+        assert!(
+            source.contains("%tn_2 = OpNot %uint %t0_2")
+                && source.contains("%t_2 = OpBitCount %uint %tn_2")
+                && source.contains("%t_3 = OpBitCount %uint %t0_3"),
+            "BCNT0/1 must count complemented/original input bits:\n{source}"
+        );
+        assert!(
+            source.contains("%tsearch_4 = OpNot %uint %t0_4")
+                && source.contains("%tsearch_5 = OpBitwiseOr %uint %t0_5 %uint_0")
+                && source.contains("%tbelow_4 = OpBitwiseAnd %uint %tm1_4 %tn_4")
+                && source.contains("%tsentinel_5 = OpShiftRightLogical %uint %tcount_5 %uint_5")
+                && source.contains("%t_5 = OpBitwiseOr %uint %tcount_5 %tmask_5"),
+            "FF0/FF1 must scan inverted/original bits and map no-hit to -1:\n{source}"
+        );
+        assert!(
+            source.contains("%tse_6 = OpBitFieldSExtract %int %ti_6 %int_0 %int_8")
+                && source.contains("%tse_7 = OpBitFieldSExtract %int %ti_7 %int_0 %int_16"),
+            "SEXT must use the documented 8/16-bit signed widths:\n{source}"
+        );
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.trim_start().starts_with("OpStore %scc %snz1_"))
+                .count(),
+            3,
+            "WQM and both bit counts update SCC; BREV/SEXT do not:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble scalar unary bit family");
+        naga_parse_and_validate(&words, "scalar unary bit family");
     }
 
     /// `s_not_b64` / `s_brev_b32` — both blocked ASTRO.BOT's compute shaders.
@@ -14897,6 +16480,455 @@ mod tests {
         );
         // Carry-out landed in dst2 as the SGPR pair s8, not swallowed by op_sel.
         assert_eq!(inst.dst2.register_id, 8, "carry-out must decode to s8");
+    }
+
+    /// RDNA2 ISA doc 70648 assigns VOP3B opcodes 0x310/0x319 to the ordinary
+    /// and reverse unsigned subtract-with-borrow forms. Both must preserve the
+    /// scalar borrow destination and lower to validator-clean integer SPIR-V.
+    #[test]
+    fn rdna2_vop3b_subtract_with_borrow_decodes_and_validates() {
+        for (opcode, expected, left_vgpr, right_vgpr) in
+            [(0x310, T::VSubI32, 3, 4), (0x319, T::VSubrevI32, 4, 3)]
+        {
+            let b0 = (0b110101u32 << 26) | (opcode << 16) | (8 << 8) | 2;
+            let b1 = 259u32 | (260u32 << 9);
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[b0, b1, 0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|err| panic!("parse RDNA2 VOP3B opcode {opcode:#x}: {err}"));
+
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, expected);
+            assert_eq!(inst.format, F::VdstSdst2Vsrc0Vsrc1);
+            assert_eq!(inst.dst2.register_id, 8, "borrow-out must target s[8:9]");
+
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .unwrap_or_else(|err| panic!("recompile RDNA2 VOP3B opcode {opcode:#x}: {err}"));
+            assert!(
+                source.contains(&format!("%ttleft_0 = OpLoad %float %v{left_vgpr}")),
+                "the subtraction's left operand is wrong:\n{source}"
+            );
+            assert!(
+                source.contains(&format!("%ttright_0 = OpLoad %float %v{right_vgpr}")),
+                "the subtraction's right operand is wrong:\n{source}"
+            );
+            assert!(
+                source.contains("%tdiff_0 = OpISub %uint %tleft_0 %tright_0"),
+                "{source}"
+            );
+            assert!(
+                source.contains("%tborrow_0 = OpULessThan %bool %tleft_0 %tright_0"),
+                "{source}"
+            );
+            assert!(
+                source.contains("OpStore %s8 %tborrow_mask_0")
+                    && source.contains("OpStore %s9 %uint_0"),
+                "the borrow mask must land in the complete scalar pair:\n{source}"
+            );
+            let words = spirv_run(&source)
+                .unwrap_or_else(|err| panic!("assemble RDNA2 VOP3B opcode {opcode:#x}: {err}"));
+            naga_parse_and_validate(&words, &format!("RDNA2 VOP3B opcode {opcode:#x}"));
+        }
+    }
+
+    /// Official RDNA2 three-source integer definitions:
+    /// `v_sad_u32 = abs(src0-src1)+src2`, and
+    /// `v_mad_u32_u24 = (src0&0xffffff)*(src1&0xffffff)+src2`.
+    #[test]
+    fn rdna2_sad_and_u24_mad_recompile_with_documented_bit_widths() {
+        let vop3a = |opcode: u32, vdst: u32| {
+            (
+                (0b110101u32 << 26) | (opcode << 16) | vdst,
+                259u32 | (260u32 << 9) | (261u32 << 18),
+            )
+        };
+        let (sad0, sad1) = vop3a(0x15d, 0);
+        let (mad0, mad1) = vop3a(0x143, 1);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &[sad0, sad1, mad0, mad1, S_ENDPGM], &mut code, true)
+            .expect("parse v_sad_u32 and v_mad_u32_u24");
+        assert_eq!(code.get_instructions()[0].type_, T::VSadU32);
+        assert_eq!(code.get_instructions()[1].type_, T::VMadU32U24);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile v_sad_u32 and v_mad_u32_u24");
+        assert!(
+            source.contains("%td_0 = OpFunctionCall %uint %abs_diff")
+                && source.contains("%t_0 = OpIAdd %uint %td_0 %t2_0"),
+            "SAD must use unsigned absolute difference plus the accumulator:\n{source}"
+        );
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| {
+                    line.contains("OpBitwiseAnd") && line.contains("%uint_0x00ffffff")
+                })
+                .count(),
+            2,
+            "both multiply inputs must be truncated to U24:\n{source}"
+        );
+        assert!(
+            source.contains("%tm_1 = OpFunctionCall %uint %mul_lo_uint")
+                && source.contains("%t_1 = OpIAdd %uint %tm_1 %t2_1"),
+            "U24 MAD must multiply the masked operands and add src2:\n{source}"
+        );
+        // `mul_lo_uint` uses OpUMulExtended, accepted by the Vulkan path but
+        // rejected by naga's frontend; assembly remains the independent bar.
+        let _ = spirv_run(&source).expect("assemble v_sad_u32 and v_mad_u32_u24");
+    }
+
+    /// AMD's VOP2 9/10/12 and VOP3A 0x142 definitions share one critical
+    /// rule: only the low 24 input bits participate, signed forms sign-extend
+    /// bit 23 and unsigned forms zero-extend.
+    #[test]
+    fn rdna2_signed_and_high_u24_multiply_family_recompiles_exactly() {
+        let vop2 = |opcode: u32, vdst: u32| {
+            (opcode << 25) | (vdst << 17) | (4 << 9) | 259 // src0=v3, src1=v4
+        };
+        let mad0 = (0b110101u32 << 26) | (0x142 << 16) | 3;
+        let mad1 = 259u32 | (260u32 << 9) | (261u32 << 18);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[vop2(9, 0), vop2(10, 1), vop2(12, 2), mad0, mad1, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse the RDNA2 I24/U24 multiply family");
+        assert_eq!(code.get_instructions()[0].type_, T::VMulI32I24);
+        assert_eq!(code.get_instructions()[1].type_, T::VMulHiI32I24);
+        assert_eq!(code.get_instructions()[2].type_, T::VMulHiU32U24);
+        assert_eq!(code.get_instructions()[3].type_, T::VMadI32I24);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile the RDNA2 I24/U24 multiply family");
+        assert_eq!(
+            source
+                .lines()
+                .filter(
+                    |line| line.contains("OpBitFieldSExtract") && line.contains("%int_0 %int_24")
+                )
+                .count(),
+            6,
+            "three signed operations must sign-extend both I24 inputs:\n{source}"
+        );
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.contains("OpBitwiseAnd") && line.contains("%uint_0x00ffffff"))
+                .count(),
+            2,
+            "the unsigned high multiply must mask both U24 inputs:\n{source}"
+        );
+        assert!(
+            source.contains("%ti24_result_i_0 = OpIMul %int")
+                && source.contains("%ti24_result_i_1 = OpFunctionCall %int %mul_hi_int")
+                && source.contains("%ti24_result_u_2 = OpFunctionCall %uint %mul_hi_uint")
+                && source.contains("%ti24_result_i_3 = OpIAdd %int %ti24_product_3"),
+            "low/high and MAD result selection must match the four AMD opcodes:\n{source}"
+        );
+        assert_eq!(
+            source.matches("OpStore %v0 %ti24_selected_0").count(),
+            1,
+            "the result must be written once after EXEC selection:\n{source}"
+        );
+        // High-half helpers use SPIR-V's extended multiply opcodes, accepted by
+        // Vulkan but rejected by naga's frontend; assembly is the correct bar.
+        let _ = spirv_run(&source).expect("assemble the RDNA2 I24/U24 multiply family");
+    }
+
+    /// The e64 VOP3 aliases of the three two-source multiply opcodes use the
+    /// same operation semantics and must not fall back to parser NI paths.
+    #[test]
+    fn rdna2_i24_multiply_vop3_aliases_decode() {
+        for (opcode, expected) in [
+            (0x109, T::VMulI32I24),
+            (0x10a, T::VMulHiI32I24),
+            (0x10c, T::VMulHiU32U24),
+        ] {
+            let b0 = (0b110101u32 << 26) | (opcode << 16);
+            let b1 = 259u32 | (260u32 << 9);
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[b0, b1, 0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .unwrap_or_else(|err| panic!("parse VOP3 alias {opcode:#x}: {err}"));
+            assert_eq!(code.get_instructions()[0].type_, expected);
+            assert_eq!(code.get_instructions()[0].format, F::SVdstSVsrc0SVsrc1);
+        }
+    }
+
+    /// The VOP3/e64 aliases of the integer min/max quartet must reach the same
+    /// signed/unsigned lowering as their compact VOP2 encodings.
+    #[test]
+    fn rdna2_integer_minmax_vop3_aliases_decode_and_validate() {
+        let mut words = Vec::new();
+        for opcode in 0x111..=0x114 {
+            words.push((0b110101u32 << 26) | (opcode << 16) | (opcode - 0x111));
+            words.push(259u32 | (260u32 << 9));
+        }
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &words, &mut code, true)
+            .expect("parse the RDNA2 integer min/max VOP3 aliases");
+        assert_eq!(
+            code.get_instructions()
+                .iter()
+                .take(4)
+                .map(|inst| (inst.type_, inst.format))
+                .collect::<Vec<_>>(),
+            [
+                (T::VMinI32, F::SVdstSVsrc0SVsrc1),
+                (T::VMaxI32, F::SVdstSVsrc0SVsrc1),
+                (T::VMinU32, F::SVdstSVsrc0SVsrc1),
+                (T::VMaxU32, F::SVdstSVsrc0SVsrc1),
+            ]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile the RDNA2 integer min/max VOP3 aliases");
+        for operation in ["SMin", "SMax", "UMin", "UMax"] {
+            assert!(
+                source.contains(&format!("%GLSL_std_450 {operation}")),
+                "missing {operation}:\n{source}"
+            );
+        }
+        let binary = spirv_run(&source).expect("assemble integer min/max VOP3 aliases");
+        naga_parse_and_validate(&binary, "integer min/max VOP3 aliases");
+    }
+
+    #[test]
+    fn rdna2_mul_hi_i32_recompiles_without_overwriting_inactive_lanes() {
+        let b0 = (0b110101u32 << 26) | (0x16c << 16);
+        let b1 = 259u32 | (260u32 << 9);
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[b0, b1, 0xBF80_0000, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse v_mul_hi_i32");
+        assert_eq!(code.get_instructions()[0].type_, T::VMulHiI32);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile v_mul_hi_i32");
+        assert!(
+            source.contains("%t_0 = OpFunctionCall %int %mul_hi_int %t0_0 %t1_0"),
+            "{source}"
+        );
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.contains("OpStore %v0"))
+                .count(),
+            1,
+            "the destination must be written only after EXEC selects old/new:\n{source}"
+        );
+        assert!(
+            source.contains("%tdst_0 = OpLoad %float %v0")
+                && source.contains("%tval_0 = OpSelect %float %exec_lo_b_0 %tf_0 %tdst_0"),
+            "inactive lanes must preserve the old destination:\n{source}"
+        );
+        let _ = spirv_run(&source).expect("assemble v_mul_hi_i32");
+    }
+
+    /// AMD specifies the integer three-input family as nested signed/unsigned
+    /// min/max operations; median is `max(min(a,b), min(max(a,b),c))`.
+    #[test]
+    fn rdna2_integer_min3_max3_med3_family_validates() {
+        let vop3 = |opcode: u32, vdst: u32| {
+            [
+                (0b110101u32 << 26) | (opcode << 16) | vdst,
+                259u32 | (260u32 << 9) | (261u32 << 18),
+            ]
+        };
+        let mut words = Vec::new();
+        for (opcode, vdst) in [
+            (0x152, 0),
+            (0x153, 1),
+            (0x155, 2),
+            (0x156, 3),
+            (0x158, 6),
+            (0x159, 7),
+        ] {
+            words.extend(vop3(opcode, vdst));
+        }
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &words, &mut code, true).expect("parse integer min3/max3/med3 family");
+        assert_eq!(
+            code.get_instructions()[..6]
+                .iter()
+                .map(|inst| inst.type_)
+                .collect::<Vec<_>>(),
+            [
+                T::VMin3I32,
+                T::VMin3U32,
+                T::VMax3I32,
+                T::VMax3U32,
+                T::VMed3I32,
+                T::VMed3U32,
+            ]
+        );
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile integer min3/max3/med3 family");
+        for needle in [
+            "%tim_0 = OpExtInst %int %GLSL_std_450 SMin",
+            "%tm_1 = OpExtInst %uint %GLSL_std_450 UMin",
+            "%tim_2 = OpExtInst %int %GLSL_std_450 SMax",
+            "%tm_3 = OpExtInst %uint %GLSL_std_450 UMax",
+            "%tcap_4 = OpExtInst %int %GLSL_std_450 SMin %tmax_4 %ti2_4",
+            "%tir_4 = OpExtInst %int %GLSL_std_450 SMax %tmin_4 %tcap_4",
+            "%tcap_5 = OpExtInst %uint %GLSL_std_450 UMin %tmax_5 %t2_5",
+            "%t_5 = OpExtInst %uint %GLSL_std_450 UMax %tmin_5 %tcap_5",
+        ] {
+            assert!(
+                source.contains(needle),
+                "missing documented integer ternary step `{needle}`:\n{source}"
+            );
+        }
+        let compiled = spirv_run(&source).expect("assemble integer min3/max3/med3 family");
+        naga_parse_and_validate(&compiled, "integer min3/max3/med3 family");
+    }
+
+    /// AMD's packed SAD definitions operate independently on four U8 lanes or
+    /// two U16 lanes. The HI variant shifts the U8 difference sum by 16 before
+    /// adding src2.
+    #[test]
+    fn rdna2_packed_sad_family_extracts_every_lane_and_validates() {
+        let vop3 = |opcode: u32, vdst: u32| {
+            [
+                (0b110101u32 << 26) | (opcode << 16) | vdst,
+                259u32 | (260u32 << 9) | (261u32 << 18),
+            ]
+        };
+        let mut words = Vec::new();
+        words.extend(vop3(0x15a, 0));
+        words.extend(vop3(0x15b, 1));
+        words.extend(vop3(0x15c, 2));
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &words, &mut code, true).expect("parse packed SAD family");
+        assert_eq!(code.get_instructions()[0].type_, T::VSadU8);
+        assert_eq!(code.get_instructions()[1].type_, T::VSadHiU8);
+        assert_eq!(code.get_instructions()[2].type_, T::VSadU16);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile packed SAD family");
+        assert_eq!(
+            source.matches("%sad_diff_0_").count(),
+            8,
+            "four U8 lane ids are each defined and consumed:\n{source}"
+        );
+        assert_eq!(
+            source.matches("%sad_diff_1_").count(),
+            8,
+            "four SAD_HI U8 lane ids are each defined and consumed:\n{source}"
+        );
+        assert_eq!(
+            source.matches("%sad_diff_2_").count(),
+            4,
+            "two U16 lane ids are each defined and consumed:\n{source}"
+        );
+        assert!(
+            source.contains("%sad_hi_1 = OpShiftLeftLogical %uint %sad_acc_1_3 %uint_16")
+                && source.contains("%sad_result_1 = OpIAdd %uint %sad_hi_1 %sad_2_1"),
+            "SAD_HI_U8 must shift the difference sum before adding src2:\n{source}"
+        );
+        assert!(
+            source.contains("%uint_255") && source.contains("%uint_0x0000ffff"),
+            "byte and halfword lane masks must both be present:\n{source}"
+        );
+        let compiled = spirv_run(&source).expect("assemble packed SAD family");
+        naga_parse_and_validate(&compiled, "packed SAD family");
+    }
+
+    /// Packed-byte interpolation and 64-bit concatenation alignment are three
+    /// adjacent AMD VOP3 operations but have distinct shift/rounding rules.
+    #[test]
+    fn rdna2_lerp_and_align_cluster_validates() {
+        let vop3 = |opcode: u32, vdst: u32| {
+            [
+                (0b110101u32 << 26) | (opcode << 16) | vdst,
+                259u32 | (260u32 << 9) | (261u32 << 18),
+            ]
+        };
+        let mut words = Vec::new();
+        words.extend(vop3(0x14d, 0));
+        words.extend(vop3(0x14e, 1));
+        words.extend(vop3(0x14f, 2));
+        words.push(S_ENDPGM);
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(0, &words, &mut code, true).expect("parse lerp/align cluster");
+        assert_eq!(code.get_instructions()[0].type_, T::VLerpU8);
+        assert_eq!(code.get_instructions()[1].type_, T::VAlignbitB32);
+        assert_eq!(code.get_instructions()[2].type_, T::VAlignbyteB32);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile lerp/align cluster");
+        assert_eq!(
+            source.matches("%lerp_avg_0_").count(),
+            8,
+            "each packed byte average must be defined and packed:\n{source}"
+        );
+        assert!(
+            source.contains("%lerp_round_0_3 = OpBitwiseAnd %uint %lerp_r_shift_0_3 %uint_1"),
+            "the high byte must use src2 bit 24 as its round mode:\n{source}"
+        );
+        assert!(
+            source.contains("%ta_inv0_1 = OpISub %uint %uint_32 %ta_s_1")
+                && source.contains("%ta_nz_1 = OpINotEqual %bool %ta_s_1 %uint_0")
+                && source.contains("%t_1 = OpSelect %uint %ta_nz_1 %ta_merge_1 %t1_1"),
+            "ALIGNBIT must concatenate src0:src1 without shifting by 32 at zero:\n{source}"
+        );
+        assert!(
+            source.contains("%tab_is_lower_2 = OpULessThan %bool %tab_byte_2 %uint_4")
+                && source.contains("%tab_in_range_2 = OpULessThan %bool %tab_byte_2 %uint_8")
+                && source
+                    .contains("%t_2 = OpSelect %uint %tab_in_range_2 %tab_candidate_2 %uint_0"),
+            "ALIGNBYTE must distinguish low/high dwords and out-of-range bytes:\n{source}"
+        );
+        let compiled = spirv_run(&source).expect("assemble lerp/align cluster");
+        naga_parse_and_validate(&compiled, "lerp/align cluster");
     }
 
     /// `v_mad_u64_u32` (VOP3B 0x176) must parse and recompile to the
@@ -15193,6 +17225,51 @@ mod tests {
         assert!(source.contains("%exec_lo_u_0"), "{source}");
         let words = spirv_run(&source).expect("assemble buffer_store_format_xyzw");
         naga_parse_and_validate(&words, "buffer_store_format_xyzw");
+    }
+
+    /// RDNA2 `buffer_store_format_xyz` writes exactly three converted
+    /// components. For 32_32_32 UINT/FLOAT every component occupies a complete
+    /// dword, so three raw stores are bit-exact after descriptor validation.
+    #[test]
+    fn rdna2_buffer_store_format_xyz_writes_exactly_three_dwords() {
+        // MUBUF opcode 6, IDXEN, VDATA=v4, VADDR=v0, V#=s[4:7].
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xE018_2000, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse buffer_store_format_xyz");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferStoreFormatXyz);
+        assert_eq!(inst.format, F::Vdata3VaddrSvSoffsIdxen);
+        assert_eq!(inst.dst.size, 3);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 4;
+        // Unified 74 = 32_32_32_FLOAT; packed legacy representation 111.
+        input_info.bind.storage_buffers.buffers[0].fields = [0, 16 << 16, 256, 74 << 12];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile buffer_store_format_xyz");
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.contains("OpFunctionCall %void %buffer_store_float1"))
+                .count(),
+            3,
+            "XYZ must issue three component stores, never two or four:\n{source}"
+        );
+        assert!(
+            !source.contains("%tbuffer_store_format_xyzw"),
+            "XYZ must not alias the four-channel helper:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble buffer_store_format_xyz");
+        naga_parse_and_validate(&words, "buffer_store_format_xyz");
     }
 
     #[test]
@@ -15753,6 +17830,49 @@ mod tests {
         // shaderStorageImageWriteWithoutFormat — the ImageStore dmaskF
         // sibling ships under the same false-negative class.
         let _ = spirv_run(&source).expect("assemble image_store dmask1");
+    }
+
+    /// RDNA2 MIMG opcode 9 is `image_store_mip`: for DIM_2D the third VADDR
+    /// component selects the mip level after the x/y texel coordinate.
+    #[test]
+    fn rdna2_image_store_mip_uses_the_guest_mip_coordinate() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF024_0F08, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store_mip dmaskF");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageStoreMip);
+        assert_eq!(inst.format, F::Vdata4Vaddr4StDmaskF);
+        assert_eq!(inst.src[0].size, 3, "DIM_2D VADDR is x, y and mip");
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile image_store_mip dmaskF");
+        assert!(
+            source.contains("%t701_0 = OpLoad %float %v2")
+                && source.contains("%t711_0 = OpBitcast %uint %t701_0")
+                && source.contains("OpFunctionCall %v2uint %mipmap %t711_0"),
+            "the guest mip VADDR component must feed mip placement:\n{source}"
+        );
+        assert!(
+            source.contains("OpImageWrite"),
+            "the mip-adjusted coordinate must reach the storage write:\n{source}"
+        );
+        // Storage writes use shaderStorageImageWriteWithoutFormat and hit
+        // naga's known InvalidImage false negative; SPIR-V assembly is the bar.
+        let _ = spirv_run(&source).expect("assemble image_store_mip dmaskF");
     }
 
     /// The measured ASTRO.BOT UAV volume (round 7, 58 dispatches/run): a T#
@@ -17122,30 +19242,17 @@ mod tests {
     // ---- 5. error paths ----------------------------------------------------
 
     #[test]
-    fn not_implemented_error_names_kyty_function() {
-        // image_sample is wired (texture chain); ImageStoreMip is the MIMG
-        // row still C2. Built by hand — guessing a store-mip encoding would
-        // test the parser, not the error naming this test is about.
-        let mut code = ShaderCode::new();
-        code.set_type(ShaderType::Pixel);
-        let inst = ShaderInstruction {
-            type_: T::ImageStoreMip,
-            format: F::Vdata4Vaddr4StDmaskF,
-            ..Default::default()
-        };
-        code.get_instructions_mut().push(inst);
-        let mut input_info = ShaderPixelInputInfo::default();
-        input_info.target_output_mode[0] = 4;
-        let err = shader_recompile_ps(&code, &input_info).unwrap_err();
-        match err {
-            ShaderRecompileError::NotImplemented {
-                kyty_func, line, ..
-            } => {
-                assert_eq!(kyty_func, "Recompile_ImageStoreMip_Vdata4Vaddr4StDmaskF");
-                assert_eq!(line, 3173);
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
+    fn current_dispatch_table_has_no_placeholder_lowerings() {
+        let placeholders = recomp_func_table()
+            .iter()
+            .filter(|row| matches!(row.func, RecompileFn::NotImplemented { .. }))
+            .map(|row| (row.type_, row.format))
+            .collect::<Vec<_>>();
+        assert!(
+            placeholders.is_empty(),
+            "every decoded table row must lower or be removed from the accepted surface: \
+             {placeholders:?}"
+        );
     }
 
     #[test]
@@ -23019,6 +25126,85 @@ mod tests {
             "packed 95 = dfmt 11, nfmt 7 is what the helper's guard admits:\n{source}"
         );
         let _ = spirv_run(&source).expect("assemble tbuffer_load_format_xy");
+    }
+
+    /// With both IDXEN and OFFEN set, VADDR is a pair: the first VGPR is the
+    /// element index and the second is an additional byte offset. AMD's MTBUF
+    /// address equation requires that second term to reach the typed helper.
+    #[test]
+    fn mtbuf_xy_offen_adds_voffset_to_the_byte_offset() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                mtbuf_word0(64, 1, 1, 1, 4),
+                mtbuf_word1(0x80, 1, 6, 4),
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse tbuffer_load_format_xy with idxen+offen");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::TBufferLoadFormatXy);
+        assert_eq!(inst.format, F::Vdata2Vaddr2SvSoffsOffenIdxenFloat2);
+        assert_eq!(inst.src[0].size, 2, "VADDR must retain index+voffset");
+
+        let input_info = ps_info_with_one_buffer();
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile tbuffer_load_format_xy idxen+offen");
+        assert!(
+            source.contains("%tfo0_0 = OpLoad %float %v5")
+                && source.contains("%tfo2_0 = OpIAdd %int %tfo1_0 %int_4")
+                && source.contains("OpStore %temp_int_2 %tfo2_0"),
+            "the second VADDR VGPR and folded immediate must form the byte offset:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble tbuffer_load_format_xy idxen+offen");
+        naga_parse_and_validate(&words, "tbuffer_load_format_xy idxen+offen");
+    }
+
+    /// The four-channel typed sibling uses the same AMD IDXEN+OFFEN address
+    /// equation and must preserve the second VADDR VGPR as a byte offset.
+    #[test]
+    fn mtbuf_xyzw_offen_adds_voffset_to_the_byte_offset() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Pixel);
+        shader_parse(
+            0,
+            &[
+                mtbuf_word0(77, 3, 1, 1, 4),
+                mtbuf_word1(0x80, 1, 8, 4),
+                0xBF80_0000,
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse tbuffer_load_format_xyzw with idxen+offen");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::TBufferLoadFormatXyzw);
+        assert_eq!(inst.format, F::Vdata4Vaddr2SvSoffsOffenIdxenFloat4);
+        assert_eq!(inst.src[0].size, 2);
+
+        let input_info = ps_info_with_one_buffer();
+        let source = spirv_generate_source(&code, None, Some(&input_info), None)
+            .expect("recompile tbuffer_load_format_xyzw idxen+offen");
+        assert!(
+            source.contains("%to100_0 = OpLoad %float %v5")
+                && source.contains("%offset_0 = OpIAdd %int %to101_0 %int_4")
+                && source.contains("OpStore %temp_int_2 %offset_0"),
+            "the second VADDR VGPR and folded immediate must form the byte offset:\n{source}"
+        );
+        assert!(
+            source.contains("%tbuffer_load_format_xyzw"),
+            "the four-channel typed helper must be emitted:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble tbuffer_load_format_xyzw idxen+offen");
+        naga_parse_and_validate(&words, "tbuffer_load_format_xyzw idxen+offen");
     }
 
     /// A register SOFFSET plus a non-zero immediate needs a runtime add that no

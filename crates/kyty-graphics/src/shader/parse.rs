@@ -397,8 +397,8 @@ fn shader_parse_sopc(
         0x09 => inst.type_ = T::SCmpGeU32,
         0x0a => inst.type_ = T::SCmpLtU32,
         0x0b => inst.type_ = T::SCmpLeU32,
-        0x0c => return Err(ni(dst, S, "s_bitcmp0_b32", opcode, pc, b0)),
-        0x0d => return Err(ni(dst, S, "s_bitcmp1_b32", opcode, pc, b0)),
+        0x0c => inst.type_ = T::SBitcmp0B32,
+        0x0d => inst.type_ = T::SBitcmp1B32,
         0x0e => return Err(ni(dst, S, "s_bitcmp0_b64", opcode, pc, b0)),
         0x0f => return Err(ni(dst, S, "s_bitcmp1_b64", opcode, pc, b0)),
         0x10 => return Err(ni(dst, S, "s_setvskip", opcode, pc, b0)),
@@ -458,22 +458,40 @@ fn shader_parse_sopk(
     inst.src[0].constant.u = i32::from(imm) as u32;
     inst.src_num = 1;
 
+    let cmpk = |inst: &mut ShaderInstruction, type_: T| {
+        let register = inst.dst;
+        let immediate = inst.src[0];
+        inst.type_ = type_;
+        inst.format = F::Ssrc0Ssrc1;
+        inst.src[0] = register;
+        inst.src[1] = immediate;
+        inst.src_num = 2;
+        inst.dst = ShaderOperand::default();
+    };
+
     match opcode {
         0x00 => inst.type_ = T::SMovkI32,
-        0x02 => return Err(ni(dst, S, "s_cmovk_i32", opcode, pc, b0)),
-        0x03 => return Err(ni(dst, S, "s_cmpk_eq_i32", opcode, pc, b0)),
-        0x04 => return Err(ni(dst, S, "s_cmpk_lg_i32", opcode, pc, b0)),
-        0x05 => return Err(ni(dst, S, "s_cmpk_gt_i32", opcode, pc, b0)),
-        0x06 => return Err(ni(dst, S, "s_cmpk_ge_i32", opcode, pc, b0)),
-        0x07 => return Err(ni(dst, S, "s_cmpk_lt_i32", opcode, pc, b0)),
-        0x08 => return Err(ni(dst, S, "s_cmpk_le_i32", opcode, pc, b0)),
-        0x09 => return Err(ni(dst, S, "s_cmpk_eq_u32", opcode, pc, b0)),
-        0x0a => return Err(ni(dst, S, "s_cmpk_lg_u32", opcode, pc, b0)),
-        0x0b => return Err(ni(dst, S, "s_cmpk_gt_u32", opcode, pc, b0)),
-        0x0c => return Err(ni(dst, S, "s_cmpk_ge_u32", opcode, pc, b0)),
-        0x0d => return Err(ni(dst, S, "s_cmpk_lt_u32", opcode, pc, b0)),
-        0x0e => return Err(ni(dst, S, "s_cmpk_le_u32", opcode, pc, b0)),
-        0x0f => return Err(ni(dst, S, "s_addk_i32", opcode, pc, b0)),
+        0x02 => inst.type_ = T::SCmovB32,
+        0x03 => cmpk(&mut inst, T::SCmpEqI32),
+        0x04 => cmpk(&mut inst, T::SCmpLgI32),
+        0x05 => cmpk(&mut inst, T::SCmpGtI32),
+        0x06 => cmpk(&mut inst, T::SCmpGeI32),
+        0x07 => cmpk(&mut inst, T::SCmpLtI32),
+        0x08 => cmpk(&mut inst, T::SCmpLeI32),
+        0x09 => cmpk(&mut inst, T::SCmpEqU32),
+        0x0a => cmpk(&mut inst, T::SCmpLgU32),
+        0x0b => cmpk(&mut inst, T::SCmpGtU32),
+        0x0c => cmpk(&mut inst, T::SCmpGeU32),
+        0x0d => cmpk(&mut inst, T::SCmpLtU32),
+        0x0e => cmpk(&mut inst, T::SCmpLeU32),
+        0x0f => {
+            let immediate = inst.src[0];
+            inst.type_ = T::SAddI32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src[0] = inst.dst;
+            inst.src[1] = immediate;
+            inst.src_num = 2;
+        }
         0x10 => inst.type_ = T::SMulkI32,
         0x11 => return Err(ni(dst, S, "s_cbranch_i_fork", opcode, pc, b0)),
         0x12 => return Err(ni(dst, S, "s_getreg_b32", opcode, pc, b0)),
@@ -651,9 +669,20 @@ fn shader_parse_sop1(
             inst.dst.size = 2;
             inst.src[0].size = 2;
         }
-        0x05 => return Err(ni(dst, S, "s_cmov_b32", opcode, pc, b0)),
-        0x06 => return Err(ni(dst, S, "s_cmov_b64", opcode, pc, b0)),
-        0x07 => return Err(ni(dst, S, "s_not_b32", opcode, pc, b0)),
+        0x05 => {
+            inst.type_ = T::SCmovB32;
+            inst.format = F::SVdstSVsrc0;
+        }
+        0x06 => {
+            inst.type_ = T::SCmovB64;
+            inst.format = F::Sdst2Ssrc02;
+            inst.dst.size = 2;
+            inst.src[0].size = 2;
+        }
+        0x07 => {
+            inst.type_ = T::SNotB32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x08 => {
             // GCN: D.u64 = ~S0.u64; SCC = (D != 0). Measured in ASTRO.BOT's
             // compute shaders (exec-mask manipulation).
@@ -662,7 +691,10 @@ fn shader_parse_sop1(
             inst.dst.size = 2;
             inst.src[0].size = 2;
         }
-        0x09 => return Err(ni(dst, S, "s_wqm_b32", opcode, pc, b0)),
+        0x09 => {
+            inst.type_ = T::SWqmB32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x0a => {
             inst.type_ = T::SWqmB64;
             inst.format = F::Sdst2Ssrc02;
@@ -675,21 +707,44 @@ fn shader_parse_sop1(
             inst.type_ = T::SBrevB32;
             inst.format = F::SVdstSVsrc0;
         }
-        0x0c => return Err(ni(dst, S, "s_brev_b64", opcode, pc, b0)),
-        0x0d => return Err(ni(dst, S, "s_bcnt0_i32_b32", opcode, pc, b0)),
+        0x0c => {
+            inst.type_ = T::SBrevB64;
+            inst.format = F::Sdst2Ssrc02;
+            inst.dst.size = 2;
+            inst.src[0].size = 2;
+        }
+        0x0d => {
+            inst.type_ = T::SBcnt0I32B32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x0e => return Err(ni(dst, S, "s_bcnt0_i32_b64", opcode, pc, b0)),
-        0x0f => return Err(ni(dst, S, "s_bcnt1_i32_b32", opcode, pc, b0)),
+        0x0f => {
+            inst.type_ = T::SBcnt1I32B32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x10 => return Err(ni(dst, S, "s_bcnt1_i32_b64", opcode, pc, b0)),
-        0x11 => return Err(ni(dst, S, "s_ff0_i32_b32", opcode, pc, b0)),
+        0x11 => {
+            inst.type_ = T::SFF0I32B32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x12 => return Err(ni(dst, S, "s_ff0_i32_b64", opcode, pc, b0)),
-        0x13 => return Err(ni(dst, S, "s_ff1_i32_b32", opcode, pc, b0)),
+        0x13 => {
+            inst.type_ = T::SFF1I32B32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x14 => return Err(ni(dst, S, "s_ff1_i32_b64", opcode, pc, b0)),
         0x15 => return Err(ni(dst, S, "s_flbit_i32_b32", opcode, pc, b0)),
         0x16 => return Err(ni(dst, S, "s_flbit_i32_b64", opcode, pc, b0)),
         0x17 => return Err(ni(dst, S, "s_flbit_i32", opcode, pc, b0)),
         0x18 => return Err(ni(dst, S, "s_flbit_i32_i64", opcode, pc, b0)),
-        0x19 => return Err(ni(dst, S, "s_sext_i32_i8", opcode, pc, b0)),
-        0x1a => return Err(ni(dst, S, "s_sext_i32_i16", opcode, pc, b0)),
+        0x19 => {
+            inst.type_ = T::SSextI32I8;
+            inst.format = F::SVdstSVsrc0;
+        }
+        0x1a => {
+            inst.type_ = T::SSextI32I16;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x1b => return Err(ni(dst, S, "s_bitset0_b32", opcode, pc, b0)),
         0x1c => return Err(ni(dst, S, "s_bitset0_b64", opcode, pc, b0)),
         0x1d => return Err(ni(dst, S, "s_bitset1_b32", opcode, pc, b0)),
@@ -850,44 +905,44 @@ fn shader_parse_sop2(
         0x02 => inst.type_ = T::SAddI32,
         0x03 => inst.type_ = T::SSubI32,
         0x04 => inst.type_ = T::SAddcU32,
-        0x05 => return Err(ni(dst, S, "s_subb_u32", opcode, pc, b0)),
-        0x06 => return Err(ni(dst, S, "s_min_i32", opcode, pc, b0)),
-        0x07 => return Err(ni(dst, S, "s_min_u32", opcode, pc, b0)),
-        0x08 => return Err(ni(dst, S, "s_max_i32", opcode, pc, b0)),
-        0x09 => return Err(ni(dst, S, "s_max_u32", opcode, pc, b0)),
+        0x05 => inst.type_ = T::SSubbU32,
+        0x06 => inst.type_ = T::SMinI32,
+        0x07 => inst.type_ = T::SMinU32,
+        0x08 => inst.type_ = T::SMaxI32,
+        0x09 => inst.type_ = T::SMaxU32,
         0x0a => inst.type_ = T::SCselectB32,
         0x0b => b64_full(&mut inst, T::SCselectB64),
         0x0e => inst.type_ = T::SAndB32,
         0x0f => b64_full(&mut inst, T::SAndB64),
         0x10 => inst.type_ = T::SOrB32,
         0x11 => b64_full(&mut inst, T::SOrB64),
-        0x12 => return Err(ni(dst, S, "s_xor_b32", opcode, pc, b0)),
+        0x12 => inst.type_ = T::SXorB32,
         0x13 => b64_full(&mut inst, T::SXorB64),
-        0x14 => return Err(ni(dst, S, "s_andn2_b32", opcode, pc, b0)),
+        0x14 => inst.type_ = T::SAndn2B32,
         0x15 => b64_full(&mut inst, T::SAndn2B64),
-        0x16 => return Err(ni(dst, S, "s_orn2_b32", opcode, pc, b0)),
+        0x16 => inst.type_ = T::SOrn2B32,
         0x17 => b64_full(&mut inst, T::SOrn2B64),
-        0x18 => return Err(ni(dst, S, "s_nand_b32", opcode, pc, b0)),
+        0x18 => inst.type_ = T::SNandB32,
         0x19 => b64_full(&mut inst, T::SNandB64),
-        0x1a => return Err(ni(dst, S, "s_nor_b32", opcode, pc, b0)),
+        0x1a => inst.type_ = T::SNorB32,
         0x1b => b64_full(&mut inst, T::SNorB64),
-        0x1c => return Err(ni(dst, S, "s_xnor_b32", opcode, pc, b0)),
+        0x1c => inst.type_ = T::SXnorB32,
         0x1d => b64_full(&mut inst, T::SXnorB64),
         0x1e => inst.type_ = T::SLshlB32,
         0x1f => b64_shift(&mut inst, T::SLshlB64),
         0x20 => inst.type_ = T::SLshrB32,
         0x21 => b64_shift(&mut inst, T::SLshrB64),
-        0x22 => return Err(ni(dst, S, "s_ashr_i32", opcode, pc, b0)),
+        0x22 => inst.type_ = T::SAshrI32,
         0x23 => return Err(ni(dst, S, "s_ashr_i64", opcode, pc, b0)),
         0x24 => inst.type_ = T::SBfmB32,
         0x25 => return Err(ni(dst, S, "s_bfm_b64", opcode, pc, b0)),
         0x26 => inst.type_ = T::SMulI32,
         0x27 => inst.type_ = T::SBfeU32,
-        0x28 => return Err(ni(dst, S, "s_bfe_i32", opcode, pc, b0)),
+        0x28 => inst.type_ = T::SBfeI32,
         0x29 => b64_shift(&mut inst, T::SBfeU64),
         0x2a => return Err(ni(dst, S, "s_bfe_i64", opcode, pc, b0)),
         0x2b => return Err(ni(dst, S, "s_cbranch_g_fork", opcode, pc, b0)),
-        0x2c => return Err(ni(dst, S, "s_absdiff_i32", opcode, pc, b0)),
+        0x2c => inst.type_ = T::SAbsDiffI32,
         // The `s_lshlN_add_u32` family, 0x2e..=0x31. Identity established from
         // two independent references that agree on every row:
         // KytyPS5 `src/graphics/shader/recompiler/ScalarAluOps.cpp` L26-28
@@ -919,9 +974,10 @@ fn shader_parse_sop2(
             };
         }
         0x32 => inst.type_ = T::SPackLlB32B16,
-        0x33 => return Err(ni(dst, S, "s_pack_lh_b32_b16", opcode, pc, b0)),
-        0x34 => return Err(ni(dst, S, "s_pack_hh_b32_b16", opcode, pc, b0)),
+        0x33 => inst.type_ = T::SPackLhB32B16,
+        0x34 => inst.type_ = T::SPackHhB32B16,
         0x35 => inst.type_ = T::SMulHiU32,
+        0x36 => inst.type_ = T::SMulHiI32,
         _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
     }
 
@@ -1717,9 +1773,9 @@ fn shader_parse_vop2(
         }
         0x07 => return Err(ni(dst, S, "v_mul_legacy_f32", opcode, pc, b0)),
         0x08 => inst.type_ = T::VMulF32,
-        0x09 => return Err(ni(dst, S, "v_mul_i32_i24", opcode, pc, b0)),
-        0x0a => return Err(ni(dst, S, "v_mul_hi_i32_i24", opcode, pc, b0)),
-        0x0c => return Err(ni(dst, S, "v_mul_hi_u32_u24", opcode, pc, b0)),
+        0x09 => inst.type_ = T::VMulI32I24,
+        0x0a => inst.type_ = T::VMulHiI32I24,
+        0x0c => inst.type_ = T::VMulHiU32U24,
         0x0d => {
             if next_gen {
                 return Err(unknown_op(dst, S, opcode, pc, b0));
@@ -2249,10 +2305,10 @@ fn shader_parse_vop3(
         }
         0x107 => return Err(ni(dst, S, "v_mul_legacy_f32", opcode, pc, b0)),
         0x108 => inst.type_ = T::VMulF32,
-        0x109 => return Err(ni(dst, S, "v_mul_i32_i24", opcode, pc, b0)),
-        0x10a => return Err(ni(dst, S, "v_mul_hi_i32_i24", opcode, pc, b0)),
+        0x109 => inst.type_ = T::VMulI32I24,
+        0x10a => inst.type_ = T::VMulHiI32I24,
         0x10b => inst.type_ = T::VMulU32U24,
-        0x10c => return Err(ni(dst, S, "v_mul_hi_u32_u24", opcode, pc, b0)),
+        0x10c => inst.type_ = T::VMulHiU32U24,
         0x10d => {
             if next_gen {
                 return Err(unknown_op(dst, S, opcode, pc, b0));
@@ -2262,10 +2318,12 @@ fn shader_parse_vop3(
         0x10e => return Err(ni(dst, S, "v_max_legacy_f32", opcode, pc, b0)),
         0x10f => inst.type_ = T::VMinF32,
         0x110 => inst.type_ = T::VMaxF32,
-        0x111 => return Err(ni(dst, S, "v_min_i32", opcode, pc, b0)),
-        0x112 => return Err(ni(dst, S, "v_max_i32", opcode, pc, b0)),
-        0x113 => return Err(ni(dst, S, "v_min_u32", opcode, pc, b0)),
-        0x114 => return Err(ni(dst, S, "v_max_u32", opcode, pc, b0)),
+        // VOP3/e64 aliases of the VOP2 integer min/max quartet. The decoder
+        // has already selected the common two-source format for 0x100..0x13d.
+        0x111 => inst.type_ = T::VMinI32,
+        0x112 => inst.type_ = T::VMaxI32,
+        0x113 => inst.type_ = T::VMinU32,
+        0x114 => inst.type_ = T::VMaxU32,
         0x115 => inst.type_ = T::VLshrB32,
         0x116 => inst.type_ = T::VLshrrevB32,
         0x117 => inst.type_ = T::VAshrI32,
@@ -2409,7 +2467,7 @@ fn shader_parse_vop3(
             return Err(ni(dst, S, "v_mad_legacy_f32", opcode, pc, b0));
         }
         0x141 => inst.type_ = T::VMadF32,
-        0x142 => return Err(ni(dst, S, "v_mad_i32_i24", opcode, pc, b0)),
+        0x142 => inst.type_ = T::VMadI32I24,
         0x143 => inst.type_ = T::VMadU32U24,
         0x144 => inst.type_ = T::VCubeIdF32,
         0x145 => inst.type_ = T::VCubeScF32,
@@ -2420,22 +2478,22 @@ fn shader_parse_vop3(
         0x14a => inst.type_ = T::VBfiB32,
         0x14b => inst.type_ = T::VFmaF32,
         0x14c => return Err(ni(dst, S, "v_fma_f64", opcode, pc, b0)),
-        0x14d => return Err(ni(dst, S, "v_lerp_u8", opcode, pc, b0)),
-        0x14e => return Err(ni(dst, S, "v_alignbit_b32", opcode, pc, b0)),
-        0x14f => return Err(ni(dst, S, "v_alignbyte_b32", opcode, pc, b0)),
+        0x14d => inst.type_ = T::VLerpU8,
+        0x14e => inst.type_ = T::VAlignbitB32,
+        0x14f => inst.type_ = T::VAlignbyteB32,
         0x150 => return Err(ni(dst, S, "v_mullit_f32", opcode, pc, b0)),
         0x151 => inst.type_ = T::VMin3F32,
-        0x152 => return Err(ni(dst, S, "v_min3_i32", opcode, pc, b0)),
-        0x153 => return Err(ni(dst, S, "v_min3_u32", opcode, pc, b0)),
+        0x152 => inst.type_ = T::VMin3I32,
+        0x153 => inst.type_ = T::VMin3U32,
         0x154 => inst.type_ = T::VMax3F32,
-        0x155 => return Err(ni(dst, S, "v_max3_i32", opcode, pc, b0)),
-        0x156 => return Err(ni(dst, S, "v_max3_u32", opcode, pc, b0)),
+        0x155 => inst.type_ = T::VMax3I32,
+        0x156 => inst.type_ = T::VMax3U32,
         0x157 => inst.type_ = T::VMed3F32,
-        0x158 => return Err(ni(dst, S, "v_med3_i32", opcode, pc, b0)),
-        0x159 => return Err(ni(dst, S, "v_med3_u32", opcode, pc, b0)),
-        0x15a => return Err(ni(dst, S, "v_sad_u8", opcode, pc, b0)),
-        0x15b => return Err(ni(dst, S, "v_sad_hi_u8", opcode, pc, b0)),
-        0x15c => return Err(ni(dst, S, "v_sad_u16", opcode, pc, b0)),
+        0x158 => inst.type_ = T::VMed3I32,
+        0x159 => inst.type_ = T::VMed3U32,
+        0x15a => inst.type_ = T::VSadU8,
+        0x15b => inst.type_ = T::VSadHiU8,
+        0x15c => inst.type_ = T::VSadU16,
         0x15d => inst.type_ = T::VSadU32,
         0x15e => return Err(ni(dst, S, "v_cvt_pk_u8_f32", opcode, pc, b0)),
         0x15f => return Err(ni(dst, S, "v_div_fixup_f32", opcode, pc, b0)),
@@ -2463,7 +2521,11 @@ fn shader_parse_vop3(
             inst.format = F::SVdstSVsrc0SVsrc1;
             inst.src_num = 2;
         }
-        0x16c => return Err(ni(dst, S, "v_mul_hi_i32", opcode, pc, b0)),
+        0x16c => {
+            inst.type_ = T::VMulHiI32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src_num = 2;
+        }
         0x16d => return Err(ni(dst, S, "v_div_scale_f32", opcode, pc, b0)),
         0x16e => return Err(ni(dst, S, "v_div_scale_f64", opcode, pc, b0)),
         0x16f => return Err(ni(dst, S, "v_div_fmas_f32", opcode, pc, b0)),
@@ -2535,14 +2597,35 @@ fn shader_parse_vop3(
         }
         0x310 => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // RDNA2 VOP3B v_sub_co_u32: two-source unsigned subtract with
+                // the borrow-out written to SDST. AMD ISA doc 70648 assigns
+                // opcode 0x310 and defines borrow as src1 > src0.
+                inst.type_ = T::VSubI32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1;
+                inst.src_num = 2;
+                inst.dst2 = operand_parse(sdst)?;
+                inst.dst2.size = 2;
+            } else {
+                return Err(ni(dst, S, "v_sub_u32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_sub_u32", opcode, pc, b0));
         }
         0x311 => return Err(ni(dst, S, "v_pack_b32_f16", opcode, pc, b0)),
         0x312 => return Err(ni(dst, S, "v_cvt_pknorm_i16_f16", opcode, pc, b0)),
         0x313 => return Err(ni(dst, S, "v_cvt_pknorm_u16_f16", opcode, pc, b0)),
         0x314 => return Err(ni(dst, S, "v_lshlrev_b16", opcode, pc, b0)),
+        0x319 => {
+            if next_gen {
+                // RDNA2 VOP3B v_subrev_co_u32 reverses the source order:
+                // result = src1 - src0 and borrow = src0 > src1.
+                inst.type_ = T::VSubrevI32;
+                inst.format = F::VdstSdst2Vsrc0Vsrc1;
+                inst.src_num = 2;
+                inst.dst2 = operand_parse(sdst)?;
+                inst.dst2.size = 2;
+            } else {
+                return Err(ni(dst, S, "v_subrev_u32", opcode, pc, b0));
+            }
+        }
         0x340 => return Err(ni(dst, S, "v_mad_u16", opcode, pc, b0)),
         0x341 => return Err(ni(dst, S, "v_mad_f16", opcode, pc, b0)),
         0x342 => return Err(ni(dst, S, "v_interp_p1ll_f16", opcode, pc, b0)),

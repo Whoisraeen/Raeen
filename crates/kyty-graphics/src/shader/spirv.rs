@@ -5625,11 +5625,14 @@ impl<'a> Spirv<'a> {
     fn write_functions(&mut self) {
         use ShaderInstructionType as T;
 
-        if self.code.has_any_of(&[T::VSadU32]) {
+        if self
+            .code
+            .has_any_of(&[T::VSadU8, T::VSadHiU8, T::VSadU16, T::VSadU32])
+        {
             self.source += FUNC_ABS_DIFF;
         }
 
-        if self.code.has_any_of(&[T::SWqmB64]) {
+        if self.code.has_any_of(&[T::SWqmB32, T::SWqmB64]) {
             self.source += FUNC_WQM;
         }
 
@@ -5657,9 +5660,13 @@ impl<'a> Spirv<'a> {
         if self.code.has_any_of(&[
             T::VMulLoI32,
             T::VMulLoU32,
+            T::VMulHiI32,
             T::VMulHiU32,
+            T::VMulHiI32I24,
+            T::VMulHiU32U24,
             T::VMadU32U24,
             T::VMulU32U24,
+            T::SMulHiI32,
             T::SMulHiU32,
             // The 32x32->64 product half of `v_mad_u64_u32`.
             T::VMadU64U32,
@@ -5741,26 +5748,32 @@ impl<'a> Spirv<'a> {
             self.source += BUFFER_LOAD_UBYTE;
         }
 
-        if has_buffers
-            && self.code.has_any_of(&[
-                T::BufferStoreDword,
-                T::BufferStoreDwordX2,
-                T::BufferStoreDwordX4,
-                T::BufferStoreFormatX,
-                T::BufferStoreFormatXy,
-            ])
-        {
+        let needs_buffer_store_float1 = self.code.has_any_of(&[
+            T::BufferStoreDword,
+            T::BufferStoreDwordX2,
+            T::BufferStoreDwordX4,
+            T::BufferStoreFormatX,
+            T::BufferStoreFormatXy,
+            T::BufferStoreFormatXyz,
+            T::BufferStoreFormatXyzw,
+        ]);
+        if has_buffers && needs_buffer_store_float1 {
+            // Every MUBUF store helper ultimately decomposes to one-dword
+            // writes. Emit this shared dependency once even when a shader mixes
+            // several store widths; duplicate SPIR-V ids are invalid.
             self.source += BUFFER_STORE_FLOAT1;
-            self.source += BUFFER_STORE_FLOAT2;
+        }
+
+        if has_buffers && self.code.has_any_of(&[T::BufferStoreFormatX]) {
             self.source += TBUFFER_STORE_FORMAT_X;
+        }
+
+        if has_buffers && self.code.has_any_of(&[T::BufferStoreFormatXy]) {
+            self.source += BUFFER_STORE_FLOAT2;
             self.source += TBUFFER_STORE_FORMAT_XY;
         }
 
         if has_buffers && self.code.has_any_of(&[T::BufferStoreFormatXyzw]) {
-            // `TBUFFER_STORE_FORMAT_XYZW` decomposes the typed store through
-            // `buffer_store_float1`; include that transitive helper even when
-            // no scalar store opcode appears in the guest stream.
-            self.source += BUFFER_STORE_FLOAT1;
             self.source += BUFFER_STORE_FLOAT4;
             self.source += TBUFFER_STORE_FORMAT_XYZW;
         }
@@ -5900,10 +5913,12 @@ impl<'a> Spirv<'a> {
             // WorkgroupMemory (0x100).
             self.add_constant_uint(0x108);
         }
-        if self
-            .code
-            .has_any_of(&[ShaderInstructionType::FlatLoadUbyte])
-        {
+        if self.code.has_any_of(&[
+            ShaderInstructionType::FlatLoadUbyte,
+            ShaderInstructionType::VLerpU8,
+            ShaderInstructionType::VSadU8,
+            ShaderInstructionType::VSadHiU8,
+        ]) {
             self.add_constant_uint(0xff);
         }
         if self.uses_lds() {
