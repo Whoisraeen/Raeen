@@ -4458,9 +4458,16 @@ fn shader_parse_mimg(
             inst.src[0].size = 4;
             inst.src[1].size = 8;
             inst.src[2].size = 4;
-            if dmask == 0x7 {
-                inst.format = F::Vdata3Vaddr4StSsDmask7;
-                inst.dst.size = 3;
+            match dmask {
+                0x7 => {
+                    inst.format = F::Vdata3Vaddr4StSsDmask7;
+                    inst.dst.size = 3;
+                }
+                0xf => {
+                    inst.format = F::Vdata4Vaddr4StSsDmaskF;
+                    inst.dst.size = 4;
+                }
+                _ => {}
             }
         }
         0x25 => return Err(ni(dst, S, "image_sample_b", opcode, pc, b0)),
@@ -7422,6 +7429,26 @@ mod tests {
         assert_eq!(inst.format, F::Vdata4Vaddr3StSsDmaskF);
         assert_eq!(inst.dst.size, 4);
         assert_eq!(inst.src[2].size, 4, "S# still present on the lz form");
+    }
+
+    #[test]
+    fn astro_image_sample_l_dmask_f_decodes_explicit_lod_and_rgba() {
+        // Exact ASTRO.BOT scene-compute instruction at pc 0x34b4.
+        let (code, result) = parse(
+            &[0xF090_0F08, 0x0040_0314, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse image_sample_l dmask 0xf");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageSampleL);
+        assert_eq!(inst.format, F::Vdata4Vaddr4StSsDmaskF);
+        assert_eq!(inst.dst.register_id, 3);
+        assert_eq!(inst.dst.size, 4);
+        assert_eq!(inst.src[0].register_id, 20);
+        assert_eq!(inst.src[0].size, 4, "xy plus explicit LOD payload");
+        assert_eq!(inst.src[1].size, 8, "T# descriptor");
+        assert_eq!(inst.src[2].size, 4, "S# descriptor");
     }
 
     #[test]

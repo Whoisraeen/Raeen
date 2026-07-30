@@ -7229,10 +7229,10 @@ fn sample_coord_snippet(
     })
 }
 
-/// Beyond Kyty: `image_sample_l` with `dmask == 0x7`, measured in
+/// Beyond Kyty: `image_sample_l` with `dmask == 0x7` or `0xf`, measured in
 /// ASTRO.BOT scene compute. VADDR contains the dimensional coordinate tuple
 /// followed immediately by the explicit floating-point LOD.
-fn recompile_image_sample_l_dmask7(
+fn recompile_image_sample_l(
     index: u32,
     code: &ShaderCode,
     dst_source: &mut String,
@@ -7240,8 +7240,14 @@ fn recompile_image_sample_l_dmask7(
     _param: &Params,
     _scc_check: SccCheck,
 ) -> Result<bool, ShaderRecompileError> {
-    const FUNC: &str = "Recompile_ImageSampleL_Vdata3Vaddr4StSsDmask7";
+    const FUNC: &str = "Recompile_ImageSampleL_VdataVaddr4StSs";
     let inst = inst_at(code, index, FUNC)?;
+    if !(3..=4).contains(&inst.dst.size) {
+        return Err(not_supported(
+            FUNC,
+            format!("unsupported destination width {}", inst.dst.size),
+        ));
+    }
 
     if let Some(bind_info) = spirv.get_bind_info()
         && bind_info.textures2d.textures2d_sampled_num > 0
@@ -7256,16 +7262,12 @@ fn recompile_image_sample_l_dmask7(
             MimgDescriptorClass::Sampled,
             true,
         )?;
-        let dst_value0 = operand_variable_to_str_shift(inst.dst, 0);
-        let dst_value1 = operand_variable_to_str_shift(inst.dst, 1);
-        let dst_value2 = operand_variable_to_str_shift(inst.dst, 2);
         let src1_value0 = operand_variable_to_str_shift(inst.src[1], 0);
         let src2_value0 = operand_variable_to_str_shift(inst.src[2], 0);
         let (suffix, dim, class) = sampled_site_route(spirv, matched, FUNC)?;
         let lod_value = operand_variable_to_str_shift(inst.src[0], dim.coord_components() as i32);
 
-        if dst_value0.type_ != SpirvType::Float
-            || src1_value0.type_ != SpirvType::Uint
+        if src1_value0.type_ != SpirvType::Uint
             || src2_value0.type_ != SpirvType::Uint
             || lod_value.type_ != SpirvType::Float
         {
@@ -7291,24 +7293,26 @@ fn recompile_image_sample_l_dmask7(
          %isl_lod_<index> = OpLoad %float %<lod_value>
          %isl_sample_<index> = OpImageSampleExplicitLod %v4float %isl_t38_<index> %t42_<index> Lod %isl_lod_<index>
                OpStore %temp_v4float %isl_sample_<index>
-         %isl_c0p_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_0
-         %isl_c0_<index> = OpLoad %float %isl_c0p_<index>
-               OpStore %<dst_value0> %isl_c0_<index>
-         %isl_c1p_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_1
-         %isl_c1_<index> = OpLoad %float %isl_c1p_<index>
-               OpStore %<dst_value1> %isl_c1_<index>
-         %isl_c2p_<index> = OpAccessChain %_ptr_Function_float %temp_v4float %uint_2
-         %isl_c2_<index> = OpLoad %float %isl_c2p_<index>
-               OpStore %<dst_value2> %isl_c2_<index>
 "#
         .replace("<coord>", &coord)
         .replace("<index>", &format!("{index}"))
         .replace("<src1_value0>", &src1_value0.value)
         .replace("<src2_value0>", &src2_value0.value)
-        .replace("<lod_value>", &lod_value.value)
-        .replace("<dst_value0>", &dst_value0.value)
-        .replace("<dst_value1>", &dst_value1.value)
-        .replace("<dst_value2>", &dst_value2.value);
+        .replace("<lod_value>", &lod_value.value);
+        for channel in 0..inst.dst.size {
+            let dst = operand_variable_to_str_shift(inst.dst, channel as i32);
+            if dst.type_ != SpirvType::Float {
+                return Err(not_supported(FUNC, "destination is not a vector register"));
+            }
+            body += &format!(
+                "         %isl_c{channel}p_{index} = OpAccessChain \
+                 %_ptr_Function_float %temp_v4float %uint_{channel}\n\
+                          %isl_c{channel}_{index} = OpLoad %float \
+                 %isl_c{channel}p_{index}\n\
+                                OpStore %{} %isl_c{channel}_{index}\n",
+                dst.value
+            );
+        }
         route_sampled_ids(&mut body, suffix);
         route_sampled_class(&mut body, class);
         *dst_source += &body;
@@ -12807,7 +12811,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_image_sample_dmask7,     T::ImageSample,    F::Vdata3Vaddr3StSsDmask7, p1("")),
     f(recompile_image_sample_dmask_b,    T::ImageSample,    F::Vdata3Vaddr3StSsDmaskB, p1("")),
     f(recompile_image_sample_dmask_f,    T::ImageSample,    F::Vdata4Vaddr3StSsDmaskF, p1("")),
-    f(recompile_image_sample_l_dmask7,   T::ImageSampleL,   F::Vdata3Vaddr4StSsDmask7, p1("")),
+    f(recompile_image_sample_l,          T::ImageSampleL,   F::Vdata3Vaddr4StSsDmask7, p1("")),
+    f(recompile_image_sample_l,          T::ImageSampleL,   F::Vdata4Vaddr4StSsDmaskF, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata1Vaddr3StSsDmask1, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata1Vaddr3StSsDmask8, p1("")),
     f(recompile_image_sample_c_lz,       T::ImageSampleCLz, F::Vdata2Vaddr3StSsDmask3, p1("")),
@@ -13687,7 +13692,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            454,
+            457,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -21777,6 +21782,49 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble image_sample_l");
         naga_parse_and_validate(&words, "image_sample_l");
+    }
+
+    #[test]
+    fn astro_image_sample_l_rgba_writes_all_four_components() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xF090_0F08,
+                0x0040_0314, // image_sample_l v[3:6], v[20:23], s[0:7], s[8:11]
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured image_sample_l rgba");
+
+        let mut input_info = ShaderComputeInputInfo {
+            threads_num: [1, 1, 1],
+            ..Default::default()
+        };
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_sampled_num = 1;
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+        input_info.bind.samplers.samplers_num = 1;
+        input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.binding_index = 1;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured image_sample_l rgba");
+        assert!(source.contains("OpImageSampleExplicitLod %v4float"));
+        for (channel, dst) in [(0, "v3"), (1, "v4"), (2, "v5"), (3, "v6")] {
+            assert!(
+                source.contains(&format!(
+                    "OpStore %{dst} %isl_c{channel}_0"
+                )),
+                "missing RGBA channel {channel} store:\n{source}"
+            );
+        }
+        let words = spirv_run(&source).expect("assemble measured image_sample_l rgba");
+        naga_parse_and_validate(&words, "image_sample_l_rgba");
     }
 
     #[test]

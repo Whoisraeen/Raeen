@@ -1046,6 +1046,9 @@ pub mod shader_instruction_format {
         /// Beyond Kyty: four-texel gather of channel W (see the dmask 0x4 row).
         Vdata4Vaddr3StSsDmask8 = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_8]),
         Vdata4Vaddr3StSsDmaskF = format_define(&[DA4, S0A3, S1A8, S2A4, DMASK_F]),
+        /// Explicit-LOD RGBA sample: XY/array coordinate plus LOD in four
+        /// VADDR registers, followed by T# and S#.
+        Vdata4Vaddr4StSsDmaskF = format_define(&[DA4, S0A4, S1A8, S2A4, DMASK_F]),
         Vdata4Vaddr4StDmaskF = format_define(&[DA4, S0A4, S1A8, DMASK_F]),
         Vdata4VaddrSvSoffsIdxen = format_define(&[DA4, S0, S1A4, S2, IDXEN]),
         Vdata4VaddrSvSoffsIdxenFloat4 = format_define(&[DA4, S0, S1A4, S2, IDXEN, FLOAT4]),
