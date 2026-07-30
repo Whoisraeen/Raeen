@@ -37,6 +37,176 @@ use tracing::debug;
 pub const CLEAR_COLOR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
 static GPU_PLUGIN_FRAME_INDEX: AtomicU64 = AtomicU64::new(0);
 
+// ─── Per-draw pipeline statistics (RAEEN_PIPELINE_STATS) ────────────────────
+//
+// A title whose draws all execute with healthy state and write no pixel gives
+// the CPU side nothing left to inspect: the state is correct, the shaders bind,
+// the submission succeeds and the validation layer is silent. The remaining
+// question — did the HARDWARE rasterize anything — is answerable only by the
+// hardware, and `VK_QUERY_TYPE_PIPELINE_STATISTICS` is the direct answer.
+//
+// The five counters below are chosen to be mutually diagnostic, in pipeline
+// order. Reading them as a chain localises a lost draw to exactly one stage:
+//
+//   input_vertices == 0                       -> the draw carried no geometry
+//   clip_invocations == 0 while vertices > 0  -> nothing reached the clipper
+//   clip_primitives == 0 while invocations>0  -> every primitive was clipped
+//                                                (degenerate w, NaN, off-screen,
+//                                                behind the near plane)
+//   fragment_invocations == 0 while prims > 0 -> zero-area / culled / scissored
+//   fragment_invocations > 0, target unchanged-> fragments ran and their writes
+//                                                went somewhere else (discard,
+//                                                blend, or another image)
+//
+// The order of `STATISTIC_FLAGS` fixes the order of the result dwords, so the
+// index constants below and the flag list must be edited together.
+static STATS_DRAWS: AtomicU64 = AtomicU64::new(0);
+static STATS_INPUT_VERTICES: AtomicU64 = AtomicU64::new(0);
+static STATS_INPUT_PRIMITIVES: AtomicU64 = AtomicU64::new(0);
+static STATS_VS_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static STATS_CLIP_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static STATS_CLIP_PRIMITIVES: AtomicU64 = AtomicU64::new(0);
+static STATS_FS_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+/// Draws whose fragment-shader invocation count came back zero — the draws that
+/// provably wrote no pixel.
+static STATS_DRAWS_NO_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+/// Draws that reached the clipper with primitives but had none survive it.
+static STATS_DRAWS_ALL_CLIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Statistics requested, in result-dword order.
+const STATISTIC_FLAGS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFlags::from_raw(
+    vk::QueryPipelineStatisticFlags::INPUT_ASSEMBLY_VERTICES.as_raw()
+        | vk::QueryPipelineStatisticFlags::INPUT_ASSEMBLY_PRIMITIVES.as_raw()
+        | vk::QueryPipelineStatisticFlags::VERTEX_SHADER_INVOCATIONS.as_raw()
+        | vk::QueryPipelineStatisticFlags::CLIPPING_INVOCATIONS.as_raw()
+        | vk::QueryPipelineStatisticFlags::CLIPPING_PRIMITIVES.as_raw()
+        | vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS.as_raw(),
+);
+/// Number of `u64` results one query of [`STATISTIC_FLAGS`] writes.
+const STATISTIC_COUNT: usize = 6;
+
+/// One draw's readings, in [`STATISTIC_FLAGS`] order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DrawPipelineStatistics {
+    pub input_vertices: u64,
+    pub input_primitives: u64,
+    pub vs_invocations: u64,
+    pub clip_invocations: u64,
+    pub clip_primitives: u64,
+    pub fs_invocations: u64,
+}
+
+impl DrawPipelineStatistics {
+    fn from_results(results: [u64; STATISTIC_COUNT]) -> Self {
+        Self {
+            input_vertices: results[0],
+            input_primitives: results[1],
+            vs_invocations: results[2],
+            clip_invocations: results[3],
+            clip_primitives: results[4],
+            fs_invocations: results[5],
+        }
+    }
+
+    /// The pipeline stage that lost this draw, or `None` when fragments ran.
+    ///
+    /// This is the whole point of the query: one short string per draw that
+    /// names the stage rather than leaving the reader to compare six numbers.
+    pub(crate) const fn lost_at(&self) -> Option<&'static str> {
+        if self.fs_invocations > 0 {
+            return None;
+        }
+        Some(if self.input_vertices == 0 {
+            "no input vertices — the draw carried no geometry"
+        } else if self.clip_invocations == 0 {
+            "no primitive reached the clipper — input assembly produced none"
+        } else if self.clip_primitives == 0 {
+            "every primitive was clipped away — degenerate/NaN/out-of-frustum positions"
+        } else {
+            "primitives survived clipping but no fragment ran — zero area, culled, or scissored"
+        })
+    }
+}
+
+/// Fold one draw's statistics into the process-global census.
+pub(crate) fn accumulate_pipeline_statistics(stats: DrawPipelineStatistics) {
+    STATS_DRAWS.fetch_add(1, Ordering::Relaxed);
+    STATS_INPUT_VERTICES.fetch_add(stats.input_vertices, Ordering::Relaxed);
+    STATS_INPUT_PRIMITIVES.fetch_add(stats.input_primitives, Ordering::Relaxed);
+    STATS_VS_INVOCATIONS.fetch_add(stats.vs_invocations, Ordering::Relaxed);
+    STATS_CLIP_INVOCATIONS.fetch_add(stats.clip_invocations, Ordering::Relaxed);
+    STATS_CLIP_PRIMITIVES.fetch_add(stats.clip_primitives, Ordering::Relaxed);
+    STATS_FS_INVOCATIONS.fetch_add(stats.fs_invocations, Ordering::Relaxed);
+    if stats.fs_invocations == 0 {
+        STATS_DRAWS_NO_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
+    }
+    if stats.clip_invocations > 0 && stats.clip_primitives == 0 {
+        STATS_DRAWS_ALL_CLIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Cumulative per-draw pipeline statistics since process start.
+///
+/// All zero unless `RAEEN_PIPELINE_STATS` is set and the device supports
+/// `pipelineStatisticsQuery`. Public so an acceptance test can prove the
+/// instrument distinguishes a rasterizing draw from a clipped-away one — a
+/// counter nobody has validated is worse than no counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PipelineStatisticsCensus {
+    pub measured_draws: u64,
+    pub input_vertices: u64,
+    pub input_primitives: u64,
+    pub vs_invocations: u64,
+    pub clip_invocations: u64,
+    pub clip_primitives: u64,
+    pub fs_invocations: u64,
+    pub draws_without_fragments: u64,
+    pub draws_all_clipped: u64,
+}
+
+/// Read the pipeline-statistics census.
+#[must_use]
+pub fn pipeline_statistics_census() -> PipelineStatisticsCensus {
+    PipelineStatisticsCensus {
+        measured_draws: STATS_DRAWS.load(Ordering::Relaxed),
+        input_vertices: STATS_INPUT_VERTICES.load(Ordering::Relaxed),
+        input_primitives: STATS_INPUT_PRIMITIVES.load(Ordering::Relaxed),
+        vs_invocations: STATS_VS_INVOCATIONS.load(Ordering::Relaxed),
+        clip_invocations: STATS_CLIP_INVOCATIONS.load(Ordering::Relaxed),
+        clip_primitives: STATS_CLIP_PRIMITIVES.load(Ordering::Relaxed),
+        fs_invocations: STATS_FS_INVOCATIONS.load(Ordering::Relaxed),
+        draws_without_fragments: STATS_DRAWS_NO_FRAGMENTS.load(Ordering::Relaxed),
+        draws_all_clipped: STATS_DRAWS_ALL_CLIPPED.load(Ordering::Relaxed),
+    }
+}
+
+/// Emit the pipeline-statistics census. No-op unless queries were recorded, so
+/// the default path never logs this line.
+pub(crate) fn report_pipeline_statistics() {
+    let draws = STATS_DRAWS.load(Ordering::Relaxed);
+    if draws == 0 {
+        return;
+    }
+    tracing::warn!(
+        measured_draws = draws,
+        input_vertices = STATS_INPUT_VERTICES.load(Ordering::Relaxed),
+        input_primitives = STATS_INPUT_PRIMITIVES.load(Ordering::Relaxed),
+        vs_invocations = STATS_VS_INVOCATIONS.load(Ordering::Relaxed),
+        clip_invocations = STATS_CLIP_INVOCATIONS.load(Ordering::Relaxed),
+        clip_primitives = STATS_CLIP_PRIMITIVES.load(Ordering::Relaxed),
+        fs_invocations = STATS_FS_INVOCATIONS.load(Ordering::Relaxed),
+        draws_without_fragments = STATS_DRAWS_NO_FRAGMENTS.load(Ordering::Relaxed),
+        draws_all_clipped = STATS_DRAWS_ALL_CLIPPED.load(Ordering::Relaxed),
+        "PIPELINE STATISTICS: what the hardware did with each measured draw. \
+         `fs_invocations == 0` with `clip_primitives > 0` means primitives rasterized nothing \
+         (zero area / culled / scissored); `clip_primitives == 0` with `clip_invocations > 0` \
+         means every primitive was CLIPPED AWAY — the signature of an unwritten gl_Position; \
+         `input_vertices == 0` means the draw packet carried no geometry. \
+         `fs_invocations > 0` against an unchanged render target means the writes are being \
+         DISCARDED or are landing in a different image (RAEEN_PIPELINE_STATS)"
+    );
+}
+
 /// Triangle vertices in Vulkan normalized device coordinates (`x, y, z, w`).
 ///
 /// Vulkan's NDC has +Y pointing **down**, so the `-0.7` vertex is the top one.
@@ -114,6 +284,224 @@ pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
             "render target format {other:?} has no readback byte size mapping"
         ))),
     }
+}
+
+// ─── Render-target dump decoding ────────────────────────────────────────────
+//
+// `RenderedImage` holds the render target's RAW bytes in the target's own
+// format — that is deliberate and load-bearing: the framebuffer map is what
+// re-seeds an attachment LOAD, what a later draw samples as a texture, and what
+// `fast_clear_image` splats packed `CB_COLOR{n}_CLEAR_WORD0/1` bytes into. It
+// must not be pre-converted.
+//
+// But `RenderedImage` carries only `bytes_per_pixel`, so it cannot say WHICH
+// format those bytes are in, and every consumer that wants colour has been
+// reading the first three bytes as if they were R, G, B. For the three
+// non-`R8G8B8A8` classes this tree already creates as colour attachments, that
+// is wrong in a specific, measurable way — verified against a measured GTA V
+// `RAEEN_DUMP_ALL_TARGETS` run in which every target held exactly
+// [`CLEAR_COLOR`] and nothing else:
+//
+//   R8G8B8A8              (64, 128, 191)  correct
+//   B8G8R8A8              (191, 128, 64)  R and B transposed
+//   R16G16B16A16_SFLOAT   (0, 52, 0)      low byte of R, high byte of R (0x34),
+//                                         low byte of G — not a colour at all
+//   B10G11R11_UFLOAT_PACK32 (64, 3, 28)   the low three bytes of the packed
+//                                         word 0x741C0340
+//
+// All four are the SAME clear. Two of them do not look like it, which is how a
+// correctly-cleared target reads as "filled by something else".
+//
+// The decoder below is used by the diagnostic dump so the instrument stops
+// lying. It deliberately uses LINEAR scaling for every format, not the sRGB
+// encode the present path applies to float targets: a dump exists to be
+// compared against register values and clear constants, so one clear colour
+// must produce one RGB triple regardless of the target's storage format.
+//
+// The PRESENT path is knowingly left alone — see `try_to_presentable_arc`.
+
+/// Names a render-target format and decodes its texels to RGB8 for a dump.
+pub(crate) struct TargetPixelDecoder {
+    format: Option<vk::Format>,
+    bytes_per_pixel: usize,
+}
+
+/// Build a decoder from a raw `VkFormat` value (as carried by
+/// `super::cache::TargetKey::format`) and the image's bytes per pixel.
+///
+/// `None`/unrecognized falls back to the historical raw-low-bytes view, which
+/// is at least stable rather than silently wrong in a new way.
+pub(crate) fn target_pixel_decoder(
+    raw_format: Option<i32>,
+    bytes_per_pixel: u32,
+) -> TargetPixelDecoder {
+    let format = raw_format.map(vk::Format::from_raw).filter(|format| {
+        // Only formats whose readback size AGREES with the image are trusted: a
+        // stale cache entry for a re-created target would otherwise decode the
+        // wrong number of bytes per texel.
+        readback_bpp(*format).is_ok_and(|bpp| bpp == bytes_per_pixel)
+    });
+    TargetPixelDecoder {
+        format,
+        bytes_per_pixel: bytes_per_pixel.max(1) as usize,
+    }
+}
+
+impl TargetPixelDecoder {
+    /// Short format name for a log line, or `"raw"` when unknown.
+    pub(crate) fn name(&self) -> String {
+        match self.format {
+            Some(format) => format!("{format:?}"),
+            None => "raw".to_owned(),
+        }
+    }
+
+    /// Whether the format is known — i.e. whether [`Self::rgb`] is a real
+    /// decode rather than the raw-bytes fallback.
+    pub(crate) const fn decoded(&self) -> bool {
+        self.format.is_some()
+    }
+
+    /// One texel's display RGB. `texel` must be at least `bytes_per_pixel` long.
+    pub(crate) fn rgb(&self, texel: &[u8]) -> [u8; 3] {
+        let unorm = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let half = |lo: usize| {
+            crate::agc_exec::half_to_f32(u16::from_le_bytes([texel[lo], texel[lo + 1]]))
+        };
+        let float = |lo: usize| {
+            f32::from_le_bytes([texel[lo], texel[lo + 1], texel[lo + 2], texel[lo + 3]])
+        };
+        let word = || u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+        let Some(format) = self.format else {
+            // Raw fallback: the leading bytes, zero-padded to three.
+            let mut rgb = [0u8; 3];
+            for (out, byte) in rgb.iter_mut().zip(texel.iter().take(self.bytes_per_pixel)) {
+                *out = *byte;
+            }
+            return rgb;
+        };
+        match format {
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SNORM | vk::Format::R8G8B8A8_SRGB => {
+                [texel[0], texel[1], texel[2]]
+            }
+            // The channel-order bug in one line: component R lives at byte 2.
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+                [texel[2], texel[1], texel[0]]
+            }
+            vk::Format::R8_UNORM => [texel[0], 0, 0],
+            vk::Format::R16_UNORM => [texel[1], 0, 0],
+            vk::Format::R32_SFLOAT => [unorm(float(0)), 0, 0],
+            vk::Format::R16G16_SFLOAT => [unorm(half(0)), unorm(half(2)), 0],
+            vk::Format::R16G16B16A16_SFLOAT => [unorm(half(0)), unorm(half(2)), unorm(half(4))],
+            vk::Format::R32G32B32A32_SFLOAT => [unorm(float(0)), unorm(float(4)), unorm(float(8))],
+            // R11 in bits 0..10, G11 in 11..21, B10 in 22..31; the 11-bit
+            // channels are 5-exponent/6-mantissa unsigned floats, the 10-bit
+            // one 5/5. Shifted into half-float position (bias 15 is shared) the
+            // existing half decoder does the arithmetic.
+            vk::Format::B10G11R11_UFLOAT_PACK32 => {
+                let w = word();
+                let r = crate::agc_exec::half_to_f32(((w & 0x7ff) << 4) as u16);
+                let g = crate::agc_exec::half_to_f32((((w >> 11) & 0x7ff) << 4) as u16);
+                let b = crate::agc_exec::half_to_f32((((w >> 22) & 0x3ff) << 5) as u16);
+                [unorm(r), unorm(g), unorm(b)]
+            }
+            // R in bits 0..9, G in 10..19, B in 20..29, A in 30..31.
+            vk::Format::A2B10G10R10_UNORM_PACK32 => {
+                let w = word();
+                let channel = |shift: u32| unorm(((w >> shift) & 0x3ff) as f32 / 1023.0);
+                [channel(0), channel(10), channel(20)]
+            }
+            // `target_pixel_decoder` only admits formats `readback_bpp` maps,
+            // and every one of those is listed above.
+            _ => [0, 0, 0],
+        }
+    }
+}
+
+/// Name — once per distinct format — a colour attachment whose bytes the
+/// PRESENT path will misread.
+///
+/// `try_to_presentable_arc` converts only the 8-byte `R16G16B16A16_SFLOAT`
+/// class and passes every other 4-byte target through as if it were
+/// `R8G8B8A8_UNORM`. For `B8G8R8A8` that transposes red and blue; for
+/// `B10G11R11_UFLOAT_PACK32` and `A2B10G10R10_UNORM_PACK32` the presented
+/// pixels are the packed word's raw bytes, not its colour.
+///
+/// This is deliberately a WARNING and not a fix. Converting at present would
+/// change the visible output of every title that programs such a target, and
+/// the three titles this tree renders correctly today (Minecraft Bedrock, Dead
+/// Cells, Blasphemous II) were verified by eye against the current behaviour —
+/// so their present path must stay byte-identical until a change can be
+/// attributed.
+///
+/// Called per draw (from `create_render_target`), so the whole body must be a
+/// match plus at most one relaxed atomic: an `R8G8B8A8` target — every target
+/// the three working titles use — returns from the match with no
+/// synchronization at all, and a misread format pays one `fetch_or` on an
+/// already-set bit after its first sighting.
+fn warn_once_if_present_misreads_format(format: vk::Format) {
+    let Some((bit, misread)) = present_misread(format) else {
+        return;
+    };
+    static WARNED: AtomicU64 = AtomicU64::new(0);
+    if WARNED.fetch_or(1 << bit, Ordering::Relaxed) & (1 << bit) != 0 {
+        return;
+    }
+    tracing::warn!(
+        format = ?format,
+        consequence = misread,
+        "CHANNEL ORDER: a colour render target uses a format the present path does not decode. \
+         `RenderedImage` carries only bytes-per-pixel, so `try_to_presentable_arc` treats every \
+         4-byte target as R8G8B8A8. If this target is ever the PRESENTED one, its colours are \
+         wrong on screen. NOT fixed here on purpose: converting would change the visible output \
+         of the titles that currently render correctly. The RAEEN_DUMP_ALL_TARGETS dump IS \
+         decoded per format (see `target_pixel_decoder`), so the dump and the screen can disagree \
+         for exactly these formats"
+    );
+}
+
+/// Whether the present path misreads `format`, as `(warn-once bit, why)`.
+///
+/// `None` is the statement "presenting this target's bytes as R8G8B8A8 is
+/// correct", which for `R8G8B8A8*` it is. Split out from the warning so the
+/// classification is testable — the point of the finding is WHICH formats are
+/// affected, and that must not be assertable only by reading a log.
+const fn present_misread(format: vk::Format) -> Option<(u32, &'static str)> {
+    // The bit indexes a one-word "already warned" set; adding a format means
+    // adding the next free bit.
+    Some(match format {
+        vk::Format::B8G8R8A8_UNORM => (0, "red and blue are transposed"),
+        vk::Format::B8G8R8A8_SRGB => (1, "red and blue are transposed"),
+        vk::Format::B10G11R11_UFLOAT_PACK32 => (
+            2,
+            "the packed 32-bit word's raw bytes are presented instead of its channels",
+        ),
+        vk::Format::A2B10G10R10_UNORM_PACK32 => (
+            3,
+            "the packed 32-bit word's raw bytes are presented instead of its channels",
+        ),
+        vk::Format::R32_SFLOAT => (4, "the format's raw bytes are presented as 8-bit RGBA"),
+        vk::Format::R16G16_SFLOAT => (5, "the format's raw bytes are presented as 8-bit RGBA"),
+        vk::Format::R32G32B32A32_SFLOAT => {
+            (6, "the format's raw bytes are presented as 8-bit RGBA")
+        }
+        vk::Format::R8_UNORM => (7, "the format's raw bytes are presented as 8-bit RGBA"),
+        vk::Format::R16_UNORM => (8, "the format's raw bytes are presented as 8-bit RGBA"),
+        // R8G8B8A8* present correctly, and R16G16B16A16_SFLOAT is the one class
+        // `try_to_presentable_arc` does convert.
+        _ => return None,
+    })
+}
+
+/// Live persistent render-target formats keyed by guest base, as raw
+/// `VkFormat` values. Used by the all-targets dump to decode each target's
+/// texels; a target the cache no longer holds is simply absent.
+pub(crate) fn live_target_formats(dev: &VulkanDevice) -> std::collections::HashMap<u64, i32> {
+    dev.draw_caches()
+        .live_target_keys()
+        .into_iter()
+        .map(|key| (key.base, key.format))
+        .collect()
 }
 
 /// Convert a linear float color to the `R8G8B8A8_UNORM` bytes it should
@@ -1337,7 +1725,11 @@ pub fn render_draw_deferred(
     dev: &VulkanDevice,
     state: &DrawState,
 ) -> Result<Option<RenderedImage>, GpuError> {
-    let force_immediate = crate::diagnostics::gpu_env().no_defer;
+    // `RAEEN_PIPELINE_STATS` implies immediate submission: a per-draw statistics
+    // query can only be read after that draw's own fence, and a deferred draw
+    // shares one fence with the whole batch.
+    let force_immediate =
+        crate::diagnostics::gpu_env().no_defer || dev.pipeline_statistics_enabled();
     let named_color = state.color_output && state.target_base.is_some();
     let named_depth = state
         .depth
@@ -2470,6 +2862,10 @@ struct Resources<'a> {
     /// Extra MRT colour attachments (slots 1–7), in `DrawState::mrt` order.
     /// Always per-draw owned (no persistent cache) and immediate-only.
     mrt_targets: Vec<MrtTargetRes>,
+    /// One-query pipeline-statistics pool, non-null only under
+    /// `RAEEN_PIPELINE_STATS` on an immediate draw. Per-draw owned and
+    /// destroyed in `Drop`; the result is read after this draw's own fence.
+    stats_pool: vk::QueryPool,
 }
 
 /// Per-draw Vulkan resources of one extra MRT attachment. Owned by
@@ -2777,6 +3173,7 @@ impl<'a> Resources<'a> {
             command_buffer: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             mrt_targets: Vec::new(),
+            stats_pool: vk::QueryPool::null(),
         }
     }
 
@@ -2851,10 +3248,100 @@ impl<'a> Resources<'a> {
         let s = t.then(std::time::Instant::now);
         self.create_command_resources()?;
         draw_stage_add(&DRAW_STAGE_CMD_NS, s);
+        self.create_statistics_pool();
         if t {
             draw_stage_tick();
         }
         Ok(())
+    }
+
+    /// One-query pipeline-statistics pool for this draw, under
+    /// `RAEEN_PIPELINE_STATS` on the immediate path only (the result is read
+    /// after this draw's own fence, which a deferred draw does not have).
+    ///
+    /// Best-effort: a creation failure leaves the pool null and the draw
+    /// proceeds unmeasured. Diagnostics must never be a reason to fail a draw.
+    fn create_statistics_pool(&mut self) {
+        if self.batched || !self.dev.pipeline_statistics_enabled() {
+            return;
+        }
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::PIPELINE_STATISTICS)
+            .query_count(1)
+            .pipeline_statistics(STATISTIC_FLAGS);
+        // SAFETY: `info` references no borrowed memory beyond the call and the
+        // device enabled `pipelineStatisticsQuery` (checked above).
+        match unsafe { self.device().create_query_pool(&info, None) } {
+            Ok(pool) => self.stats_pool = pool,
+            Err(e) => {
+                static WARNED: AtomicU64 = AtomicU64::new(0);
+                if WARNED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(error = %e, "vkCreateQueryPool for pipeline statistics failed");
+                }
+            }
+        }
+    }
+
+    /// Read this draw's statistics after its fence has been waited, and fold
+    /// them into the census. No-op when no pool was created.
+    fn collect_statistics(&self, state: &DrawState) {
+        if self.stats_pool == vk::QueryPool::null() {
+            return;
+        }
+        // ONE query whose result is `STATISTIC_COUNT` u64s. `ash` derives the
+        // query count from `data.len()`, so the element type must be the whole
+        // per-query result — a flat `[u64; 6]` would ask for SIX queries out of
+        // a one-query pool (which the validation layer rejects).
+        let mut results = [[0u64; STATISTIC_COUNT]; 1];
+        // SAFETY: the pool holds one query of exactly `STATISTIC_COUNT`
+        // statistics, the query was begun and ended in the submitted command
+        // buffer, and that submission has fence-completed. `results` is sized
+        // for the whole query, so the driver writes within it.
+        let read = unsafe {
+            self.device().get_query_pool_results(
+                self.stats_pool,
+                0,
+                &mut results,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if let Err(e) = read {
+            static WARNED: AtomicU64 = AtomicU64::new(0);
+            if WARNED.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::warn!(error = %e, "vkGetQueryPoolResults for pipeline statistics failed");
+            }
+            return;
+        }
+        let stats = DrawPipelineStatistics::from_results(results[0]);
+        accumulate_pipeline_statistics(stats);
+        // Per-draw detail for the first draws of the run: an aggregate cannot
+        // say WHICH target a lost draw was aimed at, and that is what makes the
+        // finding actionable against a specific dumped PPM.
+        static REPORTED: AtomicU64 = AtomicU64::new(0);
+        let n = REPORTED.fetch_add(1, Ordering::Relaxed);
+        if n < 32 || n.is_power_of_two() {
+            tracing::warn!(
+                draw = n,
+                target_base = format_args!("{:#x}", state.target_base.unwrap_or(0)),
+                extent = format_args!("{}x{}", state.width, state.height),
+                format = ?state.format,
+                // The concrete VkImage this draw's render pass wrote. If a
+                // dumped target looks untouched while fragments ran, this says
+                // whether the writes went to a DIFFERENT image than the one the
+                // framebuffer map holds for that base.
+                image = format_args!("{:#x}", self.image.as_raw()),
+                vertex_count = state.vertex_count,
+                indexed = state.index.is_some(),
+                input_vertices = stats.input_vertices,
+                input_primitives = stats.input_primitives,
+                vs_invocations = stats.vs_invocations,
+                clip_invocations = stats.clip_invocations,
+                clip_primitives = stats.clip_primitives,
+                fs_invocations = stats.fs_invocations,
+                lost_at = stats.lost_at().unwrap_or("nothing — fragments ran"),
+                "PIPELINE STATISTICS: one draw"
+            );
+        }
     }
 
     /// Per-draw images + readback buffers (+ seed staging) for the extra MRT
@@ -3141,6 +3628,7 @@ impl<'a> Resources<'a> {
     /// them to the cache.
     fn create_render_target(&mut self, state: &DrawState, bpp: u32) -> Result<(), GpuError> {
         let (width, height, format) = (state.width, state.height, state.format);
+        warn_once_if_present_misreads_format(format);
         if let Some(base) = state.target_base {
             let key = TargetKey {
                 base,
@@ -5013,9 +5501,29 @@ impl<'a> Resources<'a> {
         // pipeline's attachment format matches the image view's.
         // `cmd_begin_rendering` is core in Vulkan 1.3 and `dynamicRendering`
         // was required at device selection.
+        // Pipeline-statistics query (RAEEN_PIPELINE_STATS). The reset must be
+        // OUTSIDE a render pass instance and the begin/end pair must be INSIDE
+        // the same one, so the reset goes here and the pair brackets the draw.
+        // SAFETY: the pool holds query 0 and the command buffer is recording
+        // outside any render pass instance at this point.
+        if self.stats_pool != vk::QueryPool::null() {
+            unsafe {
+                self.device()
+                    .cmd_reset_query_pool(self.command_buffer, self.stats_pool, 0, 1);
+            }
+        }
+
         unsafe {
             let d = self.device();
             d.cmd_begin_rendering(self.command_buffer, &rendering_info);
+            if self.stats_pool != vk::QueryPool::null() {
+                d.cmd_begin_query(
+                    self.command_buffer,
+                    self.stats_pool,
+                    0,
+                    vk::QueryControlFlags::empty(),
+                );
+            }
             d.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -5074,6 +5582,9 @@ impl<'a> Resources<'a> {
                 d.cmd_draw_indexed(self.command_buffer, state.vertex_count, 1, 0, 0, 0);
             } else {
                 d.cmd_draw(self.command_buffer, state.vertex_count, 1, 0, 0);
+            }
+            if self.stats_pool != vk::QueryPool::null() {
+                d.cmd_end_query(self.command_buffer, self.stats_pool, 0);
             }
             d.cmd_end_rendering(self.command_buffer);
         }
@@ -5286,6 +5797,8 @@ impl<'a> Resources<'a> {
             self.dev.note_vk_error(e);
             GpuError::VulkanInitFailed(format!("vkWaitForFences failed: {e}"))
         })?;
+        // The submission has completed, so the query result is available.
+        self.collect_statistics(state);
         Ok(())
     }
 
@@ -5579,13 +6092,29 @@ impl<'a> Resources<'a> {
 /// device. The location scan intentionally handles the direct interface
 /// variables emitted by both Raeen and Kyty's current Gen5 recompiler.
 fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
-    fn writes_point_size(words: &[u32]) -> bool {
+    /// Whether the module stores to the output decorated with SPIR-V `BuiltIn`
+    /// id `builtin` (0 = Position, 1 = PointSize).
+    ///
+    /// BOTH legal shapes are recognized, because this tree emits both:
+    ///
+    /// * a `gl_PerVertex` **block member** (`OpMemberDecorate %struct member
+    ///   BuiltIn`, written through an `OpAccessChain`) — what the Kyty Gen5
+    ///   recompiler emits; and
+    /// * a **direct variable** (`OpDecorate %var BuiltIn`, written by a plain
+    ///   `OpStore`) — what `super::shaders` and `crate::shader::spirv_emitter`
+    ///   emit.
+    ///
+    /// Handling only the block form made the shipped triangle vertex shader —
+    /// which demonstrably writes `gl_Position` — read as if it did not.
+    fn writes_builtin(words: &[u32], builtin: u32) -> bool {
         let mut point_members = std::collections::HashSet::new();
         let mut pointer_pointees = std::collections::HashMap::new();
         let mut output_variables = std::collections::HashMap::new();
         let mut constants = std::collections::HashMap::new();
         let mut point_pointers = std::collections::HashSet::new();
         let mut stores = std::collections::HashSet::new();
+        // Ids decorated `BuiltIn <builtin>` directly, i.e. not through a block.
+        let mut direct_builtins = std::collections::HashSet::new();
         let mut at = 5;
         while at < words.len() {
             let header = words[at];
@@ -5596,8 +6125,13 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
             }
             let inst = &words[at..at + len];
             match op {
-                // OpMemberDecorate %struct member BuiltIn PointSize.
-                72 if len >= 5 && inst[3] == 11 && inst[4] == 1 => {
+                // OpDecorate %target BuiltIn <builtin> — the direct-variable
+                // form (Decoration::BuiltIn == 11).
+                71 if len >= 4 && inst[2] == 11 && inst[3] == builtin => {
+                    direct_builtins.insert(inst[1]);
+                }
+                // OpMemberDecorate %struct member BuiltIn <builtin>.
+                72 if len >= 5 && inst[3] == 11 && inst[4] == builtin => {
                     point_members.insert((inst[1], inst[2]));
                 }
                 // OpTypePointer %result Output %pointee.
@@ -5642,15 +6176,37 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
         }
         point_pointers
             .iter()
+            .chain(direct_builtins.iter())
             .any(|pointer| stores.contains(pointer))
     }
 
-    if state.topology == vk::PrimitiveTopology::POINT_LIST && !writes_point_size(state.vs_spirv) {
+    // SPIR-V BuiltIn ids.
+    const POSITION: u32 = 0;
+    const POINT_SIZE: u32 = 1;
+
+    if state.topology == vk::PrimitiveTopology::POINT_LIST
+        && !writes_builtin(state.vs_spirv, POINT_SIZE)
+    {
         return Err(GpuError::PipelineCreationFailed(
             "point-list draw skipped: translated vertex shader does not write gl_PointSize"
                 .to_owned(),
         ));
     }
+
+    // Census (NOT a refusal): does the EMITTED module store gl_Position?
+    //
+    // `kyty_graphics::shader::shader_exports_position` already answers the same
+    // question about the ISA. Both are needed and they are not the same
+    // question: an `exp pos0` the recompiler drops (unreached control flow, an
+    // unsupported operand shape whose row bailed) leaves a module that declares
+    // `gl_PerVertex` and never writes member 0. Every vertex is then at the
+    // undefined all-zero position, `w == 0`, and no primitive survives clipping
+    // — a black frame with a healthy pipeline and zero validation errors.
+    //
+    // Refusing here would change which draws the working titles issue, so this
+    // only counts. `validate_graphics_interface_once` memoizes by (vs, fs,
+    // topology), so the scan is per distinct interface, not per draw.
+    crate::draw_census::note_vertex_position_store(writes_builtin(state.vs_spirv, POSITION));
 
     fn locations(words: &[u32], storage_class: u32) -> std::collections::BTreeSet<u32> {
         let mut storage = std::collections::HashMap::new();
@@ -5707,6 +6263,14 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
 
 impl Drop for Resources<'_> {
     fn drop(&mut self) {
+        // Per-draw query pool. Immediate-only, and the fence was waited before
+        // `collect_statistics` returned, so the pool is not in use here.
+        if self.stats_pool != vk::QueryPool::null() {
+            // SAFETY: created from this device for this draw, destroyed exactly
+            // once, and no submission referencing it is still pending.
+            unsafe { self.dev.device().destroy_query_pool(self.stats_pool, None) };
+            self.stats_pool = vk::QueryPool::null();
+        }
         let guest_vertex_buffers = mem::take(&mut self.guest_vertex_buffers);
         let storage_buffers = mem::take(&mut self.storage_buffers);
         let texture_uploads = mem::take(&mut self.texture_uploads);
@@ -6007,6 +6571,88 @@ mod tests {
         validate_graphics_interface(&state).expect("PointSize store makes point-list valid");
     }
 
+    /// `gl_PointSize` may also be a DIRECT variable decorated `BuiltIn
+    /// PointSize` rather than a `gl_PerVertex` member — the form
+    /// `crate::shader::spirv_emitter` and `super::shaders` emit. Recognizing
+    /// only the block form made this gate refuse a point-list draw whose
+    /// translated shader does write the point size.
+    #[test]
+    fn point_list_gate_accepts_a_directly_decorated_point_size_store() {
+        let mut vs = location_module(3, 0);
+        vs.extend_from_slice(&[
+            (4 << 16) | 71, // OpDecorate %out BuiltIn PointSize
+            30,
+            11,
+            1,
+            (3 << 16) | 62, // OpStore %out %value
+            30,
+            60,
+        ]);
+        let fs = location_module(1, 0);
+        let mut state = DrawState::new(16, 16, &vs, &fs);
+        state.topology = vk::PrimitiveTopology::POINT_LIST;
+        validate_graphics_interface(&state)
+            .expect("a directly decorated PointSize store is just as valid as a block member");
+    }
+
+    /// The gl_Position census must count the real translated triangle VS as
+    /// storing a position, and a module that declares `gl_PerVertex` without
+    /// writing member 0 as not storing one.
+    ///
+    /// That second module is the exact shape a dropped `exp pos0` leaves behind:
+    /// valid SPIR-V, a valid pipeline, zero validation errors, and every vertex
+    /// at w == 0. Without this test the census could report "all fine" because
+    /// the scan never matches anything.
+    #[test]
+    fn the_position_store_census_separates_a_writing_vs_from_a_declaring_one() {
+        let fs = location_module(1, 0);
+
+        // The shipped pair, which passes the location check on its own terms.
+        let real_vs = super::super::shaders::triangle_vertex_spirv();
+        let real_fs = super::super::shaders::triangle_fragment_spirv();
+        let before = crate::draw_census::snapshot();
+        // The point-list gate is not involved; the default topology is a list.
+        let state = DrawState::new(16, 16, &real_vs, &real_fs);
+        validate_graphics_interface(&state).expect("the shipped triangle VS is a valid stage pair");
+        let after = crate::draw_census::snapshot();
+        assert_eq!(after.vs_spirv_scanned - before.vs_spirv_scanned, 1);
+        assert_eq!(
+            after.vs_spirv_without_position_store - before.vs_spirv_without_position_store,
+            0,
+            "the shipped triangle vertex shader writes gl_Position"
+        );
+
+        // Declares gl_PerVertex with member 0 = Position and an output variable
+        // of that type, but never stores through it.
+        let mut declaring_vs = location_module(3, 0);
+        declaring_vs.extend_from_slice(&[
+            (5 << 16) | 72, // OpMemberDecorate %struct 0 BuiltIn Position
+            10,
+            0,
+            11,
+            0,
+            (4 << 16) | 32, // OpTypePointer %ptr Output %struct
+            20,
+            3,
+            10,
+            (4 << 16) | 59, // OpVariable %ptr %out Output
+            20,
+            30,
+            3,
+        ]);
+        let before = crate::draw_census::snapshot();
+        let state = DrawState::new(16, 16, &declaring_vs, &fs);
+        validate_graphics_interface(&state)
+            .expect("a missing position store must not be a refusal — it is counted");
+        let after = crate::draw_census::snapshot();
+        assert_eq!(after.vs_spirv_scanned - before.vs_spirv_scanned, 1);
+        assert_eq!(
+            after.vs_spirv_without_position_store - before.vs_spirv_without_position_store,
+            1,
+            "declaring gl_PerVertex without storing member 0 must be counted"
+        );
+    }
+
     #[test]
     fn unorm8_maps_endpoints_exactly() {
         assert_eq!(unorm8([0.0, 1.0, 0.0, 1.0]), [0, 255, 0, 255]);
@@ -6125,5 +6771,219 @@ mod tests {
             colour_target_readback_transition(TargetLayout::TransferSrc).is_none(),
             "an already-readable target must not receive a redundant barrier"
         );
+    }
+
+    /// The bytes a Vulkan clear to [`CLEAR_COLOR`] leaves in memory for each
+    /// render-target format this tree creates.
+    ///
+    /// A `VkClearColorValue::float32` names COMPONENTS (R, G, B, A), so where
+    /// each component lands is decided by the format's memory layout — that is
+    /// the entire channel-order bug in one table. Every triple here was
+    /// reproduced independently from a measured GTA V `RAEEN_DUMP_ALL_TARGETS`
+    /// run in which every render target held only the clear:
+    ///
+    /// | format                    | dumped raw   | true RGB        |
+    /// |---------------------------|--------------|-----------------|
+    /// | `R8G8B8A8_UNORM`          | (64,128,191) | (64,128,191)    |
+    /// | `B8G8R8A8_UNORM`          | (191,128,64) | (64,128,191)    |
+    /// | `R16G16B16A16_SFLOAT`     | (0,52,0)     | (64,128,191)    |
+    /// | `B10G11R11_UFLOAT_PACK32` | (64,3,28)    | (64,128,191)    |
+    ///
+    /// The four "dumped raw" columns are what the old dump printed. Three of
+    /// them look like unrelated colours; all four are the same clear.
+    #[test]
+    fn every_render_target_format_decodes_the_same_clear_to_the_same_rgb() {
+        // Reference triple: what an R8G8B8A8 clear reads as.
+        let expected = {
+            let bytes = unorm8(CLEAR_COLOR);
+            [bytes[0], bytes[1], bytes[2]]
+        };
+        assert_eq!(expected, [64, 128, 191], "CLEAR_COLOR as 8-bit RGB");
+
+        // R8G8B8A8: components in memory order.
+        let rgba8 = [64u8, 128, 191, 255];
+        // B8G8R8A8: the same clear, R at byte 2 — the raw view is (191,128,64).
+        let bgra8 = [191u8, 128, 64, 255];
+        // R16G16B16A16_SFLOAT: halves of 0.25/0.5/0.75/1.0, little-endian. The
+        // raw view is the first three bytes: (0x00, 0x34, 0x00) = (0,52,0).
+        let mut rgba16f = [0u8; 8];
+        for (index, half) in [0x3400u16, 0x3800, 0x3A00, 0x3C00].iter().enumerate() {
+            rgba16f[index * 2..index * 2 + 2].copy_from_slice(&half.to_le_bytes());
+        }
+        assert_eq!(
+            &rgba16f[..3],
+            &[0x00, 0x34, 0x00],
+            "the measured (0,52,0) is this clear's first three bytes"
+        );
+        // B10G11R11_UFLOAT_PACK32: R11 = 0x340, G11 = 0x380, B10 = 0x1D0.
+        let packed = 0x340u32 | (0x380u32 << 11) | (0x1D0u32 << 22);
+        assert_eq!(
+            packed, 0x741C_0340,
+            "the measured (64,3,28) is this word's low three bytes"
+        );
+        let b10g11r11 = packed.to_le_bytes();
+        // A2B10G10R10_UNORM_PACK32: R/G/B as 10-bit unorm, A = 3.
+        let ten = |v: f32| (v * 1023.0).round() as u32;
+        let a2b10g10r10 =
+            (ten(0.25) | (ten(0.5) << 10) | (ten(0.75) << 20) | (3 << 30)).to_le_bytes();
+
+        for (format, texel, bpp) in [
+            (vk::Format::R8G8B8A8_UNORM, &rgba8[..], 4u32),
+            (vk::Format::R8G8B8A8_SRGB, &rgba8[..], 4),
+            (vk::Format::B8G8R8A8_UNORM, &bgra8[..], 4),
+            (vk::Format::B8G8R8A8_SRGB, &bgra8[..], 4),
+            (vk::Format::R16G16B16A16_SFLOAT, &rgba16f[..], 8),
+            (vk::Format::B10G11R11_UFLOAT_PACK32, &b10g11r11[..], 4),
+            (vk::Format::A2B10G10R10_UNORM_PACK32, &a2b10g10r10[..], 4),
+        ] {
+            let decoder = target_pixel_decoder(Some(format.as_raw()), bpp);
+            assert!(decoder.decoded(), "{format:?} must be recognized");
+            let rgb = decoder.rgb(texel);
+            // One unit of slack per channel: the 10/11-bit float and 10-bit
+            // unorm encodings cannot represent 0.25/0.5/0.75 to the same
+            // rounding as an 8-bit unorm.
+            for (channel, (got, want)) in rgb.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    got.abs_diff(*want) <= 1,
+                    "{format:?} channel {channel}: decoded {got}, expected about {want} \
+                     (full decode {rgb:?})"
+                );
+            }
+        }
+    }
+
+    /// A stale cache entry naming a format of a different size must not be
+    /// trusted to decode the image, and an unknown format must fall back to the
+    /// historical raw-bytes view rather than to zeroes.
+    #[test]
+    fn a_size_mismatched_or_absent_format_falls_back_to_raw_bytes() {
+        let texel = [1u8, 2, 3, 4];
+
+        let mismatched = target_pixel_decoder(Some(vk::Format::R16G16B16A16_SFLOAT.as_raw()), 4);
+        assert!(!mismatched.decoded(), "8-byte format on a 4-byte image");
+        assert_eq!(mismatched.rgb(&texel), [1, 2, 3]);
+
+        let absent = target_pixel_decoder(None, 4);
+        assert!(!absent.decoded());
+        assert_eq!(absent.rgb(&texel), [1, 2, 3]);
+        assert_eq!(absent.name(), "raw");
+
+        // A one-byte target has no green or blue to report.
+        let single = target_pixel_decoder(None, 1);
+        assert_eq!(single.rgb(&texel[..1]), [1, 0, 0]);
+    }
+
+    /// Which render-target formats the PRESENT path misreads, pinned so the set
+    /// is a fact in the test suite and not just a sentence in a log line.
+    ///
+    /// `R8G8B8A8*` must be absent (its bytes ARE RGBA) and
+    /// `R16G16B16A16_SFLOAT` must be absent (`try_to_presentable_arc` converts
+    /// it). Everything else `readback_bpp` admits as a colour attachment is
+    /// presented as raw bytes and is therefore wrong on screen.
+    #[test]
+    fn present_misreads_exactly_the_non_rgba8_colour_target_formats() {
+        for correct in [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_SNORM,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+        ] {
+            assert!(
+                present_misread(correct).is_none(),
+                "{correct:?} is presented correctly and must not warn"
+            );
+        }
+
+        let misread = [
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::B8G8R8A8_SRGB,
+            vk::Format::B10G11R11_UFLOAT_PACK32,
+            vk::Format::A2B10G10R10_UNORM_PACK32,
+            vk::Format::R32_SFLOAT,
+            vk::Format::R16G16_SFLOAT,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::Format::R8_UNORM,
+            vk::Format::R16_UNORM,
+        ];
+        let mut bits = 0u64;
+        for format in misread {
+            let (bit, why) = present_misread(format)
+                .unwrap_or_else(|| panic!("{format:?} is presented as raw bytes and must warn"));
+            assert!(!why.is_empty(), "{format:?} must name its consequence");
+            assert!(bit < 64, "{format:?} bit {bit} must fit the warn-once word");
+            assert_eq!(
+                bits & (1 << bit),
+                0,
+                "{format:?} reuses warn-once bit {bit}; one format would silence another"
+            );
+            bits |= 1 << bit;
+        }
+
+        // The misread set must be exactly the colour formats `readback_bpp`
+        // admits minus the four correct ones — otherwise a format added to the
+        // render-target path could start being presented as raw bytes with no
+        // warning at all.
+        assert_eq!(
+            misread.len(),
+            9,
+            "adding a colour render-target format means classifying it here"
+        );
+    }
+
+    /// The per-draw statistics reading must name the stage that lost the draw,
+    /// because that is what turns six numbers into a verdict.
+    #[test]
+    fn pipeline_statistics_name_the_stage_that_lost_the_draw() {
+        let stats = |input_vertices, clip_invocations, clip_primitives, fs_invocations| {
+            DrawPipelineStatistics {
+                input_vertices,
+                input_primitives: 0,
+                vs_invocations: 0,
+                clip_invocations,
+                clip_primitives,
+                fs_invocations,
+            }
+        };
+        assert_eq!(
+            stats(0, 0, 0, 0).lost_at(),
+            Some("no input vertices — the draw carried no geometry")
+        );
+        assert_eq!(
+            stats(3, 0, 0, 0).lost_at(),
+            Some("no primitive reached the clipper — input assembly produced none")
+        );
+        assert_eq!(
+            stats(3, 1, 0, 0).lost_at(),
+            Some("every primitive was clipped away — degenerate/NaN/out-of-frustum positions")
+        );
+        assert_eq!(
+            stats(3, 1, 1, 0).lost_at(),
+            Some(
+                "primitives survived clipping but no fragment ran — zero area, culled, or scissored"
+            )
+        );
+        assert_eq!(
+            stats(3, 1, 1, 64).lost_at(),
+            None,
+            "fragments ran, so nothing was lost in the pipeline"
+        );
+    }
+
+    /// The statistics flag set and the result-index constants are edited
+    /// together by hand; this pins the count so they cannot drift apart.
+    #[test]
+    fn requested_statistic_flags_match_the_result_dword_count() {
+        assert_eq!(
+            STATISTIC_FLAGS.as_raw().count_ones() as usize,
+            STATISTIC_COUNT,
+            "one result dword per requested statistic"
+        );
+        let stats = DrawPipelineStatistics::from_results([10, 20, 30, 40, 50, 60]);
+        assert_eq!(stats.input_vertices, 10);
+        assert_eq!(stats.input_primitives, 20);
+        assert_eq!(stats.vs_invocations, 30);
+        assert_eq!(stats.clip_invocations, 40);
+        assert_eq!(stats.clip_primitives, 50);
+        assert_eq!(stats.fs_invocations, 60);
     }
 }

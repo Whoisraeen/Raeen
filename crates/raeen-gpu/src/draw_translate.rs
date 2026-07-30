@@ -1339,6 +1339,21 @@ fn fetch_index_buffer(draw: &IndexedDraw) -> Result<(Vec<u8>, vk::IndexType), Dr
     }
 }
 
+/// How many vertex records this draw addresses, and the largest index it
+/// actually names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VertexReach {
+    /// Records to upload — `max_index + 1`, or the vertex count when there is
+    /// no index buffer (or an empty one).
+    records: u32,
+    /// The largest value in the bound index buffer. `None` for a non-indexed
+    /// draw and for an empty index buffer (which names no record at all). The
+    /// draw census reads this to spot an all-zero index buffer, which collapses
+    /// every primitive onto one record; recomputing it would mean a second scan
+    /// of a buffer that can be megabytes.
+    max_index: Option<u32>,
+}
+
 /// Number of vertex records addressable by this draw.
 ///
 /// Uploading the V# descriptor's full `num_records` is catastrophically
@@ -1348,9 +1363,12 @@ fn fetch_index_buffer(draw: &IndexedDraw) -> Result<(Vec<u8>, vk::IndexType), Dr
 fn required_vertex_records(
     index: Option<(&[u8], vk::IndexType)>,
     vertex_count: u32,
-) -> Result<u32, DrawError> {
+) -> Result<VertexReach, DrawError> {
     let Some((bytes, index_type)) = index else {
-        return Ok(vertex_count);
+        return Ok(VertexReach {
+            records: vertex_count,
+            max_index: None,
+        });
     };
     let max = match index_type {
         vk::IndexType::UINT16 => bytes
@@ -1369,9 +1387,12 @@ fn required_vertex_records(
     };
     // An empty index buffer addresses no record at all; fall back to the draw's
     // vertex count rather than refusing it (the pre-limit behaviour).
-    Ok(max
-        .and_then(|index| index.checked_add(1))
-        .unwrap_or(vertex_count))
+    Ok(VertexReach {
+        records: max
+            .and_then(|index| index.checked_add(1))
+            .unwrap_or(vertex_count),
+        max_index: max,
+    })
 }
 
 /// Read `size` guest bytes starting at an arbitrary (possibly unaligned)
@@ -4866,12 +4887,16 @@ impl OffscreenDrawSink<'_> {
         // Supersamples the whole draw (target + viewport + scissor together);
         // a factor of 1.0 — the default — is an exact no-op.
         state.scale_resolution(crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale);
-        let vertex_records = required_vertex_records(index, state.vertex_count)?;
+        let reach = required_vertex_records(index, state.vertex_count)?;
         let (vertex_buffers, vertex_attributes) =
-            prepare_vertex_inputs_limited(&shaders.vs_info, Some(vertex_records))?;
+            prepare_vertex_inputs_limited(&shaders.vs_info, Some(reach.records))?;
         state.vertex_buffers = vertex_buffers;
         state.vertex_attributes = vertex_attributes;
         drop(setup_timer);
+        // Always-on: can this draw have covered a pixel at all? Recorded before
+        // the backend so a submission failure still leaves the geometry facts
+        // in the census. See `crate::draw_census`.
+        crate::draw_census::note_draw(ucfg.prim_type, state.vertex_count, reach.max_index);
         // Coverage probe (RAEEN_TRACE_DRAWS). Vertex data, attribute bindings,
         // gl_Position and draw state are all confirmed correct yet coverage is
         // ZERO. An all-zero index buffer collapses every primitive to a single
@@ -6543,7 +6568,27 @@ mod tests {
         assert_eq!(
             required_vertex_records(Some((&bytes, vk::IndexType::UINT16)), 6)
                 .expect("valid quad indices"),
-            4
+            VertexReach {
+                records: 4,
+                max_index: Some(3)
+            }
+        );
+    }
+
+    /// The census reads `max_index` from this one scan. An all-zero index
+    /// buffer sizes the upload to a single record — which is correct — and must
+    /// simultaneously report `max_index == Some(0)` so the degenerate-geometry
+    /// count is not silently lost.
+    #[test]
+    fn an_all_zero_index_buffer_reports_a_zero_max_index() {
+        let bytes = [0u8; 12];
+        assert_eq!(
+            required_vertex_records(Some((&bytes, vk::IndexType::UINT16)), 6)
+                .expect("all-zero indices are readable"),
+            VertexReach {
+                records: 1,
+                max_index: Some(0)
+            }
         );
     }
 
@@ -6554,7 +6599,10 @@ mod tests {
         assert_eq!(
             required_vertex_records(Some((&[], vk::IndexType::UINT16)), 6)
                 .expect("an empty index buffer is not a refusal"),
-            6
+            VertexReach {
+                records: 6,
+                max_index: None
+            }
         );
     }
 

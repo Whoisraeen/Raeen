@@ -465,6 +465,13 @@ impl PreparedShader {
     fn recompile(&self) -> Result<Vec<u32>, AttemptError> {
         match self {
             Self::Vs { code, info } => {
+                // Census before recompile: a program with no `exp pos0` still
+                // recompiles and still draws, with gl_Position never stored.
+                // Every primitive is then clipped away and the target keeps its
+                // clear — a black frame no downstream counter can explain.
+                crate::draw_census::note_vertex_translation(
+                    kyty_graphics::shader::shader_exports_position(code),
+                );
                 let spirv = shader_recompile_vs(code, info)
                     .map_err(|e| AttemptError::named(format!("shader_recompile_vs: {e}")))?;
                 Ok(spirv)

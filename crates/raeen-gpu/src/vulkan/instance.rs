@@ -103,6 +103,11 @@ pub struct VulkanDevice {
     /// exactly when the physical device supports it). Without it every MRT
     /// attachment must share the primary's blend/write-mask state.
     independent_blend: bool,
+    /// Whether `pipelineStatisticsQuery` was enabled on the logical device —
+    /// requested only under `RAEEN_PIPELINE_STATS` and only when the physical
+    /// device reports it. When false, no per-draw statistics query pool is
+    /// created and the draw path is byte-identical to a run without the switch.
+    pipeline_statistics_query: bool,
     /// Whether Vulkan 1.2 `samplerMirrorClampToEdge` was enabled. Guest
     /// mirror-once modes must use a defined fallback when this is false.
     sampler_mirror_clamp_to_edge: bool,
@@ -211,6 +216,19 @@ impl VulkanDevice {
                 .independent_blend
                 == vk::TRUE
         };
+
+        // Mirrors the request made at device creation: the feature is enabled
+        // exactly when `RAEEN_PIPELINE_STATS` asked for it AND the device
+        // reports it. Recomputed rather than threaded through `PickedDevice`
+        // so the two sites cannot silently disagree about the env read.
+        // SAFETY: same handle validity as above.
+        let pipeline_statistics_query = crate::diagnostics::gpu_env().pipeline_stats
+            && unsafe {
+                instance
+                    .get_physical_device_features(physical_device)
+                    .pipeline_statistics_query
+                    == vk::TRUE
+            };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -349,6 +367,7 @@ impl VulkanDevice {
             device_name,
             depth_range_unrestricted,
             independent_blend,
+            pipeline_statistics_query,
             sampler_mirror_clamp_to_edge,
             imported_host_pointer_alignment,
             max_push_constants_size,
@@ -385,6 +404,13 @@ impl VulkanDevice {
     #[must_use]
     pub fn supports_independent_blend(&self) -> bool {
         self.independent_blend
+    }
+
+    /// Whether per-draw pipeline-statistics queries can be recorded on this
+    /// device (see [`crate::diagnostics`] `RAEEN_PIPELINE_STATS`).
+    #[must_use]
+    pub(crate) fn pipeline_statistics_enabled(&self) -> bool {
+        self.pipeline_statistics_query
     }
 
     /// Whether guest mirror-once sampler modes can use Vulkan's exact
@@ -1037,10 +1063,25 @@ impl VulkanDevice {
         // carry its own blend/write-mask state, matching the per-slot
         // CB_BLEND{n}_CONTROL registers; when absent the pipeline falls back
         // to the primary attachment's state for every target.
+        // `pipelineStatisticsQuery` is requested ONLY under
+        // `RAEEN_PIPELINE_STATS`: enabling a feature changes what the driver
+        // compiles, and the working titles must stay byte-comparable against
+        // their measured runs when the switch is off. A device that lacks it
+        // leaves the switch inert rather than failing to create — the query
+        // pool creation is what reports the gap, by name.
+        let want_pipeline_stats = crate::diagnostics::gpu_env().pipeline_stats
+            && supported.pipeline_statistics_query == vk::TRUE;
+        if crate::diagnostics::gpu_env().pipeline_stats && !want_pipeline_stats {
+            tracing::warn!(
+                "RAEEN_PIPELINE_STATS is set but this device does not report \
+                 pipelineStatisticsQuery — per-draw rasterization statistics are unavailable"
+            );
+        }
         let features = vk::PhysicalDeviceFeatures::default()
             .fragment_stores_and_atomics(true)
             .vertex_pipeline_stores_and_atomics(true)
             .independent_blend(supported.independent_blend == vk::TRUE)
+            .pipeline_statistics_query(want_pipeline_stats)
             .robust_buffer_access(supported.robust_buffer_access == vk::TRUE);
         // Enable whichever robustness2 features the device actually reports (all
         // three on the measured Radeon 760M). Only chained when the extension is

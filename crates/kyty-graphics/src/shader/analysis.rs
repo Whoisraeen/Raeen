@@ -5932,6 +5932,33 @@ pub fn shader_parse_cs(
 
     Ok(code)
 }
+
+/// Whether a parsed vertex program contains a **clip-position export**
+/// (`exp pos0`, EXP target 12).
+///
+/// A translated VS declares `gl_PerVertex` unconditionally
+/// ([`super::spirv`] `VERTEX_ANNOTATIONS`), so a program that never executes
+/// an `exp pos0` still recompiles, still creates a valid pipeline, and still
+/// draws — with `gl_Position` left at its undefined (in practice all-zero)
+/// initial value. Every primitive then has `w == 0`, no primitive survives
+/// clipping, and the render target keeps exactly whatever the attachment
+/// LOAD/CLEAR put there. That failure is indistinguishable from "the draws
+/// never happened" by any downstream counter, so it has to be measured here,
+/// where the ISA is still visible.
+///
+/// This is a census predicate, not a refusal: `false` is a *finding*, and the
+/// caller counts it rather than dropping the draw. Auxiliary position exports
+/// (`pos1`..`pos3` — clip/cull distances, point size) deliberately do NOT
+/// count; only `pos0` feeds `gl_Position`.
+#[must_use]
+pub fn shader_exports_position(code: &ShaderCode) -> bool {
+    use super::types::shader_instruction_format::Format;
+    code.get_instructions().iter().any(|inst| {
+        inst.type_ == ShaderInstructionType::Exp
+            && inst.format == Format::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done
+    })
+}
+
 #[cfg(test)]
 // Test fixtures build ShaderInstruction field-by-field including nested/indexed
 // operands, which a struct-literal rewrite cannot express; allow the stylistic
@@ -9901,5 +9928,78 @@ mod tests {
             rebase_ngg_constant_sharps(&user_data, &code, &user_sgpr, 8).is_none(),
             "an untyped all-zero quad must not be promoted into a resource"
         );
+    }
+
+    /// A vertex program whose only export is a PARAM slot writes no
+    /// `gl_Position`. It still recompiles and still draws — with every vertex
+    /// at the undefined initial position — so the census predicate is the only
+    /// place this is visible.
+    #[test]
+    fn position_export_census_separates_pos0_from_param_and_aux_exports() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format;
+
+        let exp = |format| ShaderInstruction {
+            type_: T::Exp,
+            format,
+            ..Default::default()
+        };
+
+        let mut param_only = ShaderCode::new();
+        param_only
+            .get_instructions_mut()
+            .push(exp(Format::Param0Vsrc0Vsrc1Vsrc2Vsrc3));
+        assert!(
+            !shader_exports_position(&param_only),
+            "a PARAM export is an interpolant, not a clip position"
+        );
+
+        // pos1..pos3 carry clip/cull distances and point size; none of them
+        // feeds gl_Position, so none of them may satisfy the census.
+        for aux in [
+            Format::Pos1Vsrc0Vsrc1Vsrc2Vsrc3,
+            Format::Pos2Vsrc0Vsrc1Vsrc2Vsrc3,
+            Format::Pos3Vsrc0Vsrc1Vsrc2Vsrc3,
+        ] {
+            let mut aux_only = ShaderCode::new();
+            aux_only.get_instructions_mut().push(exp(aux));
+            assert!(
+                !shader_exports_position(&aux_only),
+                "{aux:?} is an auxiliary position export, not pos0"
+            );
+        }
+
+        let mut with_pos0 = ShaderCode::new();
+        with_pos0
+            .get_instructions_mut()
+            .push(exp(Format::Param0Vsrc0Vsrc1Vsrc2Vsrc3));
+        with_pos0
+            .get_instructions_mut()
+            .push(exp(Format::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done));
+        assert!(
+            shader_exports_position(&with_pos0),
+            "pos0 anywhere in the program satisfies the census"
+        );
+
+        assert!(
+            !shader_exports_position(&ShaderCode::new()),
+            "an empty program exports nothing"
+        );
+    }
+
+    /// A non-`Exp` instruction that happens to carry the pos0 format token must
+    /// not count: the census keys on the pair, not the format alone.
+    #[test]
+    fn position_export_census_requires_the_exp_opcode() {
+        use crate::shader::types::ShaderInstructionType as T;
+        use crate::shader::types::shader_instruction_format::Format;
+
+        let mut misleading = ShaderCode::new();
+        misleading.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: Format::Pos0Vsrc0Vsrc1Vsrc2Vsrc3Done,
+            ..Default::default()
+        });
+        assert!(!shader_exports_position(&misleading));
     }
 }

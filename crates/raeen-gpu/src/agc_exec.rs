@@ -1859,8 +1859,24 @@ impl AgcGpuSession {
                 .iter()
                 .map(|(base, img)| (*base, (**img).clone()))
                 .collect();
-            maybe_dump_all_targets(&targets, present_index);
+            maybe_dump_all_targets(&targets, &self.live_target_formats(), present_index);
         }
+    }
+
+    /// Raw `VkFormat` per live persistent render-target base, for the
+    /// all-targets dump's per-format decode. Empty without a Vulkan backend
+    /// (fixture/CPU-2D paths), which the dump reports as `decoded=false`.
+    ///
+    /// Takes the backend lock, so it is called only under
+    /// `RAEEN_DUMP_ALL_TARGETS` and only where no backend guard is already
+    /// held.
+    fn live_target_formats(&self) -> std::collections::HashMap<u64, i32> {
+        let guard = self.backend.lock();
+        guard
+            .as_ref()
+            .and_then(|backend| backend.device())
+            .map(crate::vulkan::offscreen::live_target_formats)
+            .unwrap_or_default()
     }
 
     /// Copy an already-presentable RGBA8 intermediate into a compatible real
@@ -2440,6 +2456,15 @@ impl AgcGpuSession {
                     .collect()
             })
         });
+        // Each target's own format, captured while `device` is still borrowed
+        // (the dump runs after the backend guard is released). Without it the
+        // dump reads a B8G8R8A8 or packed/HDR target's raw leading bytes as if
+        // they were RGB — see `maybe_dump_all_targets`.
+        let all_target_formats = if all_targets.is_some() {
+            crate::vulkan::offscreen::live_target_formats(device)
+        } else {
+            std::collections::HashMap::new()
+        };
         // Prefer the buffer the title flipped to (VideoOut scanout) over the
         // last-drawn target — captured here while the framebuffers lock is
         // still held. Composited UIs draw their black background last, so the
@@ -2541,7 +2566,7 @@ impl AgcGpuSession {
             // snapshot above (taken under the lock) lets the all-targets dump
             // surface content in a non-final target instead of discarding it.
             if let Some(targets) = all_targets {
-                maybe_dump_all_targets(&targets, present_index);
+                maybe_dump_all_targets(&targets, &all_target_formats, present_index);
             }
             return Ok((Some(image), suspended));
         }
@@ -3362,7 +3387,25 @@ fn dump_frame_due(index: u64) -> bool {
     }
 }
 
-fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
+/// Dump every accumulated render target as a P6 PPM, decoded from the target's
+/// OWN format rather than from its raw leading bytes.
+///
+/// `formats` maps a guest base to its live persistent target's raw `VkFormat`
+/// (see [`crate::vulkan::offscreen::live_target_formats`]). A base absent from
+/// the map — a target the cache no longer holds — falls back to the historical
+/// raw-bytes view and says so in the census line (`decoded=false`), because a
+/// dump that quietly changes meaning is worse than one that is consistently
+/// approximate.
+///
+/// The census line carries the facts a reader would otherwise have to recover
+/// by opening the PPM: whether every texel is identical, and what that texel
+/// is. "Uniform, and equal to the clear colour" is the single most important
+/// thing a render-target dump can say, and it used to require external tooling.
+fn maybe_dump_all_targets(
+    targets: &[(u64, RenderedImage)],
+    formats: &std::collections::HashMap<u64, i32>,
+    draw_index: u64,
+) {
     let Some(dir) = crate::diagnostics::gpu_env().dump_frames.as_deref() else {
         return;
     };
@@ -3372,29 +3415,47 @@ fn maybe_dump_all_targets(targets: &[(u64, RenderedImage)], draw_index: u64) {
     for (base, image) in targets {
         let bpp = image.bytes_per_pixel.max(1) as usize;
         let non_black = visible_pixel_count(image, 1);
+        let decoder = crate::vulkan::offscreen::target_pixel_decoder(
+            formats.get(base).copied(),
+            image.bytes_per_pixel,
+        );
         let path =
             std::path::Path::new(dir).join(format!("target_{base:012x}_{draw_index:06}.ppm"));
         let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
         ppm.reserve(image.pixels.len() / bpp * 3);
-        // First 3 bytes of each pixel as approximate RGB — exact for the 4-byte
-        // RGBA/BGRA formats; a rough low-byte view for packed/HDR targets (this
-        // is a diagnostic dump, the presented frame is the RGBA8 composite).
         for px in image.pixels.chunks_exact(bpp) {
-            ppm.extend_from_slice(&px[..3]);
+            ppm.extend_from_slice(&decoder.rgb(px));
         }
         let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &ppm));
+        let first_rgb = image
+            .pixels
+            .chunks_exact(bpp)
+            .next()
+            .map(|px| decoder.rgb(px));
         tracing::info!(
             base = format_args!("{base:#x}"),
+            extent = format_args!("{}x{}", image.width, image.height),
+            format = %decoder.name(),
+            decoded = decoder.decoded(),
+            uniform = is_visually_uniform(image),
+            first_texel_rgb = ?first_rgb,
+            clear_color_rgb = ?crate::vulkan::offscreen::unorm8(
+                crate::vulkan::offscreen::CLEAR_COLOR
+            )[..3].to_vec(),
             non_black_pixels = non_black,
             total = image.pixels.len() / bpp,
-            "render-target census"
+            "render-target census: `uniform=true` with `first_texel_rgb == clear_color_rgb` means \
+             the render pass CLEARED this target and every draw into it contributed nothing. \
+             RGB is decoded from `format`, not read as raw bytes — a B8G8R8A8 or packed/HDR \
+             target's raw leading bytes are NOT its colour"
         );
     }
 }
 
 /// Decode an IEEE-754 half (binary16) to `f32`. Used to unpack an
-/// `R16G16B16A16_SFLOAT` HDR render target for sRGB encoding at present.
-fn half_to_f32(bits: u16) -> f32 {
+/// `R16G16B16A16_SFLOAT` HDR render target for sRGB encoding at present, and by
+/// the render-target dump decoder ([`crate::vulkan::offscreen`]).
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
     let sign = f32::from((bits >> 15) & 1);
     let exp = (bits >> 10) & 0x1f;
     let frac = bits & 0x3ff;
@@ -3697,6 +3758,11 @@ fn accumulate_chain_census(census: &kyty_graphics::run::ChainCensus) {
         }
         total.clone()
     };
+    // The next link in the same accounting chain: of the draws the sink
+    // completed, how many could have rasterized at all. Emitted on the same
+    // cadence so one log carries decoded -> executed -> could-rasterize.
+    crate::draw_census::report();
+    crate::vulkan::offscreen::report_pipeline_statistics();
     let decoded_draws = CHAIN_DECODED_DRAWS.load(Ordering::Relaxed);
     let executed_draws = CHAIN_EXECUTED_DRAWS.load(Ordering::Relaxed);
     // An all-zero chain census is the ANSWER "this title does not chain", not a
