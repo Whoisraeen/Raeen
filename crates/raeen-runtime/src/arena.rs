@@ -1058,6 +1058,15 @@ impl GuestArena {
     /// `STACK_OFFSET`, and `STACK_SIZE` are all far-more-than-16-aligned
     /// constants, so their sum is too — [`crate::stack::call_on_guest_stack`]
     /// relies on this alignment.
+    /// This arena's identity-map base and the real image length copied into it.
+    ///
+    /// Diagnostics only: the bind-site log that proves an address space was
+    /// actually handed to the VFS `memory:` scheme names these, so "never bound"
+    /// and "bound then dropped" are distinguishable from one log line.
+    pub(crate) fn identity_window(&self) -> (u64, u64) {
+        (self.base, self.image_len)
+    }
+
     pub(crate) fn stack_top(&self) -> u64 {
         self.base + STACK_OFFSET + STACK_SIZE
     }

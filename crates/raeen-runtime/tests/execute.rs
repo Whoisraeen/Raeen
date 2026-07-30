@@ -5541,3 +5541,218 @@ fn a_fault_publishes_its_hle_call_ring_for_the_crash_report() {
          null dereference is the whole lead; got {published:?}"
     );
 }
+
+/// The `memory:` pseudo-file scheme, end to end on a **real** [`GuestArena`],
+/// through the entry point a retail title actually uses.
+///
+/// This is the test whose absence let a working implementation ship broken.
+/// `execute_linked` and `execute_process` bound the guest address space to the
+/// VFS; `execute_process_shared` — i.e. `--run-eboot` and the Shell's runner
+/// child, the only path a retail title takes — constructed its arena inline and
+/// never bound it. Measured on GTA V as four `memory-scheme:no-address-space`
+/// refusals with zero range-validation failures: the code was right and simply
+/// never ran where it mattered. Unit tests could not see it, because they
+/// install the byte source by hand.
+///
+/// Two independent claims, both against the real arena:
+///
+/// 1. **Host side, in `on_start`** (after the arena exists, before guest code):
+///    the binding happened on THIS entry point, and a `memory:` URI aimed into
+///    the arena opens and serves the exact image bytes.
+/// 2. **Guest side, mid-run**: the guest itself calls the real
+///    `open`/`read`/`close` HLE exports on a URI addressing its own image and
+///    exits with the byte count. That is the guest→guest read path, so it also
+///    proves the `Weak` is still upgradeable once guest code is running rather
+///    than only at startup.
+///
+/// If this test ever **hangs** instead of failing, the guest→guest staging in
+/// `raeen-hle`'s `staged_guest_fill` has regressed and `hle_read` is re-entering
+/// the arena's non-reentrant address-space mutex. `raeen-hle`'s
+/// `a_memory_file_read_into_the_same_address_space_neither_deadlocks_nor_aliases`
+/// names that cause without hanging.
+#[test]
+fn memory_scheme_serves_the_real_arena_through_the_entry_point_retail_titles_use() {
+    const ASSET: usize = 0x200;
+    const ASSET_LEN: usize = 32;
+    const URI_AT: usize = 0x240;
+    const DEST: usize = 0x2C0;
+    const FD_SLOT: usize = 0x2F0;
+    const N_SLOT: usize = 0x2F8;
+    const OPEN_SLOT: usize = 0x300;
+    const READ_SLOT: usize = 0x308;
+    const CLOSE_SLOT: usize = 0x310;
+    const EXIT_SLOT: usize = 0x318;
+    /// Prefilled into the destination so a read that writes nothing cannot be
+    /// mistaken for one that produced the right bytes.
+    const POISON: u8 = 0xE7;
+
+    let mut image = vec![0u8; 0x400];
+
+    // The "already loaded" asset, content a pure function of its offset.
+    let asset: Vec<u8> = (0..ASSET_LEN)
+        .map(|i| (i as u8).wrapping_mul(7) ^ 0x5A)
+        .collect();
+    image[ASSET..ASSET + ASSET_LEN].copy_from_slice(&asset);
+    image[DEST..DEST + ASSET_LEN].fill(POISON);
+
+    // `memory:$<hex guest addr>,32,0:probe.gfx` — the Scaleform grammar, aimed
+    // at the guest's own image inside the identity-mapped arena.
+    let asset_addr = GUEST_ARENA_BASE + ASSET as u64;
+    let uri = format!("memory:${asset_addr:x},{ASSET_LEN},0:probe.gfx\0");
+    assert!(uri.len() <= DEST - URI_AT, "URI must fit its slot");
+    image[URI_AT..URI_AT + uri.len()].copy_from_slice(uri.as_bytes());
+
+    // _start: fd = open(uri, 0, 0); n = read(fd, DEST, 32); close(fd); exit(n)
+    let mut off = 0usize;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBF]); // mov rdi, uri
+    image[off + 2..off + 10].copy_from_slice(&(GUEST_ARENA_BASE + URI_AT as u64).to_le_bytes());
+    off += 10;
+    image[off..off + 2].copy_from_slice(&[0x31, 0xF6]); // xor esi, esi (O_RDONLY)
+    off += 2;
+    image[off..off + 2].copy_from_slice(&[0x31, 0xD2]); // xor edx, edx (mode 0)
+    off += 2;
+    emit_indirect_call(&mut image, &mut off, OPEN_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA3]); // mov [FD_SLOT], rax
+    image[off + 2..off + 10].copy_from_slice(&(GUEST_ARENA_BASE + FD_SLOT as u64).to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xBE]); // mov rsi, DEST
+    image[off + 2..off + 10].copy_from_slice(&(GUEST_ARENA_BASE + DEST as u64).to_le_bytes());
+    off += 10;
+    image[off] = 0xBA; // mov edx, ASSET_LEN
+    image[off + 1..off + 5].copy_from_slice(&(ASSET_LEN as u32).to_le_bytes());
+    off += 5;
+    emit_indirect_call(&mut image, &mut off, READ_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA3]); // mov [N_SLOT], rax
+    image[off + 2..off + 10].copy_from_slice(&(GUEST_ARENA_BASE + N_SLOT as u64).to_le_bytes());
+    off += 10;
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [FD_SLOT]
+    image[off + 2..off + 10].copy_from_slice(&(GUEST_ARENA_BASE + FD_SLOT as u64).to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, CLOSE_SLOT);
+    image[off..off + 2].copy_from_slice(&[0x48, 0xA1]); // mov rax, [N_SLOT]
+    image[off + 2..off + 10].copy_from_slice(&(GUEST_ARENA_BASE + N_SLOT as u64).to_le_bytes());
+    off += 10;
+    image[off..off + 3].copy_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    off += 3;
+    emit_indirect_call(&mut image, &mut off, EXIT_SLOT);
+    assert!(off < ASSET, "code must not run into the asset");
+
+    for (slot, index) in [
+        (OPEN_SLOT, 0u64),
+        (READ_SLOT, 1),
+        (CLOSE_SLOT, 2),
+        (EXIT_SLOT, 3),
+    ] {
+        image[slot..slot + 8].copy_from_slice(&(HLE_TRAMPOLINE_BASE + index * 8).to_le_bytes());
+    }
+
+    let linked = std::sync::Arc::new(LinkedModule {
+        image,
+        base: GUEST_ARENA_BASE,
+        executable_ranges: Vec::new(),
+        unresolved: Vec::new(),
+        unresolved_stubs: Vec::new(),
+        module_inits: Vec::new(),
+        hle_trampolines: vec![
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "open".into(),
+                addr: HLE_TRAMPOLINE_BASE,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "read".into(),
+                addr: HLE_TRAMPOLINE_BASE + 8,
+            },
+            HleTrampoline {
+                library: "libkernel".into(),
+                function: "close".into(),
+                addr: HLE_TRAMPOLINE_BASE + 16,
+            },
+            HleTrampoline {
+                library: "libc".into(),
+                function: "exit".into(),
+                addr: HLE_TRAMPOLINE_BASE + 24,
+            },
+        ],
+        entry: 0,
+        tls: None,
+        tls_layout: Vec::new(),
+        procparam_offset: None,
+        unwind_modules: Vec::new(),
+    });
+
+    let hle = std::sync::Arc::new(HleRegistry::new());
+    let kernel = std::sync::Arc::new(OrbisKernel::new());
+    let observer = std::sync::Arc::clone(&kernel);
+    // Counted per-VFS, not process-wide: this test binary runs its tests in
+    // parallel and sibling tests bind their own arenas, so a global counter is
+    // racy (measured: read 46 where 35 was expected). This kernel is this test's
+    // alone, so its count is deterministic.
+    let observed_kernel = std::sync::Arc::clone(&kernel);
+    assert_eq!(
+        observed_kernel.filesystem.guest_byte_source_binding_count(),
+        0,
+        "a fresh kernel must start with no address space bound"
+    );
+
+    type ProbeResult = Option<Result<Vec<u8>, String>>;
+    let host_probe: std::sync::Arc<std::sync::Mutex<ProbeResult>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let host_probe_sink = std::sync::Arc::clone(&host_probe);
+    let probe_uri = format!("memory:${asset_addr:x},{ASSET_LEN},0:probe.gfx");
+
+    let outcome = raeen_runtime::execute_process_shared_with_control(
+        linked,
+        hle,
+        kernel,
+        &["/app0/eboot.bin"],
+        &[],
+        move |_handle| {
+            // Runs after the arena exists and is bound, before guest code. With
+            // the binding missing this is `Other("...never bound...")`.
+            let result = observer
+                .filesystem
+                .open(&probe_uri, 0, 0)
+                .and_then(|fd| {
+                    let bytes = observer.filesystem.read(fd, ASSET_LEN)?;
+                    observer.filesystem.close(fd)?;
+                    Ok(bytes)
+                })
+                .map_err(|error| format!("{:?}: {error}", error.kind()));
+            *host_probe_sink.lock().unwrap() = Some(result);
+        },
+    )
+    .expect("the module must run to its exit call");
+
+    assert_eq!(
+        observed_kernel.filesystem.guest_byte_source_binding_count(),
+        1,
+        "execute_process_shared must bind the guest address space to THIS kernel's VFS — a \
+         count of 0 is the exact bug GTA V hit: correct code on an unvisited path"
+    );
+
+    let probe = host_probe
+        .lock()
+        .unwrap()
+        .take()
+        .expect("on_start must have run");
+    match probe {
+        Ok(bytes) => assert_eq!(
+            bytes, asset,
+            "the host-side memory: read must serve the arena's real image bytes"
+        ),
+        Err(error) => panic!("host-side memory: open/read failed on the real arena: {error}"),
+    }
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Exited(ASSET_LEN as u64),
+        "the GUEST's own open+read of a memory: URI must return all {ASSET_LEN} bytes; a huge \
+         value is a negative errno out of hle_read (-9 EBADF means the read refused)"
+    );
+}

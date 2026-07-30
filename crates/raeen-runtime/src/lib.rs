@@ -274,6 +274,28 @@ fn register_main_thread_stack(kernel: &OrbisKernel, arena: &arena::GuestArena) {
 /// Must run before guest code does. It is cheap (one map insert per distinct
 /// import) and idempotent, so every process entry point calls it unconditionally
 /// rather than trying to decide whether this title uses `dlsym`.
+/// Build this process's guest address space and wire it into everything that
+/// must see it before guest code runs.
+///
+/// **Every** `execute_*` entry point funnels through here. That is the point:
+/// the previous shape repeated `GuestArena::new` + `maybe_enable_wx_image` at
+/// three separate sites, and a fourth step added to only two of them was
+/// invisible. `--run-eboot` — i.e. [`execute_process_shared`], the path every
+/// retail title actually takes — was the one that got missed, measured on GTA V
+/// as four `memory-scheme:no-address-space` refusals with zero range-validation
+/// failures. A new entry point that constructs its own arena inline is now the
+/// anomaly rather than the norm.
+#[cfg(target_os = "windows")]
+fn new_process_arena(
+    module: &LinkedModule,
+    kernel: &OrbisKernel,
+) -> Result<std::sync::Arc<arena::GuestArena>, RuntimeError> {
+    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
+    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
+    bind_memory_scheme_address_space(kernel, &arena);
+    Ok(arena)
+}
+
 /// Bind this process's guest address space to the VFS so the `memory:`
 /// pseudo-file scheme can serve reads out of it.
 ///
@@ -284,16 +306,31 @@ fn register_main_thread_stack(kernel: &OrbisKernel, arena: &arena::GuestArena) {
 /// seam and the runtime supplies the arena here.
 ///
 /// The VFS keeps only a `Weak`, so this does not extend the arena past the end of
-/// the run: when the process finishes and the arena drops, `memory:` opens go
-/// back to a named, counted refusal on their own.
+/// the run. That is safe on every entry point because the strong owner outlives
+/// guest execution in all of them — a local `Arc` in `execute_linked` /
+/// `execute_process`, and `GuestProcess::arena` (moved, not dropped) in
+/// `execute_process_shared_inner`. The INFO below and the VFS's own
+/// `guest_byte_source_binding_count` exist so that claim is observable rather
+/// than argued.
+///
+/// The log is deliberately INFO, not DEBUG: "no guest address space bound"
+/// cannot by itself distinguish *never bound* from *bound then dropped*, and
+/// guessing wrong between those two is what cost four rounds on Blasphemous II's
+/// `scePthreadAttrGet`. One line naming the base and image length at bind time
+/// settles it in a single default-level run. The VFS reports the two cases as
+/// distinct blocker keys for the same reason.
 #[cfg(target_os = "windows")]
 fn bind_memory_scheme_address_space(
     kernel: &OrbisKernel,
     arena: &std::sync::Arc<arena::GuestArena>,
 ) {
+    let (base, image_len) = arena.identity_window();
     let source: std::sync::Arc<dyn raeen_kernel::filesystem::GuestByteSource> =
         std::sync::Arc::clone(arena) as _;
     kernel.filesystem.set_guest_byte_source(&source);
+    tracing::info!(
+        "VFS memory: scheme bound to guest address space base={base:#x} image_len={image_len:#x}"
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -578,11 +615,9 @@ pub fn execute_linked(
     // execute concurrently through their thread-local dispatch contexts.
     let _call_lock = dispatch::call_lock();
 
-    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
-    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
+    let arena = new_process_arena(module, kernel)?;
     let gpu = GpuShutdownGuard(raeen_gpu::AgcGpuSession::new_process(arena.clone()));
     raeen_gpu::AgcGpuSession::install_process(&gpu.0);
-    bind_memory_scheme_address_space(kernel, &arena);
     // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
     // `sceKernelGetProcParam`: its guest address is the arena base plus the
     // segment's image offset (identity-mapped). `0` clears any stale value
@@ -736,8 +771,7 @@ pub fn execute_process(
     envp: &[&str],
 ) -> Result<RunOutcome, RuntimeError> {
     let _call_lock = dispatch::call_lock();
-    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
-    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
+    let arena = new_process_arena(module, kernel)?;
     publish_hle_exports_for_dlsym(kernel, &module.hle_trampolines);
     let guard = trampoline::TrampolineGuard::reserve(&module.hle_trampolines, |t| {
         hle.returns_float(&t.library, &t.function)
@@ -801,8 +835,11 @@ fn execute_process_shared_inner(
     on_start: impl FnOnce(GuestProcessHandle),
 ) -> Result<RunOutcome, RuntimeError> {
     let _call_lock = dispatch::call_lock();
-    let arena = std::sync::Arc::new(arena::GuestArena::new(&module.image)?);
-    arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
+    // THE path a retail title takes (`--run-eboot` and the Shell's runner
+    // child). It constructed its arena inline and so silently missed the
+    // `memory:` binding; `new_process_arena` is now the single place that can
+    // happen.
+    let arena = new_process_arena(&module, &kernel)?;
     publish_hle_exports_for_dlsym(&kernel, &module.hle_trampolines);
     let guard = std::sync::Arc::new(trampoline::TrampolineGuard::reserve(
         &module.hle_trampolines,

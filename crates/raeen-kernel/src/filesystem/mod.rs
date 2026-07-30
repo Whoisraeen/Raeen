@@ -24,6 +24,51 @@ use tracing::{debug, info, warn};
 
 pub use memory_scheme::{GuestByteSource, MemoryUri, MemoryUriError};
 
+/// Why the `memory:` scheme could not reach a guest address space.
+///
+/// Two variants, not one, because they have opposite fixes and a single
+/// "no address space bound" message cannot tell them apart. Measured: GTA V's
+/// first run on this scheme reported that message four times, and the cause was
+/// [`NeverBound`](Self::NeverBound) — the `--run-eboot` entry point constructed
+/// its arena inline and never called
+/// [`set_guest_byte_source`](VirtualFileSystem::set_guest_byte_source) — not
+/// [`Dropped`](Self::Dropped), which is what a reader would assume from a
+/// nine-seconds-into-the-run failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressSpaceMiss {
+    /// No runtime entry point ever bound an address space. A missing call site.
+    NeverBound,
+    /// An address space was bound, but the arena behind the [`Weak`] is gone. A
+    /// lifetime problem.
+    Dropped,
+}
+
+impl AddressSpaceMiss {
+    /// Stable blocker key suffix, so the two cases aggregate separately.
+    #[must_use]
+    pub fn blocker_reason(self) -> &'static str {
+        match self {
+            Self::NeverBound => "no-address-space",
+            Self::Dropped => "address-space-dropped",
+        }
+    }
+
+    /// Human-readable cause, used verbatim in both the blocker detail and the
+    /// `io::Error` the guest's `open`/`read` maps to `EIO`.
+    #[must_use]
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::NeverBound => {
+                "no guest address space was ever bound to the VFS (a runtime entry point is \
+                 missing its bind call)"
+            }
+            Self::Dropped => {
+                "the bound guest address space has been dropped (its arena outlived by the VFS)"
+            }
+        }
+    }
+}
+
 /// A mount point mapping PS5 paths to host paths.
 #[derive(Debug, Clone)]
 struct MountPoint {
@@ -243,6 +288,10 @@ pub struct VirtualFileSystem {
     /// the run. A dead (or never-installed) source makes a `memory:` open a
     /// named, counted refusal rather than a silent empty file.
     guest_bytes: RwLock<Option<Weak<dyn GuestByteSource>>>,
+    /// How many times [`set_guest_byte_source`](VirtualFileSystem::set_guest_byte_source)
+    /// has run against this instance — see
+    /// [`guest_byte_source_binding_count`](VirtualFileSystem::guest_byte_source_binding_count).
+    guest_byte_source_bindings: std::sync::atomic::AtomicU64,
 }
 
 impl Default for VirtualFileSystem {
@@ -262,6 +311,7 @@ impl VirtualFileSystem {
             open_files: RwLock::new(HashMap::new()),
             next_fd: RwLock::new(3), // 0=stdin, 1=stdout, 2=stderr.
             guest_bytes: RwLock::new(None),
+            guest_byte_source_bindings: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Register standard PS5 mount points with default paths.
@@ -452,7 +502,28 @@ impl VirtualFileSystem {
     /// refusal on their own with no explicit teardown.
     pub fn set_guest_byte_source(&self, source: &Arc<dyn GuestByteSource>) {
         *self.guest_bytes.write() = Some(Arc::downgrade(source));
+        self.guest_byte_source_bindings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("VFS: memory: scheme bound to a guest address space");
+    }
+
+    /// How many times an address space has been bound to **this** VFS.
+    ///
+    /// Per-instance, not process-global, on purpose: a global counter is racy
+    /// under the parallel test harness (measured — it read 46 where 35 was
+    /// expected because sibling tests bound their own arenas concurrently), and a
+    /// flaky assertion about a wiring bug is worse than none. Each `OrbisKernel`
+    /// owns one VFS, so a test that builds its own kernel observes only its own
+    /// bindings.
+    ///
+    /// This exists because the failure it detects is not a wrong value but an
+    /// *unexecuted* one: `execute_process_shared` — the entry point every retail
+    /// title uses — never called
+    /// [`set_guest_byte_source`](Self::set_guest_byte_source) at all.
+    #[must_use]
+    pub fn guest_byte_source_binding_count(&self) -> u64 {
+        self.guest_byte_source_bindings
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drop the `memory:` guest-memory reader.
@@ -460,14 +531,26 @@ impl VirtualFileSystem {
         *self.guest_bytes.write() = None;
     }
 
-    /// The live guest-memory reader, if one is installed and still alive.
+    /// The live guest-memory reader.
     ///
     /// Upgraded to a strong `Arc` for the duration of one operation so the arena
     /// cannot drop mid-read, and the `guest_bytes` lock is released before any
     /// guest memory is touched (the source never re-enters the VFS, but holding
     /// two locks across a foreign call is not worth the risk).
-    fn guest_byte_source(&self) -> Option<Arc<dyn GuestByteSource>> {
-        self.guest_bytes.read().as_ref().and_then(Weak::upgrade)
+    ///
+    /// The two failures are reported **separately** on purpose. A single
+    /// "no address space" refusal cannot distinguish a runtime entry point that
+    /// never performed the binding from a binding whose arena has since dropped,
+    /// and those have opposite fixes — wire the missing call site, versus keep a
+    /// strong reference alive. That exact ambiguity sent this scheme's first
+    /// measurement down the wrong path (`--run-eboot` had simply never bound),
+    /// and it is the same class of ambiguity that cost four rounds on
+    /// Blasphemous II's `scePthreadAttrGet`.
+    fn guest_byte_source(&self) -> Result<Arc<dyn GuestByteSource>, AddressSpaceMiss> {
+        match self.guest_bytes.read().as_ref() {
+            None => Err(AddressSpaceMiss::NeverBound),
+            Some(weak) => weak.upgrade().ok_or(AddressSpaceMiss::Dropped),
+        }
     }
 
     /// Parse and validate a `memory:` URI, without opening a descriptor.
@@ -493,17 +576,16 @@ impl VirtualFileSystem {
                 format!("malformed memory: URI ({error})"),
             )
         })?;
-        let Some(source) = self.guest_byte_source() else {
-            memory_scheme::refuse("no-address-space", uri.addr, || {
+        let source = self.guest_byte_source().map_err(|miss| {
+            memory_scheme::refuse(miss.blocker_reason(), uri.addr, || {
                 format!(
-                    "memory: URI '{}' requested with no guest address space bound to the VFS",
-                    uri.display_name
+                    "memory: URI '{}' requested but {}",
+                    uri.display_name,
+                    miss.explanation()
                 )
             });
-            return Err(std::io::Error::other(
-                "no guest address space is bound to the VFS",
-            ));
-        };
+            std::io::Error::other(miss.explanation())
+        })?;
         // The one place a guest-supplied pointer stops being an integer. Prove
         // the WHOLE declared range is mapped and readable before a single byte
         // is served; reads re-check as well, so this is a fail-fast at open
@@ -543,17 +625,16 @@ impl VirtualFileSystem {
         if want == 0 {
             return Ok(0);
         }
-        let Some(source) = self.guest_byte_source() else {
-            memory_scheme::refuse("no-address-space", region.addr, || {
+        let source = self.guest_byte_source().map_err(|miss| {
+            memory_scheme::refuse(miss.blocker_reason(), region.addr, || {
                 format!(
-                    "read of memory: file '{}' after its guest address space went away",
-                    region.display_name
+                    "read of memory: file '{}' but {}",
+                    region.display_name,
+                    miss.explanation()
                 )
             });
-            return Err(std::io::Error::other(
-                "no guest address space is bound to the VFS",
-            ));
-        };
+            std::io::Error::other(miss.explanation())
+        })?;
         // `start <= region.len` and `addr + len` was proven non-overflowing at
         // parse time, so this cannot wrap.
         let at = region.addr + start;
@@ -2252,14 +2333,25 @@ mod tests {
         let vfs = VirtualFileSystem::new();
         vfs.set_game_directory(&dir);
 
-        // Never installed.
+        // --- Never bound: a missing runtime call site. ---
+        assert_eq!(
+            vfs.guest_byte_source().err(),
+            Some(AddressSpaceMiss::NeverBound)
+        );
         let error = vfs
             .open(GTA_V_URIS[0], O_RDONLY, 0)
             .expect_err("no address space must be an error, not a zero-length file");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains("missing its bind call"),
+            "must point at the missing call site, not merely report an absent binding — got \
+             '{error}'"
+        );
 
-        // Installed, then dropped: the weak handle must not resurrect it, and
-        // must not keep the source alive either.
+        // --- Bound, then dropped: a lifetime problem, NOT a missing call site.
+        // These two report differently on purpose: one measurement of the
+        // ambiguous message sent this scheme's first GTA V run at the wrong
+        // hypothesis. ---
         let source = FakeGuestMemory::gta_v();
         vfs.set_guest_byte_source(&source);
         let weak = Arc::downgrade(&source);
@@ -2271,10 +2363,23 @@ mod tests {
             "the VFS must hold the guest address space weakly, never extend its life"
         );
         assert_eq!(
-            vfs.open(GTA_V_URIS[1], O_RDONLY, 0)
-                .expect_err("a dead address space must refuse")
-                .kind(),
-            std::io::ErrorKind::Other
+            vfs.guest_byte_source().err(),
+            Some(AddressSpaceMiss::Dropped)
+        );
+        let error = vfs
+            .open(GTA_V_URIS[1], O_RDONLY, 0)
+            .expect_err("a dead address space must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains("dropped"),
+            "a dropped arena must not be reported as never bound — got '{error}'"
+        );
+
+        // The two blocker keys must differ, or the digest aggregates a wiring
+        // bug and a lifetime bug into one indistinguishable count.
+        assert_ne!(
+            AddressSpaceMiss::NeverBound.blocker_reason(),
+            AddressSpaceMiss::Dropped.blocker_reason()
         );
     }
 
