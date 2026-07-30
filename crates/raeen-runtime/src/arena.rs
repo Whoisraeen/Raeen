@@ -2052,6 +2052,30 @@ impl GuestMemory for GuestArena {
     }
 }
 
+/// The guest address space, as the VFS's `memory:` pseudo-file scheme sees it.
+///
+/// `raeen-kernel` sits below this crate and cannot name [`GuestArena`], so the
+/// VFS declares a two-method read-only seam and the runtime binds this arena to
+/// it (see `execute_linked` / `execute_process`). Both methods delegate to the
+/// already-audited [`GuestMemory`] implementation above, whose `read` proves
+/// every page of the range is committed host-backed memory *while holding the
+/// address-space lock* before it copies — so a Scaleform-supplied pointer is
+/// validated by exactly the same gate every other HLE guest read uses, with no
+/// second, weaker path.
+impl raeen_kernel::filesystem::GuestByteSource for GuestArena {
+    fn read_guest_bytes(&self, addr: u64, out: &mut [u8]) -> bool {
+        GuestMemory::read(self, addr, out)
+    }
+
+    fn guest_range_readable(&self, addr: u64, len: u64) -> bool {
+        // The authoritative map, not the trait's page probe: `validate_range`
+        // consults the arena's own VMA state, so an interior hole cannot slip
+        // between two readable page boundaries.
+        GuestRange::new(GuestAddress::new(addr), len)
+            .is_some_and(|range| GuestMemory::validate_range(self, range, GuestAccess::Read))
+    }
+}
+
 impl raeen_gpu::GpuGuestMemory for GuestArena {
     fn validate_gpu_range(&self, addr: u64, len: u64, _write: bool) -> bool {
         GuestRange::new(GuestAddress::new(addr), len)

@@ -138,11 +138,8 @@ fn hle_write(ctx: &HleContext, args: &[u64]) -> u64 {
                 }
                 Err(error) => {
                     warn!("write: fd {fd} failed after {transferred:#x} byte(s): {error}");
-                    return if transferred == 0 {
-                        WRITE_EBADF
-                    } else {
-                        transferred
-                    };
+                    let code = memory_file_write_refusal(ctx, fd as i32).unwrap_or(WRITE_EBADF);
+                    return if transferred == 0 { code } else { transferred };
                 }
             }
         };
@@ -455,7 +452,13 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
     // it). O_CREAT is bit 0x200 in the Orbis/BSD flag set.
     const O_CREAT: i32 = 0x200;
     let creating = flags & O_CREAT != 0;
-    let built_in_device = matches!(path.as_str(), "/dev/random" | "/dev/urandom");
+    // Paths the VFS serves without a host file. A failed open of one of these
+    // must not run the ENOENT diagnostics below — the second `resolve_path` and
+    // the font-substitution walk both assume a host path exists to reason about,
+    // and for a `memory:` URI they would only re-log a resolve that is
+    // guaranteed to fail.
+    let built_in_device = matches!(path.as_str(), "/dev/random" | "/dev/urandom")
+        || raeen_kernel::filesystem::memory_scheme::claims(&path);
 
     match ctx.services.open(&path, flags, mode) {
         Ok(fd) => {
@@ -631,6 +634,11 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
         return FILE_EFAULT;
     }
 
+    // A `memory:` descriptor's bytes come from guest memory, so its read must
+    // not go through the zero-copy `fill_write` seam — see [`staged_guest_fill`]
+    // for the deadlock and aliasing this avoids. One map lookup per call.
+    let staged = ctx.kernel.filesystem.is_memory_file(fd);
+
     let mut transferred = 0u64;
     while transferred < count {
         let chunk_len = (count - transferred).min(READ_CHUNK_BYTES) as usize;
@@ -642,12 +650,17 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
             };
         };
         let mut read_result = None;
-        let guest_fill = ctx.mem.fill_write(chunk_addr, chunk_len, &mut |out| {
+        let mut into = |out: &mut [u8]| {
             let result = ctx.services.read_into(fd, out);
             let read = result.as_ref().copied().unwrap_or(0);
             read_result = Some(result);
             read
-        });
+        };
+        let guest_fill = if staged {
+            staged_guest_fill(ctx, chunk_addr, chunk_len, &mut into)
+        } else {
+            ctx.mem.fill_write(chunk_addr, chunk_len, &mut into)
+        };
         let Some(filled) = guest_fill else {
             return if transferred == 0 {
                 FILE_EFAULT
@@ -699,6 +712,48 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     transferred
 }
 
+/// Drop-in replacement for [`GuestMemory::fill_write`] that stages through a
+/// **host** buffer instead of handing the callback a slice of guest memory.
+///
+/// Used for `memory:` pseudo-file descriptors only (see
+/// `raeen_kernel::filesystem::memory_scheme`), where those bytes come *from*
+/// guest memory too, making the read guest→guest. The zero-copy seam cannot be
+/// used for that, for two independent reasons:
+///
+/// 1. **Deadlock.** The arena's `fill_write` holds its address-space `Mutex`
+///    across the callback (so an unmap cannot race the exposed slice), and a
+///    `memory:` read *inside* that callback takes the same `Mutex` to validate
+///    its source range. `std::sync::Mutex` is not reentrant, so the first guest
+///    read of a `memory:` file would hang that thread outright.
+/// 2. **Aliasing.** `fill_write` exposes a `&mut [u8]` over the guest
+///    destination while the source is also guest memory. A guest that pointed a
+///    read at a buffer overlapping its own asset would turn the arena's
+///    `copy_nonoverlapping` into an overlapping copy — host undefined behaviour,
+///    reachable from guest-controlled arguments.
+///
+/// Staging removes both: the source read completes (arena lock taken and
+/// released) before the destination write starts, and each copy is between
+/// disjoint allocations. The extra copy is bounded by [`READ_CHUNK_BYTES`] and
+/// is paid only by this scheme, so no other title's read path changes.
+fn staged_guest_fill(
+    ctx: &HleContext,
+    guest_addr: u64,
+    len: usize,
+    fill: &mut dyn FnMut(&mut [u8]) -> usize,
+) -> Option<usize> {
+    let mut staging = vec![0u8; len];
+    let written = fill(&mut staging);
+    if written > len {
+        return None;
+    }
+    if written == 0 {
+        return Some(0);
+    }
+    ctx.mem
+        .write(guest_addr, &staging[..written])
+        .then_some(written)
+}
+
 fn pread_error(error: &std::io::Error) -> u64 {
     if error.kind() == std::io::ErrorKind::NotFound {
         FILE_EBADF
@@ -713,14 +768,22 @@ fn pread_chunk(
     guest_addr: u64,
     len: usize,
     offset: u64,
+    staged: bool,
 ) -> Result<usize, u64> {
     let mut read_result = None;
-    let guest_fill = ctx.mem.fill_write(guest_addr, len, &mut |out| {
+    let mut into = |out: &mut [u8]| {
         let result = ctx.kernel.filesystem.pread_into(fd, out, offset);
         let read = result.as_ref().copied().unwrap_or(0);
         read_result = Some(result);
         read
-    });
+    };
+    // See [`staged_guest_fill`]: a `memory:` read is guest→guest and must not
+    // borrow the guest destination while the arena lock is held.
+    let guest_fill = if staged {
+        staged_guest_fill(ctx, guest_addr, len, &mut into)
+    } else {
+        ctx.mem.fill_write(guest_addr, len, &mut into)
+    };
     let Some(filled) = guest_fill else {
         return Err(FILE_EFAULT);
     };
@@ -764,6 +827,10 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
         return FILE_EFAULT;
     }
 
+    // Same guest→guest staging requirement as `hle_read`; see
+    // [`staged_guest_fill`]. One map lookup per call, not per chunk.
+    let staged = ctx.kernel.filesystem.is_memory_file(fd);
+
     let mut transferred = 0u64;
     while transferred < count {
         let chunk_len = (count - transferred).min(READ_CHUNK_BYTES) as usize;
@@ -781,7 +848,7 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
                 transferred
             };
         };
-        match pread_chunk(ctx, fd, chunk_addr, chunk_len, chunk_offset) {
+        match pread_chunk(ctx, fd, chunk_addr, chunk_len, chunk_offset, staged) {
             Ok(read) => {
                 transferred += read as u64;
                 if read < chunk_len {
@@ -874,7 +941,9 @@ fn hle_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
             Err(error) => {
                 use std::io::ErrorKind;
                 let result = match error.kind() {
-                    ErrorKind::NotFound | ErrorKind::PermissionDenied => FILE_EBADF,
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied => {
+                        memory_file_write_refusal(ctx, fd).unwrap_or(FILE_EBADF)
+                    }
                     _ => FILE_EINVAL,
                 };
                 return if transferred == 0 {
@@ -901,6 +970,23 @@ fn hle_sce_pwrite(ctx: &HleContext, args: &[u64]) -> u64 {
 /// write-back buffer (drop the tail / zero-fill the extension), so the new
 /// length survives the flush-on-close — truncating the host file out from
 /// under a dirty buffer would be undone the moment it flushed. Bad fd (or a
+/// `EACCES` for a write-side refusal on a `memory:` pseudo-file; `None` for
+/// every other descriptor.
+///
+/// A `memory:` handle is read-only by construction (see
+/// `raeen_kernel::filesystem::memory_scheme`), so the only way its
+/// `write`/`pwrite`/`ftruncate` can fail is that refusal. The generic arms report
+/// `EBADF` for any write failure — correct for a read-only *host* fd, but it
+/// would tell a title its descriptor is invalid when the object is merely not
+/// writable, and Scaleform would retry the open. Strictly additive: no
+/// non-`memory:` descriptor reaches this.
+fn memory_file_write_refusal(ctx: &HleContext, fd: i32) -> Option<u64> {
+    ctx.kernel
+        .filesystem
+        .is_memory_file(fd)
+        .then_some(FILE_EACCES)
+}
+
 /// read-only one) → `EBADF`; negative length → `EINVAL`.
 fn hle_ftruncate(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
@@ -915,7 +1001,9 @@ fn hle_ftruncate(ctx: &HleContext, args: &[u64]) -> u64 {
         Err(e) => {
             use std::io::ErrorKind;
             match e.kind() {
-                ErrorKind::NotFound | ErrorKind::PermissionDenied => FILE_EBADF,
+                ErrorKind::NotFound | ErrorKind::PermissionDenied => {
+                    memory_file_write_refusal(ctx, fd).unwrap_or(FILE_EBADF)
+                }
                 _ => io_error_to_file_result(&e),
             }
         }
@@ -5027,6 +5115,19 @@ fn hle_stat(ctx: &HleContext, args: &[u64]) -> u64 {
     if matches!(path.as_ref(), "/dev/random" | "/dev/urandom") {
         return write_orbis_device_stat(ctx, stat_out);
     }
+    // A `memory:` pseudo-file has no host metadata to read. Answer from the URI
+    // itself (after the VFS has proven the range is mapped), because Scaleform
+    // sizes its own buffer from `st_size` before reading: a stat that reported 0
+    // while `read` served 194 KiB would be worse than the ENOENT this replaces.
+    if raeen_kernel::filesystem::memory_scheme::claims(&path) {
+        return match ctx.kernel.filesystem.memory_file_len(&path) {
+            Ok(size) => write_orbis_memory_stat(ctx, stat_out, size),
+            Err(error) => {
+                debug!("sceKernelStat('{path}') refused by the memory: scheme: {error}");
+                SCE_KERNEL_ERROR_ENOENT
+            }
+        };
+    }
     match ctx.kernel.filesystem.metadata(&path) {
         Ok(metadata) => write_orbis_stat(ctx, stat_out, &metadata),
         Err(error) => {
@@ -5055,6 +5156,29 @@ fn write_orbis_device_stat(ctx: &HleContext, stat_out: u64) -> u64 {
     stat[4..8].copy_from_slice(&1u32.to_le_bytes());
     stat[8..10].copy_from_slice(&ORBIS_MODE_CHARACTER.to_le_bytes());
     stat[10..12].copy_from_slice(&1u16.to_le_bytes());
+    if ctx.mem.write(stat_out, &stat) {
+        SCE_OK
+    } else {
+        SCE_KERNEL_ERROR_EFAULT
+    }
+}
+
+/// `stat` record for a `memory:` pseudo-file: a regular file of the length the
+/// URI declared.
+///
+/// Deliberately `S_IFREG`, not a character device — the bytes are seekable and
+/// finite, so a title that branches on `st_mode` must take its ordinary
+/// read-a-file path. Timestamps stay zero because a guest buffer has none;
+/// inventing `now()` would make an asset cache think the file just changed on
+/// every boot.
+fn write_orbis_memory_stat(ctx: &HleContext, stat_out: u64, size: u64) -> u64 {
+    let mut stat = [0u8; ORBIS_STAT_SIZE];
+    stat[4..8].copy_from_slice(&1u32.to_le_bytes()); // stable nonzero inode
+    stat[8..10].copy_from_slice(&ORBIS_MODE_REGULAR.to_le_bytes());
+    stat[10..12].copy_from_slice(&1u16.to_le_bytes());
+    stat[72..80].copy_from_slice(&size.to_le_bytes());
+    stat[80..88].copy_from_slice(&size.div_ceil(512).to_le_bytes());
+    stat[88..92].copy_from_slice(&512u32.to_le_bytes());
     if ctx.mem.write(stat_out, &stat) {
         SCE_OK
     } else {
@@ -7913,6 +8037,384 @@ mod tests {
         assert_eq!(hle_sce_open(&ctx, &[0x300, 0, 0]), 0x8002_0002);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------------------------------------------------------------
+    // `memory:` pseudo-file scheme, through the guest-facing file family
+    // ---------------------------------------------------------------------
+
+    /// A fabricated guest address space for the `memory:` scheme: `len` readable
+    /// bytes at `base`, content a pure function of the address.
+    ///
+    /// In production this seam and `ctx.mem` are the *same* object (the guest
+    /// arena), so a `memory:` read is guest→guest. Keeping them distinct in the
+    /// test is deliberate: it proves the bytes a guest `read` lands in `ctx.mem`
+    /// genuinely travelled through the URI's address range, and did not come from
+    /// `ctx.mem` itself.
+    struct FakeAddressSpace {
+        base: u64,
+        len: u64,
+    }
+
+    fn memory_pattern(addr: u64) -> u8 {
+        (addr.wrapping_mul(31).wrapping_add(7) >> 3) as u8
+    }
+
+    impl raeen_kernel::filesystem::GuestByteSource for FakeAddressSpace {
+        fn read_guest_bytes(&self, addr: u64, out: &mut [u8]) -> bool {
+            let Some(end) = addr.checked_add(out.len() as u64) else {
+                return false;
+            };
+            if addr < self.base || end > self.base + self.len {
+                return false;
+            }
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = memory_pattern(addr + index as u64);
+            }
+            true
+        }
+    }
+
+    /// Bind a fabricated address space to `kernel`'s VFS and return the `Arc` so
+    /// the caller keeps the weakly-held source alive for the test's duration.
+    fn bind_fake_address_space(
+        kernel: &raeen_kernel::OrbisKernel,
+        base: u64,
+        len: u64,
+    ) -> std::sync::Arc<dyn raeen_kernel::filesystem::GuestByteSource> {
+        let source: std::sync::Arc<dyn raeen_kernel::filesystem::GuestByteSource> =
+            std::sync::Arc::new(FakeAddressSpace { base, len });
+        kernel.filesystem.set_guest_byte_source(&source);
+        source
+    }
+
+    #[test]
+    fn a_scaleform_memory_uri_opens_reads_seeks_and_closes_through_the_guest_file_family() {
+        const BASE: u64 = 0x15_59E0_0000;
+        const LEN: u64 = 198_674;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let _source = bind_fake_address_space(&kernel, BASE, LEN);
+
+        // The exact URI GTA V was measured retrying 149 times in 25 s.
+        let uri = b"memory:$1559e00000,198674,0:00002_font_lib_efigs_ps5.gfx\0";
+        assert!(mem.write(0x100, uri));
+
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!(
+            (fd as i64) >= 3,
+            "the memory: URI must open, got {} (pre-fix this was ENOENT, -2)",
+            fd as i64
+        );
+        assert!(ctx.kernel.filesystem.is_memory_file(fd as i32));
+
+        // Sequential read: bytes must arrive from the URI's guest range.
+        let n = hle_read(&ctx, &[fd, 0x300, 32]);
+        assert_eq!(n, 32, "read must serve 32 bytes");
+        let mut head = [0u8; 32];
+        assert!(mem.read(0x300, &mut head));
+        for (offset, got) in head.iter().enumerate() {
+            assert_eq!(
+                *got,
+                memory_pattern(BASE + offset as u64),
+                "byte {offset} did not come from the URI's guest address"
+            );
+        }
+
+        // SEEK_END reports the DECLARED length — Scaleform's size probe.
+        assert_eq!(hle_lseek(&ctx, &[fd, 0, 2]), LEN);
+        assert_eq!(hle_read(&ctx, &[fd, 0x300, 16]), 0, "read at EOF is empty");
+        // SEEK_SET back into the middle, then a positional read that must not
+        // move the cursor.
+        assert_eq!(hle_lseek(&ctx, &[fd, 1024, 0]), 1024);
+        let mid = hle_pread(&ctx, &[fd, 0x340, 16, 4096]);
+        assert_eq!(mid, 16);
+        let mut middle = [0u8; 16];
+        assert!(mem.read(0x340, &mut middle));
+        for (offset, got) in middle.iter().enumerate() {
+            assert_eq!(*got, memory_pattern(BASE + 4096 + offset as u64));
+        }
+        assert_eq!(
+            hle_lseek(&ctx, &[fd, 0, 1]),
+            1024,
+            "pread must not disturb the sequential cursor"
+        );
+
+        // Read-only: every write spelling is refused with EACCES, never a
+        // silent success.
+        assert!(mem.write(0x400, b"NOPE"));
+        assert_eq!(hle_write(&ctx, &[fd, 0x400, 4]) as i64, -13, "write");
+        assert_eq!(hle_pwrite(&ctx, &[fd, 0x400, 4, 0]) as i64, -13, "pwrite");
+        assert_eq!(hle_ftruncate(&ctx, &[fd, 0]) as i64, -13, "ftruncate");
+        // A refused write did not alter what a read serves.
+        assert_eq!(hle_pread(&ctx, &[fd, 0x360, 4, 0]), 4);
+        let mut recheck = [0u8; 4];
+        assert!(mem.read(0x360, &mut recheck));
+        for (offset, got) in recheck.iter().enumerate() {
+            assert_eq!(*got, memory_pattern(BASE + offset as u64));
+        }
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        assert_eq!(hle_close(&ctx, &[fd]) as i64, -9, "double close is EBADF");
+    }
+
+    #[test]
+    fn stat_and_fstat_of_a_memory_uri_actually_write_a_regular_file_of_the_declared_length() {
+        const BASE: u64 = 0x10_85A0_8000;
+        const LEN: u64 = 9156;
+        const POISON: u8 = 0xA5;
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let _source = bind_fake_address_space(&kernel, BASE, LEN);
+
+        let uri = b"memory:$1085a08000,9156,0:00005_initial_interactive_screen_ps5.gfx\0";
+        assert!(mem.write(0x100, uri));
+
+        // `stat` by path. The destination is poisoned first: a handler that
+        // returned SCE_OK without filling it would otherwise pass while the guest
+        // read uninitialized memory and could not tell.
+        let stat_out = 0x400u64;
+        assert!(mem.write(stat_out, &[POISON; ORBIS_STAT_SIZE]));
+        assert_eq!(
+            hle_stat(&ctx, &[0x100, stat_out]),
+            SCE_OK,
+            "sceKernelStat of a memory: URI must succeed (pre-fix: ENOENT)"
+        );
+        let mut stat = [0u8; ORBIS_STAT_SIZE];
+        assert!(mem.read(stat_out, &mut stat));
+        assert!(
+            stat.iter().any(|byte| *byte != POISON),
+            "hle_stat returned SCE_OK without writing its out-parameter"
+        );
+        assert_eq!(
+            u16::from_le_bytes([stat[8], stat[9]]),
+            ORBIS_MODE_REGULAR,
+            "a memory: file must report S_IFREG so the title takes its read-a-file path"
+        );
+        assert_eq!(
+            u64::from_le_bytes(stat[72..80].try_into().unwrap()),
+            LEN,
+            "st_size must be the DECLARED length"
+        );
+        assert_eq!(
+            u64::from_le_bytes(stat[80..88].try_into().unwrap()),
+            LEN.div_ceil(512),
+            "st_blocks"
+        );
+        assert_eq!(
+            u32::from_le_bytes(stat[88..92].try_into().unwrap()),
+            512,
+            "st_blksize"
+        );
+        assert_ne!(
+            u32::from_le_bytes(stat[4..8].try_into().unwrap()),
+            0,
+            "a zero inode is read as 'invalid entry' by real parsers"
+        );
+
+        // `fstat` on the open descriptor must agree with `stat` exactly — the two
+        // disagreeing is how a title reads past what a read will serve.
+        let fd = hle_open(&ctx, &[0x100, 0, 0]);
+        assert!((fd as i64) >= 3);
+        let fstat_out = 0x500u64;
+        assert!(mem.write(fstat_out, &[POISON; ORBIS_STAT_SIZE]));
+        assert_eq!(hle_fstat(&ctx, &[fd, fstat_out]), SCE_OK);
+        let mut fstat = [0u8; ORBIS_STAT_SIZE];
+        assert!(mem.read(fstat_out, &mut fstat));
+        assert!(
+            fstat.iter().any(|byte| *byte != POISON),
+            "hle_fstat returned SCE_OK without writing its out-parameter"
+        );
+        assert_eq!(
+            u16::from_le_bytes([fstat[8], fstat[9]]),
+            ORBIS_MODE_REGULAR,
+            "fstat mode must match stat"
+        );
+        assert_eq!(
+            u64::from_le_bytes(fstat[72..80].try_into().unwrap()),
+            LEN,
+            "fstat st_size must match stat st_size"
+        );
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+
+        // A malformed URI stays ENOENT through both spellings, and does not
+        // scribble on the caller's stat buffer.
+        assert!(mem.write(0x200, b"memory:$1085a08000,0,0:zero.gfx\0"));
+        assert!(mem.write(stat_out, &[POISON; ORBIS_STAT_SIZE]));
+        assert_eq!(hle_stat(&ctx, &[0x200, stat_out]), SCE_KERNEL_ERROR_ENOENT);
+        assert_eq!(hle_open(&ctx, &[0x200, 0, 0]) as i64, -2);
+        let mut untouched = [0u8; ORBIS_STAT_SIZE];
+        assert!(mem.read(stat_out, &mut untouched));
+        assert!(
+            untouched.iter().all(|byte| *byte == POISON),
+            "a refused stat must not partially fill the guest's struct"
+        );
+    }
+
+    /// A guest memory shaped like the real [`GuestArena`], which
+    /// [`crate::TestMemory`] deliberately is not:
+    ///
+    /// * `fill_write` is **overridden** to hand the callback a slice of its own
+    ///   storage (the arena's identity mapping) *while holding* the
+    ///   address-space lock, so an unmap cannot race the exposed slice.
+    /// * that lock is a non-reentrant [`std::sync::Mutex`], exactly like
+    ///   `GuestArena::state`.
+    /// * [`raeen_kernel::filesystem::GuestByteSource`] reads come out of the
+    ///   *same* storage under the *same* lock — because in production the arena
+    ///   is both `ctx.mem` and the `memory:` scheme's byte source.
+    ///
+    /// `read_guest_bytes` uses `try_lock` rather than `lock`: with a naive
+    /// guest→guest read the nested acquisition would **hang the thread**, and a
+    /// hanging test is useless. `try_lock` converts that hang into a detectable
+    /// `false`, so this fixture fails loudly instead of never finishing.
+    struct ArenaLikeMemory {
+        base: u64,
+        bytes: std::sync::Mutex<Vec<u8>>,
+    }
+
+    impl ArenaLikeMemory {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                base,
+                bytes: std::sync::Mutex::new(vec![0u8; len]),
+            }
+        }
+
+        fn span(&self, addr: u64, len: usize, total: usize) -> Option<std::ops::Range<usize>> {
+            let start = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+            let end = start.checked_add(len)?;
+            (end <= total).then_some(start..end)
+        }
+    }
+
+    impl GuestMemory for ArenaLikeMemory {
+        fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
+            let bytes = self.bytes.lock().unwrap();
+            let Some(span) = self.span(guest_addr, out.len(), bytes.len()) else {
+                return false;
+            };
+            out.copy_from_slice(&bytes[span]);
+            true
+        }
+
+        fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
+            let mut bytes = self.bytes.lock().unwrap();
+            let total = bytes.len();
+            let Some(span) = self.span(guest_addr, data.len(), total) else {
+                return false;
+            };
+            bytes[span].copy_from_slice(data);
+            true
+        }
+
+        fn fill_write(
+            &self,
+            guest_addr: u64,
+            len: usize,
+            fill: &mut dyn FnMut(&mut [u8]) -> usize,
+        ) -> Option<usize> {
+            // The arena's shape: expose the guest range directly and keep the
+            // address-space lock held across the callback.
+            let mut bytes = self.bytes.lock().unwrap();
+            let total = bytes.len();
+            let span = self.span(guest_addr, len, total)?;
+            let written = fill(&mut bytes[span]);
+            (written <= len).then_some(written)
+        }
+    }
+
+    impl raeen_kernel::filesystem::GuestByteSource for ArenaLikeMemory {
+        fn read_guest_bytes(&self, addr: u64, out: &mut [u8]) -> bool {
+            // `try_lock`, not `lock` — see the struct doc.
+            let Ok(bytes) = self.bytes.try_lock() else {
+                return false;
+            };
+            let Some(span) = self.span(addr, out.len(), bytes.len()) else {
+                return false;
+            };
+            out.copy_from_slice(&bytes[span]);
+            true
+        }
+
+        fn guest_range_readable(&self, addr: u64, len: u64) -> bool {
+            let Ok(bytes) = self.bytes.try_lock() else {
+                return false;
+            };
+            usize::try_from(len)
+                .ok()
+                .and_then(|len| self.span(addr, len, bytes.len()))
+                .is_some()
+        }
+    }
+
+    #[test]
+    fn a_memory_file_read_into_the_same_address_space_neither_deadlocks_nor_aliases() {
+        // Guest layout inside one identity-mapped space, as in production.
+        const BASE: u64 = 0x4_0000;
+        const SIZE: usize = 0x1_0000;
+        const PATH_AT: u64 = 0x4_0100;
+        const ASSET_AT: u64 = 0x4_4000;
+        const ASSET_LEN: usize = 4096;
+        const DEST_AT: u64 = 0x4_1000;
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let arena = std::sync::Arc::new(ArenaLikeMemory::new(BASE, SIZE));
+        let source: std::sync::Arc<dyn raeen_kernel::filesystem::GuestByteSource> =
+            std::sync::Arc::clone(&arena) as _;
+        kernel.filesystem.set_guest_byte_source(&source);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = crate::test_ctx_over_memory(&kernel, arena.as_ref(), &alloc);
+
+        // Lay the "already loaded" asset into guest memory.
+        let asset: Vec<u8> = (0..ASSET_LEN).map(|i| (i % 251) as u8).collect();
+        assert!(ctx.mem.write(ASSET_AT, &asset));
+        assert!(ctx.mem.write(PATH_AT, b"memory:$44000,4096,0:asset.gfx\0"));
+
+        let fd = hle_open(&ctx, &[PATH_AT, 0, 0]);
+        assert!((fd as i64) >= 3, "open must succeed, got {}", fd as i64);
+
+        // The read that would self-deadlock on the arena's non-reentrant
+        // address-space lock if it went through the zero-copy `fill_write` seam.
+        let n = hle_read(&ctx, &[fd, DEST_AT, ASSET_LEN as u64]);
+        assert_eq!(
+            n, ASSET_LEN as u64,
+            "a guest->guest memory: read must complete; a short/EBADF result here means \
+             the read re-entered the address-space lock instead of staging"
+        );
+        let mut landed = vec![0u8; ASSET_LEN];
+        assert!(ctx.mem.read(DEST_AT, &mut landed));
+        assert_eq!(
+            landed, asset,
+            "the destination must hold the asset verbatim"
+        );
+
+        // pread takes the same path.
+        assert_eq!(hle_lseek(&ctx, &[fd, 0, 0]), 0);
+        let n = hle_pread(&ctx, &[fd, DEST_AT, 256, 1024]);
+        assert_eq!(n, 256, "pread must complete too");
+        let mut chunk = vec![0u8; 256];
+        assert!(ctx.mem.read(DEST_AT, &mut chunk));
+        assert_eq!(chunk, asset[1024..1280]);
+
+        // Aliasing: a destination that OVERLAPS the source. Staging makes this
+        // well defined — the source is snapshotted before the destination is
+        // written — where a direct guest->guest `copy_nonoverlapping` would be
+        // host undefined behaviour on guest-controlled arguments.
+        let overlap_at = ASSET_AT + 64;
+        assert_eq!(hle_pread(&ctx, &[fd, overlap_at, 512, 0]), 512);
+        let mut overlapped = vec![0u8; 512];
+        assert!(ctx.mem.read(overlap_at, &mut overlapped));
+        assert_eq!(
+            overlapped,
+            asset[..512],
+            "an overlapping read must land the source's ORIGINAL bytes"
+        );
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
     }
 
     #[test]
