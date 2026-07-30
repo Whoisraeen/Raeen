@@ -7300,7 +7300,7 @@ fn recompile_image_sample_l(
         .replace("<src2_value0>", &src2_value0.value)
         .replace("<lod_value>", &lod_value.value);
         for channel in 0..inst.dst.size {
-            let dst = operand_variable_to_str_shift(inst.dst, channel as i32);
+            let dst = operand_variable_to_str_shift(inst.dst, channel);
             if dst.type_ != SpirvType::Float {
                 return Err(not_supported(FUNC, "destination is not a vector register"));
             }
@@ -13737,7 +13737,7 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 447,
+            implemented, 457,
             "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
@@ -13773,7 +13773,7 @@ mod tests {
               Sdst/2/4/8/16-SbaseSoffsetOffset rows, \
               and the V#-buffer-load batch: five Sdst/2/4/8/16-SvSoffsetOffset \
               rows and BufferLoadFormatXyzw [Vdata4VaddrSvSoffsIdxen], \
-              and the exp-null row: EXP target 9 accepted and dropped, \n              and the Blasphemous II decoder-gap batch: 27 exp param5..param31 \n              rows, TBufferLoadFormatXy, ImageSample dmask 0xb, and ImageSampleLz \n              dmask 0x8)"
+              and the exp-null row: EXP target 9 accepted and dropped, \n              and the Blasphemous II decoder-gap batch: 27 exp param5..param31 \n              rows, TBufferLoadFormatXy, ImageSample dmask 0xb, and ImageSampleLz \n              dmask 0x8, \n              and the RDNA2 scalar-ALU + VOP3-media batch (+10 implemented, \n              ni 1 -> 0): the SOP1/SOP2/SOPC scalar expansion \n              (S_ABSDIFF_I32, S_ANDN2/NAND/NOR/NOT/ORN2/XNOR/XOR_B32, \n              S_ASHR_I32, S_BCNT0/BCNT1_I32_B32, S_BFE_I32, \n              S_BITCMP0/BITCMP1_B32, S_BITSET1_B32, S_BREV_B64, \n              S_CMOV_B32/B64, S_CMP_EQ/LG_U64, S_FF0/FF1_I32_B32, \n              S_FF1_I32_B64, S_MIN/MAX_I32/U32, S_MUL_HI_I32, \n              S_PACK_HH/LH_B32_B16, S_SEXT_I32_I8/I16, S_SUBB_U32, \n              S_TRAP, S_WQM_B32), the VOP3 media/lane set \n              (V_ALIGNBIT/ALIGNBYTE_B32, V_FMAAK/FMAMK_F32, V_LERP_U8, \n              V_MAD_I32_I24, V_MIN3/MAX3/MED3_I32/U32, \n              V_SAD_U8/HI_U8/U16, V_MUL_HI_I32/I32_I24/U32_U24, \n              V_MUL_I32_I24, V_READFIRSTLANE/READLANE/WRITELANE_B32), \n              FlatLoadUbyte, ImageSampleL dmask 0x7 and 0xF, and \n              ImageStoreMip [Vdata4Vaddr4StDmaskF] wired from the staged \n              set -- which is what took `ni` to zero, so every row in the \n              table now has a tested lowering)"
         );
         assert_eq!(ni, 0, "every current dispatch row has a tested lowering");
 
@@ -14149,9 +14149,7 @@ mod tests {
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
             .expect("recompile measured v_fmaak_f32");
         assert!(
-            source.contains(
-                "OpExtInst %float %GLSL_std_450 Fma %t0_0 %t1_0 %t2_0"
-            ),
+            source.contains("OpExtInst %float %GLSL_std_450 Fma %t0_0 %t1_0 %t2_0"),
             "V_FMAAK must remain fused and keep the literal as the addend:\n{source}"
         );
         let words = spirv_run(&source).expect("assemble measured v_fmaak_f32");
@@ -18815,12 +18813,7 @@ mod tests {
     fn s_cmp_lg_u64_recompiles_the_measured_astro_zero_test() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
-        shader_parse(
-            0,
-            &[0xBF13_8014, 0xBF80_0000, S_ENDPGM],
-            &mut code,
-            true,
-        )
+        shader_parse(0, &[0xBF13_8014, 0xBF80_0000, S_ENDPGM], &mut code, true)
             .expect("parse measured ASTRO.BOT s_cmp_lg_u64");
 
         let inst = &code.get_instructions()[0];
@@ -18842,13 +18835,8 @@ mod tests {
     fn s_ff1_i32_b64_recompiles_the_measured_astro_encoding() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
-        shader_parse(
-            0,
-            &[0xBEEB_146A, 0xBF80_0000, S_ENDPGM],
-            &mut code,
-            true,
-        )
-        .expect("parse measured ASTRO.BOT s_ff1_i32_b64");
+        shader_parse(0, &[0xBEEB_146A, 0xBF80_0000, S_ENDPGM], &mut code, true)
+            .expect("parse measured ASTRO.BOT s_ff1_i32_b64");
 
         let mut input_info = ShaderComputeInputInfo::default();
         input_info.threads_num = [1, 1, 1];
@@ -21817,9 +21805,7 @@ mod tests {
         assert!(source.contains("OpImageSampleExplicitLod %v4float"));
         for (channel, dst) in [(0, "v3"), (1, "v4"), (2, "v5"), (3, "v6")] {
             assert!(
-                source.contains(&format!(
-                    "OpStore %{dst} %isl_c{channel}_0"
-                )),
+                source.contains(&format!("OpStore %{dst} %isl_c{channel}_0")),
                 "missing RGBA channel {channel} store:\n{source}"
             );
         }

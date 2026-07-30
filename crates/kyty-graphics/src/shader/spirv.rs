@@ -3963,14 +3963,11 @@ impl<'a> Spirv<'a> {
 
         imports.push("%GLSL_std_450 = OpExtInstImport \"GLSL.std.450\"".to_string());
 
-        if self
-            .code
-            .has_any_of(&[
-                ShaderInstructionType::VReadfirstlaneB32,
-                ShaderInstructionType::VReadlaneB32,
-                ShaderInstructionType::VWritelaneB32,
-            ])
-        {
+        if self.code.has_any_of(&[
+            ShaderInstructionType::VReadfirstlaneB32,
+            ShaderInstructionType::VReadlaneB32,
+            ShaderInstructionType::VWritelaneB32,
+        ]) {
             // The subgroup broadcast instructions require these SPIR-V 1.3
             // capabilities. Vulkan exposes them as subgroup ballot support.
             extensions.push("OpCapability GroupNonUniform".to_string());

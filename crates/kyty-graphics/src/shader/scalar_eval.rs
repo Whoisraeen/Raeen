@@ -1487,10 +1487,7 @@ mod tests {
             ..Default::default()
         };
         let program = [trap, endpgm(4)];
-        assert_eq!(
-            resolve(&program, 4, &user),
-            ScalarValue::Known(0x1234_5678)
-        );
+        assert_eq!(resolve(&program, 4, &user), ScalarValue::Known(0x1234_5678));
     }
 
     #[test]
@@ -1507,8 +1504,7 @@ mod tests {
         cmp.src[1].size = 2;
         cmp.src_num = 2;
         let program = [cmp, endpgm(4)];
-        let state =
-            evaluate_before(&program, 1, Some(&user), 0).expect("64-bit compare must fold");
+        let state = evaluate_before(&program, 1, Some(&user), 0).expect("64-bit compare must fold");
         assert_eq!(
             state.scc,
             Some(true),

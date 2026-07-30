@@ -5529,11 +5529,7 @@ mod tests {
     #[test]
     fn sopc_s_cmp_lg_u64_decodes_the_measured_astro_encoding() {
         // ASTRO.BOT scene compute: s_cmp_lg_u64 s[20:21], 0.
-        let (code, result) = parse(
-            &[0xBF13_8014, S_ENDPGM],
-            ShaderType::Compute,
-            true,
-        );
+        let (code, result) = parse(&[0xBF13_8014, S_ENDPGM], ShaderType::Compute, true);
         result.expect("parse measured s_cmp_lg_u64");
         let inst = &code.get_instructions()[0];
         assert_eq!(inst.type_, T::SCmpLgU64);
@@ -5548,11 +5544,7 @@ mod tests {
     #[test]
     fn sop1_s_ff1_i32_b64_decodes_the_measured_astro_encoding() {
         // ASTRO.BOT scene compute: s_ff1_i32_b64 vcc_hi, vcc.
-        let (code, result) = parse(
-            &[0xBEEB_146A, S_ENDPGM],
-            ShaderType::Compute,
-            true,
-        );
+        let (code, result) = parse(&[0xBEEB_146A, S_ENDPGM], ShaderType::Compute, true);
         result.expect("parse measured s_ff1_i32_b64");
         let inst = &code.get_instructions()[0];
         assert_eq!(inst.type_, T::SFF1I32B64);
