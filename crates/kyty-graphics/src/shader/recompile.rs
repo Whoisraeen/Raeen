@@ -9823,6 +9823,71 @@ fn recompile_snot_b64(
     Ok(true)
 }
 
+/// RDNA2 `s_bitset1_b32`: `D.u[S0.u[4:0]] = 1`. This is a read-modify-write
+/// of the scalar destination and leaves SCC unchanged. SharpEmu lowers the
+/// same operation with SPIR-V `OpBitFieldInsert`.
+fn recompile_sbitset1_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SBitset1B32_SVdstSVsrc0";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    if !operand_is_variable(inst.dst) {
+        return Err(not_supported(FUNC, "dst is not a variable"));
+    }
+    let dst_value = operand_variable_to_str(inst.dst);
+    if dst_value.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "dst is not uint"));
+    }
+
+    let mut load_dst = String::new();
+    let mut load_src = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.dst,
+        "sbitset1_dst_<index>",
+        &index_str,
+        &mut load_dst,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "sbitset1_src_<index>",
+        &index_str,
+        &mut load_src,
+        0,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load_dst>
+        <load_src>
+        %sbitset1_offset_<index> = OpBitwiseAnd %uint %sbitset1_src_<index> %uint_31
+        %sbitset1_result_<index> = OpBitFieldInsert %uint %sbitset1_dst_<index> %uint_1 %sbitset1_offset_<index> %uint_1
+               OpStore %<dst> %sbitset1_result_<index>
+        <execz>
+"#;
+
+    *dst_source += &TEXT
+        .replace("<load_dst>", &load_dst)
+        .replace("<load_src>", &load_src)
+        .replace(
+            "<execz>",
+            if operand_is_exec(inst.dst) { EXECZ } else { "" },
+        )
+        .replace("<dst>", &dst_value.value)
+        .replace("<index>", &index_str);
+
+    Ok(true)
+}
+
 /// `s_brev_b32`: D.u = bitreverse(S0.u), SCC untouched. No Kyty upstream —
 /// added from measurement (ASTRO.BOT compute). SPIR-V has `OpBitReverse`, so
 /// this is a direct single-op lowering.
@@ -12766,11 +12831,15 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
         p1(""),
         S::None,
     ),
+    f(recompile_sbitset1_b32, T::SBitset1B32, F::SVdstSVsrc0, p1("")),
     f(recompile_sbrev_b64, T::SBrevB64, F::Sdst2Ssrc02, p1("")),
 
     f(recompile_skip, T::SInstPrefetch, F::Imm, p1("")),
     f(recompile_skip, T::SNop,          F::Imm, p1("")),
     f(recompile_skip, T::SSendmsg,      F::Imm, p1("")),
+    // AMD specifies that S_TRAP becomes a NOP when no trap handler is
+    // installed. Raeen does not expose guest GPU trap-handler state yet.
+    f(recompile_skip, T::STrap,         F::Imm, p1("")),
     f(recompile_s_waitcnt, T::SWaitcnt, F::Imm, p1("")),
     f(recompile_skip, T::SVersion,      F::Imm, p1("")),
 
@@ -15974,6 +16043,46 @@ mod tests {
         }
         let words = spirv_run(&source).expect("assemble scalar B32 bit-compare pair");
         naga_parse_and_validate(&words, "scalar B32 bit-compare pair");
+    }
+
+    #[test]
+    fn astro_s_bitset1_b32_updates_the_destination_without_touching_scc() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xBE85_1D9F, // s_bitset1_b32 s5, 31 (measured, ASTRO.BOT)
+                V_MOV_V0_0,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured s_bitset1_b32");
+        assert_eq!(code.get_instructions()[0].type_, T::SBitset1B32);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured s_bitset1_b32");
+        assert!(
+            source.contains(
+                "%sbitset1_result_0 = OpBitFieldInsert %uint %sbitset1_dst_0 \
+                 %uint_1 %sbitset1_offset_0 %uint_1"
+            ),
+            "missing destination read-modify-write semantics:\n{source}"
+        );
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.trim_start().starts_with("OpStore %scc"))
+                .count(),
+            1,
+            "only the shader prolog may initialize SCC; s_bitset1_b32 must preserve it:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble measured s_bitset1_b32");
+        naga_parse_and_validate(&words, "s_bitset1_b32");
     }
 
     /// AMD RDNA2 SOP2 0x12/14/16/18/1a/1c are the complete 32-bit bitwise

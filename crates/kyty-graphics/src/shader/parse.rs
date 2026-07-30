@@ -599,7 +599,13 @@ fn shader_parse_sopp(
         0x0e => return Err(ni(dst, S, "s_sleep", opcode, pc, b0)),
         0x0f => return Err(ni(dst, S, "s_setprio", opcode, pc, b0)),
         0x11 => return Err(ni(dst, S, "s_sendmsghalt", opcode, pc, b0)),
-        0x12 => return Err(ni(dst, S, "s_trap", opcode, pc, b0)),
+        0x12 => {
+            inst.type_ = T::STrap;
+            inst.format = F::Imm;
+            inst.src[0].type_ = O::LiteralConstant;
+            inst.src[0].constant.u = simm;
+            inst.src_num = 1;
+        }
         0x13 => return Err(ni(dst, S, "s_icache_inv", opcode, pc, b0)),
         0x14 => return Err(ni(dst, S, "s_incperflevel", opcode, pc, b0)),
         0x15 => return Err(ni(dst, S, "s_decperflevel", opcode, pc, b0)),
@@ -752,7 +758,10 @@ fn shader_parse_sop1(
         }
         0x1b => return Err(ni(dst, S, "s_bitset0_b32", opcode, pc, b0)),
         0x1c => return Err(ni(dst, S, "s_bitset0_b64", opcode, pc, b0)),
-        0x1d => return Err(ni(dst, S, "s_bitset1_b32", opcode, pc, b0)),
+        0x1d => {
+            inst.type_ = T::SBitset1B32;
+            inst.format = F::SVdstSVsrc0;
+        }
         0x1e => return Err(ni(dst, S, "s_bitset1_b64", opcode, pc, b0)),
         0x1f => {
             // The hardware returns the absolute address of the instruction
@@ -5425,6 +5434,18 @@ mod tests {
         assert_eq!(inst.type_, T::SWaitcnt);
         assert_eq!(inst.format, F::Imm);
         assert_eq!(inst.src[0].constant.u, 0x70);
+    }
+
+    #[test]
+    fn sopp_s_trap_preserves_the_trap_id_for_handler_free_lowering() {
+        // ASTRO.BOT compute: s_trap 1. AMD specifies that hardware converts
+        // this to a NOP when no trap handler is installed, which is Raeen's
+        // current guest-GPU model.
+        let (code, _) = parse_vs(&[0xBF92_0001, S_ENDPGM]);
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::STrap);
+        assert_eq!(inst.format, F::Imm);
+        assert_eq!(inst.src[0].constant.u, 1);
     }
 
     #[test]

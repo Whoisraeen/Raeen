@@ -918,6 +918,17 @@ fn step(state: &mut ScalarState, inst: &ShaderInstruction) {
             state.write32(&inst.dst, value);
             return;
         }
+        T::SBitset1B32 => {
+            // Read-modify-write: the source selects a destination bit. SCC is
+            // explicitly preserved.
+            let value = state
+                .read32(&inst.dst)
+                .zip(state.read32(&inst.src[0]), |dst, bit| {
+                    dst | (1u32 << (bit & 31))
+                });
+            state.write32(&inst.dst, value);
+            return;
+        }
         _ => {}
     }
 
@@ -1414,6 +1425,22 @@ mod tests {
         brev.src_num = 1;
         let program = [brev, endpgm(4)];
         assert_eq!(resolve(&program, 4, &user), ScalarValue::Known(0x8000_0000));
+    }
+
+    #[test]
+    fn s_bitset1_b32_reads_modifies_and_writes_its_destination() {
+        let user = user_data(&[(4, 1)]);
+        let mut bitset = ShaderInstruction {
+            pc: 0,
+            type_: T::SBitset1B32,
+            format: F::SVdstSVsrc0,
+            ..Default::default()
+        };
+        bitset.dst = sgpr(4, 1);
+        bitset.src[0] = imm(33); // low five bits select bit 1
+        bitset.src_num = 1;
+        let program = [bitset, endpgm(4)];
+        assert_eq!(resolve(&program, 4, &user), ScalarValue::Known(3));
     }
 
     #[test]

@@ -204,6 +204,9 @@ pub enum ShaderInstructionType {
     SBitcmp0B32,
     /// RDNA2 SOPC 0x0d: SCC is set iff the indexed 32-bit source bit is one.
     SBitcmp1B32,
+    /// RDNA2 SOP1 0x1d: set bit `src0[4:0]` in the existing 32-bit
+    /// destination. This read-modify-write instruction leaves SCC unchanged.
+    SBitset1B32,
     SBfeU32,
     SBfeU64,
     /// RDNA2 SOP2 0x28: signed 32-bit bitfield extract; SCC iff nonzero.
@@ -324,6 +327,10 @@ pub enum ShaderInstructionType {
     /// RDNA2 SOP2 0x05: subtract with SCC borrow-in and borrow-out.
     SSubbU32,
     SSubU32,
+    /// SOPP 0x12: enter the GPU trap handler. Raeen does not install a guest
+    /// GPU trap handler, so AMD's documented `TRAP_EN == 0` behavior converts
+    /// this instruction to a NOP while preserving the trap ID for diagnostics.
+    STrap,
     SWaitcnt,
     /// RDNA2 SOP1 0x09: expand every active bit to its complete four-bit quad.
     SWqmB32,
