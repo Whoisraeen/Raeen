@@ -133,6 +133,30 @@ SOFTWARE.
   `raeen-hle::hle_dcb_draw_index_multi_instanced`, was already attributed to
   `GraphicsDcbDrawIndexMultiInstanced` above. No C++ is vendored or compiled
   into Raeen.
+
+  The `IT_INDIRECT_BUFFER` chain-follower batch (2026-07-29,
+  `CommandProcessor::cp_op_indirect_buffer` / `cp_op_chain_branch` /
+  `run_chain` in `crates/kyty-graphics/src/run.rs`) takes three facts from
+  KytyPS5: that the two `IT_INDIRECT_BUFFER` layouts are discriminated by
+  packet LENGTH alone — 4 dwords unconditional, 14 the conditional branch
+  (`CpOpIndirectBuffer`, `pm4Handlers.cpp` L2569-2612); the conditional form's
+  body field order (`CpOpBranch`, `pm4Handlers.cpp` L2135-2175: mode +
+  function, compare address, mask, reference, then-target + size, else-target +
+  size, with mode 2 the only one carrying an else); and that the transfer is a
+  CALL rather than a jump — `CpOpIndirectBuffer` returns the packet's own body
+  length after `ProcessIndirectBuffer`, which pushes onto `m_buffer_stack` and
+  runs `ProcessPm4(execution, stop_depth)` back down to its entry depth
+  (`graphicsRun.cpp` L625). Raeen deviates deliberately: the walk is an
+  explicit bounded work-list, not KytyPS5's unbounded stack; every target is
+  validated (depth cap, per-walk buffer budget, path-cycle refusal, alignment,
+  extent, and a process-authorized read) where KytyPS5 dereferences the guest
+  pointer directly and `EXIT`s on a null one; `IT_INDIRECT_BUFFER_CNST` is
+  counted and refused rather than rejected with `EXIT_NOT_IMPLEMENTED`; a wait
+  inside a chained buffer is a named counted degradation instead of
+  `SuspendPm4`; and the whole path is off by default behind
+  `RAEEN_FOLLOW_IB_CHAINS`. All refusal semantics, counters
+  (`kyty_graphics::run::ChainCensus`) and tests are Raeen's own. No C++ is
+  vendored or compiled into Raeen.
   the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. The GTA V
   `libSceAmpr` Tier-C batch (`crates/raeen-hle/src/libsce_ampr.rs`,
   2026-07-27) behaviorally re-implements `src/libs/libAmpr.cpp`: the
@@ -572,6 +596,19 @@ re-implementations are license-compatible; this notice preserves attribution.
   source for the opcode number, together with the factual observation that
   `src/video_core/amdgpu/liverpool.cpp`'s packet `switch` has no case for it —
   shadPS4 names the opcode but does not walk its body. No C++ is copied.
+
+  The 2026-07-29 `IT_INDIRECT_BUFFER` chain-follower batch takes two facts from
+  shadPS4: the chain packet's field widths — `ibase_hi` is 16 bits, `ib_size`
+  20, bit 20 is `CHAIN`, bits 24-31 `VMID`, and the base must be 4-byte aligned
+  (`PM4CmdIndirectBuffer`, `src/video_core/amdgpu/pm4_cmds.h` L872-890) — and
+  the corroborating call semantics: `liverpool.cpp` L830 runs a nested
+  `ProcessGraphics` task to completion and then advances the parent by the chain
+  packet's own `NumWords() + 1`. The decision NOT to walk
+  `IT_INDIRECT_BUFFER_CNST` on the graphics ring rests on the factual
+  observation that shadPS4 handles `0x33` only inside `ProcessCeUpdate`
+  (`liverpool.cpp` L195), the constant-engine path. Raeen honours neither
+  shadPS4's coroutine structure nor its unvalidated `Address<const u32>()`
+  dereference. No C++ is copied.
 
   The 2026-07-28 Orbis exception-delivery work in
   `crates/raeen-hle/src/exception.rs` is a Rust re-implementation informed by

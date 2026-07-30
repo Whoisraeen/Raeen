@@ -45,6 +45,11 @@ const IT_DISPATCH_DRAW: u32 = 0x8d;
 const IT_EVENT_WRITE: u32 = 0x46;
 const IT_WRITE_DATA: u32 = 0x37;
 const IT_DMA_DATA: u32 = 0x50;
+/// Chained command buffer (`sceAgcDcbJump` 4-dword / `sceAgcCbBranch` 14-dword).
+const IT_INDIRECT_BUFFER: u32 = 0x3f;
+/// The constant-engine chain — counted, never a graphics-ring chain. See
+/// `kyty_graphics::run::CommandProcessor::cp_op_indirect_buffer`.
+const IT_INDIRECT_BUFFER_CNST: u32 = 0x33;
 
 /// One decoded Gen5 PM4 packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +141,39 @@ pub struct AgcWait32 {
     pub reference: u32,
 }
 
+/// Which chain form a decoded `IT_INDIRECT_BUFFER` family packet carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgcChainKind {
+    /// 4-dword `IT_INDIRECT_BUFFER` — unconditional chain.
+    Jump,
+    /// 14-dword `IT_INDIRECT_BUFFER` — conditional chain; `address`/`size_dwords`
+    /// name the THEN target (the else target is only reachable at execution
+    /// time, when the compare label can be read).
+    Branch,
+    /// `IT_INDIRECT_BUFFER_CNST` — constant-engine ring, never walked.
+    Const,
+}
+
+/// One chained command buffer referenced by a submitted DCB.
+///
+/// This is the decode-time half of the chain measurement: it answers "does the
+/// submitted buffer point at command stream that lives somewhere else, and
+/// where?" without walking anything. The execution-time half is
+/// [`kyty_graphics::run::ChainCensus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgcIndirectBuffer {
+    /// DWORD offset of the chain packet in the submitted DCB.
+    pub packet_offset: u32,
+    /// Chain target (the THEN target for a branch; 0 for a `Const` packet,
+    /// whose body this decoder does not interpret).
+    pub address: u64,
+    pub size_dwords: u32,
+    /// Raw control dword for the 4-dword form (`IB_SIZE` | `CHAIN` | `VMID`);
+    /// the mode/function selector for the branch form.
+    pub control: u32,
+    pub kind: AgcChainKind,
+}
+
 /// Structural facts extracted from a complete DCB submission.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgcSubmission {
@@ -153,6 +191,14 @@ pub struct AgcSubmission {
     pub eop_interrupts: Vec<AgcEopInterrupt>,
     /// GPU-timestamp label writes (`RELEASE_MEM` `data_selection` 3).
     pub timestamp_writes: Vec<AgcTimestampWrite>,
+    /// Chained command buffers this submission points at.
+    ///
+    /// NOTE for reading [`Self::draw_packets`]: that count — and therefore the
+    /// HLE's cumulative `total_draws` — covers only packets in the SUBMITTED
+    /// buffer. Draws inside these chain targets are not in it. A non-empty
+    /// `indirect_buffers` with a low `draw_packets` is the shape of a title
+    /// whose frame is assembled out of chained buffers.
+    pub indirect_buffers: Vec<AgcIndirectBuffer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -229,6 +275,45 @@ pub fn decode_submission(words: &[u32]) -> Result<AgcSubmission, AgcDecodeError>
             || (opcode == IT_NOP && register == R_DISPATCH_DIRECT)
         {
             result.dispatch_packets += 1;
+        }
+        // Chained command buffers. Decoded here so an embedder can see that a
+        // submission's frame continues elsewhere BEFORE it decides how to
+        // execute it — in particular so a DCB whose only draws live in chain
+        // targets is not mistaken for a state-only submission.
+        if opcode == IT_INDIRECT_BUFFER_CNST {
+            result.indirect_buffers.push(AgcIndirectBuffer {
+                packet_offset: offset as u32,
+                address: 0,
+                size_dwords: 0,
+                control: 0,
+                kind: AgcChainKind::Const,
+            });
+        } else if opcode == IT_INDIRECT_BUFFER {
+            let body = &words[offset + 1..offset + dwords as usize];
+            // KytyPS5 discriminates the two layouts by packet length alone
+            // (pm4Handlers.cpp L2574): 14 dwords total = the conditional branch.
+            let chain = if dwords == 14 {
+                Some(AgcIndirectBuffer {
+                    packet_offset: offset as u32,
+                    address: u64::from(body[7] & 0xffff_fffc) | (u64::from(body[8]) << 32),
+                    size_dwords: body[9] & 0x000f_ffff,
+                    control: body[0],
+                    kind: AgcChainKind::Branch,
+                })
+            } else if dwords == 4 {
+                Some(AgcIndirectBuffer {
+                    packet_offset: offset as u32,
+                    address: u64::from(body[0]) | (u64::from(body[1] & 0xffff) << 32),
+                    size_dwords: body[2] & 0x000f_ffff,
+                    control: body[2],
+                    kind: AgcChainKind::Jump,
+                })
+            } else {
+                None
+            };
+            if let Some(chain) = chain {
+                result.indirect_buffers.push(chain);
+            }
         }
         if opcode == IT_NOP && register == R_FLIP && dwords >= 6 {
             let body = &words[offset + 1..offset + dwords as usize];
@@ -663,6 +748,109 @@ mod tests {
                     data: 0x2222_2222u32.to_le_bytes().to_vec(),
                 },
             ]
+        );
+    }
+
+    /// The decode-side half of the chain measurement: a submitted DCB must
+    /// report the chain targets it points at, in all three forms, WITHOUT
+    /// walking anything. Before this, `IT_INDIRECT_BUFFER` decoded as an opaque
+    /// `AgcPacket` and a title that assembled its frame out of chained buffers
+    /// looked identical to one that did not.
+    #[test]
+    fn decode_submission_reports_the_chain_targets_a_dcb_points_at() {
+        let words = [
+            // 4-dword unconditional chain: target 0x1_8000_4000, 0x321 dwords,
+            // VMID 0xf in the control's high byte.
+            header(4, IT_INDIRECT_BUFFER, 0),
+            0x8000_4000,
+            0x0000_0001,
+            0x0f00_0321,
+            // 14-dword conditional chain: mode 2, function 3; then-target
+            // 0x2000, 0x40 dwords; else-target 0x3000, 0x50 dwords.
+            header(14, IT_INDIRECT_BUFFER, 0),
+            2 | (3 << 8),
+            0x1000,
+            0,
+            0xffff_ffff,
+            0xffff_ffff,
+            7,
+            0,
+            0x2000,
+            0,
+            0x40,
+            0x3000,
+            0,
+            0x50,
+            // The constant-engine form: counted, body not interpreted.
+            header(4, IT_INDIRECT_BUFFER_CNST, 0),
+            0x9000,
+            0,
+            0x10,
+        ];
+        let decoded = decode_submission(&words).unwrap();
+        assert_eq!(
+            decoded.indirect_buffers,
+            [
+                AgcIndirectBuffer {
+                    packet_offset: 0,
+                    address: 0x1_8000_4000,
+                    size_dwords: 0x321,
+                    control: 0x0f00_0321,
+                    kind: AgcChainKind::Jump,
+                },
+                AgcIndirectBuffer {
+                    packet_offset: 4,
+                    address: 0x2000,
+                    size_dwords: 0x40,
+                    control: 2 | (3 << 8),
+                    kind: AgcChainKind::Branch,
+                },
+                AgcIndirectBuffer {
+                    packet_offset: 18,
+                    address: 0,
+                    size_dwords: 0,
+                    control: 0,
+                    kind: AgcChainKind::Const,
+                },
+            ]
+        );
+        assert_eq!(
+            decoded.draw_packets, 0,
+            "a chain packet is not a draw — and this is exactly why `draw_packets` cannot see \
+             draws that live inside the targets"
+        );
+    }
+
+    /// A DCB with no chain packets must report none — the field cannot become a
+    /// false positive for the working titles.
+    #[test]
+    fn a_dcb_without_chain_packets_reports_no_chain_targets() {
+        let words = [
+            header(3, IT_DRAW_INDEX_OFFSET_2, 0),
+            9,
+            0,
+            header(2, IT_NOP, 0),
+            0,
+        ];
+        let decoded = decode_submission(&words).unwrap();
+        assert!(decoded.indirect_buffers.is_empty());
+        assert_eq!(decoded.draw_packets, 1);
+    }
+
+    /// A malformed chain length is not recorded as a target: guessing a body
+    /// layout would hand the executor an address that came from the wrong dword.
+    #[test]
+    fn a_chain_packet_of_an_unknown_length_is_not_recorded_as_a_target() {
+        let words = [header(6, IT_INDIRECT_BUFFER, 0), 1, 2, 3, 4, 5];
+        let decoded = decode_submission(&words).unwrap();
+        assert!(
+            decoded.indirect_buffers.is_empty(),
+            "only the 4-dword and 14-dword forms have a known layout"
+        );
+        assert_eq!(
+            decoded.packets.len(),
+            1,
+            "the packet is still accounted for"
         );
     }
 }

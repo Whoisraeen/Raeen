@@ -279,6 +279,22 @@ pub trait GuestMemory {
     /// range is not readable.
     fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>>;
 
+    /// Read a chained command buffer — the target of an `IT_INDIRECT_BUFFER`
+    /// packet.
+    ///
+    /// Deliberately its own method rather than a [`Self::read_dwords`] call:
+    /// that one is the *pointer* read used by indirect register lists and
+    /// indirect draw arguments, and embedders cap it accordingly (`raeen-gpu`
+    /// refuses over 0x1_0000 dwords there, because anything larger is a
+    /// mis-decoded pointer). A command buffer is resource-sized — the PM4
+    /// `IB_SIZE` field is 20 bits, so a legal chain target runs to 0xF_FFFF
+    /// dwords / 4 MiB — and would be refused by that cap even when it is
+    /// perfectly valid. Default delegates, so a read-only embedder keeps
+    /// today's behaviour.
+    fn read_command_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+        self.read_dwords(addr, count)
+    }
+
     /// Read `len` bytes at guest virtual address `addr`, for DMA payload
     /// copies. Default `None`: a read-only embedder skips DMA packets with a
     /// warn instead of failing the stream.
@@ -585,6 +601,22 @@ pub struct CommandProcessor {
     /// Whether to wrap the expensive packet classes in a clock — see
     /// [`WalkCensus`].
     time_walk: bool,
+    /// Chain-packet census — see [`ChainCensus`]. Always counted, and (like
+    /// `refused_draws`) it survives [`Self::reset`] so a per-frame
+    /// `R_DRAW_RESET` cannot zero the honest chain count mid-submission.
+    chain_census: ChainCensus,
+    /// Whether to WALK `IT_INDIRECT_BUFFER` targets rather than only counting
+    /// them. Embedder configuration, so it survives [`Self::reset`]: a
+    /// mid-stream queue reset must not silently turn the follower off and drop
+    /// the rest of the frame's chained work.
+    follow_chains: bool,
+    /// Raised by [`Self::cp_op_indirect_buffer`] and consumed immediately after
+    /// the packet by whichever walk loop is running it.
+    pending_chain: Option<ChainRequest>,
+    /// Chained buffers followed since the current top-level walk started —
+    /// the termination guarantee for a wide chain graph that never repeats a
+    /// buffer on any single path. Bounded by [`Self::MAX_CHAIN_BUFFERS`].
+    chain_buffers_followed: u64,
 }
 
 /// What the PM4 walk spent its time on, split by packet class.
@@ -628,6 +660,13 @@ pub struct WalkCensus {
     pub waits: u64,
     pub wait_ns: u64,
     /// Indirect register/draw/dispatch packets, which re-enter the walk.
+    ///
+    /// CONFLATED on purpose (it is a cost bucket, not a feature count): this
+    /// counts `IT_INDIRECT_BUFFER` / `IT_INDIRECT_BUFFER_CNST` together with the
+    /// AGC `R_CX_REGS_INDIRECT` / `R_SH_REGS_INDIRECT` / `R_UC_REGS_INDIRECT`
+    /// register lists, which every measured title emits constantly. A non-zero
+    /// `indirects` therefore says NOTHING about whether a title chains its
+    /// command stream — [`ChainCensus`] is the chain-only measurement.
     pub indirects: u64,
     pub indirect_ns: u64,
     /// Packets consumed by encoded length with no state change: type-2 filler,
@@ -700,6 +739,157 @@ impl WalkCensus {
     }
 }
 
+/// Which chain form an `IT_INDIRECT_BUFFER` family packet carries.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChainForm {
+    /// 4-dword `IT_INDIRECT_BUFFER`: unconditional chain into one buffer.
+    /// `raeen-hle`'s `sceAgcDcbJump` emits exactly this.
+    Jump,
+    /// 14-dword `IT_INDIRECT_BUFFER`: conditional chain, then-buffer or
+    /// else-buffer selected by a masked compare against a guest label.
+    /// `raeen-hle`'s `sceAgcCbBranch` emits exactly this; KytyPS5 routes the
+    /// same length to `CpOpBranch` (pm4Handlers.cpp L2574).
+    Branch,
+    /// `IT_INDIRECT_BUFFER_CNST` (0x33) — the CONSTANT-ENGINE ring, not the
+    /// graphics/compute ring this processor models. Counted, never followed;
+    /// see [`CommandProcessor::cp_op_indirect_buffer`].
+    Const,
+}
+
+/// One observed chain packet, for the embedder's report. Bounded by
+/// [`ChainCensus::MAX_SAMPLES`] — the point is to NAME a few real targets, not
+/// to log a frame's worth.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ChainSample {
+    /// DWORD offset of the packet inside the buffer that carried it.
+    pub offset: u32,
+    /// Chain target (0 for a `Const` packet, which is not decoded).
+    pub address: u64,
+    pub size_dwords: u32,
+    /// Raw control dword (`IB_SIZE` | `CHAIN` | `VMID`), for the 4-dword form.
+    pub control: u32,
+    pub form: ChainForm,
+}
+
+/// Whether a submitted DCB chains its frame into other command buffers, and
+/// what this processor did about each one.
+///
+/// This exists because `WalkCensus::indirects` cannot answer the question: it
+/// counts `IT_INDIRECT_BUFFER` together with the AGC `R_CX_REGS_INDIRECT` /
+/// `R_SH_REGS_INDIRECT` / `R_UC_REGS_INDIRECT` register-list packets, which
+/// every measured title emits constantly. A non-zero `indirects` therefore says
+/// nothing at all about chaining. Every field here is chain-only.
+///
+/// Always counted (a handful of `u64` increments on packets that are rare by
+/// construction), independent of [`CommandProcessor::set_walk_timing`] — a run
+/// with no diagnostics enabled must still be able to say whether chains exist.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChainCensus {
+    /// 4-dword unconditional chain packets seen.
+    pub jump_packets: u64,
+    /// 14-dword conditional chain packets seen.
+    pub branch_packets: u64,
+    /// `IT_INDIRECT_BUFFER_CNST` packets seen (never followed).
+    pub const_packets: u64,
+    /// Dwords the chain targets *claim*, summed over every chain packet seen —
+    /// how much command stream lives outside the submitted buffer.
+    pub target_dwords: u64,
+    /// Chained buffers actually walked, and their dword total.
+    pub followed: u64,
+    pub followed_dwords: u64,
+    /// Chain packets decoded but not walked because the follower is off. This
+    /// is the field that separates "no chains" from "chains we ignore".
+    pub refused_disabled: u64,
+    /// Named refusals. Each has a `warn!` at its site; these are the counts so
+    /// the 2nd..Nth are never silent.
+    pub refused_depth: u64,
+    pub refused_cycle: u64,
+    pub refused_budget: u64,
+    pub refused_unreadable: u64,
+    pub refused_malformed: u64,
+    pub refused_no_memory: u64,
+    /// Chain packets whose `CHAIN` control bit (bit 20) was set. Both
+    /// references ignore that bit; this counts it so a stream that uses it
+    /// cannot pass unnoticed. See [`CommandProcessor::cp_op_indirect_buffer`].
+    pub chain_bit_set: u64,
+    /// Wait packets encountered INSIDE a chained buffer, which this processor
+    /// cannot suspend on (the resume point is a top-level dword offset) and so
+    /// continues past, loudly.
+    pub waits_dropped: u64,
+    /// A bounded sample of the chain packets seen, newest dropped once full.
+    pub samples: Vec<ChainSample>,
+}
+
+impl ChainCensus {
+    /// How many [`ChainSample`]s are retained per drain.
+    pub const MAX_SAMPLES: usize = 8;
+
+    /// Any chain packet at all, of any form. The one-line answer to "does this
+    /// title chain its command stream?".
+    #[must_use]
+    pub const fn packets(&self) -> u64 {
+        self.jump_packets + self.branch_packets + self.const_packets
+    }
+
+    /// Every named refusal, summed.
+    #[must_use]
+    pub const fn refusals(&self) -> u64 {
+        self.refused_depth
+            + self.refused_cycle
+            + self.refused_budget
+            + self.refused_unreadable
+            + self.refused_malformed
+            + self.refused_no_memory
+    }
+
+    /// Fold `other` in, for an embedder accumulating across submissions.
+    pub fn absorb(&mut self, other: &Self) {
+        self.jump_packets += other.jump_packets;
+        self.branch_packets += other.branch_packets;
+        self.const_packets += other.const_packets;
+        self.target_dwords += other.target_dwords;
+        self.followed += other.followed;
+        self.followed_dwords += other.followed_dwords;
+        self.refused_disabled += other.refused_disabled;
+        self.refused_depth += other.refused_depth;
+        self.refused_cycle += other.refused_cycle;
+        self.refused_budget += other.refused_budget;
+        self.refused_unreadable += other.refused_unreadable;
+        self.refused_malformed += other.refused_malformed;
+        self.refused_no_memory += other.refused_no_memory;
+        self.chain_bit_set += other.chain_bit_set;
+        self.waits_dropped += other.waits_dropped;
+        for sample in &other.samples {
+            if self.samples.len() >= Self::MAX_SAMPLES {
+                break;
+            }
+            self.samples.push(*sample);
+        }
+    }
+}
+
+/// A chain the current packet asked the walk to follow, consumed by
+/// [`CommandProcessor::run_resumable`] (top level) or by the chain work-list
+/// (nested). Only ever `Some` when the follower is enabled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ChainRequest {
+    /// DWORD offset of the packet that raised it, for the refusal messages.
+    offset: u32,
+    address: u64,
+    size_dwords: u32,
+}
+
+/// One open chained command buffer on [`CommandProcessor::run_chain`]'s
+/// work-list: the guest bytes, already read and length-checked, plus the cursor
+/// into them. `address`/`size_dwords` are retained for the cycle test and for
+/// naming the buffer in a refusal.
+struct ChainFrame {
+    address: u64,
+    size_dwords: u32,
+    words: Vec<u32>,
+    pos: usize,
+}
+
 impl CommandProcessor {
     #[must_use]
     pub fn new() -> Self {
@@ -720,6 +910,34 @@ impl CommandProcessor {
     #[must_use]
     pub fn take_walk_census(&mut self) -> WalkCensus {
         std::mem::take(&mut self.census)
+    }
+
+    /// Walk `IT_INDIRECT_BUFFER` chain targets instead of only counting them.
+    ///
+    /// Off by default. With it off, a chain packet is decoded into the
+    /// [`ChainCensus`] and then consumed by its encoded length — byte-for-byte
+    /// the behaviour before the follower existed, except that the packet is now
+    /// named in the log instead of landing in the anonymous unknown-opcode arm.
+    pub const fn set_follow_chains(&mut self, on: bool) {
+        self.follow_chains = on;
+    }
+
+    /// Whether chain following is enabled.
+    #[must_use]
+    pub const fn follows_chains(&self) -> bool {
+        self.follow_chains
+    }
+
+    /// Drain the chain census accumulated since the last drain.
+    #[must_use]
+    pub fn take_chain_census(&mut self) -> ChainCensus {
+        std::mem::take(&mut self.chain_census)
+    }
+
+    /// Read the chain census without draining it.
+    #[must_use]
+    pub const fn chain_census(&self) -> &ChainCensus {
+        &self.chain_census
     }
 
     /// `Instant::now()` only when timing is on.
@@ -809,6 +1027,13 @@ impl CommandProcessor {
         let produced_labels = std::mem::take(&mut self.produced_labels);
         let side_effects = std::mem::take(&mut self.side_effects);
         let timestamp_source = self.timestamp_source;
+        // Chain following is embedder configuration and the chain census is a
+        // cumulative diagnostic: an in-stream `R_DRAW_RESET` between a chain
+        // packet and the embedder's drain must neither turn the follower off
+        // (silently dropping the rest of the frame's chained work) nor zero the
+        // count of chains already seen. Same argument as `refused_draws`.
+        let chain_census = std::mem::take(&mut self.chain_census);
+        let follow_chains = self.follow_chains;
         *self = Self::new();
         self.warned = warned;
         self.shader_bind_trace_count = shader_bind_trace_count;
@@ -817,6 +1042,8 @@ impl CommandProcessor {
         self.produced_labels = produced_labels;
         self.side_effects = side_effects;
         self.timestamp_source = timestamp_source;
+        self.chain_census = chain_census;
+        self.follow_chains = follow_chains;
     }
 
     /// Cap on completion labels retained between drains, so a pathological
@@ -1024,6 +1251,10 @@ impl CommandProcessor {
         mem: Option<&dyn GuestMemory>,
     ) -> Result<RunOutcome, CpError> {
         let mut pos = start_dword.min(data.len());
+        // Per-walk chain budget (see `MAX_CHAIN_BUFFERS`). Reset here rather
+        // than accumulated: it is a termination bound on one walk, not an
+        // accounting total — the honest totals live in `chain_census`.
+        self.chain_buffers_followed = 0;
         while pos < data.len() {
             let cmd_id = data[pos];
             let offset = pos as u32;
@@ -1102,6 +1333,23 @@ impl CommandProcessor {
                 });
             }
             pos += advance;
+            // A chain raised by the packet just executed runs HERE — after the
+            // parent advanced past the chain packet, before the parent's next
+            // packet. That is the call semantics both references implement, and
+            // it is what makes any register the child writes visible to the rest
+            // of the parent buffer. `run_chain` never fails: a fault inside a
+            // chained buffer abandons that buffer by name, so the follower can
+            // never turn a working title's walk into a structural abort.
+            // `follow_chains` first: `pending_chain` can only be `Some` when the
+            // follower is on, so a bool test keeps the default path from paying
+            // an `Option<ChainRequest>` take on every packet. The walk costs
+            // ~2.7-10 ns per packet (`tests/pm4_walk_cost.rs`) and Minecraft's
+            // frame is thousands of them.
+            if self.follow_chains
+                && let Some(request) = self.pending_chain.take()
+            {
+                self.run_chain(request, sink, mem);
+            }
             if let Some(wait) = self.pending_wait.take() {
                 return Ok(RunOutcome::Suspended(SuspendedWait {
                     resume_dword: pos,
@@ -1110,6 +1358,300 @@ impl CommandProcessor {
             }
         }
         Ok(RunOutcome::Completed)
+    }
+
+    /// Walk chained command buffers depth-first from `first`.
+    ///
+    /// An explicit work-list, not recursion: the walk depth is guest-controlled
+    /// (the chain graph lives in guest memory), and a corrupt or hostile stream
+    /// must not be able to reach the host stack at all. Both references recurse
+    /// — KytyPS5 through an unbounded `m_buffer_stack`, shadPS4 through a nested
+    /// coroutine per level — and neither bounds the depth or validates the
+    /// target address.
+    ///
+    /// Every frame is opened through [`Self::open_chain_frame`], which is the
+    /// single place a guest-supplied chain address is validated and read. Faults
+    /// abandon the offending frame with a named, counted refusal; they never
+    /// propagate, and they never touch host memory outside the embedder's
+    /// [`GuestMemory`] authority.
+    fn run_chain(
+        &mut self,
+        first: ChainRequest,
+        sink: &mut dyn DrawSink,
+        mem: Option<&dyn GuestMemory>,
+    ) {
+        let Some(mem) = mem else {
+            self.chain_census.refused_no_memory += 1;
+            if self.first(SkipKey::Note("chain_without_guest_memory")) {
+                warn!(
+                    address = format_args!("{:#x}", first.address),
+                    size_dwords = first.size_dwords,
+                    offset = first.offset,
+                    "IT_INDIRECT_BUFFER target cannot be read without a guest memory reader — \
+                     chain not walked, counted (ChainCensus::refused_no_memory)"
+                );
+            }
+            return;
+        };
+        let mut stack: Vec<ChainFrame> = Vec::new();
+        if let Some(frame) = self.open_chain_frame(&stack, first, mem) {
+            stack.push(frame);
+        }
+        while let Some(top) = stack.len().checked_sub(1) {
+            let pos = stack[top].pos;
+            if pos >= stack[top].words.len() {
+                stack.pop();
+                continue;
+            }
+            let cmd_id = stack[top].words[pos];
+            let offset = pos as u32;
+            if pm4::is_type2(cmd_id) {
+                stack[top].pos = pos + 1;
+                continue;
+            }
+            // A desynced chained buffer is not a desynced SUBMISSION: the parent
+            // stream's next packet boundary is still known exactly (the chain
+            // packet carried its own length). Abandon this buffer only.
+            let short = stack[top].words.len() - pos < 2;
+            if !pm4::is_type3(cmd_id) || short {
+                let (address, size_dwords) = (stack[top].address, stack[top].size_dwords);
+                let reason = if short {
+                    "a type-3 header is the last dword of the chained buffer — no body follows"
+                } else {
+                    "not a type-3 PM4 packet"
+                };
+                self.refuse_chain_frame(address, size_dwords, offset, reason);
+                stack.pop();
+                continue;
+            }
+            let outcome = {
+                let words = &stack[top].words;
+                self.dispatch(cmd_id, &words[pos + 1..], offset, sink, Some(mem))
+            };
+            let consumed = match outcome {
+                Ok(consumed) => consumed,
+                // Same policy as the top-level walk: a refused draw is skipped
+                // by its encoded length so the completion packets after it in
+                // the CHAINED buffer still run.
+                Err(CpError::Draw { offset, source }) => {
+                    self.refused_draws = self.refused_draws.saturating_add(1);
+                    self.last_refusal = Some(source.0.clone());
+                    if self.first(SkipKey::Note("chained_draw_refused_skip_and_continue")) {
+                        warn!(
+                            offset,
+                            reason = %source,
+                            "refused draw/dispatch inside a CHAINED command buffer skipped — \
+                             continuing that buffer's walk (counted via refused_draws, named via \
+                             last_refusal)"
+                        );
+                    }
+                    pm4::body_dw(cmd_id)
+                }
+                Err(error) => {
+                    let (address, size_dwords) = (stack[top].address, stack[top].size_dwords);
+                    self.refuse_chain_frame(address, size_dwords, offset, &error.to_string());
+                    stack.pop();
+                    continue;
+                }
+            };
+            let advance = consumed as usize + 1;
+            if advance > stack[top].words.len() - pos {
+                let (address, size_dwords) = (stack[top].address, stack[top].size_dwords);
+                self.refuse_chain_frame(
+                    address,
+                    size_dwords,
+                    offset,
+                    "packet declares more dwords than the chained buffer holds",
+                );
+                stack.pop();
+                continue;
+            }
+            stack[top].pos = pos + advance;
+            // A wait inside a chained buffer cannot suspend the stream:
+            // `RunOutcome::Suspended` carries a resume point as a dword offset
+            // into the SUBMITTED buffer, which cannot name a position inside a
+            // buffer the embedder never submitted. Degrade to the same
+            // behaviour `run_with_memory` uses for an unmet wait it cannot park
+            // — continue past it — but count it, so a title that genuinely
+            // needs cross-queue ordering inside a chain shows up as a number
+            // rather than as a glitch.
+            if let Some(wait) = self.pending_wait.take() {
+                self.chain_census.waits_dropped += 1;
+                if self.first(SkipKey::Note("chain_wait_cannot_suspend")) {
+                    warn!(
+                        label = format_args!("{:#x}", wait.address),
+                        compare = wait.compare,
+                        offset,
+                        "unmet wait inside a CHAINED command buffer — continuing past it \
+                         (a suspend resume point can only name a dword in the submitted buffer). \
+                         Counted (ChainCensus::waits_dropped)"
+                    );
+                }
+            }
+            if self.follow_chains
+                && let Some(request) = self.pending_chain.take()
+                && let Some(frame) = self.open_chain_frame(&stack, request, mem)
+            {
+                stack.push(frame);
+            }
+        }
+    }
+
+    /// Validate a chain target and read it. The ONLY place a guest-supplied
+    /// chain address is dereferenced.
+    ///
+    /// Refuses, each by name and with its own [`ChainCensus`] counter:
+    /// * nesting past [`Self::MAX_CHAIN_DEPTH`];
+    /// * more than [`Self::MAX_CHAIN_BUFFERS`] buffers in one top-level walk;
+    /// * a cycle — the same ADDRESS already open on the active path, which
+    ///   covers a self-chain, an A→B→A loop, and an A→B→A' loop that re-enters
+    ///   one base at a different declared size;
+    /// * a null, non-dword-aligned, empty, over-long or address-space-wrapping
+    ///   target;
+    /// * a target the embedder's [`GuestMemory`] will not read in full.
+    fn open_chain_frame(
+        &mut self,
+        stack: &[ChainFrame],
+        request: ChainRequest,
+        mem: &dyn GuestMemory,
+    ) -> Option<ChainFrame> {
+        let ChainRequest {
+            offset,
+            address,
+            size_dwords,
+        } = request;
+        if stack.len() >= Self::MAX_CHAIN_DEPTH {
+            self.chain_census.refused_depth += 1;
+            if self.first(SkipKey::Note("chain_depth_exceeded")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    size_dwords,
+                    offset,
+                    depth = stack.len(),
+                    limit = Self::MAX_CHAIN_DEPTH,
+                    "IT_INDIRECT_BUFFER chain nests deeper than the limit — target refused and \
+                     counted (ChainCensus::refused_depth); the walk does not recurse into it"
+                );
+            }
+            return None;
+        }
+        if self.chain_buffers_followed >= Self::MAX_CHAIN_BUFFERS {
+            self.chain_census.refused_budget += 1;
+            if self.first(SkipKey::Note("chain_buffer_budget_exhausted")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    size_dwords,
+                    offset,
+                    limit = Self::MAX_CHAIN_BUFFERS,
+                    "this walk has already followed the maximum number of chained command \
+                     buffers — target refused and counted (ChainCensus::refused_budget)"
+                );
+            }
+            return None;
+        }
+        // Keyed on the ADDRESS alone, not on `(address, size)`. A buffer
+        // re-entered on the active path is a cycle whatever length the second
+        // packet claims for it, and keying on the pair leaves an escape hatch:
+        // A→B→A' where A' names the same base with size+1 is not a repeat of the
+        // pair, so a stream could walk ~2^20 distinct "sizes" of one buffer. The
+        // depth bound and `MAX_CHAIN_BUFFERS` still force termination there, but
+        // refusing on the address is both stricter and simpler, and no real
+        // stream re-enters one base at two lengths on one path.
+        if stack.iter().any(|frame| frame.address == address) {
+            self.chain_census.refused_cycle += 1;
+            if self.first(SkipKey::Note("chain_cycle")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    size_dwords,
+                    offset,
+                    depth = stack.len(),
+                    "IT_INDIRECT_BUFFER chains back into a buffer already open on this path — \
+                     cycle refused and counted (ChainCensus::refused_cycle)"
+                );
+            }
+            return None;
+        }
+        let bytes = u64::from(size_dwords) * 4;
+        let wraps = address.checked_add(bytes).is_none();
+        // `%` rather than `u64::is_multiple_of`: this crate's MSRV is 1.85 and
+        // that method is stable only since 1.87.
+        if address == 0
+            || address % 4 != 0
+            || size_dwords == 0
+            || size_dwords > Self::MAX_CHAIN_DWORDS
+            || wraps
+        {
+            self.chain_census.refused_malformed += 1;
+            if self.first(SkipKey::Note("chain_target_malformed")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    size_dwords,
+                    offset,
+                    "IT_INDIRECT_BUFFER target is null, not DWORD-aligned, empty, over-long or \
+                     wraps the address space — refused and counted \
+                     (ChainCensus::refused_malformed) WITHOUT reading it"
+                );
+            }
+            return None;
+        }
+        // The whole `[address, address + size_dwords * 4)` range must come back
+        // in one read: the embedder's authority validates the full extent, so a
+        // partially-mapped chain target is refused rather than half-walked.
+        let Some(words) = mem.read_command_dwords(address, size_dwords) else {
+            self.chain_census.refused_unreadable += 1;
+            if self.first(SkipKey::Note("chain_target_unreadable")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    end = format_args!("{:#x}", address.saturating_add(bytes)),
+                    size_dwords,
+                    offset,
+                    "IT_INDIRECT_BUFFER target is not fully readable guest memory — refused and \
+                     counted (ChainCensus::refused_unreadable); no host memory was touched \
+                     outside the guest-memory authority"
+                );
+            }
+            return None;
+        };
+        // A short read would silently truncate the child's command stream.
+        if words.len() != size_dwords as usize {
+            self.chain_census.refused_unreadable += 1;
+            if self.first(SkipKey::Note("chain_target_short_read")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    size_dwords,
+                    got = words.len(),
+                    offset,
+                    "IT_INDIRECT_BUFFER target read returned fewer dwords than the packet \
+                     declared — refused and counted (ChainCensus::refused_unreadable)"
+                );
+            }
+            return None;
+        }
+        self.chain_buffers_followed = self.chain_buffers_followed.saturating_add(1);
+        self.chain_census.followed += 1;
+        self.chain_census.followed_dwords += u64::from(size_dwords);
+        Some(ChainFrame {
+            address,
+            size_dwords,
+            words,
+            pos: 0,
+        })
+    }
+
+    /// Abandon one chained buffer with a named, counted refusal.
+    fn refuse_chain_frame(&mut self, address: u64, size_dwords: u32, offset: u32, reason: &str) {
+        self.chain_census.refused_malformed += 1;
+        if self.first(SkipKey::Note("chain_frame_abandoned")) {
+            warn!(
+                address = format_args!("{address:#x}"),
+                size_dwords,
+                offset,
+                reason,
+                "chained command buffer abandoned mid-walk — counted \
+                 (ChainCensus::refused_malformed). The SUBMITTED buffer keeps walking: its next \
+                 packet boundary is still known, because the chain packet carried its own length"
+            );
+        }
     }
 
     /// Kyty: the `g_cp_op_func[256]` table.
@@ -1215,6 +1757,15 @@ impl CommandProcessor {
             }
             pm4::IT_DRAW_INDEX_INDIRECT | pm4::IT_DRAW_INDEX_INDIRECT_MULTI => {
                 self.cp_op_draw_indirect(cmd_id, body, offset, sink, mem, true)
+            }
+            // Chained command buffers. Decoded and CENSUSED unconditionally;
+            // walked only when the follower is enabled. See
+            // `cp_op_indirect_buffer` — before it existed these two opcodes
+            // landed in the anonymous unknown-opcode arm below, so a title that
+            // links its frame through Jump/Branch produced one rate-limited
+            // "unknown PM4 opcode" line and no evidence at all.
+            pm4::IT_INDIRECT_BUFFER | pm4::IT_INDIRECT_BUFFER_CNST => {
+                self.cp_op_indirect_buffer(cmd_id, body, offset, mem)
             }
             pm4::IT_COND_EXEC => self.cp_op_cond_exec(cmd_id, body, offset, mem),
             // The wait family is honoured: parse, evaluate against the label,
@@ -1393,6 +1944,270 @@ impl CommandProcessor {
             },
             _ => PacketClass::Inert,
         }
+    }
+
+    /// Deepest chain nesting [`Self::run_chain`] will walk, below the submitted
+    /// buffer. A malformed or hostile stream must not be able to grow the
+    /// work-list without bound; neither reference bounds this at all
+    /// (KytyPS5 `ProcessIndirectBuffer` pushes onto `m_buffer_stack` freely,
+    /// shadPS4 spawns a nested coroutine per level).
+    ///
+    /// 8 is generous against measured practice: PAL-style chunked command
+    /// streams and the AGC Jump/Branch forms nest one or two levels (a frame
+    /// buffer chaining a pass buffer chaining a state block).
+    pub const MAX_CHAIN_DEPTH: usize = 8;
+
+    /// Chained buffers one top-level walk will follow in total.
+    ///
+    /// The depth bound alone does not guarantee termination: a chain graph that
+    /// never repeats a buffer on any single path is a DAG, and a DAG can still
+    /// be walked exponentially in its depth. This is the flat ceiling that makes
+    /// termination unconditional.
+    pub const MAX_CHAIN_BUFFERS: u64 = 4096;
+
+    /// Largest chain target this processor will read: the PM4 `IB_SIZE` field is
+    /// 20 bits, so this is the field's own maximum (~4 MiB of command stream).
+    /// A larger value cannot have come out of a well-formed packet.
+    const MAX_CHAIN_DWORDS: u32 = 0x000f_ffff;
+
+    /// `IT_INDIRECT_BUFFER` (0x3F) / `IT_INDIRECT_BUFFER_CNST` (0x33) — a
+    /// chained command buffer.
+    ///
+    /// Always decodes the packet into the [`ChainCensus`]; walks the target only
+    /// when [`Self::set_follow_chains`] is on, by raising [`Self::pending_chain`]
+    /// for the walk loop to drain immediately after this packet.
+    ///
+    /// **CALL, not jump** — the parent buffer resumes at the packet after this
+    /// one once the child completes. Evidence, from both references that
+    /// implement it:
+    ///
+    /// * KytyPS5 `CpOpIndirectBuffer` (pm4Handlers.cpp L2569-2612) calls
+    ///   `cp.ProcessIndirectBuffer(...)` and then `return 3` — the parent cursor
+    ///   advances past the 4-dword packet and keeps walking. `ProcessIndirectBuffer`
+    ///   (graphicsRun.cpp L625) pushes the child onto `m_buffer_stack` and runs
+    ///   `ProcessPm4(execution, stop_depth)` down to the depth it started at, so
+    ///   control returns to the parent frame by construction.
+    /// * shadPS4 `liverpool.cpp` L830 runs a nested `ProcessGraphics` task to
+    ///   completion, `break`s, and its loop then advances by the chain packet's
+    ///   own `NumWords() + 1`.
+    ///
+    /// The control dword's bit 20 is AMD's `CHAIN` flag (shadPS4
+    /// `PM4CmdIndirectBuffer::chain`, pm4_cmds.h L881), which on hardware makes
+    /// the transfer a jump — the parent is abandoned. Neither reference honours
+    /// it, and KytyPS5's own logging of observed PS5 control values
+    /// (`control & 0x0fe00000` expected `0x0f200000`, i.e. bit 21 plus
+    /// `VMID = 0xf`) shows bit 20 CLEAR in the streams it has seen. So this
+    /// implements the call form both references implement, and merely COUNTS
+    /// (`chain_bit_set`) plus names a set chain bit rather than guessing a jump
+    /// — a wrong guess in that direction would drop the parent's remaining
+    /// draws, which is the exact bug class this handler exists to fix.
+    ///
+    /// `IT_INDIRECT_BUFFER_CNST` is deliberately NOT followed: it addresses the
+    /// **constant engine** ring, a separate queue with its own register shadow.
+    /// shadPS4 handles 0x33 only inside `ProcessCeUpdate` (liverpool.cpp L195),
+    /// never in the graphics or compute walk, and KytyPS5 refuses it outright
+    /// (`EXIT_NOT_IMPLEMENTED` on any opcode but 0x3F, pm4Handlers.cpp L2572).
+    /// Feeding a CE buffer to the graphics processor would execute it against
+    /// the wrong register file.
+    fn cp_op_indirect_buffer(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let body_dw = pm4::body_dw(cmd_id);
+        if pm4::op(cmd_id) == pm4::IT_INDIRECT_BUFFER_CNST {
+            self.chain_census.const_packets += 1;
+            self.record_chain_sample(ChainSample {
+                offset,
+                address: 0,
+                size_dwords: 0,
+                control: 0,
+                form: ChainForm::Const,
+            });
+            if self.first(SkipKey::Note("indirect_buffer_const_not_followed")) {
+                warn!(
+                    cmd_id = format_args!("{cmd_id:#010x}"),
+                    offset,
+                    "IT_INDIRECT_BUFFER_CNST addresses the CONSTANT-ENGINE ring, which this \
+                     processor does not model — counted (ChainCensus::const_packets) and \
+                     consumed by its encoded length, never walked against the graphics \
+                     register file"
+                );
+            }
+            return Ok(body_dw);
+        }
+        // KytyPS5 discriminates the two IT_INDIRECT_BUFFER layouts purely by
+        // packet length (pm4Handlers.cpp L2574/L2578): 14 dwords total = the
+        // conditional branch, 4 = the unconditional chain.
+        if body_dw == 13 {
+            return self.cp_op_chain_branch(cmd_id, body, offset, mem);
+        }
+        if body_dw != 3 {
+            self.chain_census.refused_malformed += 1;
+            if self.first(SkipKey::Note("indirect_buffer_bad_length")) {
+                warn!(
+                    cmd_id = format_args!("{cmd_id:#010x}"),
+                    body_dw,
+                    offset,
+                    "IT_INDIRECT_BUFFER with neither the 4-dword chain nor the 14-dword branch \
+                     length — refused and counted (ChainCensus::refused_malformed), consumed by \
+                     its encoded length"
+                );
+            }
+            return Ok(body_dw);
+        }
+        let lo = Self::body_at(body, 0, offset)?;
+        let hi = Self::body_at(body, 1, offset)?;
+        let control = Self::body_at(body, 2, offset)?;
+        // shadPS4 `PM4CmdIndirectBuffer`: `ibase_hi` is 16 bits, `ib_size` 20.
+        let address = u64::from(lo) | (u64::from(hi & 0xffff) << 32);
+        let size_dwords = control & Self::MAX_CHAIN_DWORDS;
+        self.chain_census.jump_packets += 1;
+        self.chain_census.target_dwords += u64::from(size_dwords);
+        if control & (1 << 20) != 0 {
+            self.chain_census.chain_bit_set += 1;
+            if self.first(SkipKey::Note("indirect_buffer_chain_bit")) {
+                warn!(
+                    control = format_args!("{control:#010x}"),
+                    offset,
+                    "IT_INDIRECT_BUFFER has the CHAIN control bit set — hardware would JUMP \
+                     (abandoning the rest of this buffer); both references and this processor \
+                     treat it as a CALL. Counted (ChainCensus::chain_bit_set)"
+                );
+            }
+        }
+        self.record_chain_sample(ChainSample {
+            offset,
+            address,
+            size_dwords,
+            control,
+            form: ChainForm::Jump,
+        });
+        self.request_chain(offset, address, size_dwords);
+        Ok(body_dw)
+    }
+
+    /// The 14-dword conditional chain: `IT_INDIRECT_BUFFER` carrying a masked
+    /// 64-bit compare and two targets.
+    ///
+    /// Body layout is KytyPS5 `CpOpBranch` (pm4Handlers.cpp L2140-2156), and is
+    /// exactly what `raeen-hle`'s `sceAgcCbBranch` (`hle_cb_branch`) already
+    /// emits: `[0]` mode | function << 8, `[1..3]` compare address, `[3..5]`
+    /// mask, `[5..7]` reference, `[7..9]` then-target, `[9]` then size,
+    /// `[10..12]` else-target, `[12]` else size.
+    fn cp_op_chain_branch(
+        &mut self,
+        cmd_id: u32,
+        body: &[u32],
+        offset: u32,
+        mem: Option<&dyn GuestMemory>,
+    ) -> Result<u32, CpError> {
+        let body_dw = pm4::body_dw(cmd_id);
+        self.chain_census.branch_packets += 1;
+        let selector = Self::body_at(body, 0, offset)?;
+        let mode = selector & 0x3;
+        let function = (selector >> 8) & 0x7;
+        let compare_address = u64::from(Self::body_at(body, 1, offset)? & 0xffff_fff8)
+            | (u64::from(Self::body_at(body, 2, offset)?) << 32);
+        let mask = u64::from(Self::body_at(body, 3, offset)?)
+            | (u64::from(Self::body_at(body, 4, offset)?) << 32);
+        let reference = u64::from(Self::body_at(body, 5, offset)?)
+            | (u64::from(Self::body_at(body, 6, offset)?) << 32);
+        let then_address = u64::from(Self::body_at(body, 7, offset)? & 0xffff_fffc)
+            | (u64::from(Self::body_at(body, 8, offset)?) << 32);
+        let then_dwords = Self::body_at(body, 9, offset)? & Self::MAX_CHAIN_DWORDS;
+        let else_address = u64::from(Self::body_at(body, 10, offset)? & 0xffff_fffc)
+            | (u64::from(Self::body_at(body, 11, offset)?) << 32);
+        let else_dwords = Self::body_at(body, 12, offset)? & Self::MAX_CHAIN_DWORDS;
+        self.chain_census.target_dwords += u64::from(then_dwords);
+        let spec = WaitSpec {
+            address: compare_address,
+            mask,
+            reference,
+            compare: function,
+            is_64: true,
+        };
+        // The compare label lives in guest memory. Without a reader, or with an
+        // unreadable label, there is no honest way to pick a branch — refuse by
+        // name rather than guessing the then-branch (which would execute work
+        // the title asked to be skipped).
+        let Some(mem) = mem else {
+            self.chain_census.refused_no_memory += 1;
+            if self.first(SkipKey::Note("chain_branch_without_guest_memory")) {
+                warn!(
+                    address = format_args!("{compare_address:#x}"),
+                    offset,
+                    "conditional IT_INDIRECT_BUFFER needs the compare label but no guest memory \
+                     reader is installed — neither branch taken, counted \
+                     (ChainCensus::refused_no_memory)"
+                );
+            }
+            return Ok(body_dw);
+        };
+        let Some(value) = spec.read_label(mem) else {
+            self.chain_census.refused_unreadable += 1;
+            if self.first(SkipKey::Note("chain_branch_unreadable_label")) {
+                warn!(
+                    address = format_args!("{compare_address:#x}"),
+                    offset,
+                    "conditional IT_INDIRECT_BUFFER compare label is unreadable — neither branch \
+                     taken, counted (ChainCensus::refused_unreadable)"
+                );
+            }
+            return Ok(body_dw);
+        };
+        // Mode 1 = then-only, mode 2 = then/else (KytyPS5 refuses any other).
+        let (address, size_dwords) = if spec.satisfied_by(value) {
+            (then_address, then_dwords)
+        } else if mode == 2 {
+            (else_address, else_dwords)
+        } else {
+            (0, 0)
+        };
+        self.record_chain_sample(ChainSample {
+            offset,
+            address,
+            size_dwords,
+            control: selector,
+            form: ChainForm::Branch,
+        });
+        if size_dwords != 0 {
+            self.request_chain(offset, address, size_dwords);
+        }
+        Ok(body_dw)
+    }
+
+    fn record_chain_sample(&mut self, sample: ChainSample) {
+        if self.chain_census.samples.len() < ChainCensus::MAX_SAMPLES {
+            self.chain_census.samples.push(sample);
+        }
+    }
+
+    /// Ask the running walk loop to follow `address`, or record that the
+    /// follower is off. Never dereferences anything — validation happens in
+    /// [`Self::open_chain_frame`], at the point the target would be read.
+    fn request_chain(&mut self, offset: u32, address: u64, size_dwords: u32) {
+        if !self.follow_chains {
+            self.chain_census.refused_disabled += 1;
+            if self.first(SkipKey::Note("indirect_buffer_follower_disabled")) {
+                warn!(
+                    address = format_args!("{address:#x}"),
+                    size_dwords,
+                    offset,
+                    "IT_INDIRECT_BUFFER chain target NOT walked — the chain follower is off. \
+                     Counted (ChainCensus::refused_disabled); the target's draws, dispatches and \
+                     completion packets do not run"
+                );
+            }
+            return;
+        }
+        self.pending_chain = Some(ChainRequest {
+            offset,
+            address,
+            size_dwords,
+        });
     }
 
     /// Conditional execution packet: a zero 32-bit label skips the following
@@ -6487,6 +7302,589 @@ mod tests {
         assert_eq!(
             sink.guest_memory_write_boundaries, 1,
             "the walk itself must behave identically either way"
+        );
+    }
+
+    // ─── IT_INDIRECT_BUFFER chains ──────────────────────────────────────────
+
+    /// Several disjoint guest buffers at chosen addresses, for chain targets.
+    /// Unlike [`BufMem`] this can hold a whole chain graph, and it REFUSES any
+    /// read that is not wholly inside one registered range — the property the
+    /// "unmapped target" test depends on.
+    #[derive(Default)]
+    struct ChainMem {
+        ranges: Vec<(u64, Vec<u32>)>,
+        /// Every `(addr, count)` this memory was asked for, in order. A refusal
+        /// test asserts against this that no read was even attempted.
+        reads: std::cell::RefCell<Vec<(u64, u32)>>,
+    }
+
+    impl ChainMem {
+        fn with(mut self, base: u64, words: Vec<u32>) -> Self {
+            self.ranges.push((base, words));
+            self
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.borrow().len()
+        }
+    }
+
+    impl GuestMemory for ChainMem {
+        fn read_dwords(&self, addr: u64, count: u32) -> Option<Vec<u32>> {
+            self.reads.borrow_mut().push((addr, count));
+            if count == 0 || addr % 4 != 0 {
+                return None;
+            }
+            self.ranges.iter().find_map(|(base, words)| {
+                let rel = addr.checked_sub(*base)?;
+                let start = usize::try_from(rel / 4).ok()?;
+                let end = start.checked_add(count as usize)?;
+                words.get(start..end).map(<[u32]>::to_vec)
+            })
+        }
+    }
+
+    /// A 4-dword unconditional chain packet (`sceAgcDcbJump`'s emission).
+    fn chain_packet(target: u64, size_dwords: u32) -> Vec<u32> {
+        vec![
+            header(4, pm4::IT_INDIRECT_BUFFER, pm4::R_ZERO),
+            target as u32,
+            ((target >> 32) & 0xffff) as u32,
+            size_dwords & 0x000f_ffff,
+        ]
+    }
+
+    /// One `IT_DRAW_INDEX_AUTO` with `index_count`, so a draw can be identified
+    /// by which buffer it came from.
+    fn tagged_draw(index_count: u32) -> Vec<u32> {
+        vec![
+            header(3, pm4::IT_DRAW_INDEX_AUTO, pm4::R_ZERO),
+            index_count,
+            0,
+        ]
+    }
+
+    fn drawn(sink: &RecordingSink) -> Vec<u32> {
+        sink.draws.iter().map(|draw| draw.0).collect()
+    }
+
+    /// The step-1 measurement: a chain packet must be DECODED and counted with
+    /// its target and size even when the follower is off, and must not be
+    /// followed. Before `cp_op_indirect_buffer` existed, 0x3F fell into the
+    /// anonymous unknown-opcode arm and the only trace of a chained frame was
+    /// one rate-limited "unknown PM4 opcode" line.
+    #[test]
+    fn a_chain_packet_is_counted_with_its_target_even_when_not_followed() {
+        let child = 0x8000_1000u64;
+        let mem = ChainMem::default().with(child, tagged_draw(77));
+        let mut dcb = chain_packet(child, 3);
+        dcb.extend(tagged_draw(11));
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a chain packet must never fault the walk");
+
+        let census = cp.take_chain_census();
+        assert_eq!(census.jump_packets, 1, "the 4-dword chain form was seen");
+        assert_eq!(census.packets(), 1);
+        assert_eq!(
+            census.target_dwords, 3,
+            "the census must report how much command stream lives outside the submitted buffer"
+        );
+        assert_eq!(
+            census.refused_disabled, 1,
+            "with the follower off the target is a NAMED refusal, not a silent skip"
+        );
+        assert_eq!(census.followed, 0);
+        assert_eq!(
+            census.samples,
+            vec![ChainSample {
+                offset: 0,
+                address: child,
+                size_dwords: 3,
+                control: 3,
+                form: ChainForm::Jump,
+            }],
+            "the sample must name the target so a run can be diagnosed from the log"
+        );
+        assert_eq!(
+            drawn(&sink),
+            vec![11],
+            "the follower is off: only the submitted buffer's draw runs"
+        );
+        assert_eq!(
+            mem.read_count(),
+            0,
+            "counting a chain must not read the target"
+        );
+    }
+
+    /// One level: the child's draws execute, and the PARENT resumes after the
+    /// chain packet. Call semantics, per KytyPS5 `CpOpIndirectBuffer` returning
+    /// 3 after `ProcessIndirectBuffer` and shadPS4 `liverpool.cpp` L830
+    /// advancing by the packet's own length after the nested task completes.
+    #[test]
+    fn a_followed_chain_executes_the_childs_draws_then_returns_to_the_parent() {
+        let child = 0x8000_1000u64;
+        let mem = ChainMem::default().with(child, tagged_draw(77));
+        let mut dcb = tagged_draw(11);
+        dcb.extend(chain_packet(child, 3));
+        dcb.extend(tagged_draw(22));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a chained stream must walk");
+
+        assert_eq!(
+            drawn(&sink),
+            vec![11, 77, 22],
+            "the child runs AT the chain packet and the parent's remaining draws still run — a \
+             CALL, not a jump (77 missing = chain not followed; 22 missing = treated as a jump)"
+        );
+        let census = cp.take_chain_census();
+        assert_eq!(census.followed, 1);
+        assert_eq!(census.followed_dwords, 3);
+        assert_eq!(census.refusals(), 0);
+    }
+
+    /// Registers a chained buffer writes must be visible to the rest of the
+    /// PARENT — the property that makes call-vs-jump ordering load-bearing
+    /// rather than cosmetic.
+    #[test]
+    fn a_chained_buffer_state_write_is_visible_to_the_parents_later_draws() {
+        let child = 0x8000_2000u64;
+        let mem = ChainMem::default().with(
+            child,
+            vec![
+                header(3, pm4::IT_SET_UCONFIG_REG, pm4::R_ZERO),
+                pm4::VGT_PRIMITIVE_TYPE,
+                17,
+            ],
+        );
+        let mut dcb = chain_packet(child, 3);
+        dcb.extend(tagged_draw(11));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a chained state stream must walk");
+
+        assert_eq!(
+            sink.draws.first().map(|draw| draw.2),
+            Some(17),
+            "the parent's draw must see the primitive type the CHILD set"
+        );
+    }
+
+    /// Nesting to exactly [`CommandProcessor::MAX_CHAIN_DEPTH`] works, and the
+    /// buffer one level past it is refused BY NAME rather than growing the
+    /// work-list. Both references bound this at nothing at all.
+    #[test]
+    fn a_chain_nests_to_the_configured_depth_and_refuses_one_deeper() {
+        // depth-1 .. depth-N buffers, each chaining into the next; the deepest
+        // one draws.
+        let base = 0x8001_0000u64;
+        let stride = 0x1000u64;
+        let depth = CommandProcessor::MAX_CHAIN_DEPTH;
+        let address = |level: usize| base + stride * level as u64;
+
+        // Every level is exactly 4 dwords so one declared size fits them all —
+        // the deepest one pads its 3-dword draw with a type-2 filler. Without
+        // that the parent's declared size would overrun the child's real extent
+        // and the test would measure a short read instead of the depth bound.
+        let build = |levels: usize| {
+            let mut mem = ChainMem::default();
+            for level in 0..levels {
+                let words = if level + 1 == levels {
+                    let mut deepest = tagged_draw(900 + level as u32);
+                    deepest.push(0x8000_0000);
+                    deepest
+                } else {
+                    chain_packet(address(level + 1), 4)
+                };
+                assert_eq!(words.len(), 4, "every chain level must be 4 dwords");
+                mem = mem.with(address(level), words);
+            }
+            mem
+        };
+
+        // Exactly at the limit: the submitted buffer chains into level 0, which
+        // is work-list depth 1, so `depth` levels fit.
+        let mem = build(depth);
+        let dcb = chain_packet(address(0), 4);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a chain at the depth limit must walk");
+        let census = cp.take_chain_census();
+        assert_eq!(
+            census.followed, depth as u64,
+            "every level up to the limit must be walked"
+        );
+        assert_eq!(census.refused_depth, 0);
+        assert_eq!(
+            drawn(&sink),
+            vec![900 + depth as u32 - 1],
+            "the deepest buffer's draw must reach the sink"
+        );
+
+        // One deeper: the last buffer is refused, and everything above it still
+        // ran.
+        let mem = build(depth + 1);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("an over-deep chain must be refused, not fault the walk");
+        let census = cp.take_chain_census();
+        assert_eq!(
+            census.refused_depth, 1,
+            "the buffer past MAX_CHAIN_DEPTH must be a named counted refusal"
+        );
+        assert_eq!(census.followed, depth as u64);
+        assert!(
+            drawn(&sink).is_empty(),
+            "the refused level held the only draw"
+        );
+    }
+
+    /// A buffer that chains to itself, and an A→B→A loop, must terminate.
+    #[test]
+    fn a_self_referential_and_a_two_buffer_chain_cycle_both_terminate() {
+        let a = 0x8002_0000u64;
+        let b = 0x8002_1000u64;
+
+        // Self-chain: A chains into A.
+        let mut a_words = chain_packet(a, 4);
+        a_words.extend(tagged_draw(1));
+        let mem = ChainMem::default().with(a, a_words);
+        let dcb = chain_packet(a, 7);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a self-referential chain must terminate");
+        let census = cp.take_chain_census();
+        assert_eq!(census.refused_cycle, 1, "A→A must be refused as a cycle");
+        assert_eq!(
+            drawn(&sink),
+            vec![1],
+            "the cycle refusal must not abandon the rest of A"
+        );
+
+        // A→B→A: A is 4 dwords (one chain packet into B), B is 7 (a chain packet
+        // back into A, then a draw).
+        let mut b_words = chain_packet(a, 4);
+        b_words.extend(tagged_draw(2));
+        let mem = ChainMem::default()
+            .with(a, chain_packet(b, 7))
+            .with(b, b_words);
+        let dcb = chain_packet(a, 4);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("an A→B→A chain must terminate");
+        let census = cp.take_chain_census();
+        assert_eq!(census.refused_cycle, 1, "A→B→A must be refused as a cycle");
+        assert_eq!(census.followed, 2, "A and B each ran once");
+        assert_eq!(drawn(&sink), vec![2]);
+
+        // The same loop with a DIFFERENT declared size for A on the way back.
+        // Keying the cycle test on `(address, size)` would miss this; keying it
+        // on the address does not.
+        let mut b_words = chain_packet(a, 3);
+        b_words.extend(tagged_draw(3));
+        let mem = ChainMem::default()
+            .with(a, chain_packet(b, 7))
+            .with(b, b_words);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("an A→B→A' chain must terminate");
+        let census = cp.take_chain_census();
+        assert_eq!(
+            census.refused_cycle, 1,
+            "re-entering A at a different declared size is still a cycle"
+        );
+        assert_eq!(drawn(&sink), vec![3]);
+    }
+
+    /// An unmapped or misaligned target is a named refusal, and the misaligned
+    /// one is refused WITHOUT the memory authority ever being asked to read it.
+    #[test]
+    fn an_unmapped_or_misaligned_chain_target_is_refused_without_touching_host_memory() {
+        let mapped = 0x8003_0000u64;
+        let mem = ChainMem::default().with(mapped, tagged_draw(5));
+
+        // Unmapped: well-formed packet, target the authority will not read.
+        let dcb = chain_packet(0x1234_5000, 4);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("an unmapped chain target must be refused, not fault");
+        let census = cp.take_chain_census();
+        assert_eq!(census.refused_unreadable, 1);
+        assert_eq!(census.followed, 0);
+        assert!(drawn(&sink).is_empty());
+
+        // Misaligned: refused BEFORE any read is attempted.
+        let mem = ChainMem::default().with(mapped, tagged_draw(5));
+        let dcb = chain_packet(mapped + 2, 3);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a misaligned chain target must be refused, not fault");
+        let census = cp.take_chain_census();
+        assert_eq!(census.refused_malformed, 1);
+        assert_eq!(
+            mem.read_count(),
+            0,
+            "a misaligned target must never be handed to the guest-memory authority"
+        );
+
+        // Null target, and a size the 20-bit IB_SIZE field cannot hold.
+        for (address, size) in [(0u64, 4u32), (mapped, 0)] {
+            let dcb = chain_packet(address, size);
+            let mut cp = CommandProcessor::new();
+            cp.set_follow_chains(true);
+            let mut sink = RecordingSink::default();
+            let mem = ChainMem::default().with(mapped, tagged_draw(5));
+            cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+                .expect("a malformed chain target must be refused, not fault");
+            assert_eq!(
+                cp.take_chain_census().refused_malformed,
+                1,
+                "null/empty target {address:#x}/{size}"
+            );
+            assert_eq!(mem.read_count(), 0);
+        }
+    }
+
+    /// A chained buffer whose stream is desynced must abandon THAT buffer only.
+    /// The submitted buffer's next packet boundary is still known, because the
+    /// chain packet carried its own length.
+    #[test]
+    fn a_desynced_chained_buffer_is_abandoned_without_aborting_the_submission() {
+        let child = 0x8004_0000u64;
+        // A type-0 header: not type 2, not type 3.
+        let mem = ChainMem::default().with(child, vec![0x0000_0000, 0, 0]);
+        let mut dcb = chain_packet(child, 3);
+        dcb.extend(tagged_draw(42));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a desynced CHILD must not fault the submitted buffer");
+        assert_eq!(
+            drawn(&sink),
+            vec![42],
+            "the submitted buffer must keep walking after a bad child"
+        );
+        assert_eq!(cp.take_chain_census().refused_malformed, 1);
+    }
+
+    /// `IT_INDIRECT_BUFFER_CNST` (0x33) addresses the constant-engine ring.
+    /// Counted and named, never walked against the graphics register file —
+    /// shadPS4 handles it only in `ProcessCeUpdate` (liverpool.cpp L195) and
+    /// KytyPS5 refuses any opcode but 0x3F (pm4Handlers.cpp L2572).
+    #[test]
+    fn indirect_buffer_const_is_counted_but_never_followed() {
+        let child = 0x8005_0000u64;
+        let mem = ChainMem::default().with(child, tagged_draw(99));
+        let mut dcb = chain_packet(child, 3);
+        dcb[0] = header(4, pm4::IT_INDIRECT_BUFFER_CNST, pm4::R_ZERO);
+        dcb.extend(tagged_draw(1));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a CE chain packet must not fault the walk");
+        let census = cp.take_chain_census();
+        assert_eq!(census.const_packets, 1);
+        assert_eq!(census.followed, 0, "the CE ring must never be walked here");
+        assert_eq!(
+            drawn(&sink),
+            vec![1],
+            "only the submitted buffer's own draw runs"
+        );
+        assert_eq!(mem.read_count(), 0);
+    }
+
+    /// The 14-dword conditional form (`sceAgcCbBranch` / KytyPS5 `CpOpBranch`):
+    /// the compare picks then- or else-target, and mode 1 has no else.
+    #[test]
+    fn the_conditional_chain_takes_the_then_or_else_buffer_by_its_compare() {
+        let label = 0x8006_0000u64;
+        let then_buffer = 0x8006_1000u64;
+        let else_buffer = 0x8006_2000u64;
+
+        // mode | function << 8. Function 3 = equal.
+        let branch = |mode: u32, function: u32| {
+            vec![
+                header(14, pm4::IT_INDIRECT_BUFFER, pm4::R_ZERO),
+                mode | (function << 8),
+                label as u32,
+                (label >> 32) as u32,
+                0xffff_ffff,
+                0xffff_ffff,
+                7,
+                0,
+                then_buffer as u32,
+                (then_buffer >> 32) as u32,
+                3,
+                else_buffer as u32,
+                (else_buffer >> 32) as u32,
+                3,
+            ]
+        };
+        let memory = |label_value: u32| {
+            ChainMem::default()
+                .with(label, vec![label_value, 0])
+                .with(then_buffer, tagged_draw(700))
+                .with(else_buffer, tagged_draw(800))
+        };
+
+        // Label == reference: then-branch.
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&branch(2, 3), &mut sink, Some(&memory(7)))
+            .expect("a conditional chain must walk");
+        assert_eq!(drawn(&sink), vec![700], "satisfied compare takes then");
+        assert_eq!(cp.take_chain_census().branch_packets, 1);
+
+        // Label != reference, mode 2: else-branch.
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&branch(2, 3), &mut sink, Some(&memory(9)))
+            .expect("a conditional chain must walk");
+        assert_eq!(drawn(&sink), vec![800], "unsatisfied compare takes else");
+
+        // Label != reference, mode 1: no else target exists.
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&branch(1, 3), &mut sink, Some(&memory(9)))
+            .expect("a then-only conditional chain must walk");
+        assert!(
+            drawn(&sink).is_empty(),
+            "mode 1 has no else buffer — neither branch runs"
+        );
+        assert_eq!(cp.take_chain_census().followed, 0);
+    }
+
+    /// An in-stream `R_DRAW_RESET` must not turn the follower off or zero the
+    /// census: a per-frame queue reset between a chain packet and the
+    /// embedder's drain would otherwise silently drop the rest of the frame.
+    #[test]
+    fn a_queue_reset_preserves_the_follower_and_the_chain_census() {
+        let child = 0x8007_0000u64;
+        let mem = ChainMem::default().with(child, tagged_draw(31));
+        let mut dcb = chain_packet(child, 3);
+        dcb.extend_from_slice(&[header(2, pm4::IT_NOP, pm4::R_DRAW_RESET), 0]);
+        dcb.extend(chain_packet(child, 3));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a reset between chains must walk");
+        assert!(cp.follows_chains(), "a queue reset is not a config change");
+        let census = cp.take_chain_census();
+        assert_eq!(
+            census.followed, 2,
+            "the chain AFTER the reset must still be followed"
+        );
+        assert_eq!(drawn(&sink), vec![31, 31]);
+    }
+
+    /// THE REGRESSION GUARD for the working titles: a submission with no chain
+    /// packets must behave identically with the follower on and off, and must
+    /// not touch the chain census at all. Minecraft draws with
+    /// `DRAW_INDEX_OFFSET_2` and is the M5 acceptance path.
+    #[test]
+    fn a_submission_without_chains_is_identical_with_the_follower_on_or_off() {
+        let label = 0x8008_0000u64;
+        let mem = BufMem {
+            base: label,
+            words: vec![0x1234_5678, 0],
+        };
+        let mut dcb = state_and_draw();
+        dcb.extend_from_slice(&[header(3, pm4::IT_DRAW_INDEX_OFFSET_2, pm4::R_ZERO), 9, 0]);
+        dcb.extend_from_slice(&[
+            header(4, pm4::IT_NOP, pm4::R_CX_REGS_INDIRECT),
+            label as u32,
+            (label >> 32) as u32,
+            1,
+        ]);
+        dcb.extend_from_slice(&[header(2, pm4::IT_NOP, pm4::R_PUSH_MARKER), 0]);
+
+        /// Everything a chainless walk can observably produce.
+        #[derive(Debug, PartialEq)]
+        struct WalkResult {
+            draws: Vec<(u32, u32, u32, bool, bool)>,
+            dispatches: Vec<RecordedDispatch>,
+            boundaries: u32,
+            guest_writes: Vec<(u64, u64)>,
+            ctx: Context,
+            ucfg: UserConfig,
+            refused_draws: u64,
+            reg_packets: u64,
+            regs: u64,
+            walk_draws: u64,
+            indirects: u64,
+            inert_packets: u64,
+            chain: ChainCensus,
+        }
+
+        let run = |follow: bool| {
+            let mut cp = CommandProcessor::new();
+            cp.set_follow_chains(follow);
+            cp.set_walk_timing(true);
+            let mut sink = RecordingSink::default();
+            cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+                .expect("a chainless stream must walk");
+            let walk = cp.take_walk_census();
+            WalkResult {
+                draws: sink.draws.clone(),
+                dispatches: sink.dispatches.clone(),
+                boundaries: sink.guest_memory_write_boundaries,
+                guest_writes: sink.guest_writes.clone(),
+                ctx: cp.get_ctx().clone(),
+                ucfg: cp.get_ucfg().clone(),
+                refused_draws: cp.refused_draws(),
+                reg_packets: walk.reg_packets,
+                regs: walk.regs,
+                walk_draws: walk.draws,
+                indirects: walk.indirects,
+                inert_packets: walk.inert_packets,
+                chain: cp.take_chain_census(),
+            }
+        };
+        let off = run(false);
+        let on = run(true);
+        assert_eq!(
+            off, on,
+            "enabling the chain follower must change NOTHING for a submission that carries no \
+             chain packets — this is what protects Minecraft / Dead Cells / Blasphemous II"
+        );
+        assert_eq!(
+            off.chain,
+            ChainCensus::default(),
+            "a chainless submission must not touch the chain census"
         );
     }
 }

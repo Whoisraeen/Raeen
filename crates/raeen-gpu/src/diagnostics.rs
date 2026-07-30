@@ -13,6 +13,7 @@ pub(crate) struct GpuEnv {
     pub dump_draw_target: Option<String>,
     pub dump_frames: Option<String>,
     pub dump_gpu_resources: Option<String>,
+    pub follow_ib_chains: bool,
     pub force_clear: bool,
     pub no_cull: bool,
     pub no_defer: bool,
@@ -47,6 +48,14 @@ impl GpuEnv {
             dump_draw_target: std::env::var("RAEEN_DUMP_DRAW_TARGET").ok(),
             dump_frames: std::env::var("RAEEN_DUMP_FRAMES").ok(),
             dump_gpu_resources: std::env::var("RAEEN_DUMP_GPU_RESOURCES").ok(),
+            // Walk `IT_INDIRECT_BUFFER` chain targets instead of only counting
+            // them. Default OFF: it dereferences guest-supplied addresses and
+            // changes which command stream executes, so the working titles
+            // (Minecraft Bedrock, Dead Cells, Blasphemous II) must be A/B-able
+            // against it in one run. With it off, chain packets are still
+            // decoded and counted — see `CHAIN CENSUS` and
+            // `kyty_graphics::run::ChainCensus`.
+            follow_ib_chains: on("RAEEN_FOLLOW_IB_CHAINS"),
             force_clear: on("RAEEN_FORCE_CLEAR"),
             no_cull: on("RAEEN_NO_CULL"),
             no_defer: on("RAEEN_NO_DEFER"),

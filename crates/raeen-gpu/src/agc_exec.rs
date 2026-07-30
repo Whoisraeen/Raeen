@@ -2269,7 +2269,15 @@ impl AgcGpuSession {
         // forcing Vulkan initialization so their register writes are latched
         // for the next submission.
         cp.set_walk_timing(crate::diagnostics::gpu_env().time_draw);
-        if decoded.draw_packets == 0 && decoded.dispatch_packets == 0 {
+        // Chain following is per-submission embedder configuration, like the
+        // walk census. Set on BOTH queues' processors, every submission.
+        let follow_chains = crate::diagnostics::gpu_env().follow_ib_chains;
+        cp.set_follow_chains(follow_chains);
+        record_submission_chains(&decoded);
+        if decoded.draw_packets == 0
+            && decoded.dispatch_packets == 0
+            && !submission_may_draw_through_chains(&decoded, follow_chains)
+        {
             let mut sink = StateOnlySink;
             let walk_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_WALK_NS);
             let outcome = cp.run_resumable(
@@ -2280,6 +2288,7 @@ impl AgcGpuSession {
             )?;
             drop(walk_timer);
             accumulate_walk_census(cp.take_walk_census());
+            accumulate_chain_census(&cp.take_chain_census());
             let _post = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_POST_NS);
             let produced = cp.take_produced_labels();
             // In-stream completion side effects (events/EOP/flips), published
@@ -2322,6 +2331,8 @@ impl AgcGpuSession {
         );
         drop(walk_timer);
         accumulate_walk_census(cp.take_walk_census());
+        accumulate_chain_census(&cp.take_chain_census());
+        record_executed_work(sink.draws, sink.dispatches);
         SUB_PHASE_DRAWS.fetch_add(sink.draws, Ordering::Relaxed);
         let flush_timer = crate::vulkan::offscreen::StageTimer::start(&SUB_PHASE_FLUSH_NS);
         if submission_compute_flush_required(sink.queued_compute, deferred_present) {
@@ -3559,6 +3570,142 @@ static WALK_CENSUS: parking_lot::Mutex<kyty_graphics::run::WalkCensus> =
         inert_packets: 0,
     });
 
+/// Whether a submitted DCB's frame continues in chained command buffers that
+/// this executor is configured to walk.
+///
+/// `decode_submission` counts draws and dispatches only in the SUBMITTED buffer.
+/// A DCB whose draws all live in `IT_INDIRECT_BUFFER` targets therefore decodes
+/// as `draw_packets == 0` and would take the state-only path — which uses
+/// `StateOnlySink` and never initializes Vulkan, so following the chain there
+/// could not render anything. When the follower is on and chain targets exist,
+/// the submission must go down the real draw path instead.
+///
+/// Returns false whenever the follower is off, so the default path is unchanged.
+fn submission_may_draw_through_chains(decoded: &agc::AgcSubmission, follow_chains: bool) -> bool {
+    follow_chains
+        && decoded
+            .indirect_buffers
+            .iter()
+            .any(|chain| !matches!(chain.kind, agc::AgcChainKind::Const) && chain.size_dwords != 0)
+}
+
+/// Chain-packet census summed over the report window — see
+/// [`kyty_graphics::run::ChainCensus`].
+///
+/// Deliberately NOT gated on `RAEEN_TIME_DRAW` the way [`WALK_CENSUS`] is: the
+/// question this answers ("does this title chain its command stream, and where
+/// to?") has to be answerable from a plain run. `WalkCensus::indirects` cannot
+/// answer it — that field counts `IT_INDIRECT_BUFFER` together with the AGC
+/// `R_*_REGS_INDIRECT` register-list packets every measured title emits
+/// constantly.
+static CHAIN_CENSUS: parking_lot::Mutex<Option<kyty_graphics::run::ChainCensus>> =
+    parking_lot::Mutex::new(None);
+/// Submissions seen since process start, for the `CHAIN CENSUS` cadence.
+static CHAIN_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+/// Submissions whose SUBMITTED buffer carried at least one chain packet.
+static CHAIN_SUBMISSIONS_WITH_CHAINS: AtomicU64 = AtomicU64::new(0);
+/// Draw packets `decode_submission` found in submitted buffers — the same count
+/// the HLE accumulates as `total_draws`, so the two reports are comparable.
+static CHAIN_DECODED_DRAWS: AtomicU64 = AtomicU64::new(0);
+static CHAIN_DECODED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+/// Draws/dispatches the executor's sink actually completed.
+static CHAIN_EXECUTED_DRAWS: AtomicU64 = AtomicU64::new(0);
+static CHAIN_EXECUTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Record one submission's decode-side chain and draw facts.
+fn record_submission_chains(decoded: &agc::AgcSubmission) {
+    CHAIN_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+    CHAIN_DECODED_DRAWS.fetch_add(u64::from(decoded.draw_packets), Ordering::Relaxed);
+    CHAIN_DECODED_DISPATCHES.fetch_add(u64::from(decoded.dispatch_packets), Ordering::Relaxed);
+    if decoded.indirect_buffers.is_empty() {
+        return;
+    }
+    let seen = CHAIN_SUBMISSIONS_WITH_CHAINS.fetch_add(1, Ordering::Relaxed) + 1;
+    // The first chain-bearing submission is the whole finding: name its targets
+    // once, in full, so the hypothesis can be settled from one log line.
+    if seen == 1 {
+        warn!(
+            packets = decoded.packets.len(),
+            top_level_draws = decoded.draw_packets,
+            top_level_dispatches = decoded.dispatch_packets,
+            chains = decoded.indirect_buffers.len(),
+            chain_target_dwords = decoded
+                .indirect_buffers
+                .iter()
+                .map(|chain| u64::from(chain.size_dwords))
+                .sum::<u64>(),
+            follower = crate::diagnostics::gpu_env().follow_ib_chains,
+            targets = ?decoded.indirect_buffers,
+            "CHAIN FIRST SIGHTING: a submitted DCB chains into other command buffers. \
+             `top_level_draws` counts ONLY the submitted buffer — draws inside these targets are \
+             not in it, and are not executed unless RAEEN_FOLLOW_IB_CHAINS is set"
+        );
+    }
+}
+
+/// Record what the executor actually completed for one submission.
+fn record_executed_work(draws: u64, dispatches: u64) {
+    CHAIN_EXECUTED_DRAWS.fetch_add(draws, Ordering::Relaxed);
+    CHAIN_EXECUTED_DISPATCHES.fetch_add(dispatches, Ordering::Relaxed);
+}
+
+/// Fold one walk's chain census in and report on a power-of-two cadence.
+///
+/// The report is cumulative rather than windowed on purpose: "did this title
+/// EVER chain?" is a lifetime question, and a windowed zero would be
+/// indistinguishable from a title that chained only during boot.
+fn accumulate_chain_census(census: &kyty_graphics::run::ChainCensus) {
+    let submissions = CHAIN_SUBMISSIONS.load(Ordering::Relaxed);
+    // Powers of two up to 256, then every 256 — ~9 lines in a 269-submission run.
+    let due = submissions.is_power_of_two() || submissions.is_multiple_of(256);
+    // Snapshot and release: the report below must not hold this lock across a log
+    // emit (`submission_phase_tick` reads the same mutex, and a tracing layer that
+    // logs would close the cycle). The clone only happens on a report.
+    let total = {
+        let mut guard = CHAIN_CENSUS.lock();
+        let total = guard.get_or_insert_with(kyty_graphics::run::ChainCensus::default);
+        total.absorb(census);
+        if !due {
+            return;
+        }
+        total.clone()
+    };
+    let decoded_draws = CHAIN_DECODED_DRAWS.load(Ordering::Relaxed);
+    let executed_draws = CHAIN_EXECUTED_DRAWS.load(Ordering::Relaxed);
+    warn!(
+        submissions,
+        submissions_with_chains = CHAIN_SUBMISSIONS_WITH_CHAINS.load(Ordering::Relaxed),
+        chain_packets = total.packets(),
+        chain_jump = total.jump_packets,
+        chain_branch = total.branch_packets,
+        chain_const = total.const_packets,
+        chain_target_dwords = total.target_dwords,
+        chains_followed = total.followed,
+        chains_followed_dwords = total.followed_dwords,
+        refused_disabled = total.refused_disabled,
+        refused_depth = total.refused_depth,
+        refused_cycle = total.refused_cycle,
+        refused_budget = total.refused_budget,
+        refused_unreadable = total.refused_unreadable,
+        refused_malformed = total.refused_malformed,
+        refused_no_memory = total.refused_no_memory,
+        chain_bit_set = total.chain_bit_set,
+        chain_waits_dropped = total.waits_dropped,
+        samples = ?total.samples,
+        decoded_draws,
+        executed_draws,
+        unexecuted_draws = decoded_draws.saturating_sub(executed_draws),
+        decoded_dispatches = CHAIN_DECODED_DISPATCHES.load(Ordering::Relaxed),
+        executed_dispatches = CHAIN_EXECUTED_DISPATCHES.load(Ordering::Relaxed),
+        follower = crate::diagnostics::gpu_env().follow_ib_chains,
+        "CHAIN CENSUS: whether this title's frame is assembled out of chained command buffers, \
+         and how many of the draws the DECODER found in submitted buffers the executor actually \
+         completed. `chain_packets == 0` retires the chained-frame hypothesis outright; \
+         `decoded_draws` far above `executed_draws` means the draws are reaching the walk and \
+         being dropped downstream, not hidden in a chain (cumulative; always on)"
+    );
+}
+
 fn accumulate_walk_census(census: kyty_graphics::run::WalkCensus) {
     if !crate::diagnostics::gpu_env().time_draw {
         return;
@@ -3648,6 +3795,13 @@ fn submission_phase_tick() {
         "SUBMISSION PHASES: one draw-bearing DCB split into pre-decode, lock acquisition, PM4 walk (draws included — see DRAW COST), compute flush, and ordered side effects (per submission; RAEEN_TIME_DRAW)"
     );
     let census = std::mem::take(&mut *WALK_CENSUS.lock());
+    // Read out before the `warn!` rather than inside it: a lock guard held across
+    // a log emit is the kind of thing that becomes a deadlock the day someone
+    // adds a tracing layer that logs.
+    let chain_packets = CHAIN_CENSUS
+        .lock()
+        .as_ref()
+        .map_or(0, kyty_graphics::run::ChainCensus::packets);
     let per_sub = |x: u64| x / SUB_PHASE_WINDOW;
     warn!(
         reg_packets = per_sub(census.reg_packets),
@@ -3665,7 +3819,8 @@ fn submission_phase_tick() {
         indirects = per_sub(census.indirects),
         indirect_us = per_sub_us(census.indirect_ns),
         inert_packets = per_sub(census.inert_packets),
-        "WALK PACKET CLASSES: which PM4 packets the walk spent itself on. Register writes are COUNTED, not timed (a clock read costs more than the packet — see WalkCensus); `boundary_us` is what the sink spent invalidating guest-memory-derived caches for the write packets (per submission; RAEEN_TIME_DRAW)"
+        chain_packets,
+        "WALK PACKET CLASSES: which PM4 packets the walk spent itself on. Register writes are COUNTED, not timed (a clock read costs more than the packet — see WalkCensus); `boundary_us` is what the sink spent invalidating guest-memory-derived caches for the write packets (per submission; RAEEN_TIME_DRAW). `indirects` CONFLATES IT_INDIRECT_BUFFER with the AGC R_*_REGS_INDIRECT register lists — `chain_packets` (cumulative, from CHAIN CENSUS) is the chain-only count"
     );
 }
 
@@ -3816,6 +3971,56 @@ mod tests {
 
     fn deny_memory() -> Arc<dyn crate::guest_mem::GpuGuestMemory> {
         Arc::new(crate::guest_mem::DenyGpuMemory)
+    }
+
+    /// The state-only early return uses `StateOnlySink` and never initializes
+    /// Vulkan, so a DCB whose only draws live in chain targets could not render
+    /// from there even with the follower on. The predicate that keeps such a
+    /// submission on the real draw path must be false whenever the follower is
+    /// off — otherwise it changes the working titles' path.
+    #[test]
+    fn a_chain_bearing_submission_leaves_the_state_only_path_only_when_following() {
+        let chain = |kind, size_dwords| agc::AgcIndirectBuffer {
+            packet_offset: 0,
+            address: 0x4000,
+            size_dwords,
+            control: size_dwords,
+            kind,
+        };
+        let with = |chains: Vec<agc::AgcIndirectBuffer>| agc::AgcSubmission {
+            indirect_buffers: chains,
+            ..agc::AgcSubmission::default()
+        };
+
+        let jump = with(vec![chain(agc::AgcChainKind::Jump, 0x40)]);
+        assert!(
+            !submission_may_draw_through_chains(&jump, false),
+            "with the follower off a chained DCB keeps today's state-only path exactly"
+        );
+        assert!(submission_may_draw_through_chains(&jump, true));
+
+        assert!(
+            !submission_may_draw_through_chains(&with(Vec::new()), true),
+            "a chainless submission must never be pulled off the state-only path"
+        );
+        assert!(
+            !submission_may_draw_through_chains(
+                &with(vec![chain(agc::AgcChainKind::Const, 0x40)]),
+                true
+            ),
+            "the constant-engine ring is never walked, so it cannot carry draws here"
+        );
+        assert!(
+            !submission_may_draw_through_chains(
+                &with(vec![chain(agc::AgcChainKind::Jump, 0)]),
+                true
+            ),
+            "an empty chain target has no packets to execute"
+        );
+        assert!(submission_may_draw_through_chains(
+            &with(vec![chain(agc::AgcChainKind::Branch, 0x10)]),
+            true
+        ));
     }
 
     #[test]
