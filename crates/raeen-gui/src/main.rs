@@ -250,6 +250,26 @@ fn main() -> anyhow::Result<()> {
     // the CLI entry). The report is logged below once logging exists.
     let title_va = raeen_runtime::reserve_title_va_window();
 
+    // Last-resort crash breadcrumbs, installed BEFORE logging — because the
+    // thing they exist to catch is a death the log cannot report.
+    //
+    // Two measured holes made runs stop with no stated cause. (a) The file log
+    // is asynchronous: `tracing_appender`'s writer thread flushes on its
+    // `WorkerGuard`'s `Drop`, which an abnormal exit skips, so the HLE thunk
+    // gateway's `tracing::error!` immediately before its `std::process::abort()`
+    // never reached the disk and the log simply truncated mid-line. (b) Nothing
+    // caught a host SEH fault on a non-guest thread: the runtime's vectored
+    // handler declines any exception on a thread with no guest context, and the
+    // minidump client attaches ONLY when the Shell set `RAEEN_CRASH_SOCKET` —
+    // so `--run-eboot`, the way titles are actually measured, had no
+    // unhandled-exception filter at all. `catch_unwind` does not close that
+    // hole: it catches Rust unwinds, never an access violation.
+    //
+    // Installed here so it also covers logging init and everything after; the
+    // records are written synchronously to `logs/last-resort.log`, and the
+    // filter chains onward so minidumps and WER still happen.
+    raeen_core::last_resort::install(std::path::Path::new(raeen_core::logging::DEFAULT_LOG_DIR));
+
     // Initialize logging to BOTH stderr and `logs/raeen.log`. `_log` must stay
     // alive for the whole process — dropping it shuts down the background
     // writer thread and loses buffered events (see `LogGuard`). Binding it here
@@ -1883,6 +1903,12 @@ fn main() -> anyhow::Result<()> {
         } else {
             info!("guest console ({} byte(s)):\n{console}", console.len());
         }
+        // Reaching here means the runner completed its own teardown, however
+        // the guest ended. Recording that is what gives the breadcrumb file its
+        // discriminating power: a `last-resort.log` holding a panic record but
+        // NO clean-exit line means the process died on that panic, and a file
+        // with neither means the death bypassed both hooks (an abort or a kill).
+        raeen_core::last_resort::mark_clean_exit();
         if std::env::var_os("RAEEN_RUNNER_CHILD").is_some()
             && let Err(error) = outcome
         {
@@ -2040,6 +2066,7 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
 
     info!("Raeen shutting down");
+    raeen_core::last_resort::mark_clean_exit();
     Ok(())
 }
 
