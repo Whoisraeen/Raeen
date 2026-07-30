@@ -684,6 +684,19 @@ attribution as that license requires.
   `src/amd/registers/gfx940.json` as the register fact that bit 5 of
   `COMPUTE_DISPATCH_INITIATOR` is `USE_THREAD_DIMENSIONS`; Raeen's Rust
   conversion and tests are original, and no Mesa code or table is copied.
+  The GTA V skipped-context-register decode (2026-07-29) uses
+  `src/amd/registers/gfx103.json` as the authoritative naming and bit-layout
+  fact for the 50 context/user-config registers a measured frame writes and the
+  PM4 decoder ignored: the `register_mappings` table resolves each context
+  offset to a name via `mm = 0x28000 + offset * 4` (user-config
+  `0x30000 + offset * 4`), and `register_types` supplies the field bit ranges
+  for `PA_SC_MODE_CNTL_0` (MSAA_ENABLE 0, VPORT_SCISSOR_ENABLE 1,
+  LINE_STIPPLE_ENABLE 2), `PA_CL_CLIP_CNTL` (VTX_KILL_OR 21,
+  DX_RASTERIZATION_KILL 22) and `CB_SHADER_MASK`. These are
+  hardware-interface facts used to name registers and place bits; the Rust
+  tables, decode and tests in `crates/kyty-graphics/src/pm4.rs` and
+  `crates/kyty-graphics/src/run.rs` are original, and no Mesa code, JSON or
+  generated header was copied into the tree.
 
 ---
 

@@ -3301,21 +3301,100 @@ impl CommandProcessor {
                 };
             }
 
+            // `PA_SC_MODE_CNTL_0` — the only one of the registers this decoder
+            // used to skip that already had a live consumer. `ScanModeControl`
+            // exists, `draw_translate` reads `vport_scissor_enable` to choose
+            // between the viewport, generic and screen scissors, and Kyty pins
+            // that field to `true`; with no writer it could never be turned
+            // off, so a guest that cleared bit 1 still had
+            // `PA_SC_VPORT_SCISSOR_0` applied to every draw. The AGC Gen5
+            // default for this register is 0x2 (VPORT_SCISSOR_ENABLE alone),
+            // which decodes back to exactly Kyty's default struct — so a
+            // stream that never writes it is unaffected.
+            pm4::PA_SC_MODE_CNTL_0 => {
+                use pm4::pa_sc_mode_cntl_0 as f;
+                self.ctx.scan_mode_control = crate::hw_regs::ScanModeControl {
+                    msaa_enable: pm4::field(value, f::MSAA_ENABLE) != 0,
+                    vport_scissor_enable: pm4::field(value, f::VPORT_SCISSOR_ENABLE) != 0,
+                    line_stipple_enable: pm4::field(value, f::LINE_STIPPLE_ENABLE) != 0,
+                };
+            }
+
             pm4::CB_BLEND_RED => self.ctx.blend_color.red = f32::from_bits(value),
             pm4::CB_BLEND_GREEN => self.ctx.blend_color.green = f32::from_bits(value),
             pm4::CB_BLEND_BLUE => self.ctx.blend_color.blue = f32::from_bits(value),
             pm4::CB_BLEND_ALPHA => self.ctx.blend_color.alpha = f32::from_bits(value),
 
             _ => {
+                // `PA_CL_CLIP_CNTL` and the EQAA sample mask are still not
+                // emulated, but both can suppress *every* fragment on real
+                // hardware, so a set kill bit must not look like ordinary
+                // register noise. Decode-and-report only: honouring these
+                // could only ever remove geometry, and guessing at their
+                // interaction with our fixed 1-sample Vulkan targets would
+                // trade a visible gap for silently wrong pixels.
+                self.report_suppressing_context_bits(reg, value);
                 if self.first(SkipKey::Reg(RegFile::Context, reg))
                     && warn_skip_reg_once(RegFile::Context, reg)
                 {
-                    warn!(
-                        reg = format_args!("{reg:#06x}"),
-                        "unknown context register — write skipped"
-                    );
+                    match pm4::context_reg_name(reg) {
+                        Some(name) => warn!(
+                            reg = format_args!("{reg:#06x}"),
+                            name, "context register not modelled — write skipped"
+                        ),
+                        None => warn!(
+                            reg = format_args!("{reg:#06x}"),
+                            "unknown context register — write skipped"
+                        ),
+                    }
                 }
             }
+        }
+    }
+
+    /// Report a skipped context-register write whose value asks for something
+    /// that would discard all rasterization on real hardware.
+    ///
+    /// This exists because "1,144 draws executed and every render target is a
+    /// single flat colour" is indistinguishable, from the log alone, between
+    /// "we dropped the geometry" and "the guest asked for nothing to be drawn".
+    /// These are the bits that make the second case possible. Nothing here
+    /// changes behaviour — it only makes the difference measurable in one run.
+    fn report_suppressing_context_bits(&mut self, reg: u32, value: u32) {
+        let (note, message) = match reg {
+            pm4::PA_CL_CLIP_CNTL => {
+                use pm4::pa_cl_clip_cntl as f;
+                if pm4::field(value, f::DX_RASTERIZATION_KILL) == 0
+                    && pm4::field(value, f::VTX_KILL_OR) == 0
+                {
+                    return;
+                }
+                (
+                    "pa_cl_clip_cntl_kill",
+                    "PA_CL_CLIP_CNTL asks to KILL rasterization (DX_RASTERIZATION_KILL \
+                     bit 22 / VTX_KILL_OR bit 21) — on hardware this discards every \
+                     primitive; not emulated, so draws still rasterize here",
+                )
+            }
+            pm4::PA_SC_AA_MASK_X0Y0_X1Y0 | pm4::PA_SC_AA_MASK_X0Y1_X1Y1 => {
+                if value != 0 {
+                    return;
+                }
+                (
+                    "zero_eqaa_sample_mask",
+                    "EQAA sample mask is zero — on hardware no sample is covered and \
+                     every draw writes nothing; not emulated, so coverage is \
+                     unaffected here",
+                )
+            }
+            _ => return,
+        };
+        if self.first(SkipKey::Note(note)) {
+            warn!(
+                reg = format_args!("{reg:#06x}"),
+                value = format_args!("{value:#010x}"),
+                message
+            );
         }
     }
 
@@ -3562,10 +3641,16 @@ impl CommandProcessor {
                 if self.first(SkipKey::Reg(RegFile::UserConfig, reg))
                     && warn_skip_reg_once(RegFile::UserConfig, reg)
                 {
-                    warn!(
-                        reg = format_args!("{reg:#06x}"),
-                        "unknown user-config register — write skipped"
-                    );
+                    match pm4::user_config_reg_name(reg) {
+                        Some(name) => warn!(
+                            reg = format_args!("{reg:#06x}"),
+                            name, "user-config register not modelled — write skipped"
+                        ),
+                        None => warn!(
+                            reg = format_args!("{reg:#06x}"),
+                            "unknown user-config register — write skipped"
+                        ),
+                    }
                 }
             }
         }
@@ -5363,6 +5448,154 @@ mod tests {
         cp.run_with_memory(&dcb, &mut sink, Some(&mem))
             .expect("skip with only a draw base");
         assert!(sink.dispatches.is_empty());
+    }
+
+    // ---- PA_SC_MODE_CNTL_0 ------------------------------------------------
+
+    /// `PA_SC_MODE_CNTL_0` (0x0292) carries VPORT_SCISSOR_ENABLE in bit 1.
+    ///
+    /// This register used to fall through to "unknown context register — write
+    /// skipped", which made [`crate::hw_regs::ScanModeControl`] a write-only
+    /// default: Kyty pins `vport_scissor_enable` to **true** and nothing in the
+    /// tree ever assigned it, so a guest that *cleared* the bit still got the
+    /// viewport scissor forcibly applied to every draw. That is a global
+    /// rasterization gate — `raeen-gpu`'s `draw_translate` prefers
+    /// `PA_SC_VPORT_SCISSOR_0` over the generic and screen scissors whenever
+    /// this flag is set — so a stale or small viewport scissor could clip every
+    /// draw in a frame while each one still "executed".
+    #[test]
+    fn set_context_reg_decodes_pa_sc_mode_cntl_0() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        // MSAA_ENABLE (bit 0) and LINE_STIPPLE_ENABLE (bit 2) set,
+        // VPORT_SCISSOR_ENABLE (bit 1) deliberately CLEAR.
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::PA_SC_MODE_CNTL_0,
+            0b101,
+        ];
+        cp.run(&dcb, &mut sink).expect("PA_SC_MODE_CNTL_0 write");
+        let smc = cp.get_ctx().scan_mode_control;
+        assert!(smc.msaa_enable, "bit 0 must set msaa_enable");
+        assert!(
+            !smc.vport_scissor_enable,
+            "bit 1 clear must DISABLE the viewport scissor; leaving Kyty's \
+             `true` default in place applies a scissor the guest turned off"
+        );
+        assert!(
+            smc.line_stipple_enable,
+            "bit 2 must set line_stipple_enable"
+        );
+    }
+
+    /// The AGC Gen5 register-defaults table serves `PA_SC_MODE_CNTL_0 = 0x2`
+    /// (`raeen-hle` `libsce_agc_reg_defaults::CX_REG_INFO1`) — VPORT_SCISSOR_ENABLE
+    /// alone. Decoding that value must reproduce Kyty's hand-written default
+    /// exactly, so a guest that blits the defaults block is a no-op change.
+    #[test]
+    fn pa_sc_mode_cntl_0_agc_default_round_trips_to_the_kyty_default() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::PA_SC_MODE_CNTL_0,
+            0x0000_0002,
+        ];
+        cp.run(&dcb, &mut sink).expect("AGC default write");
+        assert_eq!(
+            cp.get_ctx().scan_mode_control,
+            crate::hw_regs::ScanModeControl::default(),
+            "the AGC default value must decode to Kyty's default struct"
+        );
+    }
+
+    /// Guard for the titles that already render: a command stream that never
+    /// writes 0x0292 must keep Kyty's default `ScanModeControl`, i.e. behave
+    /// bit-for-bit as it did before this register was decoded. This is what
+    /// protects Minecraft / Dead Cells / Blasphemous II from the change above.
+    #[test]
+    fn scan_mode_control_keeps_its_default_when_pa_sc_mode_cntl_0_is_never_written() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::CB_TARGET_MASK,
+            0xF,
+        ];
+        cp.run(&dcb, &mut sink).expect("unrelated register write");
+        assert_eq!(
+            cp.get_ctx().scan_mode_control,
+            crate::hw_regs::ScanModeControl::default()
+        );
+        assert!(
+            cp.get_ctx().scan_mode_control.vport_scissor_enable,
+            "an untouched stream must still get vport_scissor_enable = true"
+        );
+    }
+
+    /// Every context register a GTA V frame was measured writing and this
+    /// decoder skips must at least be *named* in the log. The offsets are the
+    /// measured skip set; the names come from Mesa's `gfx103.json`.
+    ///
+    /// 0x0292 is deliberately absent: it is now decoded, so it must no longer
+    /// reach the skip path at all.
+    #[test]
+    fn every_measured_skipped_context_register_is_named() {
+        let measured = [
+            0x008f, 0x00b4, 0x00b5, 0x01b8, 0x01c2, 0x01c3, 0x01c4, 0x01ff, 0x0201, 0x0204, 0x0207,
+            0x0291, 0x029b, 0x02ab, 0x02ce, 0x02d3, 0x02d5, 0x02dc, 0x02df, 0x02e0, 0x02e1, 0x02e2,
+            0x02e3, 0x02e4, 0x02f5, 0x02f6, 0x02f8, 0x02fe, 0x02ff, 0x0300, 0x0301, 0x0302, 0x0303,
+            0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0309, 0x030a, 0x030b, 0x030c, 0x030d, 0x030e,
+            0x030f, 0x0310,
+        ];
+        for reg in measured {
+            assert!(
+                pm4::context_reg_name(reg).is_some(),
+                "context register {reg:#06x} is skipped but unnamed — a bare \
+                 offset in the log costs the next investigation a register-database \
+                 lookup"
+            );
+        }
+        for reg in [0x024a, 0x025b, 0x0262] {
+            assert!(
+                pm4::user_config_reg_name(reg).is_some(),
+                "user-config register {reg:#06x} is skipped but unnamed"
+            );
+        }
+        assert_eq!(
+            pm4::context_reg_name(pm4::PA_SC_MODE_CNTL_0),
+            None,
+            "PA_SC_MODE_CNTL_0 is decoded now and must not be listed as skipped"
+        );
+    }
+
+    /// `PA_CL_CLIP_CNTL`'s kill bits and a zero EQAA sample mask stay
+    /// unemulated, but they must not change rasterization either — the point of
+    /// decoding them is the log line, not a behaviour change. A stream that
+    /// sets every one of them must still leave the context able to draw.
+    #[test]
+    fn clip_kill_and_zero_aa_mask_are_reported_without_changing_state() {
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        let before = cp.get_ctx().scan_mode_control;
+        let dcb = vec![
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::PA_CL_CLIP_CNTL,
+            (1 << 22) | (1 << 21) | (1 << 16),
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::PA_SC_AA_MASK_X0Y0_X1Y0,
+            0,
+            header(3, pm4::IT_SET_CONTEXT_REG, pm4::R_ZERO),
+            pm4::PA_SC_AA_MASK_X0Y1_X1Y1,
+            0,
+        ];
+        cp.run(&dcb, &mut sink)
+            .expect("kill bits must not abort the command buffer");
+        assert_eq!(
+            cp.get_ctx().scan_mode_control,
+            before,
+            "reporting a kill bit must not disturb any modelled state"
+        );
     }
 
     // ---- indirect registers -----------------------------------------------

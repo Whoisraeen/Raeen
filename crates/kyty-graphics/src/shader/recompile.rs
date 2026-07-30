@@ -4596,6 +4596,12 @@ fn recompile_buffer_store_format_x_flexible(
 /// base pair (`src[1]`) to the 32-bit VGPR offset. `src[2]` is the instruction
 /// immediate offset. Loads past the bound length yield 0; stores past it drop
 /// (RDNA out-of-bounds behaviour).
+///
+/// Pre-existing `clippy::too_many_arguments` (8/7): every parameter is a
+/// distinct piece of the FLAT/GLOBAL lowering and grouping them into a struct
+/// would only move the same eight values behind one more indirection. Allowed
+/// rather than restructured — this function's behaviour is not in question.
+#[allow(clippy::too_many_arguments)]
 fn flat_mem(
     index: u32,
     code: &ShaderCode,
