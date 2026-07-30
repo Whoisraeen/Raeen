@@ -1159,6 +1159,15 @@ pub struct DepthState<'a> {
     pub clear_stencil_value: u32,
     /// `[min, max]` viewport depth from `PA_CL_VPORT_ZOFFSET`/`_ZSCALE` (Kyty
     /// GraphicsRender.cpp L2124: min = zoffset, max = zoffset + zscale).
+    ///
+    /// **Decoded but NOT applied.** The `vk::Viewport` submitted for every draw
+    /// hardcodes `min_depth: 0.0, max_depth: 1.0`; this field's only readers are
+    /// diagnostics (the `TRACE_DRAWS` summary and
+    /// `draw_translate::note_dropped_viewport_depth_range`, which WARNs when the
+    /// guest range is anything else). Wiring it through means also deciding the
+    /// `DX_CLIP_SPACE_DEF` convention and reverse-Z support
+    /// (`VK_EXT_depth_range_unrestricted`), so it is a named gap rather than a
+    /// silent one.
     pub viewport_depth: [f32; 2],
     /// Prior depth-plane contents for a LOAD, mirroring [`DrawState::initial`]:
     /// `width * height * depth_texel_bytes(format)` bytes, tightly packed.

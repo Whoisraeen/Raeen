@@ -458,6 +458,11 @@ fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, D
     // is in attachment lifetime/clear/compare state rather than vertex
     // translation. Never changes production behaviour when unset.
     let disable_depth = crate::diagnostics::gpu_env().no_depth;
+    let viewport_depth = [vp.zoffset, vp.zoffset + vp.zscale];
+    let compare_op = vk::CompareOp::from_raw(i32::from(control.zfunc));
+    if control.z_enable && !disable_depth {
+        note_dropped_viewport_depth_range(viewport_depth, compare_op, ctx.depth_clear_value);
+    }
     Ok(Some(DepthState {
         target_base: Some(target.z_write_base_addr),
         format,
@@ -465,7 +470,7 @@ fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, D
         write_enable: control.z_write_enable
             && !target.depth_view.depth_write_disable
             && !disable_depth,
-        compare_op: vk::CompareOp::from_raw(i32::from(control.zfunc)),
+        compare_op,
         // Diagnostic bisection only: lets a real-title run distinguish an
         // empty frame caused by stencil rejection from shader/geometry faults.
         // Production behaviour remains register-derived when unset.
@@ -476,7 +481,7 @@ fn depth_state_from_regs(ctx: &Context) -> Result<Option<DepthState<'static>>, D
         clear_stencil: ctx.render_control.stencil_clear_enable,
         clear_depth_value: ctx.depth_clear_value,
         clear_stencil_value: u32::from(ctx.stencil_clear_value),
-        viewport_depth: [vp.zoffset, vp.zoffset + vp.zscale],
+        viewport_depth,
         initial: None,
         initial_stencil: None,
     }))
@@ -3492,6 +3497,66 @@ fn note_unsupported_tile_mode(mode: u8, format: u16) {
     }
 }
 
+/// The one viewport depth range the Vulkan pipeline actually implements.
+///
+/// [`crate::vulkan::offscreen`] builds every draw's `vk::Viewport` with
+/// `min_depth: 0.0, max_depth: 1.0` hardcoded, so a guest range equal to this
+/// is honoured by coincidence and any other range is silently discarded.
+const PIPELINE_VIEWPORT_DEPTH: [f32; 2] = [0.0, 1.0];
+
+/// Report that `PA_CL_VPORT_ZOFFSET`/`_ZSCALE` were decoded and then **not
+/// applied**.
+///
+/// [`DepthState::viewport_depth`] is computed from those two registers, but its
+/// only reader is a `TRACE_DRAWS` summary — the submitted `vk::Viewport`
+/// hardcodes [`PIPELINE_VIEWPORT_DEPTH`]. Nothing said so, which made this the
+/// kind of gap that survives several investigations: the register is decoded,
+/// the field exists and looks live, and the drop happens in another file.
+///
+/// It earns a WARN rather than a DEBUG because of what it can do when the guest
+/// uses reverse-Z (`zoffset = 1, zscale = -1`, i.e. `[1, 0]` — the range
+/// `vulkan::instance` already anticipates for PS5 titles). Substituting `[0, 1]`
+/// then inverts every fragment's window depth, and against the matching
+/// `GREATER*` compare and a 0.0 depth clear, EVERY fragment fails the depth
+/// test. An early depth test rejects them before the fragment shader runs, so
+/// hardware pipeline statistics read `clip_primitives > 0` with
+/// `fs_invocations = 0` — indistinguishable, from the counters alone, from
+/// geometry that landed off-target.
+///
+/// This is a report, not a claim that it is happening: only a run can say
+/// whether a title programs a range other than `[0, 1]`. Deduped per distinct
+/// (range, compare) so a per-draw rewrite cannot flood the log.
+fn note_dropped_viewport_depth_range(range: [f32; 2], compare: vk::CompareOp, clear: f32) {
+    if range == PIPELINE_VIEWPORT_DEPTH {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32, i32)>>> = Mutex::new(None);
+    let key = (range[0].to_bits(), range[1].to_bits(), compare.as_raw());
+    let first = SEEN
+        .lock()
+        .map(|mut set| set.get_or_insert_with(HashSet::new).insert(key))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    tracing::warn!(
+        guest_min_depth = range[0],
+        guest_max_depth = range[1],
+        applied_min_depth = PIPELINE_VIEWPORT_DEPTH[0],
+        applied_max_depth = PIPELINE_VIEWPORT_DEPTH[1],
+        compare_op = format_args!("{compare:?}"),
+        depth_clear_value = clear,
+        reverse_z = range[1] < range[0],
+        "PA_CL_VPORT_ZOFFSET/ZSCALE viewport depth range is NOT applied — the \
+         Vulkan viewport hardcodes minDepth=0.0/maxDepth=1.0. If this range is \
+         reverse-Z, every fragment's window depth is inverted against the depth \
+         test, which an early depth test can reject before the fragment shader \
+         runs (reads as clip_primitives>0 with fs_invocations=0)."
+    );
+}
+
 fn eud_raw_window_want_bytes(required_dwords: u32) -> u64 {
     const MIN_BYTES: u64 = 256 * 1024;
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -6386,6 +6451,53 @@ mod tests {
         assert_eq!(depth.compare_op, vk::CompareOp::LESS);
         assert!(depth.clear_depth);
         assert_eq!(depth.clear_depth_value, 0.625);
+    }
+
+    /// The guest viewport depth range is computed from
+    /// `PA_CL_VPORT_ZOFFSET`/`_ZSCALE`, including the reverse-Z case a PS5 title
+    /// programs as `zoffset = 1, zscale = -1`. This pins the decode; the range
+    /// is then deliberately NOT applied (see
+    /// `note_dropped_viewport_depth_range`), which is what the WARN reports.
+    #[test]
+    fn reverse_z_viewport_depth_is_decoded_even_though_it_is_not_applied() {
+        let mut ctx = ctx_96x48();
+        ctx.depth_control.z_enable = true;
+        ctx.depth_control.zfunc = vk::CompareOp::GREATER_OR_EQUAL.as_raw() as u8;
+        ctx.depth_render_target.z_info.format = 3;
+        ctx.depth_render_target.z_write_base_addr = 0x9000_0000;
+        ctx.screen_viewport.viewports[0].zoffset = 1.0;
+        ctx.screen_viewport.viewports[0].zscale = -1.0;
+
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV)
+            .expect("depth-bearing register state");
+        let depth = state.depth.expect("depth attachment is wired");
+        assert_eq!(
+            depth.viewport_depth,
+            [1.0, 0.0],
+            "min = zoffset, max = zoffset + zscale"
+        );
+        assert_ne!(
+            depth.viewport_depth, PIPELINE_VIEWPORT_DEPTH,
+            "a reverse-Z range is exactly the case the pipeline's hardcoded \
+             [0, 1] silently replaces"
+        );
+    }
+
+    /// The ordinary range is the one the hardcoded pipeline viewport already
+    /// matches, so it must NOT be reported as dropped — otherwise the WARN fires
+    /// on every title that renders correctly today and means nothing.
+    #[test]
+    fn the_identity_depth_range_is_what_the_pipeline_applies() {
+        let mut ctx = ctx_96x48();
+        ctx.depth_control.z_enable = true;
+        ctx.depth_render_target.z_info.format = 3;
+        ctx.depth_render_target.z_write_base_addr = 0x9000_0000;
+        ctx.screen_viewport.viewports[0].zoffset = 0.0;
+        ctx.screen_viewport.viewports[0].zscale = 1.0;
+
+        let state = draw_state_from_regs(&ctx, &ucfg_rect(), 3, SPIRV, SPIRV).expect("valid");
+        let depth = state.depth.expect("depth attachment is wired");
+        assert_eq!(depth.viewport_depth, PIPELINE_VIEWPORT_DEPTH);
     }
 
     #[test]
