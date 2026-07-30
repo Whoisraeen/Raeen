@@ -411,6 +411,107 @@ impl Default for ScanModeControl {
     }
 }
 
+/// `PA_CL_CLIP_CNTL` (context offset 0x0204) — the primitive clipper's gates.
+///
+/// Not a Kyty struct: `HardwareContext.h` has no clipper model at all, which is
+/// why the register was skipped outright. Field layout from Mesa's
+/// `gfx103.json` via [`crate::pm4::pa_cl_clip_cntl`]; the emulation contract
+/// for [`Self::clip_disable`] follows shadPS4 (see [`Self::is_clip_disabled`]).
+///
+/// **All-zero is the real hardware/AGC default** (`libsce_agc_reg_defaults`
+/// lists `(0x0204, 0x00000000)`), so `#[derive(Default)]` is correct here and a
+/// stream that never writes the register decodes to exactly this.
+///
+/// Every field is decoded so the log can *name* what it is refusing. Only
+/// `clip_disable` is acted on; the rest are reported. Guessing at the others
+/// would trade a named gap for silently wrong geometry.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipControl {
+    /// `UCP_ENA_0..5` as one 6-bit mask: user clip planes enabled.
+    pub ucp_ena: u8,
+    pub ps_ucp_y_scale_neg: bool,
+    pub ps_ucp_mode: u8,
+    /// Bit 16. Disables the primitive clipper: vertex positions are no longer
+    /// required to land inside the view frustum.
+    pub clip_disable: bool,
+    pub ucp_cull_only_ena: bool,
+    pub boundary_edge_flag_ena: bool,
+    /// Bit 19. 0 = OpenGL clip space (`-w <= z <= w`), 1 = DirectX
+    /// (`0 <= z <= w`).
+    pub dx_clip_space_def: bool,
+    pub dis_clip_err_detect: bool,
+    /// Bit 21. **Not an unconditional kill.** This selects the *condition* for
+    /// the per-vertex kill flag: 0 = kill the primitive when ALL vertices are
+    /// flagged, 1 = when ANY is (shadPS4 `PrimKillCond`,
+    /// `regs_primitive.h` L20-23). It only bites when the VS emits a kill
+    /// flag, which this pipeline does not produce.
+    pub vtx_kill_or: bool,
+    /// Bit 22. Discards **all** rasterization on hardware.
+    pub dx_rasterization_kill: bool,
+    pub dx_linear_attr_clip_ena: bool,
+    pub vte_vport_provoke_disable: bool,
+    pub zclip_near_disable: bool,
+    pub zclip_far_disable: bool,
+    pub zclip_prog_near_ena: bool,
+    /// The raw register value, kept so a diagnostic can print exactly what the
+    /// guest wrote without the caller having to re-encode the fields.
+    pub raw: u32,
+}
+
+impl ClipControl {
+    /// Decode a raw `PA_CL_CLIP_CNTL` write.
+    #[must_use]
+    pub const fn from_raw(value: u32) -> Self {
+        use crate::pm4::field;
+        use crate::pm4::pa_cl_clip_cntl as f;
+        Self {
+            ucp_ena: field(value, f::UCP_ENA) as u8,
+            ps_ucp_y_scale_neg: field(value, f::PS_UCP_Y_SCALE_NEG) != 0,
+            ps_ucp_mode: field(value, f::PS_UCP_MODE) as u8,
+            clip_disable: field(value, f::CLIP_DISABLE) != 0,
+            ucp_cull_only_ena: field(value, f::UCP_CULL_ONLY_ENA) != 0,
+            boundary_edge_flag_ena: field(value, f::BOUNDARY_EDGE_FLAG_ENA) != 0,
+            dx_clip_space_def: field(value, f::DX_CLIP_SPACE_DEF) != 0,
+            dis_clip_err_detect: field(value, f::DIS_CLIP_ERR_DETECT) != 0,
+            vtx_kill_or: field(value, f::VTX_KILL_OR) != 0,
+            dx_rasterization_kill: field(value, f::DX_RASTERIZATION_KILL) != 0,
+            dx_linear_attr_clip_ena: field(value, f::DX_LINEAR_ATTR_CLIP_ENA) != 0,
+            vte_vport_provoke_disable: field(value, f::VTE_VPORT_PROVOKE_DISABLE) != 0,
+            zclip_near_disable: field(value, f::ZCLIP_NEAR_DISABLE) != 0,
+            zclip_far_disable: field(value, f::ZCLIP_FAR_DISABLE) != 0,
+            zclip_prog_near_ena: field(value, f::ZCLIP_PROG_NEAR_ENA) != 0,
+            raw: value,
+        }
+    }
+
+    /// True when the guest turned the primitive clipper off.
+    ///
+    /// shadPS4 `AmdGpu::Liverpool::IsClipDisabled`
+    /// (`src/video_core/amdgpu/regs.h` L183-185) also folds in
+    /// `primitive_type == RectList`, because a rect list carries window-space
+    /// positions. That half is deliberately **not** mirrored here: this struct
+    /// only sees one register, and the primitive type lives elsewhere. The
+    /// caller that owns both must combine them.
+    #[must_use]
+    pub const fn is_clip_disabled(&self) -> bool {
+        self.clip_disable
+    }
+
+    /// Whether any decoded bit asks for something this pipeline does not
+    /// implement, i.e. whether the log must say so. `clip_disable` is absent:
+    /// it *is* implemented.
+    #[must_use]
+    pub const fn has_unimplemented_gate(&self) -> bool {
+        self.ucp_ena != 0
+            || self.dx_rasterization_kill
+            || self.vtx_kill_or
+            || self.dx_clip_space_def
+            || self.zclip_near_disable
+            || self.zclip_far_disable
+            || self.zclip_prog_near_ena
+    }
+}
+
 /// Kyty: `DepthControl` (L246) — `DB_DEPTH_CONTROL` decode.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DepthControl {
@@ -922,5 +1023,81 @@ mod tests {
         };
         assert_eq!(a.width, 95);
         assert_eq!(a.height, 47);
+    }
+
+    /// The AGC/hardware default for `PA_CL_CLIP_CNTL` is 0x00000000
+    /// (`raeen-hle` `libsce_agc_reg_defaults`), so a decode of it must equal the
+    /// derived `Default` — that equality is what makes "a stream that never
+    /// writes 0x0204 behaves exactly as before" true by construction.
+    #[test]
+    fn clip_control_zero_decodes_to_the_default() {
+        assert_eq!(ClipControl::from_raw(0), ClipControl::default());
+        assert!(!ClipControl::default().is_clip_disabled());
+        assert!(!ClipControl::default().has_unimplemented_gate());
+    }
+
+    /// Every named bit lands in its own field. A transposed shift here would
+    /// silently read a neighbouring gate — `CLIP_DISABLE` (16) sits three bits
+    /// from `DX_CLIP_SPACE_DEF` (19) and one from `UCP_CULL_ONLY_ENA` (17).
+    #[test]
+    fn clip_control_decodes_each_bit_position_independently() {
+        /// Reads one decoded flag, so the bit positions can be table-driven.
+        type Probe = fn(&ClipControl) -> bool;
+        let cases: [(u32, Probe); 12] = [
+            (1 << 13, |c| c.ps_ucp_y_scale_neg),
+            (1 << 16, |c| c.clip_disable),
+            (1 << 17, |c| c.ucp_cull_only_ena),
+            (1 << 18, |c| c.boundary_edge_flag_ena),
+            (1 << 19, |c| c.dx_clip_space_def),
+            (1 << 20, |c| c.dis_clip_err_detect),
+            (1 << 21, |c| c.vtx_kill_or),
+            (1 << 22, |c| c.dx_rasterization_kill),
+            (1 << 24, |c| c.dx_linear_attr_clip_ena),
+            (1 << 25, |c| c.vte_vport_provoke_disable),
+            (1 << 26, |c| c.zclip_near_disable),
+            (1 << 27, |c| c.zclip_far_disable),
+        ];
+        for (raw, get) in cases {
+            let c = ClipControl::from_raw(raw);
+            assert!(get(&c), "bit for {raw:#010x} did not decode");
+            assert_eq!(c.raw, raw);
+            // Exactly one flag set: compare against a decode of no bits with
+            // only `raw` differing.
+            let only = ClipControl {
+                raw,
+                ..Default::default()
+            };
+            assert_ne!(c, only, "{raw:#010x} decoded to nothing");
+        }
+        assert_eq!(ClipControl::from_raw(0x3F).ucp_ena, 0x3F);
+        assert_eq!(ClipControl::from_raw(0x1F).ucp_ena, 0x1F);
+        assert_eq!(ClipControl::from_raw(0xC000).ps_ucp_mode, 3);
+        assert!(ClipControl::from_raw(1 << 28).zclip_prog_near_ena);
+    }
+
+    /// `UCP_ENA` must not swallow the `PS_UCP_*` bits above it, and
+    /// `CLIP_DISABLE` must not be confused with a user clip plane.
+    #[test]
+    fn clip_control_ucp_mask_is_six_bits_wide() {
+        assert_eq!(
+            ClipControl::from_raw(0xFFFF_FFFF).ucp_ena,
+            0x3F,
+            "UCP_ENA is 6 bits (Mesa UCP_ENA_0..5)"
+        );
+        assert_eq!(ClipControl::from_raw(1 << 16).ucp_ena, 0);
+        assert!(!ClipControl::from_raw(0x3F).clip_disable);
+    }
+
+    /// `clip_disable` on its own is implemented, so it must NOT be reported as
+    /// an unimplemented gate; the bits we refuse must be.
+    #[test]
+    fn clip_disable_alone_is_not_an_unimplemented_gate() {
+        assert!(!ClipControl::from_raw(1 << 16).has_unimplemented_gate());
+        for raw in [1 << 22, 1 << 21, 1 << 19, 1 << 26, 1 << 27, 1 << 28, 0x1] {
+            assert!(
+                ClipControl::from_raw(raw).has_unimplemented_gate(),
+                "{raw:#010x} must be reported as a refused gate"
+            );
+        }
     }
 }

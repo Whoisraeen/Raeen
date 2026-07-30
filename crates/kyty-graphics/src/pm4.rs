@@ -623,16 +623,31 @@ pub mod pa_sc_offset_scissor {
 /// `PA_CL_CLIP_CNTL` field layout (Mesa `gfx103.json`, mm `0x28810`, context
 /// offset 0x0204).
 ///
-/// Only the bits that can suppress rasterization outright are named. They are
-/// **decoded for diagnostics, not emulated** — see
-/// [`crate::run`]'s clip-control handling.
+/// Every field Mesa's gfx103 register database names is listed, so a decode of
+/// this register can account for all 32 bits instead of quietly ignoring the
+/// ones nobody looked up yet: a *named* refusal is the whole point of
+/// [`crate::hw_regs::ClipControl`]. Bit positions cross-checked against
+/// shadPS4's `AmdGpu::ClipperControl` (`src/video_core/amdgpu/regs_primitive.h`
+/// L23-42), which agrees field for field.
+///
+/// `UCP_ENA` is the 6-bit user-clip-plane enable mask (Mesa splits it into
+/// `UCP_ENA_0..5`; one field is easier to test as "any plane enabled").
 pub mod pa_cl_clip_cntl {
+    field!(UCP_ENA, 0, 0x3F);
+    field!(PS_UCP_Y_SCALE_NEG, 13, 0x1);
+    field!(PS_UCP_MODE, 14, 0x3);
     field!(CLIP_DISABLE, 16, 0x1);
+    field!(UCP_CULL_ONLY_ENA, 17, 0x1);
+    field!(BOUNDARY_EDGE_FLAG_ENA, 18, 0x1);
     field!(DX_CLIP_SPACE_DEF, 19, 0x1);
+    field!(DIS_CLIP_ERR_DETECT, 20, 0x1);
     field!(VTX_KILL_OR, 21, 0x1);
     field!(DX_RASTERIZATION_KILL, 22, 0x1);
+    field!(DX_LINEAR_ATTR_CLIP_ENA, 24, 0x1);
+    field!(VTE_VPORT_PROVOKE_DISABLE, 25, 0x1);
     field!(ZCLIP_NEAR_DISABLE, 26, 0x1);
     field!(ZCLIP_FAR_DISABLE, 27, 0x1);
+    field!(ZCLIP_PROG_NEAR_ENA, 28, 0x1);
 }
 
 /// Human-readable names for the context registers this decoder does not model.

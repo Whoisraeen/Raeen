@@ -191,6 +191,40 @@ fn warn_skip_reg_once(file: RegFile, reg: u32) -> bool {
         .insert((file, reg))
 }
 
+/// Process-global dedup for the *values* written to a rasterization-gate
+/// register, so the log reports each distinct value once rather than once per
+/// register.
+///
+/// `warn_skip_reg_once` above is keyed on the register alone, which is right
+/// for "this register is not modelled" but useless for "what did the guest
+/// actually ask for": a title that writes `PA_CL_CLIP_CNTL` twice — once benign
+/// and once with a gate set — would have only the first write reported, and
+/// which one that is depends on submit order. Keyed on `(reg, value)` instead,
+/// every distinct request shows up exactly once.
+///
+/// Bounded at [`GATE_VALUE_REPORT_LIMIT`] distinct values because the key
+/// includes guest data: a stream that rewrites the register with a new value
+/// per draw must not be able to grow this set or the log without limit.
+static WARNED_GATE_VALUES: std::sync::Mutex<BTreeSet<(u32, u32)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Distinct `(register, value)` pairs reported before the gate diagnostic goes
+/// quiet. A title writes a handful of clip-control values, not sixteen.
+const GATE_VALUE_REPORT_LIMIT: usize = 16;
+
+/// True the first time this `(reg, value)` pair is seen process-wide, until the
+/// report budget is spent. Recovers from a poisoned lock for the same reason
+/// [`warn_skip_reg_once`] does.
+fn warn_gate_value_once(reg: u32, value: u32) -> bool {
+    let mut seen = WARNED_GATE_VALUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.len() >= GATE_VALUE_REPORT_LIMIT && !seen.contains(&(reg, value)) {
+        return false;
+    }
+    seen.insert((reg, value))
+}
+
 /// One process-wide note that the CB compression-metadata registers
 /// (DCC/CMASK/FMASK addresses, slices, and DCC_CONTROL) are decoded into
 /// named `RenderTarget` fields but deliberately NOT emulated: every target
@@ -4283,13 +4317,22 @@ impl CommandProcessor {
                 if self.first(SkipKey::Reg(RegFile::Context, reg))
                     && warn_skip_reg_once(RegFile::Context, reg)
                 {
+                    // The value is part of the line because a named register
+                    // with no value is only half a diagnostic: whether a skip
+                    // matters is almost always a property of the bits the guest
+                    // wrote, not of the register. `PA_CL_CLIP_CNTL` cost one
+                    // investigation a whole measurement round-trip to learn
+                    // which bits were set.
                     match pm4::context_reg_name(reg) {
                         Some(name) => warn!(
                             reg = format_args!("{reg:#06x}"),
-                            name, "context register not modelled — write skipped"
+                            name,
+                            value = format_args!("{value:#010x}"),
+                            "context register not modelled — write skipped"
                         ),
                         None => warn!(
                             reg = format_args!("{reg:#06x}"),
+                            value = format_args!("{value:#010x}"),
                             "unknown context register — write skipped"
                         ),
                     }
@@ -4309,18 +4352,8 @@ impl CommandProcessor {
     fn report_suppressing_context_bits(&mut self, reg: u32, value: u32) {
         let (note, message) = match reg {
             pm4::PA_CL_CLIP_CNTL => {
-                use pm4::pa_cl_clip_cntl as f;
-                if pm4::field(value, f::DX_RASTERIZATION_KILL) == 0
-                    && pm4::field(value, f::VTX_KILL_OR) == 0
-                {
-                    return;
-                }
-                (
-                    "pa_cl_clip_cntl_kill",
-                    "PA_CL_CLIP_CNTL asks to KILL rasterization (DX_RASTERIZATION_KILL \
-                     bit 22 / VTX_KILL_OR bit 21) — on hardware this discards every \
-                     primitive; not emulated, so draws still rasterize here",
-                )
+                self.report_clip_control(value);
+                return;
             }
             pm4::PA_SC_AA_MASK_X0Y0_X1Y0 | pm4::PA_SC_AA_MASK_X0Y1_X1Y1 => {
                 if value != 0 {
@@ -4342,6 +4375,35 @@ impl CommandProcessor {
                 message
             );
         }
+    }
+
+    /// Report every `PA_CL_CLIP_CNTL` value the guest writes, fully decoded,
+    /// once per distinct value.
+    ///
+    /// The previous version of this reported only `DX_RASTERIZATION_KILL` /
+    /// `VTX_KILL_OR` and returned silently otherwise, so a GTA V frame that
+    /// writes the register produced a bare "write skipped" line with no value in
+    /// it — leaving `CLIP_DISABLE`, the one bit here that changes where geometry
+    /// lands, unmeasurable from a log. Naming all of the bits costs one WARN per
+    /// distinct value and answers the question in a single run.
+    fn report_clip_control(&mut self, value: u32) {
+        let clip = crate::hw_regs::ClipControl::from_raw(value);
+        if !warn_gate_value_once(pm4::PA_CL_CLIP_CNTL, value) {
+            return;
+        }
+        warn!(
+            reg = format_args!("{:#06x}", pm4::PA_CL_CLIP_CNTL),
+            value = format_args!("{value:#010x}"),
+            clip_disable = clip.clip_disable,
+            dx_rasterization_kill = clip.dx_rasterization_kill,
+            vtx_kill_or = clip.vtx_kill_or,
+            dx_clip_space_def = clip.dx_clip_space_def,
+            zclip_near_disable = clip.zclip_near_disable,
+            zclip_far_disable = clip.zclip_far_disable,
+            zclip_prog_near_ena = clip.zclip_prog_near_ena,
+            ucp_ena = format_args!("{:#04x}", clip.ucp_ena),
+            "PA_CL_CLIP_CNTL decoded (write not applied to any state yet)"
+        );
     }
 
     /// Kyty: `cp_op_set_shader_reg` (L3311).
