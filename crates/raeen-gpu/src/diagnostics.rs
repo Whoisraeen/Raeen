@@ -24,6 +24,7 @@ pub(crate) struct GpuEnv {
     pub no_mip_chain: bool,
     pub no_stencil: bool,
     pub no_tex_cache: bool,
+    pub pipeline_stats: bool,
     pub time_compute: bool,
     pub time_draw: bool,
     pub time_worker: bool,
@@ -88,6 +89,19 @@ impl GpuEnv {
             // bisection switch: `RAEEN_NO_TEX_CACHE=1` restores per-draw guest
             // decode and upload.
             no_tex_cache: on("RAEEN_NO_TEX_CACHE"),
+            // Ask the HARDWARE what it did with each draw: a per-draw Vulkan
+            // pipeline-statistics query (input vertices/primitives, VS
+            // invocations, primitives entering and leaving clipping, fragment
+            // shader invocations). This is the only measurement that separates
+            // "the draw carried no geometry" from "every primitive was clipped
+            // away" from "fragments ran and the writes went somewhere else".
+            //
+            // Default OFF and it costs a device feature (`pipelineStatistics
+            // Query`, enabled only when this is set) plus one query per draw,
+            // and it FORCES the immediate (non-deferred) draw path so the
+            // result can be read after that draw's own fence. Both are
+            // observable perturbations, so it must never be the default.
+            pipeline_stats: on("RAEEN_PIPELINE_STATS"),
             time_compute: on("RAEEN_TIME_COMPUTE"),
             time_draw: on("RAEEN_TIME_DRAW"),
             time_worker: on("RAEEN_TIME_WORKER"),

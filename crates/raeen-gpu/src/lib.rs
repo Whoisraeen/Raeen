@@ -28,6 +28,7 @@ pub mod agc_exec;
 pub mod backend;
 pub mod contracts;
 mod diagnostics;
+pub mod draw_census;
 pub(crate) mod draw_translate;
 pub mod frame_ipc;
 pub mod frame_pool;
@@ -51,6 +52,7 @@ pub use agc_exec::{
 };
 pub use backend::{BackendKind, GpuBackend, ShaderFormat, create_backend, default_backend_kind};
 pub use contracts::{ShaderMappedData, ShaderSemantic, ShaderSharp, ShaderUserData};
+pub use draw_census::DrawGeometryCensus;
 pub use frame_pool::FramePoolStats;
 pub use guest_mem::GpuGuestMemory;
 pub use present_plugin::{
