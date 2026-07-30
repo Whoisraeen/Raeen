@@ -839,12 +839,32 @@ fn step(state: &mut ScalarState, inst: &ShaderInstruction) {
             | T::SVersion
             | T::SInstPrefetch
             | T::SSendmsg
+            | T::STrap
             | T::SBranch
     ) {
         return;
     }
 
-    // SOPC compares write only SCC.
+    // The two RDNA2 64-bit SOPC compares operate on scalar pairs and write
+    // only SCC. Keep them separate from the 32-bit compare table so an inline
+    // scalar constant receives the architecture's sign/zero-extended high
+    // half through `read64`.
+    if matches!(inst.type_, T::SCmpEqU64 | T::SCmpLgU64) {
+        state.scc = match (
+            state.read64(&inst.src[0]).full(),
+            state.read64(&inst.src[1]).full(),
+        ) {
+            (Some(left), Some(right)) => Some(if inst.type_ == T::SCmpEqU64 {
+                left == right
+            } else {
+                left != right
+            }),
+            _ => None,
+        };
+        return;
+    }
+
+    // 32-bit SOPC compares write only SCC.
     if let Some(scc) = fold_compare(
         inst.type_,
         state.read32(&inst.src[0]),
@@ -927,6 +947,20 @@ fn step(state: &mut ScalarState, inst: &ShaderInstruction) {
                     dst | (1u32 << (bit & 31))
                 });
             state.write32(&inst.dst, value);
+            return;
+        }
+        T::SFF1I32B64 => {
+            let value = state.read64(&inst.src[0]).full().map(|source| {
+                if source == 0 {
+                    u32::MAX
+                } else {
+                    source.trailing_zeros()
+                }
+            });
+            state.write32(
+                &inst.dst,
+                value.map_or(ScalarValue::Unknown, ScalarValue::Known),
+            );
             return;
         }
         _ => {}
@@ -1441,6 +1475,65 @@ mod tests {
         bitset.src_num = 1;
         let program = [bitset, endpgm(4)];
         assert_eq!(resolve(&program, 4, &user), ScalarValue::Known(3));
+    }
+
+    #[test]
+    fn handler_free_s_trap_is_a_scalar_evaluator_no_op() {
+        let user = user_data(&[(4, 0x1234_5678)]);
+        let trap = ShaderInstruction {
+            pc: 0,
+            type_: T::STrap,
+            format: F::Imm,
+            ..Default::default()
+        };
+        let program = [trap, endpgm(4)];
+        assert_eq!(
+            resolve(&program, 4, &user),
+            ScalarValue::Known(0x1234_5678)
+        );
+    }
+
+    #[test]
+    fn s_cmp_lg_u64_compares_both_scalar_halves() {
+        let user = user_data(&[(20, 0), (21, 1)]);
+        let mut cmp = ShaderInstruction {
+            pc: 0,
+            type_: T::SCmpLgU64,
+            format: F::Ssrc02Ssrc12,
+            ..Default::default()
+        };
+        cmp.src[0] = sgpr(20, 2);
+        cmp.src[1] = imm(0);
+        cmp.src[1].size = 2;
+        cmp.src_num = 2;
+        let program = [cmp, endpgm(4)];
+        let state =
+            evaluate_before(&program, 1, Some(&user), 0).expect("64-bit compare must fold");
+        assert_eq!(
+            state.scc,
+            Some(true),
+            "a nonzero high half makes the full pair unequal to zero"
+        );
+    }
+
+    #[test]
+    fn s_ff1_i32_b64_searches_low_then_high_and_uses_minus_one_for_zero() {
+        let run = |lo, hi| {
+            let user = user_data(&[(20, lo), (21, hi)]);
+            let mut ff1 = ShaderInstruction {
+                pc: 0,
+                type_: T::SFF1I32B64,
+                format: F::SdstSsrc02,
+                ..Default::default()
+            };
+            ff1.dst = sgpr(4, 1);
+            ff1.src[0] = sgpr(20, 2);
+            ff1.src_num = 1;
+            resolve(&[ff1, endpgm(4)], 4, &user)
+        };
+        assert_eq!(run(0x10, 1), ScalarValue::Known(4));
+        assert_eq!(run(0, 0x100), ScalarValue::Known(40));
+        assert_eq!(run(0, 0), ScalarValue::Known(u32::MAX));
     }
 
     #[test]

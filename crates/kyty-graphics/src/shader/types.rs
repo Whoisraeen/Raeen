@@ -166,6 +166,15 @@ pub enum ShaderInstructionType {
     ImageGather4Lz,
     /// MIMG 0x0e: query texture dimensions/mip information.
     ImageGetResinfo,
+    /// RDNA2 MIMG 0xe6: intersect a ray with one AMD BVH node. This is kept
+    /// distinct from ordinary texture operations because it consumes a
+    /// 128-bit resource descriptor and 8/11 address VGPRs, then returns four
+    /// traversal results. Decoding it gives unsupported hardware traversal a
+    /// precise diagnostic instead of the misleading generic `r128` refusal.
+    ImageBvhIntersectRay,
+    /// RDNA2 MIMG 0xe7: the 64-bit-node-pointer form of
+    /// [`ImageBvhIntersectRay`], consuming 9/12 address VGPRs.
+    ImageBvh64IntersectRay,
     ImageLoad,
     ImageSample,
     /// MIMG 0x24: sampled image read with an explicit LOD supplied after the
@@ -224,6 +233,9 @@ pub enum ShaderInstructionType {
     SFF0I32B32,
     /// RDNA2 SOP1 0x13: least-significant one-bit index, or -1 when none.
     SFF1I32B32,
+    /// RDNA2 SOP1 0x14: least-significant one-bit index across a 64-bit scalar
+    /// pair, returned as a 32-bit index (or -1 when the pair is zero).
+    SFF1I32B64,
     SBufferLoadDword,
     SBufferLoadDwordx16,
     SBufferLoadDwordx2,
@@ -239,6 +251,8 @@ pub enum ShaderInstructionType {
     /// RDNA2 SOP1 0x06: write the 64-bit source pair only when SCC is set.
     SCmovB64,
     SCmpEqI32,
+    /// RDNA2 SOPC 0x12: compare two 64-bit scalar values for equality.
+    SCmpEqU64,
     SCmpEqU32,
     SCmpGeI32,
     SCmpGeU32,
@@ -247,6 +261,8 @@ pub enum ShaderInstructionType {
     SCmpLeI32,
     SCmpLeU32,
     SCmpLgI32,
+    /// RDNA2 SOPC 0x13: compare two 64-bit scalar values for inequality.
+    SCmpLgU64,
     SCmpLgU32,
     SCmpLtI32,
     SCmpLtU32,
@@ -485,6 +501,10 @@ pub enum ShaderInstructionType {
     VExpF32,
     VFloorF32,
     VFmaF32,
+    /// RDNA2 VOP2 0x2d: fused `src0 * vsrc1 + literal`.
+    VFmaakF32,
+    /// RDNA2 VOP2 0x2c: fused `src0 * literal + vsrc1`.
+    VFmamkF32,
     /// VOP3P 0x20 (`v_fma_mix_f32`, `v_mad_mix_f32` on gfx9). A SINGLE f32
     /// `fma(a, b, c)` whose three sources are each read independently as
     /// either a full f32 register/constant or one f16 half widened to f32 —
@@ -562,7 +582,13 @@ pub enum ShaderInstructionType {
     /// VOP1 0x02: copy the value from the first active lane of a VGPR into a
     /// scalar destination. Lowered with SPIR-V subgroup broadcast-first; GTA V
     /// first reaches it in compute shader 0x148d47200.
+    /// RDNA2 VOP3 0x360: copy one selected vector lane into a scalar
+    /// destination using subgroup broadcast semantics.
+    VReadlaneB32,
     VReadfirstlaneB32,
+    /// RDNA2 VOP3 0x361: write a scalar value into one selected lane of a
+    /// vector register, preserving every other lane and ignoring EXEC.
+    VWritelaneB32,
     VMulF32,
     VMulHiI32,
     /// RDNA2 VOP2 9: low 32 bits of a signed 24x24-bit product.
@@ -667,6 +693,11 @@ pub mod shader_instruction_format {
     pub const S0A2: u64 = 16;
     pub const S0A3: u64 = 17;
     pub const S0A4: u64 = 18;
+    /// Beyond Kyty: wide MIMG address payloads used by RDNA2 BVH traversal.
+    pub const S0A8: u64 = 88;
+    pub const S0A9: u64 = 89;
+    pub const S0A11: u64 = 90;
+    pub const S0A12: u64 = 91;
     pub const S1A2: u64 = 19;
     pub const S1A3: u64 = 20;
     pub const S1A4: u64 = 21;
@@ -845,6 +876,7 @@ pub mod shader_instruction_format {
         SdstSbaseSoffset = format_define(&[D, S0A2, S1]),
         Sdst16SvSoffset = format_define(&[DA16, S0A4, S1]),
         Sdst2Ssrc02 = format_define(&[DA2, S0A2]),
+        SdstSsrc02 = format_define(&[D, S0A2]),
         Sdst2Ssrc02Ssrc1 = format_define(&[DA2, S0A2, S1]),
         Sdst2Ssrc02Ssrc12 = format_define(&[DA2, S0A2, S1A2]),
         Sdst2SvSoffset = format_define(&[DA2, S0A4, S1]),
@@ -929,6 +961,7 @@ pub mod shader_instruction_format {
         Sdst16SvSoffsetOffset = format_define(&[DA16, S0A4, S1, S2]),
         SmaskVsrc0Vsrc1 = format_define(&[DA2, S0, S1]),
         Ssrc0Ssrc1 = format_define(&[S0, S1]),
+        Ssrc02Ssrc12 = format_define(&[S0A2, S1A2]),
         SVdstSVsrc0 = format_define(&[D, S0]),
         SVdstSVsrc0SVsrc1 = format_define(&[D, S0, S1]),
         Vdata1Vaddr3StDmask1 = format_define(&[D, S0A3, S1A8, DMASK_1]),
@@ -991,6 +1024,12 @@ pub mod shader_instruction_format {
         Vdata4Vaddr2SvSoffsOffenIdxenFloat4 =
             format_define(&[DA4, S0A2, S1A4, S2, OFFEN, IDXEN, FLOAT4]),
         Vdata4Vaddr3StDmaskF = format_define(&[DA4, S0A3, S1A8, DMASK_F]),
+        /// RDNA2 BVH traversal operand shapes. The resource is four SGPRs
+        /// (`r128=1`); A16 only changes the ray payload width.
+        Vdata4Vaddr8Srsrc4 = format_define(&[DA4, S0A8, S1A4]),
+        Vdata4Vaddr9Srsrc4 = format_define(&[DA4, S0A9, S1A4]),
+        Vdata4Vaddr11Srsrc4 = format_define(&[DA4, S0A11, S1A4]),
+        Vdata4Vaddr12Srsrc4 = format_define(&[DA4, S0A12, S1A4]),
         /// Beyond Kyty: four-texel single-channel gather — measured on
         /// ASTRO.BOT `image_gather4_lz` (MIMG 0x47 dmask 0x1): vdata is 4
         /// consecutive VGPRs (one per gathered texel) while the dmask names
@@ -1649,6 +1688,10 @@ fn dbg_fmt_print(inst: &ShaderInstruction) -> String {
             sif::S0A2 => operand_array_to_str(&inst.src[0], 2),
             sif::S0A3 => operand_array_to_str(&inst.src[0], 3),
             sif::S0A4 => operand_array_to_str(&inst.src[0], 4),
+            sif::S0A8 => operand_array_to_str(&inst.src[0], 8),
+            sif::S0A9 => operand_array_to_str(&inst.src[0], 9),
+            sif::S0A11 => operand_array_to_str(&inst.src[0], 11),
+            sif::S0A12 => operand_array_to_str(&inst.src[0], 12),
             sif::S1A2 => operand_array_to_str(&inst.src[1], 2),
             sif::S1A3 => operand_array_to_str(&inst.src[1], 3),
             sif::S1A4 => operand_array_to_str(&inst.src[1], 4),

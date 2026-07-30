@@ -407,6 +407,18 @@ fn shader_parse_sopc(
         0x0e => return Err(ni(dst, S, "s_bitcmp0_b64", opcode, pc, b0)),
         0x0f => return Err(ni(dst, S, "s_bitcmp1_b64", opcode, pc, b0)),
         0x10 => return Err(ni(dst, S, "s_setvskip", opcode, pc, b0)),
+        0x12 => {
+            inst.type_ = T::SCmpEqU64;
+            inst.format = F::Ssrc02Ssrc12;
+            inst.src[0].size = 2;
+            inst.src[1].size = 2;
+        }
+        0x13 => {
+            inst.type_ = T::SCmpLgU64;
+            inst.format = F::Ssrc02Ssrc12;
+            inst.src[0].size = 2;
+            inst.src[1].size = 2;
+        }
         _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
     }
 
@@ -743,7 +755,11 @@ fn shader_parse_sop1(
             inst.type_ = T::SFF1I32B32;
             inst.format = F::SVdstSVsrc0;
         }
-        0x14 => return Err(ni(dst, S, "s_ff1_i32_b64", opcode, pc, b0)),
+        0x14 => {
+            inst.type_ = T::SFF1I32B64;
+            inst.format = F::SdstSsrc02;
+            inst.src[0].size = 2;
+        }
         0x15 => return Err(ni(dst, S, "s_flbit_i32_b32", opcode, pc, b0)),
         0x16 => return Err(ni(dst, S, "s_flbit_i32_b64", opcode, pc, b0)),
         0x17 => return Err(ni(dst, S, "s_flbit_i32", opcode, pc, b0)),
@@ -1932,15 +1948,35 @@ fn shader_parse_vop2(
         }
         0x2c => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // V_FMAMK_F32 inserts the mandatory trailing literal between
+                // src0 and vsrc1: fused(src0 * literal + vsrc1).
+                inst.type_ = T::VFmamkF32;
+                inst.format = F::VdstVsrc0Vsrc1Vsrc2;
+                inst.src_num = 3;
+                inst.src[2] = inst.src[1];
+                inst.src[1].type_ = O::LiteralConstant;
+                inst.src[1].constant.u = dw(buffer, size, pc)?;
+                inst.src[1].size = 0;
+                size += 1;
+            } else {
+                return Err(ni(dst, S, "v_cvt_pkaccum_u8_f32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_cvt_pkaccum_u8_f32", opcode, pc, b0));
         }
         0x2d => {
             if next_gen {
-                return Err(unknown_op(dst, S, opcode, pc, b0));
+                // V_FMAAK_F32 appends the mandatory trailing literal:
+                // fused(src0 * vsrc1 + literal). ASTRO.BOT's three complete
+                // scene shaders all use this exact compact form.
+                inst.type_ = T::VFmaakF32;
+                inst.format = F::VdstVsrc0Vsrc1Vsrc2;
+                inst.src_num = 3;
+                inst.src[2].type_ = O::LiteralConstant;
+                inst.src[2].constant.u = dw(buffer, size, pc)?;
+                inst.src[2].size = 0;
+                size += 1;
+            } else {
+                return Err(ni(dst, S, "v_cvt_pknorm_i16_f32", opcode, pc, b0));
             }
-            return Err(ni(dst, S, "v_cvt_pknorm_i16_f32", opcode, pc, b0));
         }
         0x2e => return Err(ni(dst, S, "v_cvt_pknorm_u16_f32", opcode, pc, b0)),
         0x2f => inst.type_ = T::VCvtPkrtzF16F32,
@@ -2668,6 +2704,24 @@ fn shader_parse_vop3(
         0x35a => return Err(ni(dst, S, "v_interp_p2_f16", opcode, pc, b0)),
         0x35e => return Err(ni(dst, S, "v_mad_i16", opcode, pc, b0)),
         0x35f => return Err(ni(dst, S, "v_div_fixup_f16", opcode, pc, b0)),
+        0x360 => {
+            // V_READLANE uses the VOP3A VDST byte for an SGPR destination; the
+            // ordinary VOP3 path has already interpreted it as a VGPR. SharpEmu
+            // Gen5 makes the same destination correction. Source zero is the
+            // per-lane vector value and source one selects the guest wave lane.
+            inst.type_ = T::VReadlaneB32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src_num = 2;
+            inst.dst = operand_parse(vdst)?;
+        }
+        0x361 => {
+            // V_WRITELANE keeps the ordinary VOP3A VGPR destination. Source
+            // zero supplies the scalar value and source one selects the guest
+            // wave lane. The instruction writes independently of EXEC.
+            inst.type_ = T::VWritelaneB32;
+            inst.format = F::SVdstSVsrc0SVsrc1;
+            inst.src_num = 2;
+        }
         // RDNA2 (`next_gen`) VOP3 encodings of the mbcnt pair (VOP2-native
         // 0x23/0x24 on GCN, already wired above). Verified against SharpEmu's
         // Gen5 decoder: `0x365 => VMbcntLoU32B32`, `0x366 => VMbcntHiU32B32`
@@ -4177,13 +4231,18 @@ fn shader_parse_mimg(
     let srsrc = (b1 >> 16) & 0x1f; // T#
     let vdata = (b1 >> 8) & 0xff;
     let vaddr = b1 & 0xff;
+    let a16 = (b1 >> 30) & 0x1;
+    let is_bvh = matches!(opcode, 0xe6 | 0xe7);
 
     // Kyty L2935-2941: EXIT_NOT_IMPLEMENTED checks.
     if da == 1 {
         return Err(feature(S, "da == 1", pc));
     }
-    if r128 == 1 {
+    if r128 == 1 && !is_bvh {
         return Err(feature(S, "r128 == 1", pc));
+    }
+    if r128 == 0 && is_bvh {
+        return Err(feature(S, "image_bvh_intersect_ray requires r128 == 1", pc));
     }
     if tff == 1 {
         return Err(feature(S, "tff == 1", pc));
@@ -4207,7 +4266,7 @@ fn shader_parse_mimg(
     // loads/stores already use integer texel coordinates, so the bit has no
     // additional semantic effect there. GTA's measured image_store sets it
     // together with GLC.
-    if unrm == 1 && !direct_image_memory {
+    if unrm == 1 && !direct_image_memory && !is_bvh {
         return Err(feature(S, "unrm == 1", pc));
     }
 
@@ -4603,6 +4662,51 @@ fn shader_parse_mimg(
         0x6d => return Err(ni(dst, S, "image_sample_cd_cl_o", opcode, pc, b0)),
         0x6e => return Err(ni(dst, S, "image_sample_c_cd_o", opcode, pc, b0)),
         0x6f => return Err(ni(dst, S, "image_sample_c_cd_cl_o", opcode, pc, b0)),
+        0xe6 | 0xe7 => {
+            // RDNA2 hardware BVH traversal. Unlike ordinary image operations,
+            // these opcodes REQUIRE a 128-bit resource descriptor and return
+            // four traversal words. The A16 bit packs ray direction and
+            // reciprocal-direction components, reducing the address payload
+            // from 11 to 8 VGPRs (or 12 to 9 for the 64-bit pointer form).
+            //
+            // Raeen does not yet translate AMD BVH traversal to Vulkan ray
+            // queries, but decoding the full five-dword NSA instruction keeps
+            // every following PC/branch boundary correct and reports the
+            // actual unsupported operation instead of a generic `r128` error.
+            if dmask != 0xf {
+                return Err(feature(
+                    S,
+                    "image_bvh_intersect_ray requires dmask == 0xf",
+                    pc,
+                ));
+            }
+            inst.dst.size = 4;
+            inst.src[1].size = 4;
+            inst.src_num = 2;
+            match (opcode, a16) {
+                (0xe6, 0) => {
+                    inst.type_ = T::ImageBvhIntersectRay;
+                    inst.format = F::Vdata4Vaddr11Srsrc4;
+                    inst.src[0].size = 11;
+                }
+                (0xe6, 1) => {
+                    inst.type_ = T::ImageBvhIntersectRay;
+                    inst.format = F::Vdata4Vaddr8Srsrc4;
+                    inst.src[0].size = 8;
+                }
+                (0xe7, 0) => {
+                    inst.type_ = T::ImageBvh64IntersectRay;
+                    inst.format = F::Vdata4Vaddr12Srsrc4;
+                    inst.src[0].size = 12;
+                }
+                (0xe7, 1) => {
+                    inst.type_ = T::ImageBvh64IntersectRay;
+                    inst.format = F::Vdata4Vaddr9Srsrc4;
+                    inst.src[0].size = 9;
+                }
+                _ => unreachable!("opcode and A16 are single-bit constrained"),
+            }
+        }
         0x7e => return Err(ni(dst, S, "image_rsrc256", opcode, pc, b0)),
         0x7f => return Err(ni(dst, S, "image_sampler", opcode, pc, b0)),
         // Other `_a` variants remain named unsupported until measured and
@@ -5413,6 +5517,105 @@ mod tests {
         assert_eq!(inst.format, F::Ssrc0Ssrc1);
         assert_eq!(inst.src_num, 2);
         assert_eq!(inst.dst.type_, O::Unknown);
+    }
+
+    #[test]
+    fn sopc_s_cmp_lg_u64_decodes_the_measured_astro_encoding() {
+        // ASTRO.BOT scene compute: s_cmp_lg_u64 s[20:21], 0.
+        let (code, result) = parse(
+            &[0xBF13_8014, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse measured s_cmp_lg_u64");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SCmpLgU64);
+        assert_eq!(inst.format, F::Ssrc02Ssrc12);
+        assert_eq!(inst.src[0].register_id, 20);
+        assert_eq!(inst.src[0].size, 2);
+        assert_eq!(inst.src[1].type_, O::IntegerInlineConstant);
+        assert_eq!(inst.src[1].constant.u, 0);
+        assert_eq!(inst.src[1].size, 2);
+    }
+
+    #[test]
+    fn sop1_s_ff1_i32_b64_decodes_the_measured_astro_encoding() {
+        // ASTRO.BOT scene compute: s_ff1_i32_b64 vcc_hi, vcc.
+        let (code, result) = parse(
+            &[0xBEEB_146A, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse measured s_ff1_i32_b64");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SFF1I32B64);
+        assert_eq!(inst.format, F::SdstSsrc02);
+        assert_eq!(inst.dst.type_, O::VccHi);
+        assert_eq!(inst.src[0].type_, O::VccLo);
+        assert_eq!(inst.src[0].size, 2);
+    }
+
+    #[test]
+    fn vop3_v_readlane_b32_decodes_its_scalar_destination() {
+        // ASTRO.BOT scene compute: v_readlane_b32 vcc_lo, v9, vcc_hi.
+        let (code, result) = parse(
+            &[0xD760_006A, 0x0000_D709, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse measured v_readlane_b32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VReadlaneB32);
+        assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1);
+        assert_eq!(inst.dst.type_, O::VccLo);
+        assert_eq!(inst.src[0].type_, O::Vgpr);
+        assert_eq!(inst.src[0].register_id, 9);
+        assert_eq!(inst.src[1].type_, O::VccHi);
+        assert_eq!(inst.src_num, 2);
+    }
+
+    #[test]
+    fn vop3_v_writelane_b32_decodes_the_measured_astro_operands() {
+        // ASTRO.BOT scene compute: v_writelane_b32 v59, vcc_lo, s46.
+        let (code, result) = parse(
+            &[0xD761_003B, 0x0000_5C6A, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse measured v_writelane_b32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VWritelaneB32);
+        assert_eq!(inst.format, F::SVdstSVsrc0SVsrc1);
+        assert_eq!(inst.dst.type_, O::Vgpr);
+        assert_eq!(inst.dst.register_id, 59);
+        assert_eq!(inst.src[0].type_, O::VccLo);
+        assert_eq!(inst.src[1].type_, O::Sgpr);
+        assert_eq!(inst.src[1].register_id, 46);
+        assert_eq!(inst.src_num, 2);
+    }
+
+    #[test]
+    fn vop2_v_fmaak_f32_decodes_the_measured_astro_literal() {
+        // ASTRO.BOT scene compute: v_fmaak_f32 v6, s13, v21, 0.0442.
+        let (code, result) = parse(
+            &[0x5A0C_2A0D, 0x3D35_0B0F, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("parse measured v_fmaak_f32");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::VFmaakF32);
+        assert_eq!(inst.format, F::VdstVsrc0Vsrc1Vsrc2);
+        assert_eq!(inst.dst.type_, O::Vgpr);
+        assert_eq!(inst.dst.register_id, 6);
+        assert_eq!(inst.src[0].type_, O::Sgpr);
+        assert_eq!(inst.src[0].register_id, 13);
+        assert_eq!(inst.src[1].type_, O::Vgpr);
+        assert_eq!(inst.src[1].register_id, 21);
+        assert_eq!(inst.src[2].type_, O::LiteralConstant);
+        assert_eq!(inst.src[2].constant.u, 0x3D35_0B0F);
+        assert_eq!(inst.src_num, 3);
+        assert_eq!(code.get_instructions()[1].pc, 8);
     }
 
     #[test]
@@ -6362,6 +6565,44 @@ mod tests {
             code.get_instructions()[0].src[0].size,
             3,
             "DIM_2D_ARRAY consumes x/y/layer"
+        );
+    }
+
+    #[test]
+    fn astro_bvh_intersect_ray_decodes_its_wide_nsa_payload() {
+        // Exact five-dword instruction captured from ASTRO.BOT compute shader
+        // 0x50059c200 at pc 0x25f0. Opcode 0xe6 is
+        // IMAGE_BVH_INTERSECT_RAY, R128 is required, A16 is clear, and the
+        // operation consumes eleven address VGPRs plus a four-SGPR resource.
+        let (code, result) = parse(
+            &[
+                0xF198_9F07,
+                0x0004_0606,
+                0x4442_413D,
+                0x4543_403E,
+                0x0000_4746,
+                S_ENDPGM,
+            ],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("decode ASTRO.BOT IMAGE_BVH_INTERSECT_RAY");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::ImageBvhIntersectRay);
+        assert_eq!(inst.format, F::Vdata4Vaddr11Srsrc4);
+        assert_eq!(inst.dst.register_id, 6);
+        assert_eq!(inst.dst.size, 4);
+        assert_eq!(inst.src[0].register_id, 6);
+        assert_eq!(inst.src[0].size, 11);
+        assert_eq!(inst.src[1].register_id, 16);
+        assert_eq!(inst.src[1].size, 4);
+        assert_eq!(inst.src_num, 2);
+        assert_eq!(inst.mimg_nsa_dwords, 3);
+        assert_eq!(code.get_instructions()[1].type_, T::SEndpgm);
+        assert_eq!(
+            code.get_instructions()[1].pc,
+            20,
+            "the NSA payload is instruction data, not four fake opcodes"
         );
     }
 

@@ -301,6 +301,7 @@ fn enum_value(kind: EKind, tok: &str) -> Option<u32> {
         (E::BuiltIn, "LocalInvocationId") => 27,
         (E::BuiltIn, "GlobalInvocationId") => 28,
         (E::BuiltIn, "LocalInvocationIndex") => 29,
+        (E::BuiltIn, "SubgroupLocalInvocationId") => 41,
         (E::BuiltIn, "VertexIndex") => 42,
         (E::BuiltIn, "InstanceIndex") => 43,
         (E::SelectionControl, "None") => 0,
@@ -472,6 +473,7 @@ fn op_info(name: &str) -> Option<OpInfo> {
         ),
         "OpExecutionMode" => op(16, false, false, &[Id, Enum(E::ExecutionMode), LitRest]),
         "OpCapability" => op(17, false, false, &[Enum(E::Capability)]),
+        "OpGroupNonUniformBroadcast" => op(337, true, true, &[Id, Id, Id]),
         "OpGroupNonUniformBroadcastFirst" => op(338, true, true, &[Id, Id]),
         // --- Types ---------------------------------------------------------
         "OpTypeVoid" => op(19, false, true, &[]),

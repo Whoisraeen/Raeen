@@ -3965,10 +3965,14 @@ impl<'a> Spirv<'a> {
 
         if self
             .code
-            .has_any_of(&[ShaderInstructionType::VReadfirstlaneB32])
+            .has_any_of(&[
+                ShaderInstructionType::VReadfirstlaneB32,
+                ShaderInstructionType::VReadlaneB32,
+                ShaderInstructionType::VWritelaneB32,
+            ])
         {
-            // OpGroupNonUniformBroadcastFirst requires this SPIR-V 1.3
-            // capability. Vulkan exposes it as subgroup ballot support.
+            // The subgroup broadcast instructions require these SPIR-V 1.3
+            // capabilities. Vulkan exposes them as subgroup ballot support.
             extensions.push("OpCapability GroupNonUniform".to_string());
             extensions.push("OpCapability GroupNonUniformBallot".to_string());
         }
@@ -4076,6 +4080,12 @@ impl<'a> Spirv<'a> {
                 }
                 vars.push("%gl_LocalInvocationID".to_string());
                 vars.push("%gl_WorkGroupID".to_string());
+                if self
+                    .code
+                    .has_any_of(&[ShaderInstructionType::VWritelaneB32])
+                {
+                    vars.push("%gl_SubgroupLocalInvocationID".to_string());
+                }
                 HEADER.replace("<Type>", "GLCompute")
             }
             _ => {
@@ -4186,6 +4196,16 @@ impl<'a> Spirv<'a> {
                 self.source += &VERTEX_ANNOTATIONS.replace("<Variables>", &vars.join(&sep));
             }
             ShaderType::Compute => {
+                if self
+                    .code
+                    .has_any_of(&[ShaderInstructionType::VWritelaneB32])
+                {
+                    vars.push(
+                        "OpDecorate %gl_SubgroupLocalInvocationID BuiltIn \
+                         SubgroupLocalInvocationId"
+                            .to_string(),
+                    );
+                }
                 self.source += &COMPUTE_ANNOTATIONS.replace("<Variables>", &vars.join(&sep));
             }
             _ => {
@@ -4800,6 +4820,15 @@ impl<'a> Spirv<'a> {
                 self.source += &VERTEX_VARIABLES.replace("<Variables>", &vars.join(&sep));
             }
             ShaderType::Compute => {
+                if self
+                    .code
+                    .has_any_of(&[ShaderInstructionType::VWritelaneB32])
+                {
+                    vars.push(
+                        "%gl_SubgroupLocalInvocationID = OpVariable %_ptr_Input_uint Input"
+                            .to_string(),
+                    );
+                }
                 if let Some(info) = self.cs_input_info {
                     vars.push(format!(
                         "%gl_WorkGroupSize = OpConstantComposite %v3uint %uint_{} %uint_{} %uint_{}",

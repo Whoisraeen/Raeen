@@ -2759,6 +2759,72 @@ fn recompile_s_ff_b32(
     Ok(true)
 }
 
+/// RDNA2 `s_ff1_i32_b64`: find the least-significant set bit across a scalar
+/// pair. Work on two uints so the shader does not require SPIR-V Int64:
+/// prefer the low-half count, otherwise add 32 to the high-half count, and
+/// return AMD's `0xffff_ffff` sentinel when both halves are zero.
+fn recompile_s_ff1_b64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SFF1_I32_B64_SdstSsrc02";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Uint || operand_is_exec(inst.dst) {
+        return Err(not_supported(FUNC, "destination is not a scalar uint"));
+    }
+
+    let mut load_lo = String::new();
+    let mut load_hi = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "ff64_lo_<index>",
+        &index_str,
+        &mut load_lo,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "ff64_hi_<index>",
+        &index_str,
+        &mut load_hi,
+        1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+        <load_lo>
+        <load_hi>
+        %ff64_lo_nz_<index> = OpINotEqual %bool %ff64_lo_<index> %uint_0
+        %ff64_hi_nz_<index> = OpINotEqual %bool %ff64_hi_<index> %uint_0
+        %ff64_lo_m1_<index> = OpISub %uint %ff64_lo_<index> %uint_1
+        %ff64_lo_not_<index> = OpNot %uint %ff64_lo_<index>
+        %ff64_lo_below_<index> = OpBitwiseAnd %uint %ff64_lo_m1_<index> %ff64_lo_not_<index>
+        %ff64_lo_count_<index> = OpBitCount %uint %ff64_lo_below_<index>
+        %ff64_hi_m1_<index> = OpISub %uint %ff64_hi_<index> %uint_1
+        %ff64_hi_not_<index> = OpNot %uint %ff64_hi_<index>
+        %ff64_hi_below_<index> = OpBitwiseAnd %uint %ff64_hi_m1_<index> %ff64_hi_not_<index>
+        %ff64_hi_count_<index> = OpBitCount %uint %ff64_hi_below_<index>
+        %ff64_hi_index_<index> = OpIAdd %uint %ff64_hi_count_<index> %uint_32
+        %ff64_fallback_<index> = OpSelect %uint %ff64_hi_nz_<index> %ff64_hi_index_<index> %uint_0xffffffff
+        %ff64_result_<index> = OpSelect %uint %ff64_lo_nz_<index> %ff64_lo_count_<index> %ff64_fallback_<index>
+        OpStore %<dst> %ff64_result_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load_lo>", &load_lo)
+        .replace("<load_hi>", &load_hi)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
+    Ok(true)
+}
+
 /// RDNA2 `s_cmov_b32`: conditionally replace the destination when SCC is
 /// nonzero; the false arm must preserve the old destination value.
 fn recompile_s_cmov_b32(
@@ -3848,6 +3914,138 @@ fn recompile_vreadfirstlane_b32(
         .replace("<load0>", &load0)
         .replace("<index>", &index_str);
 
+    Ok(true)
+}
+
+/// RDNA2 `v_readlane_b32`: copy `vsrc0` from the guest lane selected by scalar
+/// `src1` into an SGPR. This is a real subgroup data exchange, not a local move.
+fn recompile_vreadlane_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VReadlaneB32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+    if code.get_type() != ShaderType::Compute {
+        return Err(not_supported(
+            FUNC,
+            "subgroup broadcast is currently guaranteed only for compute shaders",
+        ));
+    }
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Uint {
+        return Err(not_supported(FUNC, "destination is not a scalar uint"));
+    }
+
+    let index_str = format!("{index}");
+    let mut load_value = String::new();
+    let mut load_lane = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "readlane_value_<index>",
+        &index_str,
+        &mut load_value,
+        -1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "readlane_lane_<index>",
+        &index_str,
+        &mut load_lane,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+    <load_value>
+    <load_lane>
+    %readlane_result_<index> = OpGroupNonUniformBroadcast %uint %uint_3 %readlane_value_<index> %readlane_lane_<index>
+    OpStore %<dst> %readlane_result_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load_value>", &load_value)
+        .replace("<load_lane>", &load_lane)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
+    Ok(true)
+}
+
+/// RDNA2 `v_writelane_b32`: copy scalar `src0` into the guest lane selected
+/// by scalar `src1`, preserve every other lane's old VGPR value, and do not
+/// apply the EXEC mask. SharpEmu uses the same per-invocation select lowering.
+fn recompile_vwritelane_b32(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_VWritelaneB32_SVdstSVsrc0SVsrc1";
+    let inst = inst_at(code, index, FUNC)?;
+    if code.get_type() != ShaderType::Compute {
+        return Err(not_supported(
+            FUNC,
+            "subgroup lane identity is currently guaranteed only for compute shaders",
+        ));
+    }
+    let dst = operand_variable_to_str(inst.dst);
+    if dst.type_ != SpirvType::Float {
+        return Err(not_supported(FUNC, "destination is not a vector register"));
+    }
+
+    let index_str = format!("{index}");
+    let mut load_old = String::new();
+    let mut load_value = String::new();
+    let mut load_lane = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.dst,
+        "writelane_old_<index>",
+        &index_str,
+        &mut load_old,
+        -1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "writelane_value_<index>",
+        &index_str,
+        &mut load_value,
+        -1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "writelane_lane_<index>",
+        &index_str,
+        &mut load_lane,
+        -1,
+    )? {
+        return Ok(false);
+    }
+
+    const TEXT: &str = r#"
+    <load_old>
+    <load_value>
+    <load_lane>
+    %writelane_host_lane_<index> = OpLoad %uint %gl_SubgroupLocalInvocationID
+    %writelane_host_lane64_<index> = OpBitwiseAnd %uint %writelane_host_lane_<index> %uint_63
+    %writelane_guest_lane64_<index> = OpBitwiseAnd %uint %writelane_lane_<index> %uint_63
+    %writelane_is_target_<index> = OpIEqual %bool %writelane_host_lane64_<index> %writelane_guest_lane64_<index>
+    %writelane_result_<index> = OpSelect %uint %writelane_is_target_<index> %writelane_value_<index> %writelane_old_<index>
+    %writelane_result_float_<index> = OpBitcast %float %writelane_result_<index>
+    OpStore %<dst> %writelane_result_float_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<load_old>", &load_old)
+        .replace("<load_value>", &load_value)
+        .replace("<load_lane>", &load_lane)
+        .replace("<dst>", &dst.value)
+        .replace("<index>", &index_str);
     Ok(true)
 }
 
@@ -9652,6 +9850,84 @@ fn recompile_scmp_xxx_u32(
     Ok(true)
 }
 
+/// RDNA2 `s_cmp_{eq,lg}_u64`: compare two scalar-register pairs without
+/// requiring SPIR-V Int64 support. Equality combines the two dword comparisons
+/// with logical AND; inequality combines them with logical OR.
+fn recompile_scmp_xxx_u64(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_SCmp_XXX_U64_Ssrc02Ssrc12";
+    let inst = inst_at(code, index, FUNC)?;
+    let index_str = format!("{index}");
+
+    let mut lhs_lo = String::new();
+    let mut lhs_hi = String::new();
+    let mut rhs_lo = String::new();
+    let mut rhs_hi = String::new();
+    if !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "scmp64_lhs_lo_<index>",
+        &index_str,
+        &mut lhs_lo,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[0],
+        "scmp64_lhs_hi_<index>",
+        &index_str,
+        &mut lhs_hi,
+        1,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "scmp64_rhs_lo_<index>",
+        &index_str,
+        &mut rhs_lo,
+        0,
+    )? || !operand_load_uint(
+        spirv,
+        inst.src[1],
+        "scmp64_rhs_hi_<index>",
+        &index_str,
+        &mut rhs_hi,
+        1,
+    )? {
+        return Ok(false);
+    }
+
+    let (predicate, combine) = match inst.type_ {
+        T::SCmpEqU64 => ("OpIEqual", "OpLogicalAnd"),
+        T::SCmpLgU64 => ("OpINotEqual", "OpLogicalOr"),
+        _ => return Err(not_supported(FUNC, "unexpected instruction type")),
+    };
+    const TEXT: &str = r#"
+          <lhs_lo>
+          <lhs_hi>
+          <rhs_lo>
+          <rhs_hi>
+          %scmp64_lo_<index> = <predicate> %bool %scmp64_lhs_lo_<index> %scmp64_rhs_lo_<index>
+          %scmp64_hi_<index> = <predicate> %bool %scmp64_lhs_hi_<index> %scmp64_rhs_hi_<index>
+          %scmp64_result_<index> = <combine> %bool %scmp64_lo_<index> %scmp64_hi_<index>
+          %scmp64_scc_<index> = OpSelect %uint %scmp64_result_<index> %uint_1 %uint_0
+          OpStore %scc %scmp64_scc_<index>
+"#;
+    *dst_source += &TEXT
+        .replace("<lhs_lo>", &lhs_lo)
+        .replace("<lhs_hi>", &lhs_hi)
+        .replace("<rhs_lo>", &rhs_lo)
+        .replace("<rhs_hi>", &rhs_hi)
+        .replace("<predicate>", predicate)
+        .replace("<combine>", combine)
+        .replace("<index>", &index_str);
+    Ok(true)
+}
+
 /// RDNA2 `s_bitcmp{0,1}_b32`: select one source bit with a masked five-bit
 /// index and write only the scalar condition code.
 fn recompile_s_bitcmp_b32(
@@ -12782,6 +13058,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     fs(recompile_s_xxx_b32_svdst_svsrc0, T::SBcnt1I32B32, F::SVdstSVsrc0, p1("%t_<index> = OpBitCount %uint %t0_<index>"), S::NonZero),
     f(recompile_s_ff_b32, T::SFF0I32B32, F::SVdstSVsrc0, p1("%tsearch_<index> = OpNot %uint %t0_<index>")),
     f(recompile_s_ff_b32, T::SFF1I32B32, F::SVdstSVsrc0, p1("%tsearch_<index> = OpBitwiseOr %uint %t0_<index> %uint_0")),
+    f(recompile_s_ff1_b64, T::SFF1I32B64, F::SdstSsrc02, p1("")),
     f(recompile_s_xxx_b32_svdst_svsrc0, T::SSextI32I8, F::SVdstSVsrc0, p3("%ti_<index> = OpBitcast %int %t0_<index>", "%tse_<index> = OpBitFieldSExtract %int %ti_<index> %int_0 %int_8", "%t_<index> = OpBitcast %uint %tse_<index>")),
     f(recompile_s_xxx_b32_svdst_svsrc0, T::SSextI32I16, F::SVdstSVsrc0, p3("%ti_<index> = OpBitcast %int %t0_<index>", "%tse_<index> = OpBitFieldSExtract %int %ti_<index> %int_0 %int_16", "%t_<index> = OpBitcast %uint %tse_<index>")),
     f(recompile_smulk_i32, T::SMulkI32, F::SVdstSVsrc0, p1("")),
@@ -12814,6 +13091,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_vcvt_f32_xxx, T::VCvtF32Ubyte3, F::SVdstSVsrc0, p2("%tb_<index> = OpBitFieldUExtract %uint %t0_<index> %uint_24 %uint_8", "%t_<index> = OpConvertUToF %float %tb_<index>")),
     f(recompile_vmov_b32, T::VMovB32, F::SVdstSVsrc0, p1("")),
     f(recompile_vreadfirstlane_b32, T::VReadfirstlaneB32, F::SVdstSVsrc0, p1("")),
+    f(recompile_vreadlane_b32, T::VReadlaneB32, F::SVdstSVsrc0SVsrc1, p1("")),
+    f(recompile_vwritelane_b32, T::VWritelaneB32, F::SVdstSVsrc0SVsrc1, p1("")),
 
     fs(recompile_s_and_saveexec_b64, T::SAndSaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
     fs(recompile_s_orn2_saveexec_b64, T::SOrn2SaveexecB64, F::Sdst2Ssrc02, p1(""), S::NonZero),
@@ -12941,6 +13220,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_scmp_xxx_u32, T::SCmpLeU32, F::Ssrc0Ssrc1, p1("OpULessThanEqual")),
     f(recompile_scmp_xxx_u32, T::SCmpLtU32, F::Ssrc0Ssrc1, p1("OpULessThan")),
     f(recompile_scmp_xxx_u32, T::SCmpLgU32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
+    f(recompile_scmp_xxx_u64, T::SCmpEqU64, F::Ssrc02Ssrc12, p1("")),
+    f(recompile_scmp_xxx_u64, T::SCmpLgU64, F::Ssrc02Ssrc12, p1("")),
     f(recompile_s_bitcmp_b32, T::SBitcmp0B32, F::Ssrc0Ssrc1, p1("OpIEqual")),
     f(recompile_s_bitcmp_b32, T::SBitcmp1B32, F::Ssrc0Ssrc1, p1("OpINotEqual")),
 
@@ -12963,6 +13244,8 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
 
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VMadF32,   F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VFmaF32,   F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
+    f(recompile_v_xxx_f32_vdst_vsrc012, T::VFmaakF32, F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
+    f(recompile_v_xxx_f32_vdst_vsrc012, T::VFmamkF32, F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VMadakF32, F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VMadmkF32, F::VdstVsrc0Vsrc1Vsrc2, p1("%t_<index> = OpExtInst %float %GLSL_std_450 Fma %t0_<index> %t1_<index> %t2_<index>")),
     f(recompile_v_xxx_f32_vdst_vsrc012, T::VMax3F32,  F::VdstVsrc0Vsrc1Vsrc2, p2("%tm_<index> = OpExtInst %float %GLSL_std_450 FMax %t0_<index> %t1_<index>",
@@ -13404,7 +13687,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            447,
+            454,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -13763,6 +14046,111 @@ mod tests {
 
         let words = spirv_run(&source).expect("assemble measured GTA readfirstlane");
         naga_parse_and_validate(&words, "gta_readfirstlane");
+    }
+
+    #[test]
+    fn astro_readlane_uses_the_selected_subgroup_lane() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xD760_006A,
+                0x0000_D709, // v_readlane_b32 vcc_lo, v9, vcc_hi
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured ASTRO.BOT v_readlane_b32");
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [64, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured v_readlane_b32");
+        assert!(
+            source.contains(
+                "OpGroupNonUniformBroadcast %uint %uint_3 %readlane_value_0 %readlane_lane_0"
+            ),
+            "selected-lane subgroup broadcast must carry the scalar lane operand:\n{source}"
+        );
+        assert!(source.contains("OpStore %vcc_lo %readlane_result_0"));
+        let words = spirv_run(&source).expect("assemble measured v_readlane_b32");
+        naga_parse_and_validate(&words, "astro_v_readlane");
+    }
+
+    #[test]
+    fn astro_writelane_updates_only_the_selected_lane_without_exec() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xD761_003B,
+                0x0000_5C6A, // v_writelane_b32 v59, vcc_lo, s46
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured ASTRO.BOT v_writelane_b32");
+
+        let input_info = ShaderComputeInputInfo {
+            threads_num: [64, 1, 1],
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured v_writelane_b32");
+        assert!(source.contains(
+            "OpDecorate %gl_SubgroupLocalInvocationID BuiltIn SubgroupLocalInvocationId"
+        ));
+        assert!(source.contains(
+            "%writelane_result_0 = OpSelect %uint %writelane_is_target_0 \
+             %writelane_value_0 %writelane_old_0"
+        ));
+        assert!(source.contains("OpStore %v59 %writelane_result_float_0"));
+        assert!(
+            !source.contains("writelane_exec"),
+            "V_WRITELANE must not be guarded by EXEC"
+        );
+
+        let words = spirv_run(&source).expect("assemble measured v_writelane_b32");
+        naga_parse_and_validate(&words, "astro_v_writelane");
+    }
+
+    #[test]
+    fn astro_fmaak_uses_fused_multiply_add_with_the_captured_literal() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0x5A0C_2A0D,
+                0x3D35_0B0F, // v_fmaak_f32 v6, s13, v21, 0.0442
+                0xBF80_0000,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured ASTRO.BOT v_fmaak_f32");
+
+        let input_info = ShaderComputeInputInfo {
+            threads_num: [64, 1, 1],
+            ..Default::default()
+        };
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured v_fmaak_f32");
+        assert!(
+            source.contains(
+                "OpExtInst %float %GLSL_std_450 Fma %t0_0 %t1_0 %t2_0"
+            ),
+            "V_FMAAK must remain fused and keep the literal as the addend:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble measured v_fmaak_f32");
+        naga_parse_and_validate(&words, "astro_v_fmaak");
     }
 
     #[test]
@@ -18416,6 +18804,57 @@ mod tests {
         assert!(source.contains("OpStore %scc"));
         let words = spirv_run(&source).expect("assemble measured s_cmp_eq_i32");
         naga_parse_and_validate(&words, "s_cmp_eq_i32");
+    }
+
+    #[test]
+    fn s_cmp_lg_u64_recompiles_the_measured_astro_zero_test() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xBF13_8014, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+            .expect("parse measured ASTRO.BOT s_cmp_lg_u64");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::SCmpLgU64);
+        assert_eq!(inst.format, F::Ssrc02Ssrc12);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured s_cmp_lg_u64");
+        assert_eq!(source.matches("OpINotEqual %bool").count(), 2);
+        assert!(source.contains("OpLogicalOr %bool"));
+        assert!(source.contains("OpStore %scc"));
+        let words = spirv_run(&source).expect("assemble measured s_cmp_lg_u64");
+        naga_parse_and_validate(&words, "s_cmp_lg_u64");
+    }
+
+    #[test]
+    fn s_ff1_i32_b64_recompiles_the_measured_astro_encoding() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xBEEB_146A, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse measured ASTRO.BOT s_ff1_i32_b64");
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile measured s_ff1_i32_b64");
+        assert!(source.contains("OpBitCount %uint"));
+        assert!(source.contains("OpIAdd %uint"));
+        assert!(source.contains("%uint_0xffffffff"));
+        assert!(source.contains("OpStore %vcc_hi"));
+        let words = spirv_run(&source).expect("assemble measured s_ff1_i32_b64");
+        naga_parse_and_validate(&words, "s_ff1_i32_b64");
     }
 
     #[test]
