@@ -157,6 +157,23 @@ SOFTWARE.
   `RAEEN_FOLLOW_IB_CHAINS`. All refusal semantics, counters
   (`kyty_graphics::run::ChainCensus`) and tests are Raeen's own. No C++ is
   vendored or compiled into Raeen.
+
+  The follow-up hardening pass (same day, after an independent review found two
+  proven defects) keeps the KytyPS5 *decisions* while diverging further on
+  policy. KytyPS5's `CpOpBranch` guards — mode must be 1 or 2
+  (`EXIT_NOT_IMPLEMENTED(mode != 1 && mode != 2)`, pm4Handlers.cpp L2158) — are
+  honoured as Raeen's counted named refusals instead of a fatal `EXIT`, and a
+  zero compare mask is refused as well, which KytyPS5 does not check (Raeen's
+  own `cp_op_wait_mem` already refuses one, so the same packet field gets the
+  same treatment). The conditional form no longer reads its compare label at
+  all when the follower is disabled, which has no KytyPS5 analogue because
+  KytyPS5 has no such gate. The 4-dword form now REFUSES a high address dword
+  with reserved bits 31:16 set rather than masking them, stricter than both
+  references (KytyPS5 reads that dword unmasked; shadPS4's
+  `PM4CmdIndirectBuffer` masks to 16 bits without checking) — masking can turn
+  a mis-decoded pointer into a different, possibly mapped address and then read
+  command stream from it. The `CHAIN` bit policy, the depth/budget/cycle bounds,
+  the wait-inside-a-chain degradation, and every test remain Raeen's own.
   the `*GetSize` byte counts pinned to Kyty's Gen5 emitters. The GTA V
   `libSceAmpr` Tier-C batch (`crates/raeen-hle/src/libsce_ampr.rs`,
   2026-07-27) behaviorally re-implements `src/libs/libAmpr.cpp`: the

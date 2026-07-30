@@ -1034,6 +1034,15 @@ impl CommandProcessor {
         // count of chains already seen. Same argument as `refused_draws`.
         let chain_census = std::mem::take(&mut self.chain_census);
         let follow_chains = self.follow_chains;
+        // MUST survive, and for a stronger reason than the two above: this is a
+        // SAFETY bound, not configuration or a diagnostic. `R_DRAW_RESET` is a
+        // guest-stream packet handled inside `dispatch`, so it fires from inside a
+        // chained buffer too — leaving the budget zeroed here let guest data
+        // refill it at will (measured: 4296 buffers followed against a 4096 cap).
+        // With depth capped at 8 and the cycle test refusing only addresses open
+        // on the ACTIVE path, this counter is the only bound on fan-out: k chain
+        // packets per buffer admits up to k^8 frames.
+        let chain_buffers_followed = self.chain_buffers_followed;
         *self = Self::new();
         self.warned = warned;
         self.shader_bind_trace_count = shader_bind_trace_count;
@@ -1044,6 +1053,7 @@ impl CommandProcessor {
         self.timestamp_source = timestamp_source;
         self.chain_census = chain_census;
         self.follow_chains = follow_chains;
+        self.chain_buffers_followed = chain_buffers_followed;
     }
 
     /// Cap on completion labels retained between drains, so a pathological
@@ -1251,10 +1261,15 @@ impl CommandProcessor {
         mem: Option<&dyn GuestMemory>,
     ) -> Result<RunOutcome, CpError> {
         let mut pos = start_dword.min(data.len());
-        // Per-walk chain budget (see `MAX_CHAIN_BUFFERS`). Reset here rather
-        // than accumulated: it is a termination bound on one walk, not an
-        // accounting total — the honest totals live in `chain_census`.
-        self.chain_buffers_followed = 0;
+        // Chain budget (see `MAX_CHAIN_BUFFERS`), armed once per SUBMISSION —
+        // `start_dword == 0` is the only entry that is a fresh buffer rather than
+        // a resume. Resetting on every entry handed each suspend/resume segment a
+        // brand-new 4096-buffer allowance, and a stream can suspend as often as it
+        // likes, so the bound was not a bound. Same `start_dword == 0` guard the
+        // embedder uses to record `Stage::DcbSubmitted` once per submission.
+        if start_dword == 0 {
+            self.chain_buffers_followed = 0;
+        }
         while pos < data.len() {
             let cmd_id = data[pos];
             let offset = pos as u32;
@@ -1428,6 +1443,39 @@ impl CommandProcessor {
                 let words = &stack[top].words;
                 self.dispatch(cmd_id, &words[pos + 1..], offset, sink, Some(mem))
             };
+            // DRAIN THE WAIT HERE, BEFORE ANY REFUSAL PATH CAN `continue`.
+            //
+            // `RunOutcome::Suspended` carries a resume point as a dword offset
+            // into the SUBMITTED buffer, so a wait armed inside a chained buffer
+            // has no representable resume point and must never escape this
+            // function. Draining after the refusal branches below was a real bug:
+            // `cp_op_wait_mem` reads only body 0..6 but returns the header's
+            // `body_dw` (up to 0x4000), so a wait packet whose declared length
+            // overruns its chained buffer ARMS `pending_wait` and then takes the
+            // overrun-refusal path, which popped the frame and skipped the drain.
+            // `run_chain` returned with `pending_wait == Some`, `run_resumable`
+            // turned that into `Suspended` against a top-level offset that never
+            // held a wait, and the parent's remaining packets never ran — the
+            // queue then parked until the dead-wait force-resume. Reachable from a
+            // merely MIS-SIZED `IB_SIZE`, not only a hostile one.
+            //
+            // Degrade the same way `run_with_memory` does for a wait it cannot
+            // park — continue past it — but count it, so a title that genuinely
+            // needs cross-queue ordering inside a chain shows up as a number
+            // rather than as a glitch.
+            if let Some(wait) = self.pending_wait.take() {
+                self.chain_census.waits_dropped += 1;
+                if self.first(SkipKey::Note("chain_wait_cannot_suspend")) {
+                    warn!(
+                        label = format_args!("{:#x}", wait.address),
+                        compare = wait.compare,
+                        offset,
+                        "unmet wait inside a CHAINED command buffer — continuing past it \
+                         (a suspend resume point can only name a dword in the submitted buffer). \
+                         Counted (ChainCensus::waits_dropped)"
+                    );
+                }
+            }
             let consumed = match outcome {
                 Ok(consumed) => consumed,
                 // Same policy as the top-level walk: a refused draw is skipped
@@ -1467,27 +1515,6 @@ impl CommandProcessor {
                 continue;
             }
             stack[top].pos = pos + advance;
-            // A wait inside a chained buffer cannot suspend the stream:
-            // `RunOutcome::Suspended` carries a resume point as a dword offset
-            // into the SUBMITTED buffer, which cannot name a position inside a
-            // buffer the embedder never submitted. Degrade to the same
-            // behaviour `run_with_memory` uses for an unmet wait it cannot park
-            // — continue past it — but count it, so a title that genuinely
-            // needs cross-queue ordering inside a chain shows up as a number
-            // rather than as a glitch.
-            if let Some(wait) = self.pending_wait.take() {
-                self.chain_census.waits_dropped += 1;
-                if self.first(SkipKey::Note("chain_wait_cannot_suspend")) {
-                    warn!(
-                        label = format_args!("{:#x}", wait.address),
-                        compare = wait.compare,
-                        offset,
-                        "unmet wait inside a CHAINED command buffer — continuing past it \
-                         (a suspend resume point can only name a dword in the submitted buffer). \
-                         Counted (ChainCensus::waits_dropped)"
-                    );
-                }
-            }
             if self.follow_chains
                 && let Some(request) = self.pending_chain.take()
                 && let Some(frame) = self.open_chain_frame(&stack, request, mem)
@@ -2066,6 +2093,36 @@ impl CommandProcessor {
         let size_dwords = control & Self::MAX_CHAIN_DWORDS;
         self.chain_census.jump_packets += 1;
         self.chain_census.target_dwords += u64::from(size_dwords);
+        // Bits 31:16 of the high dword are RESERVED in the AMD packet
+        // (shadPS4 `PM4CmdIndirectBuffer::ibase_hi` is `BitField<0, 16, u32>`),
+        // and a PS5 guest VA fits in 48 bits, so a real target's high dword is
+        // always <= 0xffff. Their being set therefore proves a MIS-DECODE, and
+        // masking them away silently would be the worst outcome available: it can
+        // turn a garbage pointer into a different, possibly MAPPED address and
+        // then read command stream from it. Refuse instead.
+        //
+        // This is deliberately stricter than either reference — KytyPS5 reads the
+        // high dword unmasked and shadPS4 masks without checking. It is also why
+        // this form masks while `cp_op_chain_branch` does not: the 4-dword form is
+        // the AMD IB packet with a documented 16-bit field, whereas the 14-dword
+        // conditional form is AGC's own encoding riding on the same opcode, where
+        // the high dword is a full 32 bits — which is exactly what `raeen-hle`'s
+        // `hle_cb_branch` writes and what KytyPS5's `CpOpBranch` reads. Both are
+        // right for their own layout; `chain_jump_hi_dword_reserved_bits_are_refused`
+        // and `the_conditional_chain_takes_a_full_32_bit_high_dword` pin the pair.
+        if hi >> 16 != 0 {
+            self.chain_census.refused_malformed += 1;
+            if self.first(SkipKey::Note("indirect_buffer_reserved_hi_bits")) {
+                warn!(
+                    hi = format_args!("{hi:#010x}"),
+                    offset,
+                    "IT_INDIRECT_BUFFER high address dword has reserved bits 31:16 set — that \
+                     cannot come from a well-formed packet, so the target is refused and counted \
+                     (ChainCensus::refused_malformed) rather than masked into a DIFFERENT address"
+                );
+            }
+            return Ok(body_dw);
+        }
         if control & (1 << 20) != 0 {
             self.chain_census.chain_bit_set += 1;
             if self.first(SkipKey::Note("indirect_buffer_chain_bit")) {
@@ -2122,6 +2179,80 @@ impl CommandProcessor {
             | (u64::from(Self::body_at(body, 11, offset)?) << 32);
         let else_dwords = Self::body_at(body, 12, offset)? & Self::MAX_CHAIN_DWORDS;
         self.chain_census.target_dwords += u64::from(then_dwords);
+        // Validate the SELECTOR before anything else — this is pure decoding, so
+        // a malformed branch is named whether or not the follower is on.
+        //
+        // Mode 1 = then-only, mode 2 = then/else. KytyPS5 refuses anything else
+        // outright (`EXIT_NOT_IMPLEMENTED(mode != 1 && mode != 2)`,
+        // pm4Handlers.cpp L2158), and it must be refused rather than defaulted:
+        // falling through to the then-target on an unknown mode executes command
+        // stream the title may have asked to be skipped.
+        //
+        // A zero mask makes every compare function degenerate — the masked value
+        // is always 0 — so `== reference` would silently take the then-branch for
+        // any label at all. `cp_op_wait_mem` already refuses a zero mask for
+        // exactly this reason; the same packet field deserves the same treatment.
+        if mode != 1 && mode != 2 {
+            self.chain_census.refused_malformed += 1;
+            if self.first(SkipKey::Note("chain_branch_bad_mode")) {
+                warn!(
+                    mode,
+                    function,
+                    offset,
+                    "conditional IT_INDIRECT_BUFFER has a mode this processor does not model \
+                     (only 1 = then-only and 2 = then/else are defined) — neither branch taken, \
+                     counted (ChainCensus::refused_malformed). Defaulting to the then-target \
+                     would execute stream the title may have asked to skip"
+                );
+            }
+            return Ok(body_dw);
+        }
+        if mask == 0 && function != 0 && function != 7 {
+            self.chain_census.refused_malformed += 1;
+            if self.first(SkipKey::Note("chain_branch_zero_mask")) {
+                warn!(
+                    address = format_args!("{compare_address:#x}"),
+                    function,
+                    offset,
+                    "conditional IT_INDIRECT_BUFFER has a zero compare mask, which makes every \
+                     compare function degenerate — neither branch taken, counted \
+                     (ChainCensus::refused_malformed), matching cp_op_wait_mem's zero-mask refusal"
+                );
+            }
+            return Ok(body_dw);
+        }
+        // WITH THE FOLLOWER OFF, STOP HERE — before the label read.
+        //
+        // The compare label is guest memory. Reading it when nothing will act on
+        // the result is a guest dereference the caller did not ask for, and it
+        // falsified `set_follow_chains`'s contract: the gate used to live only in
+        // `request_chain`, so the default path still dereferenced the label of
+        // every conditional chain. The census still records the packet and names
+        // the THEN target, which is what the measurement needs.
+        if !self.follow_chains {
+            self.chain_census.refused_disabled += 1;
+            self.record_chain_sample(ChainSample {
+                offset,
+                address: then_address,
+                size_dwords: then_dwords,
+                control: selector,
+                form: ChainForm::Branch,
+            });
+            if self.first(SkipKey::Note("chain_branch_follower_disabled")) {
+                warn!(
+                    then_target = format_args!("{then_address:#x}"),
+                    then_dwords,
+                    else_target = format_args!("{else_address:#x}"),
+                    else_dwords,
+                    offset,
+                    "conditional IT_INDIRECT_BUFFER NOT walked — the chain follower is off, so \
+                     the compare label is not read either. Counted \
+                     (ChainCensus::refused_disabled); the sampled target is the declared THEN \
+                     branch, not a claim about which branch the label would select"
+                );
+            }
+            return Ok(body_dw);
+        }
         let spec = WaitSpec {
             address: compare_address,
             mask,
@@ -2158,7 +2289,7 @@ impl CommandProcessor {
             }
             return Ok(body_dw);
         };
-        // Mode 1 = then-only, mode 2 = then/else (KytyPS5 refuses any other).
+        // Mode is already validated to 1 or 2 above.
         let (address, size_dwords) = if spec.satisfied_by(value) {
             (then_address, then_dwords)
         } else if mode == 2 {
@@ -7885,6 +8016,414 @@ mod tests {
             off.chain,
             ChainCensus::default(),
             "a chainless submission must not touch the chain census"
+        );
+    }
+
+    // ─── chain follower: safety bounds and default-path isolation ────────────
+
+    /// A 14-dword conditional chain, then-target `then`, else-target `else_`.
+    /// Mode 2 (then/else), compare function 3 (equal), full 64-bit mask.
+    fn branch_packet(label: u64, then: u64, then_dw: u32, else_: u64, else_dw: u32) -> Vec<u32> {
+        branch_packet_with(
+            label,
+            2,
+            3,
+            0xffff_ffff_ffff_ffff,
+            then,
+            then_dw,
+            else_,
+            else_dw,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the 13-dword packet body"
+    )]
+    fn branch_packet_with(
+        label: u64,
+        mode: u32,
+        function: u32,
+        mask: u64,
+        then: u64,
+        then_dw: u32,
+        else_: u64,
+        else_dw: u32,
+    ) -> Vec<u32> {
+        vec![
+            header(14, pm4::IT_INDIRECT_BUFFER, pm4::R_ZERO),
+            mode | (function << 8),
+            label as u32,
+            (label >> 32) as u32,
+            mask as u32,
+            (mask >> 32) as u32,
+            7,
+            0,
+            then as u32,
+            (then >> 32) as u32,
+            then_dw,
+            else_ as u32,
+            (else_ >> 32) as u32,
+            else_dw,
+        ]
+    }
+
+    /// C1 REGRESSION. `cp_op_wait_mem` reads only body 0..6 but returns the
+    /// HEADER's `body_dw`, so a wait packet whose declared length overruns its
+    /// chained buffer arms `pending_wait` and then takes the overrun-refusal path.
+    /// That path popped the frame and `continue`d BEFORE the wait was drained, so
+    /// `run_chain` returned with `pending_wait == Some` and `run_resumable` turned
+    /// it into a `Suspended` against a top-level offset that never held a wait —
+    /// abandoning the parent's remaining packets and parking the queue until the
+    /// dead-wait force-resume. Reachable from a merely MIS-SIZED `IB_SIZE`.
+    #[test]
+    fn a_wait_that_overruns_its_chained_buffer_cannot_suspend_the_submission() {
+        let label = 0x8100_0000u64;
+        let child = 0x8100_1000u64;
+        // 6 dwords, but the header declares a 20-dword packet: body 0..4 is
+        // readable (so the wait is parsed and armed) and the advance overruns.
+        let child_words = vec![
+            header(20, pm4::IT_WAIT_REG_MEM, pm4::R_ZERO),
+            3, // compare function 3 = equal
+            label as u32,
+            (label >> 32) as u32,
+            0xdead_beef, // reference the label will not match
+            0xffff_ffff, // mask
+        ];
+        assert_eq!(child_words.len(), 6);
+        let mem = ChainMem::default()
+            .with(label, vec![0, 0])
+            .with(child, child_words);
+        let mut dcb = chain_packet(child, 6);
+        dcb.extend(tagged_draw(99));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        let outcome = cp
+            .run_resumable(&dcb, 0, &mut sink, Some(&mem))
+            .expect("an overrunning wait inside a chain must not fault the walk");
+
+        assert_eq!(
+            outcome,
+            RunOutcome::Completed,
+            "a wait armed inside a CHAINED buffer has no representable resume point and must \
+             never suspend the submission"
+        );
+        let census = cp.take_chain_census();
+        assert_eq!(
+            census.waits_dropped, 1,
+            "the dropped wait must be counted, on the refusal path too"
+        );
+        assert_eq!(
+            census.refused_malformed, 1,
+            "the overrunning packet is still a named refusal"
+        );
+        assert_eq!(
+            drawn(&sink),
+            vec![99],
+            "the parent's post-chain draw must still run"
+        );
+    }
+
+    /// The same drain on the ordinary path: a well-formed unmet wait inside a
+    /// chained buffer is counted and walked past, and the child's later packets
+    /// still run.
+    #[test]
+    fn an_unmet_wait_inside_a_chained_buffer_is_counted_and_walked_past() {
+        let label = 0x8110_0000u64;
+        let child = 0x8110_1000u64;
+        // 6 dwords total: header + the 5 body dwords `WaitForm::Standard` reads.
+        let mut child_words = vec![
+            header(6, pm4::IT_WAIT_REG_MEM, pm4::R_ZERO),
+            3,
+            label as u32,
+            (label >> 32) as u32,
+            0xdead_beef,
+            0xffff_ffff,
+        ];
+        child_words.extend(tagged_draw(55));
+        let mem = ChainMem::default()
+            .with(label, vec![0, 0])
+            .with(child, child_words);
+        let dcb = chain_packet(child, 9);
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        let outcome = cp
+            .run_resumable(&dcb, 0, &mut sink, Some(&mem))
+            .expect("a chained wait must not fault the walk");
+        assert_eq!(outcome, RunOutcome::Completed);
+        let census = cp.take_chain_census();
+        assert_eq!(census.waits_dropped, 1);
+        assert_eq!(
+            drawn(&sink),
+            vec![55],
+            "the child's packets after the unmet wait must still run"
+        );
+    }
+
+    /// C2 REGRESSION, part 1. `R_DRAW_RESET` is a guest-stream packet handled
+    /// inside `dispatch`, so it fires from inside a chained buffer. Zeroing
+    /// `chain_buffers_followed` on reset let guest data refill the only bound on
+    /// chain fan-out at will.
+    #[test]
+    fn an_in_stream_queue_reset_cannot_refill_the_chain_buffer_budget() {
+        let child = 0x8120_0000u64;
+        let second = 0x8120_1000u64;
+        // The child resets the queue, then chains again. With the budget one
+        // short of the cap, the FIRST chain consumes the last slot and the second
+        // must be refused — the reset between them must change nothing.
+        let mut child_words = vec![header(2, pm4::IT_NOP, pm4::R_DRAW_RESET), 0];
+        child_words.extend(chain_packet(second, 3));
+        let mem = ChainMem::default()
+            .with(child, child_words)
+            .with(second, tagged_draw(7));
+        // Entered as a RESUME (`start_dword != 0`) so the pre-set budget is not
+        // re-armed — `a_resumed_walk_continues_the_chain_budget_instead_of_re_arming_it`
+        // covers that half. This test is only about the reset.
+        let mut dcb = vec![header(2, pm4::IT_NOP, pm4::R_PUSH_MARKER), 0];
+        dcb.extend(chain_packet(child, 6));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        cp.chain_buffers_followed = CommandProcessor::MAX_CHAIN_BUFFERS - 1;
+        let mut sink = RecordingSink::default();
+        cp.run_resumable(&dcb, 2, &mut sink, Some(&mem))
+            .expect("an exhausted budget must refuse, not fault");
+        let census = cp.take_chain_census();
+        assert_eq!(
+            census.followed, 1,
+            "only the last budget slot may be spent — the reset must not grant more"
+        );
+        assert_eq!(
+            census.refused_budget, 1,
+            "the chain past the budget must be a named counted refusal"
+        );
+        assert!(
+            drawn(&sink).is_empty(),
+            "the refused buffer held the only draw"
+        );
+    }
+
+    /// C2 REGRESSION, part 2. A resumed walk is a continuation of one submission,
+    /// not a new one. Re-arming the budget per resume segment meant a stream that
+    /// suspends often got an unbounded total allowance.
+    #[test]
+    fn a_resumed_walk_continues_the_chain_budget_instead_of_re_arming_it() {
+        let child = 0x8130_0000u64;
+        let mem = ChainMem::default().with(child, tagged_draw(3));
+        let dcb = chain_packet(child, 3);
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        cp.chain_buffers_followed = CommandProcessor::MAX_CHAIN_BUFFERS;
+        let mut sink = RecordingSink::default();
+        // A RESUME (start_dword != 0 on a longer buffer) must not re-arm.
+        let mut resumable = vec![header(2, pm4::IT_NOP, pm4::R_PUSH_MARKER), 0];
+        resumable.extend(chain_packet(child, 3));
+        cp.run_resumable(&resumable, 2, &mut sink, Some(&mem))
+            .expect("a resumed walk must not fault");
+        assert_eq!(
+            cp.take_chain_census().refused_budget,
+            1,
+            "a resume segment must inherit the exhausted budget"
+        );
+
+        // A FRESH submission (start_dword == 0) does re-arm — the bound is per
+        // submission, which is what the embedder's submission rate bounds.
+        cp.chain_buffers_followed = CommandProcessor::MAX_CHAIN_BUFFERS;
+        let mut sink = RecordingSink::default();
+        cp.run_resumable(&dcb, 0, &mut sink, Some(&mem))
+            .expect("a fresh submission must walk");
+        let census = cp.take_chain_census();
+        assert_eq!(census.refused_budget, 0);
+        assert_eq!(census.followed, 1);
+        assert_eq!(drawn(&sink), vec![3]);
+    }
+
+    /// I3 REGRESSION. With the follower off the conditional form used to read its
+    /// compare label out of guest memory before any `follow_chains` test — the
+    /// gate lived only in `request_chain`. That falsified `set_follow_chains`'s
+    /// documented contract on the DEFAULT path.
+    #[test]
+    fn the_conditional_chain_reads_no_guest_memory_when_the_follower_is_off() {
+        let label = 0x8140_0000u64;
+        let then_buffer = 0x8140_1000u64;
+        let else_buffer = 0x8140_2000u64;
+        let mem = ChainMem::default()
+            .with(label, vec![7, 0])
+            .with(then_buffer, tagged_draw(700))
+            .with(else_buffer, tagged_draw(800));
+        let dcb = branch_packet(label, then_buffer, 3, else_buffer, 3);
+
+        let mut cp = CommandProcessor::new();
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a conditional chain must not fault with the follower off");
+
+        assert_eq!(
+            mem.read_count(),
+            0,
+            "with the follower off NOTHING may be dereferenced — not the targets, and not the \
+             compare label either"
+        );
+        let census = cp.take_chain_census();
+        assert_eq!(census.branch_packets, 1, "the packet is still measured");
+        assert_eq!(census.refused_disabled, 1);
+        assert_eq!(census.followed, 0);
+        assert_eq!(
+            census.samples,
+            vec![ChainSample {
+                offset: 0,
+                address: then_buffer,
+                size_dwords: 3,
+                control: 2 | (3 << 8),
+                form: ChainForm::Branch,
+            }],
+            "the sample names the DECLARED then-target, not a claim about the branch taken"
+        );
+        assert!(drawn(&sink).is_empty());
+    }
+
+    /// A mode this processor does not model, and a zero compare mask, must both
+    /// refuse rather than fall through to the then-target. KytyPS5 `EXIT`s on
+    /// mode ∉ {1,2} (pm4Handlers.cpp L2158) and `cp_op_wait_mem` already refuses a
+    /// zero mask; a silent then-branch would execute stream the title asked to
+    /// skip.
+    #[test]
+    fn a_conditional_chain_with_an_unmodelled_mode_or_zero_mask_is_refused() {
+        let label = 0x8150_0000u64;
+        let then_buffer = 0x8150_1000u64;
+        let memory = || {
+            ChainMem::default()
+                .with(label, vec![7, 0])
+                .with(then_buffer, tagged_draw(700))
+        };
+
+        for mode in [0u32, 3] {
+            let dcb = branch_packet_with(label, mode, 3, u64::MAX, then_buffer, 3, 0, 0);
+            let mut cp = CommandProcessor::new();
+            cp.set_follow_chains(true);
+            let mut sink = RecordingSink::default();
+            let mem = memory();
+            cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+                .expect("an unmodelled branch mode must refuse, not fault");
+            assert_eq!(
+                cp.take_chain_census().refused_malformed,
+                1,
+                "mode {mode} must be a named refusal"
+            );
+            assert!(drawn(&sink).is_empty(), "mode {mode} must take no branch");
+            assert_eq!(mem.read_count(), 0, "mode {mode} must read nothing");
+        }
+
+        // Zero mask: every compare function degenerates to comparing 0.
+        let dcb = branch_packet_with(label, 2, 3, 0, then_buffer, 3, 0, 0);
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        let mem = memory();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a zero compare mask must refuse, not fault");
+        assert_eq!(cp.take_chain_census().refused_malformed, 1);
+        assert!(
+            drawn(&sink).is_empty(),
+            "a zero mask must not silently take the then-branch"
+        );
+        assert_eq!(mem.read_count(), 0);
+    }
+
+    /// The 4-dword form's high address dword is a documented 16-bit field, so
+    /// reserved bits 31:16 being set proves a mis-decode. Masking them away could
+    /// turn garbage into a DIFFERENT, possibly mapped address and then read
+    /// command stream from it.
+    #[test]
+    fn a_chain_jump_with_reserved_high_bits_set_is_refused_not_masked() {
+        let real = 0x8160_0000u64;
+        let mem = ChainMem::default().with(real, tagged_draw(11));
+        let mut dcb = chain_packet(real, 3);
+        // Set a reserved bit in the high dword. Masking would leave the address
+        // unchanged and happily read the buffer.
+        dcb[2] |= 1 << 20;
+        dcb.extend(tagged_draw(22));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("reserved high bits must refuse, not fault");
+        let census = cp.take_chain_census();
+        assert_eq!(census.refused_malformed, 1);
+        assert_eq!(census.followed, 0);
+        assert_eq!(mem.read_count(), 0, "refused before any read");
+        assert_eq!(
+            drawn(&sink),
+            vec![22],
+            "the submitted buffer keeps walking after the refusal"
+        );
+    }
+
+    /// The conditional form's high dword is AGC's own encoding, a full 32 bits —
+    /// which is what `raeen-hle`'s `hle_cb_branch` writes and what KytyPS5's
+    /// `CpOpBranch` reads. It must NOT be masked to 16 bits like the 4-dword
+    /// form's. This test and the one above pin the deliberate asymmetry.
+    #[test]
+    fn the_conditional_chain_takes_a_full_32_bit_high_dword() {
+        let label = 0x8170_0000u64;
+        // A target whose high dword exceeds 16 bits: masking it would change the
+        // address and the read would miss.
+        let then_buffer = 0x0001_0000_8170_1000u64;
+        assert_ne!(then_buffer >> 32, (then_buffer >> 32) & 0xffff);
+        let mem = ChainMem::default()
+            .with(label, vec![7, 0])
+            .with(then_buffer, tagged_draw(700));
+        let dcb = branch_packet(label, then_buffer, 3, 0, 0);
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a full-width branch target must walk");
+        assert_eq!(
+            drawn(&sink),
+            vec![700],
+            "the branch high dword must be taken unmasked"
+        );
+        assert_eq!(cp.take_chain_census().followed, 1);
+    }
+
+    /// The `CHAIN` control bit (bit 20) would make the transfer a JUMP on
+    /// hardware. Neither reference honours it and KytyPS5's observed PS5 control
+    /// values have it clear, so this processor treats it as a CALL and COUNTS it —
+    /// guessing a jump would drop the parent's remaining draws, the exact bug
+    /// class the follower exists to fix.
+    #[test]
+    fn the_chain_control_bit_is_counted_and_still_executed_as_a_call() {
+        let child = 0x8180_0000u64;
+        let mem = ChainMem::default().with(child, tagged_draw(77));
+        let mut dcb = chain_packet(child, 3);
+        dcb[3] |= 1 << 20;
+        dcb.extend(tagged_draw(22));
+
+        let mut cp = CommandProcessor::new();
+        cp.set_follow_chains(true);
+        let mut sink = RecordingSink::default();
+        cp.run_with_memory(&dcb, &mut sink, Some(&mem))
+            .expect("a chain-bit packet must walk");
+        let census = cp.take_chain_census();
+        assert_eq!(census.chain_bit_set, 1, "the bit must be counted");
+        assert_eq!(census.followed, 1);
+        assert_eq!(
+            drawn(&sink),
+            vec![77, 22],
+            "still a CALL: the parent's remaining draw must run"
+        );
+        assert_eq!(
+            census.samples.first().map(|sample| sample.size_dwords),
+            Some(3),
+            "the CHAIN bit must not corrupt the decoded size"
         );
     }
 }

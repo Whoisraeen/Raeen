@@ -27,7 +27,7 @@ use raeen_core::frame_path::{self, Stage};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Default offscreen size for PM4-triggered M2 draws.
 pub const M2_DRAW_WIDTH: u32 = 64;
@@ -2273,7 +2273,7 @@ impl AgcGpuSession {
         // walk census. Set on BOTH queues' processors, every submission.
         let follow_chains = crate::diagnostics::gpu_env().follow_ib_chains;
         cp.set_follow_chains(follow_chains);
-        record_submission_chains(&decoded);
+        record_submission_chains(&decoded, start_dword);
         if decoded.draw_packets == 0
             && decoded.dispatch_packets == 0
             && !submission_may_draw_through_chains(&decoded, follow_chains)
@@ -3613,12 +3613,26 @@ static CHAIN_EXECUTED_DRAWS: AtomicU64 = AtomicU64::new(0);
 static CHAIN_EXECUTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Record one submission's decode-side chain and draw facts.
-fn record_submission_chains(decoded: &agc::AgcSubmission) {
+///
+/// `start_dword != 0` is a RESUME of a submission already recorded, not a new
+/// one: `decode_submission` always decodes the whole buffer, so counting it again
+/// per resume segment inflated `decoded_draws` — and therefore `unexecuted_draws`
+/// — by however many times the stream suspended. That made the
+/// `decoded` / `executed` pair unable to do the one job it exists for on a title
+/// with cross-queue waits: distinguishing "the draws are hidden in a chain" from
+/// "the draws reach the walk and are dropped downstream". Same `start_dword == 0`
+/// guard [`AgcGpuSession::execute_dcb_cp`] uses for `Stage::DcbSubmitted`.
+///
+/// Returns whether the submission was recorded.
+fn record_submission_chains(decoded: &agc::AgcSubmission, start_dword: usize) -> bool {
+    if start_dword != 0 {
+        return false;
+    }
     CHAIN_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
     CHAIN_DECODED_DRAWS.fetch_add(u64::from(decoded.draw_packets), Ordering::Relaxed);
     CHAIN_DECODED_DISPATCHES.fetch_add(u64::from(decoded.dispatch_packets), Ordering::Relaxed);
     if decoded.indirect_buffers.is_empty() {
-        return;
+        return true;
     }
     let seen = CHAIN_SUBMISSIONS_WITH_CHAINS.fetch_add(1, Ordering::Relaxed) + 1;
     // The first chain-bearing submission is the whole finding: name its targets
@@ -3635,13 +3649,26 @@ fn record_submission_chains(decoded: &agc::AgcSubmission) {
                 .map(|chain| u64::from(chain.size_dwords))
                 .sum::<u64>(),
             follower = crate::diagnostics::gpu_env().follow_ib_chains,
-            targets = ?decoded.indirect_buffers,
+            // CAPPED: a mis-decoded DCB can present thousands of chain packets,
+            // and Debug-printing an unbounded vec into one log line is a way to
+            // turn a diagnostic into the problem. The count above is exact; this
+            // is a sample.
+            targets = ?&decoded.indirect_buffers
+                [..decoded.indirect_buffers.len().min(FIRST_SIGHTING_TARGETS)],
+            truncated = decoded
+                .indirect_buffers
+                .len()
+                .saturating_sub(FIRST_SIGHTING_TARGETS),
             "CHAIN FIRST SIGHTING: a submitted DCB chains into other command buffers. \
              `top_level_draws` counts ONLY the submitted buffer — draws inside these targets are \
              not in it, and are not executed unless RAEEN_FOLLOW_IB_CHAINS is set"
         );
     }
+    true
 }
+
+/// Chain targets named in full by `CHAIN FIRST SIGHTING`.
+const FIRST_SIGHTING_TARGETS: usize = 16;
 
 /// Record what the executor actually completed for one submission.
 fn record_executed_work(draws: u64, dispatches: u64) {
@@ -3672,6 +3699,26 @@ fn accumulate_chain_census(census: &kyty_graphics::run::ChainCensus) {
     };
     let decoded_draws = CHAIN_DECODED_DRAWS.load(Ordering::Relaxed);
     let executed_draws = CHAIN_EXECUTED_DRAWS.load(Ordering::Relaxed);
+    // An all-zero chain census is the ANSWER "this title does not chain", not a
+    // warning. Shouting it every cadence trains the reader to skip the line that
+    // matters. The draw accounting is still worth reporting either way, so the
+    // no-chain case keeps it at `info!` with only the fields that can be non-zero.
+    if total.packets() == 0 && total.refusals() == 0 {
+        info!(
+            submissions,
+            chain_packets = 0,
+            decoded_draws,
+            executed_draws,
+            unexecuted_draws = decoded_draws.saturating_sub(executed_draws),
+            decoded_dispatches = CHAIN_DECODED_DISPATCHES.load(Ordering::Relaxed),
+            executed_dispatches = CHAIN_EXECUTED_DISPATCHES.load(Ordering::Relaxed),
+            "CHAIN CENSUS: no IT_INDIRECT_BUFFER packet has been seen — this title does not chain \
+             its command stream, so any missing draws are downstream of execution. \
+             `decoded_draws` counts what the decoder found in submitted buffers; \
+             `executed_draws` what the sink completed (cumulative; always on)"
+        );
+        return;
+    }
     warn!(
         submissions,
         submissions_with_chains = CHAIN_SUBMISSIONS_WITH_CHAINS.load(Ordering::Relaxed),
@@ -3978,6 +4025,29 @@ mod tests {
     /// from there even with the follower on. The predicate that keeps such a
     /// submission on the real draw path must be false whenever the follower is
     /// off — otherwise it changes the working titles' path.
+    /// A resumed walk is the SAME submission, and `decode_submission` always
+    /// decodes the whole buffer, so recording it again per resume segment inflated
+    /// `decoded_draws` and therefore `unexecuted_draws` by however many times the
+    /// stream suspended. That broke the one comparison the census exists for on a
+    /// title with cross-queue waits.
+    #[test]
+    fn a_resumed_submission_is_not_counted_again_by_the_chain_census() {
+        let decoded = agc::AgcSubmission {
+            draw_packets: 3,
+            ..agc::AgcSubmission::default()
+        };
+        assert!(
+            record_submission_chains(&decoded, 0),
+            "start_dword 0 is a new submission and must be recorded"
+        );
+        for resume in [1usize, 4, 1024] {
+            assert!(
+                !record_submission_chains(&decoded, resume),
+                "start_dword {resume} is a RESUME of a submission already counted"
+            );
+        }
+    }
+
     #[test]
     fn a_chain_bearing_submission_leaves_the_state_only_path_only_when_following() {
         let chain = |kind, size_dwords| agc::AgcIndirectBuffer {
