@@ -1304,6 +1304,21 @@ pub(crate) fn test_ctx<'a>(
     mem: &'a TestMemory,
     alloc: &'a TestAllocator,
 ) -> HleContext<'a> {
+    test_ctx_over_memory(kernel, mem, alloc)
+}
+
+/// [`test_ctx`] over ANY [`GuestMemory`], not just [`TestMemory`].
+///
+/// Needed because `TestMemory` does not override [`GuestMemory::fill_write`], so
+/// it silently exercises the *staging* default. A test that has to reproduce the
+/// real arena's zero-copy, lock-held-across-callback `fill_write` must supply its
+/// own memory (see `libkernel`'s `ArenaLikeMemory`).
+#[cfg(test)]
+pub(crate) fn test_ctx_over_memory<'a>(
+    kernel: &'a raeen_kernel::OrbisKernel,
+    mem: &'a dyn GuestMemory,
+    alloc: &'a TestAllocator,
+) -> HleContext<'a> {
     struct NoGpu;
     impl GpuSubmissionSubsystem for NoGpu {
         fn submit(&self, _words: Vec<u32>, _queue: raeen_core::subsystems::GpuQueue) {}
@@ -1325,13 +1340,23 @@ pub(crate) fn test_ctx<'a>(
         }
     }
     static NO_GPU: NoGpu = NoGpu;
-    test_ctx_with_gpu(kernel, mem, alloc, &NO_GPU)
+    test_ctx_with_gpu_over_memory(kernel, mem, alloc, &NO_GPU)
 }
 
 #[cfg(test)]
 pub(crate) fn test_ctx_with_gpu<'a>(
     kernel: &'a raeen_kernel::OrbisKernel,
     mem: &'a TestMemory,
+    alloc: &'a TestAllocator,
+    gpu: &'a dyn GpuSubmissionSubsystem,
+) -> HleContext<'a> {
+    test_ctx_with_gpu_over_memory(kernel, mem, alloc, gpu)
+}
+
+#[cfg(test)]
+pub(crate) fn test_ctx_with_gpu_over_memory<'a>(
+    kernel: &'a raeen_kernel::OrbisKernel,
+    mem: &'a dyn GuestMemory,
     alloc: &'a TestAllocator,
     gpu: &'a dyn GpuSubmissionSubsystem,
 ) -> HleContext<'a> {

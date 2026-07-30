@@ -274,6 +274,28 @@ fn register_main_thread_stack(kernel: &OrbisKernel, arena: &arena::GuestArena) {
 /// Must run before guest code does. It is cheap (one map insert per distinct
 /// import) and idempotent, so every process entry point calls it unconditionally
 /// rather than trying to decide whether this title uses `dlsym`.
+/// Bind this process's guest address space to the VFS so the `memory:`
+/// pseudo-file scheme can serve reads out of it.
+///
+/// Scaleform/GFx (GTA V's UI layer) hands the file layer a pointer+length URI
+/// instead of a path — `memory:$<hex addr>,<len>,<flags>:<name>` — which is not
+/// a host path and must never be walked as one. `raeen-kernel` sits below this
+/// crate and cannot name [`arena::GuestArena`], so the VFS declares a read-only
+/// seam and the runtime supplies the arena here.
+///
+/// The VFS keeps only a `Weak`, so this does not extend the arena past the end of
+/// the run: when the process finishes and the arena drops, `memory:` opens go
+/// back to a named, counted refusal on their own.
+#[cfg(target_os = "windows")]
+fn bind_memory_scheme_address_space(
+    kernel: &OrbisKernel,
+    arena: &std::sync::Arc<arena::GuestArena>,
+) {
+    let source: std::sync::Arc<dyn raeen_kernel::filesystem::GuestByteSource> =
+        std::sync::Arc::clone(arena) as _;
+    kernel.filesystem.set_guest_byte_source(&source);
+}
+
 #[cfg(target_os = "windows")]
 fn publish_hle_exports_for_dlsym(
     kernel: &OrbisKernel,
@@ -560,6 +582,7 @@ pub fn execute_linked(
     arena::maybe_enable_wx_image(&arena, &module.executable_ranges);
     let gpu = GpuShutdownGuard(raeen_gpu::AgcGpuSession::new_process(arena.clone()));
     raeen_gpu::AgcGpuSession::install_process(&gpu.0);
+    bind_memory_scheme_address_space(kernel, &arena);
     // Expose the module's PT_SCE_PROCPARAM block (if any) to the guest via
     // `sceKernelGetProcParam`: its guest address is the arena base plus the
     // segment's image offset (identity-mapped). `0` clears any stale value
@@ -721,6 +744,7 @@ pub fn execute_process(
     })?;
     let gpu = raeen_gpu::AgcGpuSession::new_process(arena.clone());
     raeen_gpu::AgcGpuSession::install_process(&gpu);
+    bind_memory_scheme_address_space(kernel, &arena);
     let result = execute_process_mapped(
         module,
         hle,

@@ -8,12 +8,21 @@
 //! - `/system/`    → Firmware modules
 //! - `/dev/`       → Device files (stubbed)
 //! - `/proc/`      → Process info (stubbed)
+//!
+//! One guest path family is deliberately *not* a host path: the `memory:` URI
+//! scheme, served straight out of guest memory by [`memory_scheme`]. It is
+//! routed off before host-path resolution ever sees it.
+
+pub mod memory_scheme;
 
 use parking_lot::{Mutex, RwLock};
 use raeen_core::types::Fd;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
+
+pub use memory_scheme::{GuestByteSource, MemoryUri, MemoryUriError};
 
 /// A mount point mapping PS5 paths to host paths.
 #[derive(Debug, Clone)]
@@ -94,6 +103,12 @@ struct OpenFile {
     /// True for `/dev/random` and `/dev/urandom`. Reads are supplied directly
     /// by the host OS entropy source rather than a host file.
     random_device: bool,
+    /// Present for a `memory:` pseudo-file (see [`memory_scheme`]). Reads are
+    /// served out of the guest address range this URI declared, re-validated on
+    /// every access; there is no host file and no `data` buffer. Mutually
+    /// exclusive with `reader`, `dirents`, and `random_device`, and always
+    /// paired with `writable == false`.
+    memory_region: Option<MemoryUri>,
     /// Lazy read-only backing: the host file handle and its length. Present
     /// instead of `data` for a read-only fd of an existing file, so a large
     /// file streams on demand rather than being slurped whole into memory at
@@ -219,6 +234,15 @@ pub struct VirtualFileSystem {
     open_files: RwLock<HashMap<Fd, OpenFile>>,
     /// Next file descriptor to assign.
     next_fd: RwLock<Fd>,
+    /// Guest-memory reader for the `memory:` pseudo-file scheme, installed by
+    /// the runtime once the guest address space exists (see
+    /// [`set_guest_byte_source`](Self::set_guest_byte_source)).
+    ///
+    /// Held **weakly** on purpose: the source is the process's guest arena, and
+    /// a strong reference here would keep its reservations alive past the end of
+    /// the run. A dead (or never-installed) source makes a `memory:` open a
+    /// named, counted refusal rather than a silent empty file.
+    guest_bytes: RwLock<Option<Weak<dyn GuestByteSource>>>,
 }
 
 impl Default for VirtualFileSystem {
@@ -237,6 +261,7 @@ impl VirtualFileSystem {
             savedata_mounts: RwLock::new(std::array::from_fn(|_| None)),
             open_files: RwLock::new(HashMap::new()),
             next_fd: RwLock::new(3), // 0=stdin, 1=stdout, 2=stderr.
+            guest_bytes: RwLock::new(None),
         };
 
         // Register standard PS5 mount points with default paths.
@@ -418,6 +443,135 @@ impl VirtualFileSystem {
         self.mount(&root, &path.to_string_lossy());
     }
 
+    /// Install the guest-memory reader that backs the `memory:` pseudo-file
+    /// scheme, replacing any previous one.
+    ///
+    /// Called by the runtime once the guest address space exists. Only a
+    /// [`Weak`] is retained, so this never extends the arena's lifetime; when the
+    /// process ends and the arena drops, `memory:` opens revert to a named
+    /// refusal on their own with no explicit teardown.
+    pub fn set_guest_byte_source(&self, source: &Arc<dyn GuestByteSource>) {
+        *self.guest_bytes.write() = Some(Arc::downgrade(source));
+        debug!("VFS: memory: scheme bound to a guest address space");
+    }
+
+    /// Drop the `memory:` guest-memory reader.
+    pub fn clear_guest_byte_source(&self) {
+        *self.guest_bytes.write() = None;
+    }
+
+    /// The live guest-memory reader, if one is installed and still alive.
+    ///
+    /// Upgraded to a strong `Arc` for the duration of one operation so the arena
+    /// cannot drop mid-read, and the `guest_bytes` lock is released before any
+    /// guest memory is touched (the source never re-enters the VFS, but holding
+    /// two locks across a foreign call is not worth the risk).
+    fn guest_byte_source(&self) -> Option<Arc<dyn GuestByteSource>> {
+        self.guest_bytes.read().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Parse and validate a `memory:` URI, without opening a descriptor.
+    ///
+    /// This is what `stat` needs: the declared length, proven to name a mapped
+    /// guest range, with no fd allocated. Every refusal is named and counted.
+    pub fn memory_file_len(&self, path: &str) -> Result<u64, std::io::Error> {
+        Ok(self.parse_and_validate_memory_uri(path)?.len)
+    }
+
+    /// The shared `memory:` gate: parse strictly, then prove the whole declared
+    /// range is mapped and readable *before* anything is served.
+    ///
+    /// Refusals are `NotFound` (the guest's ENOENT) except a missing address
+    /// space, which is a host-side wiring failure and reported as such.
+    fn parse_and_validate_memory_uri(&self, path: &str) -> Result<MemoryUri, std::io::Error> {
+        let uri = memory_scheme::parse(path).map_err(|error| {
+            memory_scheme::refuse(error.name(), 0, || {
+                format!("malformed memory: URI '{path}' ({error})")
+            });
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("malformed memory: URI ({error})"),
+            )
+        })?;
+        let Some(source) = self.guest_byte_source() else {
+            memory_scheme::refuse("no-address-space", uri.addr, || {
+                format!(
+                    "memory: URI '{}' requested with no guest address space bound to the VFS",
+                    uri.display_name
+                )
+            });
+            return Err(std::io::Error::other(
+                "no guest address space is bound to the VFS",
+            ));
+        };
+        // The one place a guest-supplied pointer stops being an integer. Prove
+        // the WHOLE declared range is mapped and readable before a single byte
+        // is served; reads re-check as well, so this is a fail-fast at open
+        // rather than the only guard.
+        if !source.guest_range_readable(uri.addr, uri.len) {
+            memory_scheme::refuse("unmapped-range", uri.addr, || {
+                format!(
+                    "memory: URI '{}' declares [{:#x}, {:#x}) which is not fully mapped readable \
+                     guest memory",
+                    uri.display_name,
+                    uri.addr,
+                    uri.end().unwrap_or(u64::MAX)
+                )
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "memory: range is not mapped readable guest memory",
+            ));
+        }
+        Ok(uri)
+    }
+
+    /// Serve one read of a `memory:` descriptor at absolute `offset`.
+    ///
+    /// Clamps to the declared length (a read past EOF is a short/empty read, as
+    /// POSIX requires) and then copies through [`GuestByteSource`], which
+    /// re-validates: the guest may have unmapped the buffer since `open`, and a
+    /// stale range must fail, never serve host bytes.
+    fn read_memory_region(
+        &self,
+        region: &MemoryUri,
+        out: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, std::io::Error> {
+        let start = offset.min(region.len);
+        let want = usize::try_from((region.len - start).min(out.len() as u64)).unwrap_or(0);
+        if want == 0 {
+            return Ok(0);
+        }
+        let Some(source) = self.guest_byte_source() else {
+            memory_scheme::refuse("no-address-space", region.addr, || {
+                format!(
+                    "read of memory: file '{}' after its guest address space went away",
+                    region.display_name
+                )
+            });
+            return Err(std::io::Error::other(
+                "no guest address space is bound to the VFS",
+            ));
+        };
+        // `start <= region.len` and `addr + len` was proven non-overflowing at
+        // parse time, so this cannot wrap.
+        let at = region.addr + start;
+        if !source.read_guest_bytes(at, &mut out[..want]) {
+            memory_scheme::refuse("unmapped-read", at, || {
+                format!(
+                    "read of {want} bytes at {at:#x} in memory: file '{}' hit unmapped guest memory",
+                    region.display_name
+                )
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "memory: read hit unmapped guest memory",
+            ));
+        }
+        Ok(want)
+    }
+
     /// Resolve a PS5 path to a host path.
     ///
     /// This is the guest->host sandbox boundary: every file syscall maps a guest
@@ -425,6 +579,16 @@ impl VirtualFileSystem {
     /// that matches no mount, or that would escape its mount root, resolves to
     /// `None` (default-deny / fail-closed) — see [`combine_within_mount`].
     pub fn resolve_path(&self, ps5_path: &str) -> Option<PathBuf> {
+        // A `memory:` URI is not a host path and must never be walked as one.
+        // Refusing it here (rather than letting it reach `combine_within_mount`
+        // and trip the drive-qualifier guard) keeps the log honest: the guard's
+        // warning describes a sandbox escape attempt, which this is not. The
+        // guard itself is untouched — an ORDINARY path containing `:` still
+        // reaches it and is still refused.
+        if memory_scheme::claims(ps5_path) {
+            debug!("VFS resolve: '{ps5_path}' is a memory: pseudo-file, not a host path");
+            return None;
+        }
         // Mount matching is a literal prefix compare, so it must run on a
         // normalized spelling — see [`normalize_guest_path`].
         let normalized = normalize_guest_path(ps5_path);
@@ -539,6 +703,57 @@ impl VirtualFileSystem {
         let truncate = flags & O_TRUNC != 0;
         let append = flags & O_APPEND != 0;
 
+        // --- `memory:` pseudo-file, BEFORE any host-path resolution. ---
+        //
+        // Ordering mirrors shadPS4's `/dev/` branch (`file_system.cpp:119`):
+        // after the access-mode decode, before `GetHostPath`. Once the scheme
+        // claims the path the decision is authoritative — a malformed URI or an
+        // unmapped range is a named refusal, never a fall-through that would
+        // turn a bad URI into a host filesystem probe.
+        if memory_scheme::claims(path) {
+            if writable || create || truncate {
+                // The guest already owns this buffer and can store to it
+                // directly; a writable file handle would be a second aliasing
+                // path into it. EACCES, matching `/dev/random`'s refusal and the
+                // Orbis read-only-object convention.
+                memory_scheme::refuse("write-open", 0, || {
+                    format!("memory: URI '{path}' opened for writing (flags {flags:#x})")
+                });
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "memory: pseudo-files are read-only",
+                ));
+            }
+            let region = self.parse_and_validate_memory_uri(path)?;
+            let mut next = self.next_fd.write();
+            let fd = *next;
+            *next += 1;
+            debug!(
+                "VFS open: '{}' -> fd={fd} ({} bytes of guest memory at {:#x}, flags {})",
+                region.display_name, region.len, region.addr, region.flags
+            );
+            self.open_files.write().insert(
+                fd,
+                OpenFile {
+                    fd,
+                    host_path: PathBuf::new(),
+                    ps5_path: path.to_string(),
+                    random_device: false,
+                    memory_region: Some(region),
+                    reader: None,
+                    writable: false,
+                    dirents: None,
+                    inner: Mutex::new(OpenFileMut {
+                        position: 0,
+                        data: None,
+                        dirty: false,
+                        flags,
+                    }),
+                },
+            );
+            return Ok(fd);
+        }
+
         if matches!(path, "/dev/random" | "/dev/urandom") {
             if writable {
                 return Err(std::io::Error::new(
@@ -556,6 +771,7 @@ impl VirtualFileSystem {
                     host_path: PathBuf::new(),
                     ps5_path: path.to_string(),
                     random_device: true,
+                    memory_region: None,
                     reader: None,
                     writable: false,
                     dirents: None,
@@ -617,6 +833,7 @@ impl VirtualFileSystem {
                     host_path: PathBuf::new(),
                     ps5_path: path.to_string(),
                     random_device: false,
+                    memory_region: None,
                     reader: None,
                     writable: false,
                     dirents: Some(pack_dirents(&entries)),
@@ -730,6 +947,7 @@ impl VirtualFileSystem {
             host_path,
             ps5_path: path.to_string(),
             random_device: false,
+            memory_region: None,
             reader,
             writable,
             dirents,
@@ -780,6 +998,15 @@ impl VirtualFileSystem {
                 .map_err(|error| std::io::Error::other(format!("host entropy failed: {error}")))?;
             return Ok(out.len());
         }
+        if let Some(region) = file.memory_region.as_ref() {
+            // Hold the per-fd lock across the guest copy so `position` advances
+            // coherently, exactly as the `data`/`reader` branches below do.
+            let mut inner = file.inner.lock();
+            let pos = inner.position;
+            let read = self.read_memory_region(region, out, pos)?;
+            inner.position = pos + read as u64;
+            return Ok(read);
+        }
         let mut inner = file.inner.lock();
         let pos = inner.position;
         if let Some(data) = inner.data.as_ref() {
@@ -821,6 +1048,21 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
+        // A `memory:` fd is never `writable`, so the check below would already
+        // refuse this. Naming the scheme first turns a bare EACCES into a log
+        // line a compatibility report can act on.
+        if let Some(region) = file.memory_region.as_ref() {
+            memory_scheme::refuse("write-attempt", region.addr, || {
+                format!(
+                    "write to read-only memory: file '{}' (fd {fd})",
+                    region.display_name
+                )
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "memory: pseudo-files are read-only",
+            ));
+        }
         if !file.writable {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -876,6 +1118,12 @@ impl VirtualFileSystem {
                 .map_err(|error| std::io::Error::other(format!("host entropy failed: {error}")))?;
             return Ok(out.len());
         }
+        if let Some(region) = file.memory_region.as_ref() {
+            // A `memory:` region is immutable after open and this touches no
+            // per-fd state, so no per-file lock is needed — concurrent preads
+            // and the sequential stream on one such fd never serialize.
+            return self.read_memory_region(region, out, offset);
+        }
         // In-memory branch: read the write-back buffer coherently with a
         // concurrent same-fd `write`, still WITHOUT touching `position`.
         let inner = file.inner.lock();
@@ -924,6 +1172,21 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
+        // A `memory:` fd is never `writable`, so the check below would already
+        // refuse this. Naming the scheme first turns a bare EACCES into a log
+        // line a compatibility report can act on.
+        if let Some(region) = file.memory_region.as_ref() {
+            memory_scheme::refuse("write-attempt", region.addr, || {
+                format!(
+                    "write to read-only memory: file '{}' (fd {fd})",
+                    region.display_name
+                )
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "memory: pseudo-files are read-only",
+            ));
+        }
         if !file.writable {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -967,6 +1230,21 @@ impl VirtualFileSystem {
                 format!("fd {fd} not open"),
             ));
         };
+        // A `memory:` fd is never `writable`, so the check below would already
+        // refuse this. Naming the scheme first turns a bare EACCES into a log
+        // line a compatibility report can act on.
+        if let Some(region) = file.memory_region.as_ref() {
+            memory_scheme::refuse("write-attempt", region.addr, || {
+                format!(
+                    "write to read-only memory: file '{}' (fd {fd})",
+                    region.display_name
+                )
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "memory: pseudo-files are read-only",
+            ));
+        }
         if !file.writable {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -999,16 +1277,7 @@ impl VirtualFileSystem {
             ));
         };
         let mut inner = file.inner.lock();
-        let size = inner
-            .data
-            .as_ref()
-            .map(|d| d.len() as u64)
-            .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
-            // A directory's "size" is its packed dirent listing (always a
-            // multiple of 512), so lseek(SEEK_END) reports what getdents
-            // walks — mirroring shadPS4's NormalDirectory.
-            .or_else(|| file.dirents.as_ref().map(|b| b.len() as u64))
-            .unwrap_or(0);
+        let size = backing_len(file, &inner);
         let base = match whence {
             0 => 0i64,                  // SEEK_SET
             1 => inner.position as i64, // SEEK_CUR
@@ -1042,17 +1311,20 @@ impl VirtualFileSystem {
         let files = self.open_files.read();
         let file = files.get(&fd)?;
         let inner = file.inner.lock();
-        Some(
-            inner
-                .data
-                .as_ref()
-                .map(|d| d.len() as u64)
-                .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
-                // Directories report their packed dirent listing size
-                // (512-aligned), matching shadPS4's directory fstat/lseek.
-                .or_else(|| file.dirents.as_ref().map(|b| b.len() as u64))
-                .unwrap_or(0),
-        )
+        Some(backing_len(file, &inner))
+    }
+
+    /// Whether `fd` names a `memory:` pseudo-file (see [`memory_scheme`]).
+    ///
+    /// Exposed so `fstat` and diagnostics can tell a guest-memory-backed regular
+    /// file apart from a host-backed one; both report `S_IFREG`, which is what
+    /// the title expects, so this is informational rather than a mode switch.
+    #[must_use]
+    pub fn is_memory_file(&self, fd: Fd) -> bool {
+        self.open_files
+            .read()
+            .get(&fd)
+            .is_some_and(|file| file.memory_region.is_some())
     }
 
     /// Whether `fd` is an open directory descriptor.
@@ -1231,6 +1503,17 @@ impl VirtualFileSystem {
             ));
         };
         let inner = file.inner.into_inner();
+        if let Some(region) = file.memory_region.as_ref() {
+            // Nothing to flush and nothing to unmap: the bytes belong to the
+            // guest, which still owns that buffer after the handle is gone.
+            // `host_path` is empty for these, so falling into the flush branch
+            // below would try to `std::fs::write("")`.
+            debug!(
+                "VFS close: fd={fd} (memory: file '{}', {} bytes at {:#x})",
+                region.display_name, region.len, region.addr
+            );
+            return Ok(());
+        }
         if inner.dirty && file.writable {
             if let Some(ref data) = inner.data {
                 match std::fs::write(&file.host_path, data) {
@@ -1250,6 +1533,28 @@ impl VirtualFileSystem {
         }
         Ok(())
     }
+}
+
+/// The length of whichever backing an open descriptor has.
+///
+/// One definition shared by `lseek(SEEK_END)` and `fstat`, because the two
+/// disagreeing is how a title ends up reading past what a read will serve.
+/// Ordered by authority:
+/// * a `memory:` region's **declared** length — never re-derived, since that is
+///   the number the title itself supplied and will size its own buffer from;
+/// * the in-memory `data` buffer (a writable fd's write-back store);
+/// * the lazy host `reader`'s length;
+/// * a directory's packed dirent listing, always a multiple of 512, so
+///   `lseek(SEEK_END)` reports exactly what `getdents` walks — mirroring
+///   shadPS4's `NormalDirectory`.
+fn backing_len(file: &OpenFile, inner: &OpenFileMut) -> u64 {
+    file.memory_region
+        .as_ref()
+        .map(|region| region.len)
+        .or_else(|| inner.data.as_ref().map(|data| data.len() as u64))
+        .or_else(|| file.reader.as_ref().map(|(_, len)| *len))
+        .or_else(|| file.dirents.as_ref().map(|bin| bin.len() as u64))
+        .unwrap_or(0)
 }
 
 /// Flush one open file's write-back buffer and report whether it was dirty.
@@ -1679,6 +1984,544 @@ mod tests {
         let d = std::env::temp_dir().join(format!("raeen-vfs-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // ---------------------------------------------------------------------
+    // `memory:` pseudo-file scheme
+    // ---------------------------------------------------------------------
+
+    /// The five URIs GTA V was measured requesting. Addresses and lengths are
+    /// as logged; the *contents* below are fabricated by [`pattern_byte`], so no
+    /// game bytes are involved.
+    const GTA_V_URIS: [&str; 5] = [
+        "memory:$1085a08000,9156,0:00005_initial_interactive_screen_ps5.gfx",
+        "memory:$1546320000,110250,0:00010_game_stream.gfx",
+        "memory:$1546320000,63305,0:00011_generic_instructional_buttons.gfx",
+        "memory:$1559e00000,198674,0:00002_font_lib_efigs_ps5.gfx",
+        "memory:$1559ec0000,114275,0:00015_loadingscreen_startup.gfx",
+    ];
+
+    /// Deterministic content as a pure function of the guest address, so a read
+    /// at any offset can be verified without holding a reference copy.
+    fn pattern_byte(addr: u64) -> u8 {
+        (addr.wrapping_mul(31).wrapping_add(7) >> 3) as u8
+    }
+
+    /// A fabricated guest address space: a set of readable regions and nothing
+    /// else. Deliberately does NOT override `guest_range_readable`, so the
+    /// trait's default page probe is exercised too.
+    struct FakeGuestMemory {
+        regions: Vec<(u64, u64)>,
+        /// Set to model the guest unmapping its buffers while a descriptor is
+        /// still open — every subsequent read must fail closed.
+        revoked: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeGuestMemory {
+        fn over_regions(regions: &[(u64, u64)]) -> Arc<dyn GuestByteSource> {
+            Arc::new(Self {
+                regions: regions.to_vec(),
+                revoked: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        /// The four distinct buffers the five GTA V URIs address. Two URIs share
+        /// base `0x1546320000` with different lengths, exactly as measured — one
+        /// buffer, two views — so the larger length covers both.
+        fn gta_v() -> Arc<dyn GuestByteSource> {
+            Self::over_regions(&[
+                (0x10_85A0_8000, 9156),
+                (0x15_4632_0000, 110_250),
+                (0x15_59E0_0000, 198_674),
+                (0x15_59EC_0000, 114_275),
+            ])
+        }
+    }
+
+    impl GuestByteSource for FakeGuestMemory {
+        fn read_guest_bytes(&self, addr: u64, out: &mut [u8]) -> bool {
+            if self.revoked.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            let Some(end) = addr.checked_add(out.len() as u64) else {
+                return false;
+            };
+            let covered = self
+                .regions
+                .iter()
+                .any(|&(base, len)| addr >= base && end <= base + len);
+            if !covered {
+                return false;
+            }
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = pattern_byte(addr + index as u64);
+            }
+            true
+        }
+    }
+
+    /// A VFS with a real `/app0` mount (so a plain path still resolves) and the
+    /// fabricated GTA V address space bound. The `Arc` is returned so the caller
+    /// keeps the weakly-held source alive.
+    fn vfs_with_gta_v_memory() -> (VirtualFileSystem, Arc<dyn GuestByteSource>, PathBuf) {
+        let dir = temp_dir("memory-scheme");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let source = FakeGuestMemory::gta_v();
+        vfs.set_guest_byte_source(&source);
+        (vfs, source, dir)
+    }
+
+    #[test]
+    fn the_five_gta_v_scaleform_uris_open_and_read_back_their_whole_declared_length() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+
+        for uri in GTA_V_URIS {
+            let expected = memory_scheme::parse(uri).expect("fixture URI parses");
+            let fd = vfs
+                .open(uri, O_RDONLY, 0)
+                .unwrap_or_else(|e| panic!("{uri} must open, got {e}"));
+            assert!(vfs.is_memory_file(fd), "{uri} must be a memory: descriptor");
+            assert_eq!(
+                vfs.file_size(fd),
+                Some(expected.len),
+                "{uri} must report its DECLARED length, not a re-derived one"
+            );
+
+            // Whole file through the sequential cursor, in one call.
+            let bytes = vfs.read(fd, expected.len as usize + 64).expect("read");
+            assert_eq!(
+                bytes.len(),
+                expected.len as usize,
+                "{uri}: a read past EOF must return the short tail, not over-read"
+            );
+            for (offset, got) in bytes.iter().enumerate() {
+                assert_eq!(
+                    *got,
+                    pattern_byte(expected.addr + offset as u64),
+                    "{uri}: byte at offset {offset} came from the wrong guest address"
+                );
+            }
+            // Cursor is at EOF; a further read is empty and does not error.
+            assert_eq!(vfs.read(fd, 16).expect("read at eof").len(), 0);
+            vfs.close(fd).expect("close");
+        }
+    }
+
+    #[test]
+    fn memory_backed_reads_serve_offset_zero_mid_file_and_a_tail_that_straddles_the_end() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        let uri = "memory:$1559e00000,198674,0:00002_font_lib_efigs_ps5.gfx";
+        let base = 0x15_59E0_0000u64;
+        let len = 198_674u64;
+        let fd = vfs.open(uri, O_RDONLY, 0).expect("open");
+
+        // Offset 0.
+        let mut head = [0xEEu8; 32];
+        assert_eq!(vfs.pread_into(fd, &mut head, 0).expect("pread head"), 32);
+        for (i, got) in head.iter().enumerate() {
+            assert_eq!(*got, pattern_byte(base + i as u64), "head byte {i}");
+        }
+
+        // Mid-file.
+        let mid = len / 2;
+        let mut middle = [0xEEu8; 64];
+        assert_eq!(
+            vfs.pread_into(fd, &mut middle, mid).expect("pread mid"),
+            64,
+            "a mid-file positional read must be complete"
+        );
+        for (i, got) in middle.iter().enumerate() {
+            assert_eq!(*got, pattern_byte(base + mid + i as u64), "mid byte {i}");
+        }
+
+        // Straddling the end: only the bytes before EOF are served, and the ones
+        // past it are left untouched rather than zero-filled.
+        let mut tail = [0xEEu8; 100];
+        let from = len - 40;
+        assert_eq!(
+            vfs.pread_into(fd, &mut tail, from).expect("pread tail"),
+            40,
+            "a straddling read must be short, not padded"
+        );
+        for (i, got) in tail[..40].iter().enumerate() {
+            assert_eq!(*got, pattern_byte(base + from + i as u64), "tail byte {i}");
+        }
+        assert!(
+            tail[40..].iter().all(|b| *b == 0xEE),
+            "bytes past EOF must not be written at all"
+        );
+
+        // Wholly past the end: empty, not an error.
+        let mut past = [0xEEu8; 16];
+        assert_eq!(vfs.pread_into(fd, &mut past, len + 4096).unwrap(), 0);
+        assert!(past.iter().all(|b| *b == 0xEE));
+
+        // pread never disturbed the sequential cursor.
+        let mut sequential = [0u8; 8];
+        assert_eq!(vfs.read_into(fd, &mut sequential).unwrap(), 8);
+        for (i, got) in sequential.iter().enumerate() {
+            assert_eq!(*got, pattern_byte(base + i as u64), "cursor byte {i}");
+        }
+        vfs.close(fd).expect("close");
+    }
+
+    #[test]
+    fn lseek_on_a_memory_file_uses_the_declared_length_and_reads_nothing_past_eof() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        let uri = "memory:$1085a08000,9156,0:00005_initial_interactive_screen_ps5.gfx";
+        let base = 0x10_85A0_8000u64;
+        let len = 9156u64;
+        let fd = vfs.open(uri, O_RDONLY, 0).expect("open");
+
+        // SEEK_END(0) is the size probe Scaleform uses before allocating.
+        assert_eq!(vfs.seek(fd, 0, 2).expect("SEEK_END"), len);
+        assert_eq!(vfs.read(fd, 16).expect("read at eof").len(), 0);
+
+        // SEEK_SET into the middle, then a relative SEEK_CUR.
+        assert_eq!(vfs.seek(fd, 100, 0).expect("SEEK_SET"), 100);
+        assert_eq!(vfs.seek(fd, 28, 1).expect("SEEK_CUR"), 128);
+        let mut at128 = [0u8; 4];
+        assert_eq!(vfs.read_into(fd, &mut at128).unwrap(), 4);
+        for (i, got) in at128.iter().enumerate() {
+            assert_eq!(*got, pattern_byte(base + 128 + i as u64));
+        }
+
+        // Seeking PAST eof is legal (POSIX) and leaves the cursor there; the
+        // read that follows is empty and must not move it backwards.
+        assert_eq!(vfs.seek(fd, 1_000_000, 0).expect("past eof"), 1_000_000);
+        assert_eq!(vfs.read(fd, 32).expect("read past eof").len(), 0);
+        assert_eq!(
+            vfs.seek(fd, 0, 1).expect("cursor unchanged"),
+            1_000_000,
+            "a 0-byte EOF read must leave the offset alone"
+        );
+        assert_eq!(vfs.seek(fd, -8, 2).expect("SEEK_END back"), len - 8);
+        assert_eq!(vfs.read(fd, 64).expect("read tail").len(), 8);
+
+        // Negative absolute offsets are still refused.
+        assert_eq!(
+            vfs.seek(fd, -1, 0).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        vfs.close(fd).expect("close");
+    }
+
+    #[test]
+    fn a_memory_uri_naming_unmapped_guest_memory_is_refused_without_allocating_a_descriptor() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        let before = *vfs.next_fd.read();
+
+        for (uri, why) in [
+            // Right length, address nowhere near a mapped region.
+            ("memory:$dead0000,4096,0:phantom.gfx", "an unmapped range"),
+            // Correct base, one byte longer than the mapped buffer — the case a
+            // lexical range check without a map would wave through.
+            (
+                "memory:$1085a08000,9157,0:one_too_far.gfx",
+                "a range one byte past the mapping",
+            ),
+        ] {
+            let error = vfs
+                .open(uri, O_RDONLY, 0)
+                .expect_err("{why} must not become a descriptor");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{why}: {uri}");
+            // Must be THIS scheme's refusal, naming the range — not the generic
+            // "path is not mounted" a host-path walk produces.
+            assert!(
+                error.to_string().contains("memory:"),
+                "{why} must be refused by the memory: scheme, got '{error}'"
+            );
+        }
+
+        assert_eq!(
+            *vfs.next_fd.read(),
+            before,
+            "a refused memory: open must not consume a guest descriptor"
+        );
+    }
+
+    #[test]
+    fn a_memory_uri_without_a_bound_address_space_is_refused_rather_than_served_empty() {
+        use open_flags::O_RDONLY;
+        let dir = temp_dir("memory-no-space");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+
+        // Never installed.
+        let error = vfs
+            .open(GTA_V_URIS[0], O_RDONLY, 0)
+            .expect_err("no address space must be an error, not a zero-length file");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+
+        // Installed, then dropped: the weak handle must not resurrect it, and
+        // must not keep the source alive either.
+        let source = FakeGuestMemory::gta_v();
+        vfs.set_guest_byte_source(&source);
+        let weak = Arc::downgrade(&source);
+        assert!(vfs.open(GTA_V_URIS[0], O_RDONLY, 0).is_ok());
+        drop(source);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "the VFS must hold the guest address space weakly, never extend its life"
+        );
+        assert_eq!(
+            vfs.open(GTA_V_URIS[1], O_RDONLY, 0)
+                .expect_err("a dead address space must refuse")
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn a_memory_backed_read_is_revalidated_so_a_range_unmapped_after_open_cannot_be_read() {
+        use open_flags::O_RDONLY;
+        let dir = temp_dir("memory-revoke");
+        let vfs = VirtualFileSystem::new();
+        vfs.set_game_directory(&dir);
+        let concrete = Arc::new(FakeGuestMemory {
+            regions: vec![(0x10_85A0_8000, 9156)],
+            revoked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let source: Arc<dyn GuestByteSource> = concrete.clone();
+        vfs.set_guest_byte_source(&source);
+
+        let fd = vfs.open(GTA_V_URIS[0], O_RDONLY, 0).expect("open");
+        assert_eq!(vfs.read(fd, 16).expect("first read").len(), 16);
+
+        // The guest frees its buffer while the handle is still open.
+        concrete
+            .revoked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let mut out = [0u8; 16];
+        assert_eq!(
+            vfs.read_into(fd, &mut out).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "validation at open must not be the only guard — every read re-checks"
+        );
+        assert_eq!(
+            vfs.pread_into(fd, &mut out, 0).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        // A size probe still answers from the URI; only byte access faults.
+        assert_eq!(vfs.file_size(fd), Some(9156));
+        vfs.close(fd).expect("close still succeeds");
+    }
+
+    #[test]
+    fn every_malformed_memory_uri_is_refused_by_name_and_never_reaches_host_resolution() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        let before = *vfs.next_fd.read();
+        for uri in [
+            "memory:",                                  // nothing at all
+            "memory:1085a08000,9156,0:x.gfx",           // missing `$`
+            "memory:$,9156,0:x.gfx",                    // empty address
+            "memory:$zzzz,9156,0:x.gfx",                // non-hex address
+            "memory:$0,9156,0:x.gfx",                   // null address
+            "memory:$1085a08000",                       // missing length field
+            "memory:$1085a08000,9156",                  // missing flags field
+            "memory:$1085a08000,nine,0:x.gfx",          // non-decimal length
+            "memory:$1085a08000,0,0:x.gfx",             // zero length
+            "memory:$1085a08000,999999999999,0:x.gfx",  // absurd length
+            "memory:$1085a08000,9156,zero:x.gfx",       // non-decimal flags
+            "memory:$1085a08000,9156,0",                // missing display name
+            "memory:$1085a08000,9156,0:",               // empty display name
+            "memory:$ffffffffffffffff,9156,0:wrap.gfx", // addr+len wraps
+        ] {
+            let Err(error) = vfs.open(uri, O_RDONLY, 0) else {
+                panic!("{uri} must be refused, not opened");
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "{uri} must be a named ENOENT refusal"
+            );
+            assert!(
+                error.to_string().contains("memory:"),
+                "{uri} refusal must name the scheme, got '{error}'"
+            );
+            // Never a host path, so never a host filesystem probe.
+            assert_eq!(vfs.resolve_path(uri), None, "{uri} must not resolve");
+        }
+        assert_eq!(
+            *vfs.next_fd.read(),
+            before,
+            "no malformed URI may consume a descriptor"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_guest_path_containing_a_colon_is_still_refused_by_the_drive_qualifier_guard() {
+        use open_flags::*;
+        let (vfs, _source, dir) = vfs_with_gta_v_memory();
+
+        // The escape the guard exists for: a drive-qualified segment. Still
+        // denied — routing `memory:` off did not relax it.
+        for hostile in [
+            "/app0/C:/Windows/System32/drivers/etc/hosts",
+            "/app0/sub/D:evil.bin",
+            "/app0/stream:ads",
+            "memoryfoo:$1000,4,0:not-the-scheme.gfx",
+        ] {
+            assert_eq!(
+                vfs.resolve_path(hostile),
+                None,
+                "{hostile} must not resolve to a host path"
+            );
+            assert!(
+                vfs.open(hostile, O_RDONLY, 0).is_err(),
+                "{hostile} must not open read-only"
+            );
+            assert!(
+                vfs.open(hostile, O_WRONLY | O_CREAT, 0o644).is_err(),
+                "{hostile} must not be creatable"
+            );
+        }
+
+        // And an ordinary colon-free path in the same mount still works, so the
+        // guard was not turned into a blanket denial.
+        std::fs::write(dir.join("ordinary.bin"), b"REAL").unwrap();
+        let fd = vfs.open("/app0/ordinary.bin", O_RDONLY, 0).expect("open");
+        assert_eq!(vfs.read(fd, 4).unwrap(), b"REAL");
+        vfs.close(fd).unwrap();
+        let _ = std::fs::remove_file(dir.join("ordinary.bin"));
+    }
+
+    #[test]
+    fn a_memory_backed_descriptor_refuses_every_write_path_and_touches_no_host_file() {
+        use open_flags::*;
+        let (vfs, _source, dir) = vfs_with_gta_v_memory();
+
+        // Opening for write never yields a descriptor at all.
+        let before = *vfs.next_fd.read();
+        for flags in [
+            O_WRONLY,
+            O_RDWR,
+            O_RDONLY | O_CREAT,
+            O_RDONLY | O_TRUNC,
+            O_WRONLY | O_CREAT | O_TRUNC,
+        ] {
+            let Err(error) = vfs.open(GTA_V_URIS[0], flags, 0o644) else {
+                panic!("flags {flags:#x} must be refused, not opened");
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "flags {flags:#x} must be EACCES, never a silent success"
+            );
+        }
+        assert_eq!(*vfs.next_fd.read(), before);
+
+        // And every fd-side mutation on a read-only handle is refused too.
+        let fd = vfs.open(GTA_V_URIS[0], O_RDONLY, 0).expect("open");
+        assert_eq!(
+            vfs.write(fd, b"NOPE").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            vfs.pwrite(fd, b"NOPE", 0).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            vfs.ftruncate(fd, 0).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // A refused write must not have altered what a read serves.
+        let mut check = [0u8; 4];
+        assert_eq!(vfs.pread_into(fd, &mut check, 0).unwrap(), 4);
+        for (i, got) in check.iter().enumerate() {
+            assert_eq!(*got, pattern_byte(0x10_85A0_8000 + i as u64));
+        }
+        assert_eq!(vfs.file_size(fd), Some(9156), "length is unchanged");
+
+        // fsync succeeds (nothing to flush) and close writes no host file.
+        vfs.sync(fd).expect("fsync on a read-only handle succeeds");
+        let host_files_before = std::fs::read_dir(&dir).unwrap().count();
+        vfs.close(fd).expect("close");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            host_files_before,
+            "closing a memory: handle must not create or flush a host file"
+        );
+    }
+
+    #[test]
+    fn a_memory_backed_descriptor_is_not_a_directory_and_not_an_entropy_device() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        let fd = vfs.open(GTA_V_URIS[3], O_RDONLY, 0).expect("open");
+        assert!(!vfs.is_directory(fd));
+        assert!(!vfs.is_random_device(fd));
+        assert!(vfs.is_memory_file(fd));
+        assert_eq!(
+            vfs.open_path(fd).as_deref(),
+            Some(GTA_V_URIS[3]),
+            "the URI is retained verbatim for diagnostics"
+        );
+        assert_eq!(
+            vfs.getdents(fd, 512).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "getdents on a regular memory: file must be ENOTDIR-shaped, not a panic"
+        );
+        assert_eq!(vfs.flags(fd), Some(O_RDONLY));
+        vfs.close(fd).expect("close");
+        assert!(!vfs.is_memory_file(fd), "a closed fd is no longer known");
+    }
+
+    #[test]
+    fn memory_file_len_answers_stat_sized_queries_without_opening_a_descriptor() {
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        let before = *vfs.next_fd.read();
+        for uri in GTA_V_URIS {
+            let expected = memory_scheme::parse(uri).unwrap().len;
+            assert_eq!(
+                vfs.memory_file_len(uri)
+                    .unwrap_or_else(|e| panic!("{uri}: {e}")),
+                expected,
+                "{uri}: stat must report the declared length"
+            );
+        }
+        // Unmapped and malformed are both refusals here too, not a size of 0.
+        assert!(vfs.memory_file_len("memory:$dead0000,16,0:x.gfx").is_err());
+        assert!(vfs.memory_file_len("memory:$1085a08000,0,0:x.gfx").is_err());
+        assert!(vfs.memory_file_len("/app0/plain.bin").is_err());
+        assert_eq!(*vfs.next_fd.read(), before, "stat must allocate no fd");
+    }
+
+    #[test]
+    fn two_descriptors_over_one_aliased_guest_buffer_keep_independent_cursors() {
+        use open_flags::O_RDONLY;
+        let (vfs, _source, _dir) = vfs_with_gta_v_memory();
+        // The two measured URIs that share base 0x1546320000 with different
+        // declared lengths — one buffer, two views.
+        let long = vfs
+            .open(GTA_V_URIS[1], O_RDONLY, 0)
+            .expect("open long view");
+        let short = vfs
+            .open(GTA_V_URIS[2], O_RDONLY, 0)
+            .expect("open short view");
+        assert_eq!(vfs.file_size(long), Some(110_250));
+        assert_eq!(vfs.file_size(short), Some(63_305));
+
+        assert_eq!(vfs.read(long, 1000).unwrap().len(), 1000);
+        assert_eq!(
+            vfs.seek(short, 0, 1).unwrap(),
+            0,
+            "reading one view must not move the other's cursor"
+        );
+        // The short view's EOF is its own declared length, not the long one's.
+        assert_eq!(vfs.seek(short, 0, 2).unwrap(), 63_305);
+        assert_eq!(vfs.read(short, 16).unwrap().len(), 0);
+        assert_eq!(vfs.seek(long, 0, 2).unwrap(), 110_250);
+        vfs.close(long).unwrap();
+        vfs.close(short).unwrap();
     }
 
     #[test]
