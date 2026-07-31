@@ -147,6 +147,9 @@ pub struct ComputeOutputs {
     /// One entry per storage image (`StorageImageBinding.images` order),
     /// RGBA8 tightly packed rows.
     pub images: Vec<Vec<u8>>,
+    /// Sparse guest-window changes from translated FLAT/GLOBAL stores. `None`
+    /// for read-only or degraded zero windows.
+    pub global_mem: Option<ComputeBufferOutput>,
 }
 
 /// One changed byte range in a writable compute storage buffer.
@@ -270,6 +273,11 @@ pub fn dispatch_compute(
                 .and_then(|binding| binding.storage_buffers.as_ref()),
         )?,
         images: resources.read_images()?,
+        global_mem: resources.read_global_mem(
+            state
+                .binding
+                .and_then(|binding| binding.global_mem.as_ref()),
+        )?,
     };
     let map_copy = phase_at.map_or(std::time::Duration::ZERO, |at| at.elapsed());
     let storage_bytes = state
@@ -367,6 +375,11 @@ pub fn dispatch_compute_deferred(
             "deferred compute requires an explicit resource binding".to_owned(),
         )
     })?;
+    if binding.global_mem.is_some() {
+        return Err(GpuError::PipelineCreationFailed(
+            "FLAT/GLOBAL guest-memory windows require synchronous dispatch/writeback".to_owned(),
+        ));
+    }
     let storage = binding.storage_buffers.as_ref();
     let images = binding.storage_images.as_ref();
     if storage.is_none() && images.is_none() {
@@ -495,6 +508,8 @@ struct ComputeResources<'a> {
     /// The raw EUD-window snapshot (SharpEmu port); per-dispatch, owned,
     /// never read back.
     eud_raw: Option<BufferAllocation>,
+    /// The `%global_mem` header + guest snapshot; per-dispatch and owned.
+    global_mem: Option<BufferAllocation>,
     /// Oversized translated resource table, uploaded as a UBO instead of
     /// exceeding the device's push-constant limit.
     push_uniform: Option<BufferAllocation>,
@@ -522,6 +537,7 @@ impl<'a> ComputeResources<'a> {
             samplers: Vec::new(),
             gds: vk::Buffer::null(),
             eud_raw: None,
+            global_mem: None,
             push_uniform: None,
             shader: vk::ShaderModule::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
@@ -551,12 +567,14 @@ impl<'a> ComputeResources<'a> {
         let textures = state.binding.and_then(|b| b.textures.as_ref());
         let gds_binding = state.binding.and_then(|b| b.gds_binding);
         let eud_raw = state.binding.and_then(|b| b.eud_raw.as_ref());
+        let global_mem = state.binding.and_then(|b| b.global_mem.as_ref());
         let push_uniform_binding = state.binding.and_then(|b| b.push_uniform_binding);
         if storage.is_some()
             || storage_images.is_some()
             || textures.is_some()
             || gds_binding.is_some()
             || eud_raw.is_some()
+            || global_mem.is_some()
             || push_uniform_binding.is_some()
         {
             let binding = state.binding.expect("resource groups come from a binding");
@@ -753,6 +771,37 @@ impl<'a> ComputeResources<'a> {
                         .stage_flags(vk::ShaderStageFlags::COMPUTE),
                 );
             }
+            // FLAT/GLOBAL direct-address accesses use one SSBO containing an
+            // eight-byte guest-base header followed by the authorized window.
+            if let Some(window) = global_mem {
+                if window.bytes.len() < 12 || !window.bytes.len().is_multiple_of(4) {
+                    return Err(GpuError::PipelineCreationFailed(format!(
+                        "FLAT/GLOBAL window carries {} bytes — expected base header plus at \
+                         least one dword",
+                        window.bytes.len()
+                    )));
+                }
+                if window.guest_size != 0
+                    && (window.guest_base == 0
+                        || window.bytes.len() != window.guest_size.saturating_add(8))
+                {
+                    return Err(GpuError::PipelineCreationFailed(format!(
+                        "FLAT/GLOBAL window base={:#x} guest_size={} total_bytes={} is inconsistent",
+                        window.guest_base,
+                        window.guest_size,
+                        window.bytes.len()
+                    )));
+                }
+                self.global_mem =
+                    Some(self.create_storage_buffer(&window.bytes, 0, window.bytes.len(), None)?);
+                layout_bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(window.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                );
+            }
             if let Some(uniform_binding) = push_uniform_binding {
                 if binding.push_constants.is_empty() {
                     return Err(GpuError::PipelineCreationFailed(
@@ -783,6 +832,7 @@ impl<'a> ComputeResources<'a> {
                     self.storage.len() as u32
                         + u32::from(!self.gds.is_null())
                         + u32::from(self.eud_raw.is_some())
+                        + u32::from(self.global_mem.is_some())
                         + u32::from(self.push_uniform.is_some()),
                 ),
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
@@ -969,6 +1019,24 @@ impl<'a> ComputeResources<'a> {
                         .dst_binding(window.binding)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(&eud_raw_info),
+                );
+            }
+            let global_mem_info = self
+                .global_mem
+                .as_ref()
+                .map(|allocation| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(allocation.buffer)
+                        .range(allocation.size as u64)]
+                })
+                .unwrap_or_default();
+            if let Some(window) = global_mem {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_set)
+                        .dst_binding(window.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&global_mem_info),
                 );
             }
             // The push-constant spill SSBO: created above when the kernel
@@ -2036,6 +2104,40 @@ impl<'a> ComputeResources<'a> {
         Ok(outputs)
     }
 
+    fn read_global_mem(
+        &self,
+        window: Option<&super::offscreen::GlobalMemBinding>,
+    ) -> Result<Option<ComputeBufferOutput>, GpuError> {
+        let Some(window) = window.filter(|window| window.writable && window.guest_size != 0) else {
+            return Ok(None);
+        };
+        let allocation = self.global_mem.as_ref().ok_or_else(|| {
+            GpuError::PipelineCreationFailed(
+                "writable FLAT/GLOBAL binding has no Vulkan allocation".to_owned(),
+            )
+        })?;
+        let full = self.read_storage_dirty(allocation.memory, allocation.size, &window.bytes)?;
+        let body_start = 8usize;
+        let body_end = body_start.saturating_add(window.guest_size);
+        let mut dirty = Vec::new();
+        for span in full.dirty {
+            let span_end = span.offset.saturating_add(span.bytes.len());
+            let start = span.offset.max(body_start);
+            let end = span_end.min(body_end);
+            if start >= end {
+                continue;
+            }
+            dirty.push(ComputeDirtySpan {
+                offset: start - body_start,
+                bytes: span.bytes[start - span.offset..end - span.offset].to_vec(),
+            });
+        }
+        Ok(Some(ComputeBufferOutput {
+            size: window.guest_size,
+            dirty,
+        }))
+    }
+
     /// Map a cached coherent storage allocation and retain only changed
     /// 4 KiB pages. Page granularity keeps the comparison linear and cheap
     /// while coalescing adjacent writes into one guest-memory copy.
@@ -2132,6 +2234,10 @@ impl Drop for ComputeResources<'_> {
             self.command_buffer = vk::CommandBuffer::null();
         }
         if let Some(allocation) = self.eud_raw.take() {
+            self.caches
+                .release_host_buffer(self.dev, allocation.buffer, allocation.memory);
+        }
+        if let Some(allocation) = self.global_mem.take() {
             self.caches
                 .release_host_buffer(self.dev, allocation.buffer, allocation.memory);
         }

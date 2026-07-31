@@ -172,6 +172,8 @@ fn register_display_buffer(kernel: &OrbisKernel) {
                 tiling_mode: TILING_LINEAR,
                 width: DISPLAY_W,
                 height: DISPLAY_H,
+                // Tightly packed: this synthetic buffer has no row padding.
+                pitch_pixels: DISPLAY_W,
                 option: 0,
                 dcc_clear_color: 0,
                 dcc_control: 0,

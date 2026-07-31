@@ -12,7 +12,48 @@
 //! naga deliberately does not serve here: its SPIR-V front end is itself a
 //! structurizer and ACCEPTS back-edge modules spirv-val (and drivers) reject.
 
-use spirv_tools::val::{self, Validator};
+use spirv_tools::{
+    opt::{self, Optimizer},
+    val::{self, Validator},
+};
+
+/// Run SPIRV-Tools' performance recipe over a freshly translated module.
+///
+/// The GCN/RDNA2 translator intentionally models guest registers as function
+/// variables. That keeps instruction lowering simple and auditable, but leaves
+/// thousands of load/store words for a complex shader and can prevent the
+/// Vulkan driver from promoting guest registers before a large draw. The
+/// Khronos optimizer performs that SSA/mem2reg cleanup once, before the module
+/// reaches the driver or the persistent cache.
+///
+/// Bindings and specialization constants are part of Raeen's analyzed stage
+/// ABI, so both are explicitly preserved.
+pub fn optimize_spirv(words: &[u32]) -> Result<Vec<u32>, String> {
+    let mut optimizer = opt::create(Some(spirv_tools::TargetEnv::Vulkan_1_3));
+    optimizer.register_performance_passes();
+
+    let mut messages = Vec::new();
+    let mut callback = |message: spirv_tools::error::Message| {
+        if !message.message.trim().is_empty() {
+            messages.push(message.message);
+        }
+    };
+    let options = opt::Options {
+        preserve_bindings: true,
+        preserve_spec_constants: true,
+        ..Default::default()
+    };
+    optimizer
+        .optimize(words, &mut callback, Some(options))
+        .map(|binary| binary.as_words().to_vec())
+        .map_err(|error| {
+            let detail = messages
+                .into_iter()
+                .find(|message| !message.trim().is_empty())
+                .unwrap_or_else(|| error.to_string());
+            format!("spirv-opt: {detail}")
+        })
+}
 
 /// Validate `words` exactly the way the Vulkan validation layer does
 /// (`spirv-val --relax-block-layout --target-env vulkan1.3`). `Err` carries a
@@ -87,6 +128,14 @@ mod tests {
     #[test]
     fn accepts_a_minimal_valid_module() {
         assert_eq!(validate_spirv(&minimal_valid_module()), Ok(()));
+    }
+
+    #[test]
+    fn performance_optimizer_preserves_a_valid_module() {
+        let original = minimal_valid_module();
+        let optimized = optimize_spirv(&original).expect("optimizer accepts valid SPIR-V");
+        assert_eq!(validate_spirv(&optimized), Ok(()));
+        assert_eq!(optimized.first(), original.first(), "SPIR-V magic");
     }
 
     #[test]

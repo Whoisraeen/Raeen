@@ -854,6 +854,23 @@ const TBUF_STORE_FORMAT_XYZW: TypedBufferHelper = TypedBufferHelper {
     takes_format_arg: true,
 };
 
+/// `%buffer_store_float1`, selected for a `buffer_store_format_xyzw` whose
+/// resource descriptor narrows the operation to one 32-bit component.
+///
+/// The XYZW opcode supplies up to four source VGPRs; the resource format
+/// controls how many components are actually stored. GTA V uses unified
+/// format 20 (`32_UINT`, packed 36), so forwarding all four VGPRs would
+/// overwrite three adjacent dwords. The existing raw one-dword helper is
+/// bit-exact for both accepted 32-bit representations and needs no runtime
+/// format guard because selection happens here.
+const BUF_STORE_FORMAT_XYZW_X32: TypedBufferHelper = TypedBufferHelper {
+    name: "buffer_store_float1",
+    accepted: &[(36, "32_UINT"), (39, "32_FLOAT")],
+    channels: 1,
+    is_store: true,
+    takes_format_arg: false,
+};
+
 /// `%buffer_load_format_xyzw_unorm8`: the beyond-Kyty four-byte normalized
 /// unpack (`BUFFER_LOAD_FORMAT_XYZW_UNORM8`) — legacy `dfmt 10, nfmt 0`, so
 /// packed `10 * 8 + 0` = **80**, RDNA2 unified **56**.
@@ -919,7 +936,9 @@ const BUF_LOAD_FORMAT_XYZW_UNORM8: TypedBufferHelper = TypedBufferHelper {
 /// is made, once, from the bound descriptor. Resolving all candidates in one
 /// call keeps the descriptor lookup and the skip counter single-shot, and lets
 /// the refusal name every format the row could have served rather than only the
-/// first one tried.
+/// first one tried. The XYZW store also dispatches by width: a one-component
+/// 32-bit descriptor selects the raw one-dword helper while a four-component
+/// descriptor selects the four-dword typed helper.
 fn mubuf_descriptor_packed_format(
     inst: &ShaderInstruction,
     bind_info: &ShaderBindResources,
@@ -985,9 +1004,9 @@ fn mubuf_descriptor_packed_format(
         .map(|helper| helper.name)
         .collect::<Vec<_>>()
         .join(" / ");
-    // Every candidate for one row is the same access shape, so the consequence
-    // of refusing is the same whichever would have been picked; take it from
-    // the first, and fall back to the store wording only if there are none.
+    // Load candidates for one row have the same access shape. Stores use
+    // generic wording because descriptor-selected candidates may differ in
+    // width (for example XYZW with a one-component resource format).
     let consequence = match candidates.first() {
         Some(helper) if !helper.is_store => format!(
             "leave v[{d}:{d_end}] untouched",
@@ -4860,19 +4879,33 @@ fn mubuf_flexible(
         op,
         MubufFlexOp::StoreDword | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw
     );
-    // The typed helper this op calls, for the ops that take a format argument.
-    // `None` for the raw dword/byte ops, which have no format guard at all.
-    let format_helper = match op {
-        MubufFlexOp::LoadFormatX => Some(&TBUF_LOAD_FORMAT_X),
-        MubufFlexOp::StoreFormatX => Some(&TBUF_STORE_FORMAT_X),
-        MubufFlexOp::StoreFormatXyzw => Some(&TBUF_STORE_FORMAT_XYZW),
-        MubufFlexOp::LoadDword | MubufFlexOp::LoadUbyte | MubufFlexOp::StoreDword => None,
+    // Resolve a typed access once, before choosing its vdata width and SPIR-V
+    // helper. In particular, buffer_store_format_xyzw is only four dwords when
+    // its resource format has four components; GTA V's 32_UINT descriptor
+    // selects the one-dword candidate.
+    let (packed_format, format_helper) = match op {
+        MubufFlexOp::LoadFormatX | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw => {
+            // Type-check dword3 anyway: this row still reaches the same V#
+            // quad, and a non-uint there means the operand model is wrong.
+            let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
+            if src1_value3.type_ != SpirvType::Uint {
+                return Err(not_supported(func, "unexpected V# dword3 type"));
+            }
+            let candidates: &[&TypedBufferHelper] = match op {
+                MubufFlexOp::LoadFormatX => &[&TBUF_LOAD_FORMAT_X],
+                MubufFlexOp::StoreFormatX => &[&TBUF_STORE_FORMAT_X],
+                MubufFlexOp::StoreFormatXyzw => {
+                    &[&TBUF_STORE_FORMAT_XYZW, &BUF_STORE_FORMAT_XYZW_X32]
+                }
+                _ => unreachable!("only typed MUBUF ops reach candidate selection"),
+            };
+            let (packed, helper) =
+                mubuf_descriptor_packed_format(&inst, bind_info, spirv, func, candidates)?;
+            (Some(packed), Some(helper))
+        }
+        MubufFlexOp::LoadDword | MubufFlexOp::LoadUbyte | MubufFlexOp::StoreDword => (None, None),
     };
-    let vdata_n: i32 = if op == MubufFlexOp::StoreFormatXyzw {
-        4
-    } else {
-        1
-    };
+    let vdata_n = format_helper.map_or(1, |helper| helper.channels);
 
     let mut vdata = Vec::with_capacity(vdata_n as usize);
     for i in 0..vdata_n {
@@ -4958,36 +4991,31 @@ fn mubuf_flexible(
     // that unified number in — a comparison that can never succeed, so every
     // flexible-addressing typed access was a silent no-op. See
     // [`mubuf_descriptor_packed_format`].
-    if let Some(helper) = format_helper {
-        // Type-check dword3 anyway: this row still reaches the same V# quad,
-        // and a non-uint there means the operand model is wrong, not the
-        // format.
-        let src1_value3 = operand_variable_to_str_shift(inst.src[1], 3);
-        if src1_value3.type_ != SpirvType::Uint {
-            return Err(not_supported(func, "unexpected V# dword3 type"));
-        }
-        let (packed_format, _) =
-            mubuf_descriptor_packed_format(&inst, bind_info, spirv, func, &[helper])?;
+    if format_helper.is_some_and(|helper| helper.takes_format_arg) {
+        let packed_format =
+            packed_format.expect("a typed helper that takes a format has a resolved format");
         text += &format!("               OpStore %temp_int_5 %int_{packed_format}\n");
     }
 
     let helper = match op {
-        MubufFlexOp::LoadDword => "%buffer_load_float1",
-        MubufFlexOp::LoadUbyte => "%buffer_load_ubyte",
-        MubufFlexOp::StoreDword => "%buffer_store_float1",
-        MubufFlexOp::LoadFormatX => "%tbuffer_load_format_x",
-        MubufFlexOp::StoreFormatX => "%tbuffer_store_format_x",
-        MubufFlexOp::StoreFormatXyzw => "%tbuffer_store_format_xyzw",
+        MubufFlexOp::LoadDword => "buffer_load_float1",
+        MubufFlexOp::LoadUbyte => "buffer_load_ubyte",
+        MubufFlexOp::StoreDword => "buffer_store_float1",
+        MubufFlexOp::LoadFormatX | MubufFlexOp::StoreFormatX | MubufFlexOp::StoreFormatXyzw => {
+            format_helper
+                .expect("typed MUBUF op has a selected helper")
+                .name
+        }
     };
     let mut args = String::new();
     for v in &vdata {
         args += &format!("%{v} ");
     }
     args += "%temp_int_1 %temp_int_2 %temp_int_3 %temp_int_4";
-    if format_helper.is_some() {
+    if format_helper.is_some_and(|helper| helper.takes_format_arg) {
         args += " %temp_int_5";
     }
-    text += &format!("        %mbf_c_{i} = OpFunctionCall %void {helper} {args}\n");
+    text += &format!("        %mbf_c_{i} = OpFunctionCall %void %{helper} {args}\n");
 
     if is_store {
         text += &format!(
@@ -6337,26 +6365,33 @@ pub(crate) fn mimg_register_eud_alias_index(
 /// [`mimg_register_eud_alias_index`]): the S# is captured at its EUD-virtual
 /// start register but read by the MIMG from a real SGPR a covered EUD `s_load`
 /// fills.
+fn sampler_register_eud_alias_index(
+    bind: &ShaderBindResources,
+    code: &ShaderCode,
+    reg: i32,
+    at: usize,
+) -> Option<usize> {
+    if !bind.extended.used {
+        return None;
+    }
+    let k = eud_alias_offset(code, bind.extended.start_register, reg, at)?;
+    let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
+        .unwrap_or(0)
+        .min(bind.samplers.start_register.len());
+    (0..samp_num).find(|&i| {
+        bind.samplers.extended[i]
+            && super::spirv::eud_rel_index(bind, bind.samplers.start_register[i], 0, "mimg alias")
+                .is_ok_and(|rel| rel == k)
+    })
+}
+
 pub(crate) fn sampler_register_is_eud_alias(
     bind: &ShaderBindResources,
     code: &ShaderCode,
     reg: i32,
     at: usize,
 ) -> bool {
-    if !bind.extended.used {
-        return false;
-    }
-    let Some(k) = eud_alias_offset(code, bind.extended.start_register, reg, at) else {
-        return false;
-    };
-    let samp_num = usize::try_from(bind.samplers.samplers_num.max(0))
-        .unwrap_or(0)
-        .min(bind.samplers.start_register.len());
-    (0..samp_num).any(|i| {
-        bind.samplers.extended[i]
-            && super::spirv::eud_rel_index(bind, bind.samplers.start_register[i], 0, "mimg alias")
-                .is_ok_and(|rel| rel == k)
-    })
+    sampler_register_eud_alias_index(bind, code, reg, at).is_some()
 }
 
 /// SharpEmu-parity translate-time guard against RUNTIME image descriptors.
@@ -6452,6 +6487,112 @@ fn sampled_site_is_guest_cube(spirv: &Spirv<'_>, matched: Option<usize>) -> bool
         .is_some_and(|desc| desc.texture.type_() == 11)
 }
 
+/// The component selection performed by AMD's sampled-image descriptor.
+///
+/// GFX10 `SQ_IMG_RSRC_WORD3.DST_SEL_{X,Y,Z,W}` uses 0/1 for constants and
+/// 4/5/6/7 for source X/Y/Z/W. Vulkan's default image view mapping is
+/// identity, so leaving this descriptor field untranslated makes an R8 image
+/// sample return `(r, 0, 0, 1)` even when the guest requested `(r, r, r, r)`.
+/// GTA V's legal-text shader then reads W and receives a constant one, drawing
+/// every atlas quad as a solid rectangle.
+fn sampled_site_swizzle(spirv: &Spirv<'_>, matched: Option<usize>) -> Option<[u8; 4]> {
+    let descriptor = spirv
+        .get_bind_info()?
+        .textures2d
+        .desc
+        .get(matched?)?
+        .texture;
+    Some([
+        descriptor.dst_sel_x(),
+        descriptor.dst_sel_y(),
+        descriptor.dst_sel_z(),
+        descriptor.dst_sel_w(),
+    ])
+}
+
+/// Apply one resolved T#'s `DST_SEL` to a sampled vec4 in the recompiler's
+/// float-typed register model.
+///
+/// Integer samples have already been bitcast to `%v4float` by
+/// [`route_sampled_class`], so source-component shuffles preserve their raw
+/// bits. Constant one must likewise use integer bit-pattern 1 for an integer
+/// image rather than IEEE float 1.0.
+fn apply_sampled_component_swizzle(
+    body: &mut String,
+    sample_id: &str,
+    swizzle: [u8; 4],
+    class: SampledClass,
+) -> bool {
+    const IDENTITY: [u8; 4] = [4, 5, 6, 7];
+    if swizzle == IDENTITY {
+        return true;
+    }
+    // Values 2 and 3 are reserved in AMD's SQ_SEL_XYZW01 enum. Preserve the
+    // pre-existing identity behavior instead of inventing semantics for an
+    // undefined descriptor.
+    if swizzle
+        .iter()
+        .any(|&selection| selection > 7 || matches!(selection, 2 | 3))
+    {
+        return false;
+    }
+
+    let definition = format!("{sample_id} = ");
+    let Some(definition_at) = body.find(&definition) else {
+        return false;
+    };
+    let after_definition = body[definition_at..]
+        .find('\n')
+        .map_or(body.len(), |end| definition_at + end + 1);
+    let stem = sample_id.strip_prefix('%').unwrap_or(sample_id);
+    let mut inserted = String::new();
+    let constant_op = if class == SampledClass::Float {
+        "OpConvertUToF"
+    } else {
+        "OpBitcast"
+    };
+    if swizzle.contains(&0) {
+        inserted.push_str(&format!(
+            "         %{stem}_swizzle_zero = {constant_op} %float %uint_0\n"
+        ));
+    }
+    if swizzle.contains(&1) {
+        inserted.push_str(&format!(
+            "         %{stem}_swizzle_one = {constant_op} %float %uint_1\n"
+        ));
+    }
+
+    let mut operands = Vec::with_capacity(4);
+    for (channel, selection) in swizzle.into_iter().enumerate() {
+        match selection {
+            0 => operands.push(format!("%{stem}_swizzle_zero")),
+            1 => operands.push(format!("%{stem}_swizzle_one")),
+            4..=7 => {
+                let component = selection - 4;
+                let id = format!("%{stem}_swizzle_{channel}");
+                inserted.push_str(&format!(
+                    "         {id} = OpCompositeExtract %float {sample_id} {component}\n"
+                ));
+                operands.push(id);
+            }
+            _ => unreachable!("reserved selectors were rejected above"),
+        }
+    }
+    let swizzled_id = format!("%{stem}_swizzled");
+    inserted.push_str(&format!(
+        "         {swizzled_id} = OpCompositeConstruct %v4float {}\n",
+        operands.join(" ")
+    ));
+
+    let (head, tail) = body.split_at(after_definition);
+    let tail = tail
+        .replace(&format!("{sample_id} "), &format!("{swizzled_id} "))
+        .replace(&format!("{sample_id}\r\n"), &format!("{swizzled_id}\r\n"))
+        .replace(&format!("{sample_id}\n"), &format!("{swizzled_id}\n"));
+    *body = format!("{head}{inserted}{tail}");
+    true
+}
+
 /// Rewrite the four sampled-image identifiers in a freshly-built MIMG body to
 /// the per-Dim suffixed names, routing the sample to the array matching the
 /// T#'s Dim in a mixed shader. `suffix == ""` (homogeneous) is a no-op.
@@ -6537,6 +6678,41 @@ fn route_storage_ids(body: &mut String, suffix: &str) {
         )
         .replace("%textures2D_L ", &format!("%textures2D_L{suffix} "))
         .replace("%ImageL ", &format!("%ImageL{suffix} "));
+}
+
+/// Build the four-component texel consumed by `OpImageWrite` from the
+/// float-typed VGPR register model. Integer storage images consume the raw
+/// register bits via `OpBitcast`; they must never numerically convert them.
+/// Missing dmask components are zero in the image's own scalar type.
+fn storage_texel_text(index: u32, format: StorageFormat, values: &[&str]) -> String {
+    let uint = format == StorageFormat::R8ui;
+    let mut body = String::new();
+    let mut components = Vec::with_capacity(4);
+    for channel in 0..4 {
+        if let Some(value) = values.get(channel) {
+            let loaded = format!("%t{}_{}", 84 + channel, index);
+            body += &format!("         {loaded} = OpLoad %float %{value}\n");
+            if uint {
+                let bits = format!("%t{}u_{}", 84 + channel, index);
+                body += &format!("         {bits} = OpBitcast %uint {loaded}\n");
+                components.push(bits);
+            } else {
+                components.push(loaded);
+            }
+        } else {
+            components.push(if uint {
+                "%uint_0".to_string()
+            } else {
+                "%float_0_000000".to_string()
+            });
+        }
+    }
+    let vector = if uint { "%v4uint" } else { "%v4float" };
+    body += &format!(
+        "         %t88_{index} = OpCompositeConstruct {vector} {} {} {} {}\n",
+        components[0], components[1], components[2], components[3]
+    );
+    body
 }
 
 /// Retype a freshly-built MIMG body's texel result for an INTEGER-class
@@ -6740,6 +6916,171 @@ fn mimg_descriptor_guard(
     Ok(Some(t_index))
 }
 
+/// Return the key-local descriptor-array index for the sampled T# already
+/// resolved by [`mimg_descriptor_guard`].
+///
+/// A scalar load can refill the T# SGPR range with raw guest descriptor words
+/// after the prolog seeded its rewritten array index. The matched descriptor
+/// remains statically known, so MIMG lowering must use that match directly
+/// rather than trusting the runtime value of descriptor dword zero.
+fn sampled_descriptor_index_constant(
+    spirv: &Spirv<'_>,
+    matched: Option<usize>,
+    func: &'static str,
+) -> Result<String, ShaderRecompileError> {
+    let bind = spirv
+        .get_bind_info()
+        .ok_or_else(|| not_supported(func, "sampled descriptor has no binding table"))?;
+    let matched =
+        matched.ok_or_else(|| not_supported(func, "sampled descriptor was not resolved"))?;
+    let texture_num = usize::try_from(bind.textures2d.textures_num.max(0))
+        .unwrap_or(0)
+        .min(bind.textures2d.desc.len());
+    let Some(desc) = bind
+        .textures2d
+        .desc
+        .get(matched)
+        .filter(|_| matched < texture_num)
+    else {
+        return Err(not_supported(
+            func,
+            format!("sampled descriptor index {matched} is outside the binding table"),
+        ));
+    };
+    if desc.textures2d_without_sampler {
+        return Err(not_supported(
+            func,
+            format!("descriptor {matched} is storage, not sampled"),
+        ));
+    }
+    let key = sampled_key_of(&desc.texture);
+    let key_index = bind.textures2d.desc[..matched]
+        .iter()
+        .filter(|d| !d.textures2d_without_sampler && sampled_key_of(&d.texture) == key)
+        .count() as u32;
+    Ok(spirv.get_constant_uint(key_index))
+}
+
+/// Resolve the sampler-array slot named by one sample-family instruction.
+fn sampler_descriptor_index_constant(
+    index: u32,
+    code: &ShaderCode,
+    inst: &ShaderInstruction,
+    spirv: &Spirv<'_>,
+    func: &'static str,
+) -> Result<String, ShaderRecompileError> {
+    let bind = spirv
+        .get_bind_info()
+        .ok_or_else(|| not_supported(func, "sampler has no binding table"))?;
+    let s_op = inst.src[2];
+    if s_op.type_ != ShaderOperandType::Sgpr {
+        return Err(not_supported(func, "S# operand is not an SGPR range"));
+    }
+    let shift_regs = if spirv.get_vs_input_info().is_some_and(|v| v.gs_prolog) {
+        8
+    } else {
+        0
+    };
+    let sampler_num = usize::try_from(bind.samplers.samplers_num.max(0))
+        .unwrap_or(0)
+        .min(bind.samplers.start_register.len());
+    let matched = bind.samplers.start_register[..sampler_num]
+        .iter()
+        .position(|&start| start + shift_regs == s_op.register_id)
+        .or_else(|| sampler_register_eud_alias_index(bind, code, s_op.register_id, index as usize))
+        .ok_or_else(|| {
+            not_supported(
+                func,
+                format!(
+                    "dynamic-image-descriptor: S# at s{} matches no captured sampler",
+                    s_op.register_id
+                ),
+            )
+        })?;
+    Ok(spirv.get_constant_uint(matched as u32))
+}
+
+/// Pin sampled-image descriptor loads in one generated MIMG body to the
+/// analyzer's proven array slots.
+///
+/// The instruction-specific lowerers retain their historical temporary ids;
+/// replacing only the `OpLoad` expression with `constant + 0` keeps those
+/// bodies stable while preventing raw T#/S# dword-zero values from becoming
+/// Vulkan descriptor indices. SPIRV-Tools folds the add to the constant.
+pub(crate) fn pin_sampled_mimg_descriptor_indices(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+) -> Result<(), ShaderRecompileError> {
+    use ShaderInstructionType as T;
+
+    let inst = inst_at(code, index, "PinSampledMimgDescriptorIndices")?;
+    let uses_sampler = matches!(
+        inst.type_,
+        T::ImageSample
+            | T::ImageSampleCLz
+            | T::ImageSampleL
+            | T::ImageSampleLz
+            | T::ImageSampleLzO
+            | T::ImageGather4Lz
+    );
+    let is_sampled = uses_sampler || matches!(inst.type_, T::ImageLoad | T::ImageGetResinfo);
+    if !is_sampled {
+        return Ok(());
+    }
+
+    const FUNC: &str = "PinSampledMimgDescriptorIndices";
+    let matched = mimg_descriptor_guard(
+        index,
+        spirv,
+        code,
+        &inst,
+        FUNC,
+        MimgDescriptorClass::Sampled,
+        uses_sampler,
+    )?;
+    let texture_index = sampled_descriptor_index_constant(spirv, matched, FUNC)?;
+    let texture_variable = operand_variable_to_str_shift(inst.src[1], 0);
+    let texture_load = format!("OpLoad %uint %{}", texture_variable.value);
+    if !dst_source.contains(&texture_load) {
+        return Err(not_supported(
+            FUNC,
+            format!(
+                "{:?} body has no texture descriptor load from %{}",
+                inst.type_, texture_variable.value
+            ),
+        ));
+    }
+    *dst_source = dst_source.replacen(
+        &texture_load,
+        &format!("OpIAdd %uint %{texture_index} %uint_0"),
+        1,
+    );
+
+    if uses_sampler {
+        let sampler_index = sampler_descriptor_index_constant(index, code, &inst, spirv, FUNC)?;
+        let sampler_variable = operand_variable_to_str_shift(inst.src[2], 0);
+        let sampler_load = format!("OpLoad %uint %{}", sampler_variable.value);
+        if !dst_source.contains(&sampler_load) {
+            return Err(not_supported(
+                FUNC,
+                format!(
+                    "{:?} body has no sampler descriptor load from %{}",
+                    inst.type_, sampler_variable.value
+                ),
+            ));
+        }
+        *dst_source = dst_source.replacen(
+            &sampler_load,
+            &format!("OpIAdd %uint %{sampler_index} %uint_0"),
+            1,
+        );
+    }
+
+    Ok(())
+}
+
 /// Shared body of the seven `Recompile_ImageSample_*` dmask variants
 /// (ShaderSpirv.cpp L2471/L2525/L2579/L2638/L2697/L2756/L2968). Upstream
 /// duplicates the whole function per dmask; the bodies differ only in which
@@ -6860,6 +7201,14 @@ fn image_sample_channels(
                 .replace("<index>", &format!("{index}"));
             route_sampled_ids(&mut body, suffix);
             route_sampled_class(&mut body, class);
+            if let Some(swizzle) = sampled_site_swizzle(spirv, matched) {
+                apply_sampled_component_swizzle(
+                    &mut body,
+                    &format!("%t43_{index}"),
+                    swizzle,
+                    class,
+                );
+            }
             *dst_source += &body;
 
             return Ok(true);
@@ -8474,15 +8823,16 @@ fn recompile_image_store_dmask1(
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
 <coord>
-         %t84_<index> = OpLoad %float %<dst_value0>
-         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %float_0_000000 %float_0_000000 %float_0_000000
-               OpImageWrite %t27_<index> %t73_<index> %t88_<index>
+<texel>
+                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let (suffix, _, format) = storage_site_route(spirv, matched, FUNC)?;
+            let texel = storage_texel_text(index, format, &[&dst_value0.value]);
             let mut body = TEXT
                 .replace("<coord>", &coord)
+                .replace("<texel>", &texel)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<storage_index>", &storage_index)
@@ -8540,16 +8890,16 @@ fn recompile_image_store_dmask3(
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
 <coord>
-         %t84_<index> = OpLoad %float %<dst_value0>
-         %t85_<index> = OpLoad %float %<dst_value1>
-         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %float_0_000000 %float_0_000000
-               OpImageWrite %t27_<index> %t73_<index> %t88_<index>
+<texel>
+                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let (suffix, _, format) = storage_site_route(spirv, matched, FUNC)?;
+            let texel = storage_texel_text(index, format, &[&dst_value0.value, &dst_value1.value]);
             let mut body = TEXT
                 .replace("<coord>", &coord)
+                .replace("<texel>", &texel)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<storage_index>", &storage_index)
@@ -8619,18 +8969,25 @@ fn recompile_image_store_dmask_f(
          %t67_<index> = OpLoad %float %<src0_value0>
          %t69_<index> = OpBitcast %uint %t67_<index>
 <coord>
-         %t84_<index> = OpLoad %float %<dst_value0>
-         %t85_<index> = OpLoad %float %<dst_value1>
-         %t86_<index> = OpLoad %float %<dst_value2>
-         %t87_<index> = OpLoad %float %<dst_value3>
-         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %t86_<index> %t87_<index>
-               OpImageWrite %t27_<index> %t73_<index> %t88_<index>
+<texel>
+                OpImageWrite %t27_<index> %t73_<index> %t88_<index>
 "#;
             let coord = storage_image_coord_text(spirv, &inst, matched)?;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let (suffix, _, format) = storage_site_route(spirv, matched, FUNC)?;
+            let texel = storage_texel_text(
+                index,
+                format,
+                &[
+                    &dst_value0.value,
+                    &dst_value1.value,
+                    &dst_value2.value,
+                    &dst_value3.value,
+                ],
+            );
             let mut body = TEXT
                 .replace("<coord>", &coord)
+                .replace("<texel>", &texel)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<storage_index>", &storage_index)
@@ -8711,17 +9068,24 @@ fn recompile_image_store_mip_dmask_f(
          %t711_<index> = OpBitcast %uint %t701_<index>
          %t160_<index> = OpFunctionCall %v2uint %mipmap %t711_<index> %t146_<index> %t151_<index>
          %t73_<index> = OpCompositeConstruct %v2uint %t69_<index> %t71_<index>
-         %t84_<index> = OpLoad %float %<dst_value0>
-         %t85_<index> = OpLoad %float %<dst_value1>
-         %t86_<index> = OpLoad %float %<dst_value2>
-         %t87_<index> = OpLoad %float %<dst_value3>
          %t172_<index> = OpIAdd %v2uint %t160_<index> %t73_<index>
-         %t88_<index> = OpCompositeConstruct %v4float %t84_<index> %t85_<index> %t86_<index> %t87_<index>
-               OpImageWrite %t27_<index> %t172_<index> %t88_<index>
+<texel>
+                OpImageWrite %t27_<index> %t172_<index> %t88_<index>
 "#;
             let storage_index = storage_descriptor_index_constant(spirv, matched, FUNC)?;
-            let (suffix, _, _) = storage_site_route(spirv, matched, FUNC)?;
+            let (suffix, _, format) = storage_site_route(spirv, matched, FUNC)?;
+            let texel = storage_texel_text(
+                index,
+                format,
+                &[
+                    &dst_value0.value,
+                    &dst_value1.value,
+                    &dst_value2.value,
+                    &dst_value3.value,
+                ],
+            );
             let mut body = TEXT
+                .replace("<texel>", &texel)
                 .replace("<index>", &format!("{index}"))
                 .replace("<src0_value0>", &src0_value0.value)
                 .replace("<src0_value1>", &src0_value1.value)
@@ -13483,6 +13847,85 @@ mod tests {
     /// generator's "s_endpgm before instruction 2" floor.
     const V_MOV_V0_0: u32 = 0x7E00_0280;
 
+    #[test]
+    fn sampled_component_swizzle_routes_font_atlas_red_into_alpha() {
+        let mut body = "         %sample = OpImageSampleImplicitLod %v4float %image %coord\n\
+                        OpStore %temp_v4float %sample\n"
+            .to_owned();
+
+        assert!(apply_sampled_component_swizzle(
+            &mut body,
+            "%sample",
+            [4, 5, 6, 4],
+            SampledClass::Float,
+        ));
+        assert!(
+            body.contains("%sample_swizzle_3 = OpCompositeExtract %float %sample 0"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "%sample_swizzled = OpCompositeConstruct %v4float \
+                 %sample_swizzle_0 %sample_swizzle_1 %sample_swizzle_2 %sample_swizzle_3"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("OpStore %temp_v4float %sample_swizzled"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn sampled_component_swizzle_leaves_identity_and_reserved_selectors_unchanged() {
+        let original =
+            "%sample = OpImageSampleImplicitLod %v4float %image %coord\nOpStore %out %sample\n";
+        let mut identity = original.to_owned();
+        assert!(apply_sampled_component_swizzle(
+            &mut identity,
+            "%sample",
+            [4, 5, 6, 7],
+            SampledClass::Float,
+        ));
+        assert_eq!(identity, original);
+
+        let mut reserved = original.to_owned();
+        assert!(!apply_sampled_component_swizzle(
+            &mut reserved,
+            "%sample",
+            [4, 5, 6, 3],
+            SampledClass::Float,
+        ));
+        assert_eq!(reserved, original);
+    }
+
+    #[test]
+    fn sampled_component_swizzle_materializes_constants_without_optional_float_ids() {
+        let original =
+            "%sample = OpImageSampleImplicitLod %v4float %image %coord\nOpStore %out %sample\n";
+        let mut float = original.to_owned();
+        assert!(apply_sampled_component_swizzle(
+            &mut float,
+            "%sample",
+            [4, 5, 0, 1],
+            SampledClass::Float,
+        ));
+        assert!(float.contains("OpConvertUToF %float %uint_0"), "{float}");
+        assert!(float.contains("OpConvertUToF %float %uint_1"), "{float}");
+        assert!(!float.contains("%float_0"), "{float}");
+        assert!(!float.contains("%float_1"), "{float}");
+
+        let mut integer = original.to_owned();
+        assert!(apply_sampled_component_swizzle(
+            &mut integer,
+            "%sample",
+            [4, 5, 0, 1],
+            SampledClass::Uint,
+        ));
+        assert!(integer.contains("OpBitcast %float %uint_0"), "{integer}");
+        assert!(integer.contains("OpBitcast %float %uint_1"), "{integer}");
+    }
+
     fn parse(src: &[u32], type_: ShaderType) -> ShaderCode {
         let mut code = ShaderCode::new();
         code.set_type(type_);
@@ -13572,7 +14015,17 @@ mod tests {
         );
         let mut input_info = ShaderComputeInputInfo::default();
         input_info.threads_num = [1, 1, 1];
-        let words = shader_recompile_cs(&code, &input_info).expect("forward skip must translate");
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("forward skip must translate");
+        assert!(
+            !source.contains("reloop"),
+            "a single acyclic skip must not pay for a dynamic dispatch loop:\n{source}"
+        );
+        assert!(
+            source.contains("OpSelectionMerge"),
+            "the acyclic path must remain structured:\n{source}"
+        );
+        let words = spirv_run(&source).expect("forward skip must assemble");
         spirv_val_ok(&words, "forward_skip");
     }
 
@@ -15624,11 +16077,17 @@ mod tests {
         input_info.bind.push_constant_size = 64;
         input_info.bind.textures2d.textures_num = 1;
         input_info.bind.textures2d.textures2d_sampled_num = 1;
+        // Raw descriptor dword zero is a guest base, never a Vulkan array
+        // index. GTA V's failing PS carried these exact shapes: a one-element
+        // image array and a small sampler array, while scalar loads refilled
+        // the SGPRs with large raw descriptor words before the sample.
+        input_info.bind.textures2d.desc[0].texture.fields[0] = 23_152_432;
         input_info.bind.textures2d.desc[0].texture.fields[3] |= 13 << 28; // 2DArray
         input_info.bind.textures2d.binding_sampled_index = 0;
         input_info.bind.textures2d.binding_storage_index = 1;
         input_info.bind.samplers.samplers_num = 1;
         input_info.bind.samplers.start_register[0] = 8;
+        input_info.bind.samplers.samplers[0].fields[0] = 18;
         input_info.bind.samplers.binding_index = 2;
 
         let source = spirv_generate_source(&code, None, None, Some(&input_info))
@@ -15646,6 +16105,15 @@ mod tests {
         assert!(
             !source.contains("%temp_v4float %uint_2"),
             "a dmask3 sample must stop at two channels:\n{source}"
+        );
+        assert!(
+            !source.contains("OpLoad %uint %s0") && !source.contains("OpLoad %uint %s8"),
+            "sampled MIMG bodies must use their proven descriptor slots, not raw T#/S# dwords:\n\
+             {source}"
+        );
+        assert!(
+            source.matches("OpIAdd %uint %uint_0 %uint_0").count() >= 6,
+            "three texture and three sampler indices must pin to slot zero:\n{source}"
         );
         let words = spirv_run(&source).expect("assemble 2DArray sample");
         naga_parse_and_validate(&words, "2DArray sample");
@@ -18293,6 +18761,54 @@ mod tests {
                 "{ty:?} must be implemented, not NI"
             );
         }
+    }
+
+    /// GTA V's legal-screen font atlas writer binds unified format 5
+    /// (`8_UINT`) and stores raw bytes loaded by `flat_load_ubyte`. The storage
+    /// image and the `OpImageWrite` texel must therefore both be UINT-typed;
+    /// interpreting those register bits as float made byte 0xff a subnormal
+    /// float which quantized to zero in the old Rgba8 UNORM image.
+    #[test]
+    fn gta_r8_uint_image_store_preserves_raw_byte_bits() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xF020_0F00, 0x0061_0800, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse image_store dmaskF");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [64, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.textures2d.textures_num = 1;
+        input_info.bind.textures2d.textures2d_storage_num = 1;
+        input_info.bind.textures2d.desc[0].start_register = 4;
+        input_info.bind.textures2d.desc[0].textures2d_without_sampler = true;
+        input_info.bind.textures2d.desc[0].texture.fields[1] |= 5 << 20; // unified 5 = R8 UINT
+        input_info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28; // 2D
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile GTA R8_UINT image_store");
+        assert!(
+            source.contains("%ImageL = OpTypeImage %uint 2D 0 0 0 2 R8ui"),
+            "the descriptor's integer class and texel width must reach OpTypeImage:\n{source}"
+        );
+        assert!(
+            source.contains("OpCompositeConstruct %v4uint"),
+            "OpImageWrite's texel must match the UINT image type:\n{source}"
+        );
+        assert!(
+            source.contains("OpBitcast %uint"),
+            "raw VGPR bits must be preserved instead of converted numerically:\n{source}"
+        );
+        assert!(
+            !source.contains("OpConvertFToU"),
+            "the byte payload is already stored as raw register bits:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble GTA R8_UINT image_store");
+        spirv_val_ok(&words, "GTA R8_UINT image_store");
     }
 
     #[test]
@@ -24718,6 +25234,45 @@ mod tests {
             let words = spirv_run(&source).unwrap_or_else(|e| panic!("{label} assembles: {e}"));
             spirv_val_ok(&words, &label);
         }
+    }
+
+    /// GTA V's first post-coverage shader refusal is a
+    /// `buffer_store_format_xyzw` through a V# whose RDNA2 unified format is
+    /// **20** (`32_UINT`, legacy packed 36). The opcode names the maximum
+    /// vdata width; the resource descriptor supplies the actual component
+    /// count. A one-component descriptor therefore stores only `vdata.x`.
+    ///
+    /// Treating format 20 as a four-component layout either refuses a legal
+    /// instruction (the measured failure) or, worse, overwrites three adjacent
+    /// dwords. Keep the exact measured row executable and SPIR-V-valid while
+    /// proving that only v4 reaches the raw one-dword store helper.
+    #[test]
+    fn gta_buffer_store_format_xyzw_with_32_uint_stores_only_vdata_x() {
+        const WORD0: u32 = 0xE01C_2000;
+        let (source, code) = mubuf_typed_source(WORD0, 20)
+            .expect("unified 20 must narrow buffer_store_format_xyzw to one dword");
+
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferStoreFormatXyzw);
+        assert_eq!(inst.format, F::Vdata4VaddrSvSoffsIdxen);
+
+        let call = source
+            .lines()
+            .find(|line| line.contains("%mbf_c_0 = OpFunctionCall"))
+            .expect("flexible MUBUF call");
+        assert!(
+            call.contains("OpFunctionCall %void %buffer_store_float1 %v4 "),
+            "format 20 must store vdata.x through the one-dword helper: {call}"
+        );
+        for forbidden in ["%v5", "%v6", "%v7", "%temp_int_5"] {
+            assert!(
+                !call.contains(forbidden),
+                "format 20 must not pass {forbidden}: {call}"
+            );
+        }
+
+        let words = spirv_run(&source).expect("assemble GTA typed store");
+        spirv_val_ok(&words, "gta_store_format_xyzw_32_uint");
     }
 
     /// Dead Cells' only shader is a compute dispatch that stores through a `V#`

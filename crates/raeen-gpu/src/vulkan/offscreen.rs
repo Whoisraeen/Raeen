@@ -268,7 +268,7 @@ impl RenderedImage {
 pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
     match format {
         vk::Format::R8_UNORM => Ok(1),
-        vk::Format::R16_UNORM => Ok(2),
+        vk::Format::R16_UNORM | vk::Format::R16_SFLOAT => Ok(2),
         vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SNORM
         | vk::Format::R8G8B8A8_SRGB
@@ -276,9 +276,10 @@ pub(crate) fn readback_bpp(format: vk::Format) -> Result<u32, GpuError> {
         | vk::Format::B8G8R8A8_SRGB
         | vk::Format::R32_SFLOAT
         | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16_UNORM
         | vk::Format::B10G11R11_UFLOAT_PACK32
         | vk::Format::A2B10G10R10_UNORM_PACK32 => Ok(4),
-        vk::Format::R16G16B16A16_SFLOAT => Ok(8),
+        vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32_SFLOAT => Ok(8),
         vk::Format::R32G32B32A32_SFLOAT => Ok(16),
         other => Err(GpuError::VulkanInitFailed(format!(
             "render target format {other:?} has no readback byte size mapping"
@@ -365,6 +366,10 @@ impl TargetPixelDecoder {
     /// One texel's display RGB. `texel` must be at least `bytes_per_pixel` long.
     pub(crate) fn rgb(&self, texel: &[u8]) -> [u8; 3] {
         let unorm = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let unorm16 = |lo: usize| {
+            let value = u16::from_le_bytes([texel[lo], texel[lo + 1]]);
+            ((u32::from(value) * 255 + 32_767) / 65_535) as u8
+        };
         let half = |lo: usize| {
             crate::agc_exec::half_to_f32(u16::from_le_bytes([texel[lo], texel[lo + 1]]))
         };
@@ -390,8 +395,11 @@ impl TargetPixelDecoder {
             }
             vk::Format::R8_UNORM => [texel[0], 0, 0],
             vk::Format::R16_UNORM => [texel[1], 0, 0],
+            vk::Format::R16_SFLOAT => [unorm(half(0)), 0, 0],
             vk::Format::R32_SFLOAT => [unorm(float(0)), 0, 0],
             vk::Format::R16G16_SFLOAT => [unorm(half(0)), unorm(half(2)), 0],
+            vk::Format::R16G16_UNORM => [unorm16(0), unorm16(2), 0],
+            vk::Format::R32G32_SFLOAT => [unorm(float(0)), unorm(float(4)), 0],
             vk::Format::R16G16B16A16_SFLOAT => [unorm(half(0)), unorm(half(2)), unorm(half(4))],
             vk::Format::R32G32B32A32_SFLOAT => [unorm(float(0)), unorm(float(4)), unorm(float(8))],
             // R11 in bits 0..10, G11 in 11..21, B10 in 22..31; the 11-bit
@@ -487,6 +495,15 @@ const fn present_misread(format: vk::Format) -> Option<(u32, &'static str)> {
         }
         vk::Format::R8_UNORM => (7, "the format's raw bytes are presented as 8-bit RGBA"),
         vk::Format::R16_UNORM => (8, "the format's raw bytes are presented as 8-bit RGBA"),
+        vk::Format::R32G32_SFLOAT => (
+            9,
+            "the 8-byte format is misinterpreted as four half-float channels at present",
+        ),
+        vk::Format::R16_SFLOAT => (
+            10,
+            "the 2-byte format is passed to an RGBA8 present surface without conversion",
+        ),
+        vk::Format::R16G16_UNORM => (11, "the format's raw bytes are presented as 8-bit RGBA"),
         // R8G8B8A8* present correctly, and R16G16B16A16_SFLOAT is the one class
         // `try_to_presentable_arc` does convert.
         _ => return None,
@@ -566,6 +583,20 @@ pub struct EudRawBinding {
     pub bytes: Vec<u8>,
 }
 
+/// Dispatch-time guest-memory window backing translated FLAT/GLOBAL accesses.
+///
+/// `bytes` is the exact `%global_mem` SSBO ABI: guest base low/high dwords,
+/// followed by a bounded process-authorized guest snapshot. A writable window
+/// is dispatched synchronously and copied back without the eight-byte header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalMemBinding {
+    pub binding: u32,
+    pub guest_base: u64,
+    pub guest_size: usize,
+    pub writable: bool,
+    pub bytes: Vec<u8>,
+}
+
 /// One storage image (UAV) a translated compute shader reads and writes.
 ///
 /// The pixels are the guest's initial content (tightly packed rows, `depth`
@@ -604,9 +635,9 @@ pub struct StorageImageUpload {
     /// retiles each array layer to this layout before publishing guest bytes.
     pub tile_mode: u8,
     /// The Vulkan texel format matching the recompiled SPIR-V's `%ImageL`
-    /// declaration: `R8G8B8A8_UNORM` (Rgba8), `R16G16B16A16_SFLOAT`
-    /// (Rgba16f, guest T# format 71), or `R32G32B32A32_SFLOAT`
-    /// (Rgba32f, guest T# format 77).
+    /// declaration: `R8_UINT` (R8ui, guest T# format 5),
+    /// `R8G8B8A8_UNORM` (Rgba8), `R16G16B16A16_SFLOAT` (Rgba16f, guest T#
+    /// format 71), or `R32G32B32A32_SFLOAT` (Rgba32f, guest T# format 77).
     pub format: vk::Format,
     /// Initial linear content,
     /// `width * height * depth * layers * texel_bytes()` bytes.
@@ -624,6 +655,7 @@ impl StorageImageUpload {
     #[must_use]
     pub fn texel_bytes(&self) -> u32 {
         match self.format {
+            vk::Format::R8_UINT => 1,
             vk::Format::R16G16B16A16_SFLOAT => 8,
             vk::Format::R32G32B32A32_SFLOAT => 16,
             _ => 4,
@@ -634,9 +666,9 @@ impl StorageImageUpload {
 /// One or more descriptor bindings containing arrays of storage images.
 ///
 /// The recompiled SPIR-V declares `%textures2D_L` as
-/// `OpTypeImage %float <dim> 0 0 0 2 <format>` — a STORAGE_IMAGE array in
-/// the upload's format — indexed by dword 0 of the rewritten T# it reads
-/// from the push constants.
+/// `OpTypeImage <component> <dim> 0 0 0 2 <format>` — a STORAGE_IMAGE array
+/// in the upload's format and numeric class — indexed by dword 0 of the
+/// rewritten T# it reads from the push constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageImageBinding {
     pub binding: u32,
@@ -780,13 +812,17 @@ pub(crate) const fn format_block_extent(format: vk::Format) -> u32 {
 fn texture_texel_bytes(format: vk::Format) -> Result<u32, GpuError> {
     match format {
         vk::Format::R8_UNORM | vk::Format::R8_UINT => Ok(1),
-        vk::Format::R16_UNORM | vk::Format::R8G8_UNORM => Ok(2),
-        vk::Format::B10G11R11_UFLOAT_PACK32
+        vk::Format::R16_UNORM | vk::Format::R16_SFLOAT | vk::Format::R8G8_UNORM => Ok(2),
+        vk::Format::A2B10G10R10_UNORM_PACK32
+        | vk::Format::B10G11R11_UFLOAT_PACK32
         | vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SNORM
         | vk::Format::R32_SFLOAT
-        | vk::Format::R16G16_SFLOAT => Ok(4),
-        vk::Format::R16G16B16A16_UNORM | vk::Format::R16G16B16A16_SFLOAT => Ok(8),
+        | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16_UNORM => Ok(4),
+        vk::Format::R16G16B16A16_UNORM
+        | vk::Format::R16G16B16A16_SFLOAT
+        | vk::Format::R32G32_SFLOAT => Ok(8),
         vk::Format::R32G32B32A32_SFLOAT => Ok(16),
         // BC blocks: 8 bytes for the two-colour-endpoint families (BC1/BC4),
         // 16 for everything else. Matches SharpEmu's
@@ -973,6 +1009,9 @@ pub struct ShaderStageBinding {
     /// detection is wired on the CS translate path; the graphics draw path
     /// rejects a stage that carries it rather than binding nothing.
     pub eud_raw: Option<EudRawBinding>,
+    /// FLAT/GLOBAL guest-memory window. Compute-only; graphics rejects it by
+    /// name so emitted SPIR-V can never reach Vulkan with an omitted binding.
+    pub global_mem: Option<GlobalMemBinding>,
 }
 
 /// Register-derived alpha-blend state for the single color attachment.
@@ -4073,6 +4112,17 @@ impl<'a> Resources<'a> {
                 stage.stage
             )));
         }
+        if let Some(stage) = state
+            .stage_bindings
+            .iter()
+            .find(|stage| stage.global_mem.is_some())
+        {
+            return Err(GpuError::PipelineCreationFailed(format!(
+                "{:?} stage binds a FLAT/GLOBAL guest-memory window — implemented for COMPUTE \
+                 dispatches only",
+                stage.stage
+            )));
+        }
         let resource_stages: Vec<_> = state
             .stage_bindings
             .iter()
@@ -6597,6 +6647,18 @@ mod tests {
     }
 
     #[test]
+    fn packed_a2b10g10r10_texture_staging_uses_four_bytes_per_texel() {
+        let pixels = vec![0x42; 2 * 2 * 4];
+        let mut upload = sampled_upload(pixels.clone(), 1, false);
+        upload.format = vk::Format::A2B10G10R10_UNORM_PACK32;
+
+        let staging = upload
+            .staging_pixels(1)
+            .expect("GTA packed format has a complete 4-byte texel mapping");
+        assert_eq!(staging.as_ref(), pixels);
+    }
+
+    #[test]
     fn graphics_interface_gate_rejects_missing_vertex_output() {
         // Vulkan requires every fragment input Location to be supplied by the
         // previous host stage. The guest may source it from a GS-copy stage,
@@ -7052,9 +7114,12 @@ mod tests {
             vk::Format::A2B10G10R10_UNORM_PACK32,
             vk::Format::R32_SFLOAT,
             vk::Format::R16G16_SFLOAT,
+            vk::Format::R16G16_UNORM,
+            vk::Format::R32G32_SFLOAT,
             vk::Format::R32G32B32A32_SFLOAT,
             vk::Format::R8_UNORM,
             vk::Format::R16_UNORM,
+            vk::Format::R16_SFLOAT,
         ];
         let mut bits = 0u64;
         for format in misread {
@@ -7076,7 +7141,7 @@ mod tests {
         // warning at all.
         assert_eq!(
             misread.len(),
-            9,
+            12,
             "adding a colour render-target format means classifying it here"
         );
     }

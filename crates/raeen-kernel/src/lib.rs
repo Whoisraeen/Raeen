@@ -719,6 +719,16 @@ pub struct VideoOutBufferAttribute {
     pub tiling_mode: u32,
     pub width: u32,
     pub height: u32,
+    /// `pitchInPixel` — the buffer's row stride in PIXELS, which is NOT
+    /// necessarily `width`.
+    ///
+    /// A title may allocate a display buffer whose rows are padded (or share a
+    /// wider allocation) and present only a `width`-wide window of each row.
+    /// Reading such a buffer at a `width` stride walks diagonally through it
+    /// instead of down it, which renders as horizontal striping. `0` means the
+    /// guest left the field unset, in which case a tightly-packed row
+    /// (`pitch == width`) is the right assumption.
+    pub pitch_pixels: u32,
     pub option: u64,
     pub dcc_clear_color: u64,
     pub dcc_control: u32,

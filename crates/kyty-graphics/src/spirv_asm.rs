@@ -227,6 +227,7 @@ fn enum_value(kind: EKind, tok: &str) -> Option<u32> {
         // Capabilities used by Kyty: `OpCapability Shader` / `ImageQuery`
         // (ShaderSpirv.cpp WriteHeader, L6689 region).
         (E::Capability, "Shader") => 1,
+        (E::Capability, "StorageImageExtendedFormats") => 49,
         (E::Capability, "ImageQuery") => 50,
         (E::Capability, "GroupNonUniform") => 61,
         (E::Capability, "GroupNonUniformBallot") => 64,
@@ -271,6 +272,7 @@ fn enum_value(kind: EKind, tok: &str) -> Option<u32> {
         (E::ImageFormat, "Rgba8Snorm") => 5,
         (E::ImageFormat, "R32i") => 24,
         (E::ImageFormat, "R32ui") => 33,
+        (E::ImageFormat, "R8ui") => 39,
         (E::Decoration, "RelaxedPrecision") => 0,
         (E::Decoration, "SpecId") => 1,
         (E::Decoration, "Block") => 2,

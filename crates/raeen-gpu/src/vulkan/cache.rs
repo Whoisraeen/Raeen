@@ -369,6 +369,10 @@ pub(crate) struct TextureKey {
     pub format: i32,
 }
 
+fn texture_aliases_compute_image(key: &TextureKey, base: u64) -> bool {
+    base != 0 && key.base == base
+}
+
 /// The device half of one cached guest texture. The image rests in
 /// `SHADER_READ_ONLY_OPTIMAL` between draws (the upload's tail barrier put it
 /// there with visibility to both graphics shader stages), so a cache hit
@@ -381,10 +385,10 @@ pub(crate) struct TextureKey {
 ///   writes that leave every sampled chunk byte-identical are therefore NOT
 ///   detected until any sampled byte changes — that is the staleness window,
 ///   bounded by the sample coverage.
-/// - Writeback paths we control (compute storage writeback, DMA copies,
-///   render-target readbacks) do NOT proactively invalidate: no cheap range
-///   index exists over this cache today, so they too are covered by the
-///   per-bind rehash above.
+/// - A completed compute storage-image write invalidates cached sampled views
+///   at the same guest base. This covers format-reinterpreted aliases (for
+///   example an `R32_UINT` UAV later sampled as `R8_UNORM`) without a range
+///   index. Other writes still use the per-bind rehash above.
 /// - `RAEEN_NO_TEX_CACHE=1` is the full-honesty escape hatch: every draw
 ///   decodes and uploads its textures per draw, the pre-stage-D behaviour.
 #[derive(Clone, Copy)]
@@ -1348,6 +1352,31 @@ impl DrawCaches {
         self.textures.insert(key, texture);
     }
 
+    /// Drop sampled views that alias a completed compute storage-image write.
+    ///
+    /// The write owns the complete image at `base`, while a title may consume
+    /// the same bytes through another format and extent. Sparse guest hashing
+    /// can miss those changed texels; exact base identity is the stronger
+    /// coherence boundary. Destruction stays batch-safe because an older draw
+    /// may still reference the evicted view.
+    pub(crate) fn invalidate_textures_at_base(&mut self, dev: &VulkanDevice, base: u64) -> usize {
+        let stale: Vec<_> = self
+            .textures
+            .keys()
+            .filter(|key| texture_aliases_compute_image(key, base))
+            .copied()
+            .collect();
+        let count = stale.len();
+        for key in stale {
+            if let Some(old) = self.textures.remove(&key) {
+                self.texture_bytes = self.texture_bytes.saturating_sub(old.bytes);
+                self.destroy_texture_when_safe(dev, old);
+                self.stats.texture_cache_evictions += 1;
+            }
+        }
+        count
+    }
+
     /// Reuse or create a guest-addressed compute SSBO and make its content
     /// exactly `bytes`.
     ///
@@ -1616,6 +1645,18 @@ impl DrawCaches {
                 };
             let linear = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), linear_size) };
             let nonzero = linear.iter().any(|&byte| byte != 0);
+            if crate::diagnostics::gpu_env().trace_draws {
+                tracing::warn!(
+                    base = format_args!("{:#x}", key.base),
+                    len = linear_size,
+                    nonzero,
+                    width = key.width,
+                    height = key.height,
+                    format = ?vk::Format::from_raw(key.format),
+                    tile_mode = writeback.tile_mode,
+                    "TRACE_DRAWS: deferred compute image writeback"
+                );
+            }
             if nonzero
                 && matches!(
                     vk::Format::from_raw(key.format),
@@ -1651,14 +1692,16 @@ impl DrawCaches {
                 unsafe { dev.device().unmap_memory(entry.readback_memory) };
             }
             let guest = guest?;
+            let guest_len = guest.len();
             if crate::guest_mem::mirror_compute_image_to_guest(
                 key.base,
-                &guest,
+                guest,
                 "compute-batch-image",
             ) == crate::guest_mem::ComputeImageGuestMirror::Written
             {
-                written = written.saturating_add(guest.len());
+                written = written.saturating_add(guest_len);
             }
+            self.invalidate_textures_at_base(dev, key.base);
         }
         Ok((written, presentable))
     }
@@ -2746,6 +2789,25 @@ unsafe fn destroy_depth_target(device: &ash::Device, target: &PersistentDepthTar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_image_write_invalidates_every_format_alias_at_the_same_base() {
+        let key = TextureKey {
+            base: 0x1614_73000,
+            width: 2048,
+            height: 4096,
+            layers: 1,
+            depth: 1,
+            cube: false,
+            array: false,
+            volume: false,
+            format: vk::Format::R8_UNORM.as_raw(),
+        };
+
+        assert!(texture_aliases_compute_image(&key, 0x1614_73000));
+        assert!(!texture_aliases_compute_image(&key, 0x1614_74000));
+        assert!(!texture_aliases_compute_image(&key, 0));
+    }
 
     /// The pipeline key must distinguish state that really feeds pipeline
     /// creation and must NOT include dynamic state (viewport/scissor/blend

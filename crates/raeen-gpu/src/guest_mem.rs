@@ -13,6 +13,7 @@
 
 use kyty_graphics::run::GuestMemory;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +60,113 @@ impl GpuGuestMemory for DenyGpuMemory {
 thread_local! {
     static ACTIVE_MEMORY: RefCell<Option<Arc<dyn GpuGuestMemory>>> = RefCell::new(None);
     static ACTIVE_BUDGET: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Guest-layout bytes produced by a compute storage image whose allocation has
+/// no writable CPU mirror.
+///
+/// A PS5 image can be rebound through a different descriptor (for example,
+/// GTA V writes a 32-bit UAV at `0x161473000`, then samples the same bytes as a
+/// 2048x4096 R8 font atlas). Keeping only the Vulkan storage image cannot serve
+/// that alias because the sampled view can have a different format and tiling
+/// interpretation. The encoded guest-layout bytes are therefore the coherence
+/// boundary: later resource reads see the GPU result exactly as if writeback
+/// had reached guest memory.
+struct GpuImageShadow {
+    base: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct GpuImageShadows {
+    entries: VecDeque<GpuImageShadow>,
+    bytes: usize,
+}
+
+/// Keep GPU-only shadows bounded independently of the Vulkan compute-image
+/// cache. A single oversized result is retained (correctness wins for the most
+/// recent image); otherwise oldest complete images are evicted first.
+const MAX_GPU_IMAGE_SHADOW_BYTES: usize = 256 << 20;
+
+static GPU_IMAGE_SHADOWS: Mutex<GpuImageShadows> = Mutex::new(GpuImageShadows {
+    entries: VecDeque::new(),
+    bytes: 0,
+});
+
+fn shadow_covers(base: u64, len: u64, shadow: &GpuImageShadow) -> Option<std::ops::Range<usize>> {
+    let end = base.checked_add(len)?;
+    let shadow_end = shadow.base.checked_add(shadow.bytes.len() as u64)?;
+    if base < shadow.base || end > shadow_end {
+        return None;
+    }
+    let start = usize::try_from(base - shadow.base).ok()?;
+    let len = usize::try_from(len).ok()?;
+    Some(start..start.checked_add(len)?)
+}
+
+fn read_gpu_image_shadow(base: u64, len: u64) -> Option<Vec<u8>> {
+    let shadows = GPU_IMAGE_SHADOWS.lock().ok()?;
+    // The back is the most recent writer. Overlapping resources therefore
+    // observe the last completed compute publication.
+    shadows.entries.iter().rev().find_map(|shadow| {
+        let range = shadow_covers(base, len, shadow)?;
+        Some(shadow.bytes[range].to_vec())
+    })
+}
+
+fn gpu_image_shadow_covers(base: u64, len: u64) -> bool {
+    GPU_IMAGE_SHADOWS.lock().is_ok_and(|shadows| {
+        shadows
+            .entries
+            .iter()
+            .rev()
+            .any(|shadow| shadow_covers(base, len, shadow).is_some())
+    })
+}
+
+fn invalidate_gpu_image_shadows(base: u64, len: u64) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if let Ok(mut shadows) = GPU_IMAGE_SHADOWS.lock() {
+        let mut removed = 0usize;
+        shadows.entries.retain(|shadow| {
+            let shadow_end = shadow.base.saturating_add(shadow.bytes.len() as u64);
+            let overlaps = base < shadow_end && shadow.base < end;
+            if overlaps {
+                removed = removed.saturating_add(shadow.bytes.len());
+            }
+            !overlaps
+        });
+        shadows.bytes = shadows.bytes.saturating_sub(removed);
+    }
+}
+
+fn retain_gpu_image_shadow(base: u64, bytes: Vec<u8>) {
+    if base == 0 || bytes.is_empty() {
+        return;
+    }
+    let end = base.saturating_add(bytes.len() as u64);
+    if let Ok(mut shadows) = GPU_IMAGE_SHADOWS.lock() {
+        let mut removed = 0usize;
+        shadows.entries.retain(|shadow| {
+            let shadow_end = shadow.base.saturating_add(shadow.bytes.len() as u64);
+            let overlaps = base < shadow_end && shadow.base < end;
+            if overlaps {
+                removed = removed.saturating_add(shadow.bytes.len());
+            }
+            !overlaps
+        });
+        shadows.bytes = shadows.bytes.saturating_sub(removed);
+        shadows.bytes = shadows.bytes.saturating_add(bytes.len());
+        shadows.entries.push_back(GpuImageShadow { base, bytes });
+        while shadows.bytes > MAX_GPU_IMAGE_SHADOW_BYTES && shadows.entries.len() > 1 {
+            if let Some(evicted) = shadows.entries.pop_front() {
+                shadows.bytes = shadows.bytes.saturating_sub(evicted.bytes.len());
+            }
+        }
+    }
 }
 
 /// Cumulative guest bytes one submission may read through resource fetches
@@ -181,6 +289,9 @@ pub(crate) const MAX_RESOURCE_READ_DWORDS: u32 = 0x0400_0000;
 /// Committed-readable prefix of a guest range, for naming a failed fetch
 /// precisely (wild base ≈ 0; lazy tail ≈ a page-aligned interior cut).
 pub(crate) fn readable_prefix(addr: u64, size: u64) -> u64 {
+    if gpu_image_shadow_covers(addr, size) {
+        return size;
+    }
     with_active_memory(|memory| {
         if memory.validate_gpu_range(addr, size, false) {
             size
@@ -242,6 +353,11 @@ pub(crate) fn read_bytes_validated(addr: u64, len: u64) -> Option<Vec<u8>> {
     let count = u32::try_from(len / 4).ok()?;
     if count == 0 || count > MAX_RESOURCE_READ_DWORDS || !charge_guest_bytes(len) {
         return None;
+    }
+    // Prefer the newest GPU publication over a readable-but-stale CPU mirror.
+    // This also makes genuinely GPU-only allocations readable to later draws.
+    if let Some(bytes) = read_gpu_image_shadow(addr, len) {
+        return Some(bytes);
     }
     let bytes = usize::try_from(len).ok()?;
     let mut out = Vec::<u8>::new();
@@ -360,10 +476,14 @@ pub(crate) fn write_bytes_checked(addr: u64, bytes: &[u8]) -> bool {
     if !charge_guest_bytes(bytes.len() as u64) {
         return false;
     }
-    with_active_memory(|memory| {
+    let written = with_active_memory(|memory| {
         memory.validate_gpu_range(addr, bytes.len() as u64, true) && memory.write_gpu(addr, bytes)
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+    if written {
+        invalidate_gpu_image_shadows(addr, bytes.len() as u64);
+    }
+    written
 }
 
 /// Result of trying to mirror a completed compute storage image into guest
@@ -388,24 +508,27 @@ pub(crate) enum ComputeImageGuestMirror {
 /// two) because titles commonly reuse the same GPU-only image every frame.
 pub(crate) fn mirror_compute_image_to_guest(
     addr: u64,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     source: &'static str,
 ) -> ComputeImageGuestMirror {
     trace_scanout_fill(addr, bytes.len(), source);
-    if write_bytes_checked(addr, bytes) {
+    if write_bytes_checked(addr, &bytes) {
         return ComputeImageGuestMirror::Written;
     }
 
+    let len = bytes.len();
+    retain_gpu_image_shadow(addr, bytes);
     static GPU_ONLY_IMAGES: AtomicU64 = AtomicU64::new(0);
     let count = GPU_ONLY_IMAGES.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 || count.is_power_of_two() {
         tracing::warn!(
             count,
             base = format_args!("{addr:#x}"),
-            end = format_args!("{:#x}", addr.saturating_add(bytes.len() as u64)),
-            len = bytes.len(),
+            end = format_args!("{:#x}", addr.saturating_add(len as u64)),
+            len,
             source,
-            "compute storage image has no writable CPU guest mirror; retaining GPU-resident result"
+            "compute storage image has no writable CPU guest mirror; retaining a guest-layout \
+             shadow for later GPU reads"
         );
     }
     ComputeImageGuestMirror::GpuOnly
@@ -608,11 +731,20 @@ mod tests {
 
     #[test]
     fn compute_image_guest_mirror_keeps_gpu_only_results_non_fatal() {
-        let bytes = [0x11, 0x22, 0x33, 0x44];
+        let bytes = vec![0x11, 0x22, 0x33, 0x44];
         assert_eq!(
-            mirror_compute_image_to_guest(0x4441_0000, &bytes, "test-compute-image"),
+            mirror_compute_image_to_guest(0x4441_0000, bytes.clone(), "test-compute-image"),
             ComputeImageGuestMirror::GpuOnly,
             "a GPU-only image is retained even without a CPU guest mapping"
+        );
+        let denied: Arc<dyn GpuGuestMemory> = Arc::new(DenyGpuMemory);
+        let shadow = with_guest_memory(&denied, || {
+            read_bytes_validated(0x4441_0000, bytes.len() as u64)
+        });
+        assert_eq!(
+            shadow,
+            Some(bytes.clone()),
+            "later GPU reads must observe the guest-layout compute result"
         );
 
         let mut destination = [0u8; 4];
@@ -622,10 +754,10 @@ mod tests {
             len: destination.len() as u64,
         });
         let publication = with_guest_memory(&memory, || {
-            mirror_compute_image_to_guest(addr, &bytes, "test-compute-image")
+            mirror_compute_image_to_guest(addr, bytes.clone(), "test-compute-image")
         });
         assert_eq!(publication, ComputeImageGuestMirror::Written);
-        assert_eq!(destination, bytes);
+        assert_eq!(destination, bytes.as_slice());
     }
 
     #[test]

@@ -487,6 +487,7 @@ fn title_translated_ps_sweep() {
                 storage_images: None,
                 gds_binding: None,
                 eud_raw: None,
+                global_mem: None,
             }]
         } else {
             Vec::new()
@@ -656,6 +657,7 @@ fn captured_hdr_composite_shader_pair_submits_safely() {
         storage_images: None,
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
 
     let target_base = std::env::var_os("RAEEN_REPLAY_PERSISTENT")

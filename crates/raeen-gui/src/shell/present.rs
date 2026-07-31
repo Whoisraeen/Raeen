@@ -40,6 +40,16 @@ fn display_epoch(local_epoch: u64, remote: Option<&raeen_gpu::frame_ipc::RemoteF
     remote.map_or(local_epoch, |frame| frame.epoch | REMOTE_EPOCH_BIT)
 }
 
+/// Whether the viewer must upload pixels for this observation.
+///
+/// `has_displayed_frame` is deliberately source-neutral. The native-wgpu path
+/// stores its texture id in `displayed` and leaves the legacy managed
+/// `texture` empty, so using `texture.is_none()` here turns every Shell repaint
+/// into another full-frame upload even when the published epoch is unchanged.
+fn needs_frame_refresh(epoch: u64, shown_at_epoch: u64, has_displayed_frame: bool) -> bool {
+    epoch != shown_at_epoch || !has_displayed_frame
+}
+
 /// Rolling window of per-frame times backing the performance HUD. Sized so a
 /// 60 FPS title keeps ~2 seconds of history — long enough for "worst" to catch
 /// a hitch, short enough that recovery is visible quickly.
@@ -320,7 +330,7 @@ impl GameFrameView {
         // ever receives whole, finished frames — never a half-read one.
         let epoch = display_epoch(session.present_epoch(), remote.as_ref());
         self.frame_stats.observe(Instant::now(), epoch);
-        if epoch != self.shown_at_epoch || self.texture.is_none() {
+        if needs_frame_refresh(epoch, self.shown_at_epoch, self.displayed.is_some()) {
             // Deliberately does NOT `wait_idle()`: submission is asynchronous,
             // and blocking the UI thread until the GPU drained is exactly the
             // stall this Shell already had once. A viewer wants the latest frame
@@ -613,6 +623,20 @@ mod tests {
             display_epoch(2, Some(&remote)),
             REMOTE_EPOCH_BIT | remote.epoch
         );
+    }
+
+    #[test]
+    fn native_frame_is_not_reuploaded_until_its_epoch_advances() {
+        let epoch = REMOTE_EPOCH_BIT | 16;
+
+        // No frame has been uploaded yet: the first observation must upload.
+        assert!(needs_frame_refresh(epoch, 0, false));
+        // The native-wgpu path owns `displayed` but deliberately leaves the
+        // legacy managed `texture` empty. Repainting the same completed frame
+        // must not write all 4K pixels to the GPU again.
+        assert!(!needs_frame_refresh(epoch, epoch, true));
+        // A newly published frame still refreshes exactly once.
+        assert!(needs_frame_refresh(epoch + 2, epoch, true));
     }
 
     #[test]

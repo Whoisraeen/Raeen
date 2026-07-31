@@ -2369,7 +2369,8 @@ pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBind
 
     bind.global_mem = ShaderGlobalMemResources::default();
 
-    let uses_flat = code.get_instructions().iter().any(|inst| {
+    let instructions = code.get_instructions();
+    let uses_flat = instructions.iter().any(|inst| {
         matches!(
             inst.type_,
             T::FlatLoadUbyte
@@ -2385,6 +2386,13 @@ pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBind
     if !uses_flat {
         return;
     }
+    let writable = instructions.iter().any(|inst| {
+        matches!(
+            inst.type_,
+            T::FlatStoreDword | T::FlatStoreDwordX2 | T::FlatStoreDwordX4
+        )
+    });
+    let base_sgpr = flat_global_base_sgpr(instructions).unwrap_or(-1);
 
     // Next binding index after every group `shader_calc_binding_indices`
     // assigned, then the raw-EUD fallback (GDS takes the last index without
@@ -2408,11 +2416,84 @@ pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBind
     bind.global_mem = ShaderGlobalMemResources {
         used: true,
         binding_index,
+        base_sgpr,
+        writable,
     };
     tracing::debug!(
         binding_index,
+        base_sgpr,
+        writable,
         "flat/global window: FLAT-class op reads guest memory directly"
     );
+}
+
+/// Recover the scalar base pair which feeds a FLAT/GLOBAL address when the
+/// common compiler shape remains visible in the decoded instruction stream.
+///
+/// GLOBAL encodes the SGPR pair directly in `src[1]`. FLAT carries a VGPR pair;
+/// GTA V's transition kernel writes its low/high halves from s12/s13 in two
+/// nearby vector additions. Walking backward to each half's last writer keeps
+/// this deliberately bounded and refuses ambiguous dataflow.
+fn flat_global_base_sgpr(instructions: &[ShaderInstruction]) -> Option<i32> {
+    use ShaderInstructionType as T;
+    use ShaderOperandType as O;
+
+    let is_flat_mem = |inst: &ShaderInstruction| {
+        matches!(
+            inst.type_,
+            T::FlatLoadUbyte
+                | T::FlatLoadDword
+                | T::FlatLoadDwordX2
+                | T::FlatLoadDwordX3
+                | T::FlatLoadDwordX4
+                | T::FlatStoreDword
+                | T::FlatStoreDwordX2
+                | T::FlatStoreDwordX4
+        )
+    };
+    let writes_vgpr = |inst: &ShaderInstruction, register: i32| {
+        inst.dst.type_ == O::Vgpr
+            && register >= inst.dst.register_id
+            && register < inst.dst.register_id.saturating_add(inst.dst.size.max(1))
+    };
+    let scalar_source = |inst: &ShaderInstruction| {
+        inst.src[..inst.src_num.max(0) as usize]
+            .iter()
+            .find(|src| src.type_ == O::Sgpr && src.size <= 1)
+            .map(|src| src.register_id)
+    };
+
+    for (index, inst) in instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| is_flat_mem(inst))
+    {
+        if !inst.uses_flat_address {
+            let base = inst.src[1];
+            if base.type_ == O::Sgpr {
+                return Some(base.register_id);
+            }
+            continue;
+        }
+        let address = inst.src[0];
+        if address.type_ != O::Vgpr {
+            continue;
+        }
+        let low = instructions[..index]
+            .iter()
+            .rev()
+            .find(|writer| writes_vgpr(writer, address.register_id))
+            .and_then(scalar_source);
+        let high = instructions[..index]
+            .iter()
+            .rev()
+            .find(|writer| writes_vgpr(writer, address.register_id.saturating_add(1)))
+            .and_then(scalar_source);
+        if low.is_some_and(|low| high == Some(low + 1)) {
+            return low;
+        }
+    }
+    None
 }
 
 /// Vulkan only guarantees 128 bytes of push constants; the Windows GPUs we
@@ -2995,10 +3076,11 @@ pub(crate) fn sampled_key_layout(bind: &ShaderBindResources) -> Vec<SampledArray
 }
 
 /// SPIR-V storage-image format of one RW (storage) T#, decoded from the
-/// unified FORMAT field: guest format 71 (16_16_16_16 FLOAT) = `Rgba16f`,
-/// 77 (32_32_32_32 FLOAT) = `Rgba32f`, everything else keeps the legacy
-/// `Rgba8` view (the 32-bpp guest formats the upload path reads, or the
-/// zero-filled seed). One axis of the storage-array key — one SPIR-V array
+/// unified FORMAT field: guest format 5 (8 UINT) = `R8ui`, 71
+/// (16_16_16_16 FLOAT) = `Rgba16f`, 77 (32_32_32_32 FLOAT) = `Rgba32f`,
+/// and everything else keeps the legacy `Rgba8` view (the 32-bpp guest
+/// formats the upload path reads, or the zero-filled seed). One axis of the
+/// storage-array key — one SPIR-V array
 /// type carries exactly one `OpTypeImage` (Dim, format), so a mixed shader
 /// declares one array per PRESENT key (see [`storage_key_layout`]) instead
 /// of the historical shader-wide refusal (measured: ASTRO.BOT compute binds
@@ -3008,14 +3090,16 @@ pub enum StorageFormat {
     Rgba8,
     Rgba16f,
     Rgba32f,
+    R8ui,
 }
 
 impl StorageFormat {
-    /// Classify a unified T# format. Same arms as the historical
-    /// `storage_texture_dim_format` — the measured RW T#s on ASTRO.BOT
-    /// (71 = 16_16_16_16 FLOAT) and its table-1 UAV (77 = 32_32_32_32 FLOAT).
+    /// Classify a unified T# format. Format 5 is GTA V's measured 8_UINT
+    /// glyph-atlas UAV; 71 and 77 are the historical ASTRO.BOT
+    /// 16_16_16_16 FLOAT and 32_32_32_32 FLOAT UAVs.
     pub const fn from_unified_format(fmt: u16) -> Self {
         match fmt {
+            5 => Self::R8ui,
             71 => Self::Rgba16f,
             77 => Self::Rgba32f,
             _ => Self::Rgba8,
@@ -3028,6 +3112,15 @@ impl StorageFormat {
             Self::Rgba8 => "Rgba8",
             Self::Rgba16f => "Rgba16f",
             Self::Rgba32f => "Rgba32f",
+            Self::R8ui => "R8ui",
+        }
+    }
+
+    /// Scalar component type required by `OpTypeImage` and `OpImageWrite`.
+    pub(crate) const fn sampled_type_str(self) -> &'static str {
+        match self {
+            Self::R8ui => "%uint",
+            Self::Rgba8 | Self::Rgba16f | Self::Rgba32f => "%float",
         }
     }
 
@@ -3037,6 +3130,7 @@ impl StorageFormat {
             Self::Rgba8 => 0,
             Self::Rgba16f => 1,
             Self::Rgba32f => 2,
+            Self::R8ui => 3,
         }
     }
 }
@@ -3062,7 +3156,7 @@ pub(crate) const fn storage_key_of(
 /// order, by the SPIR-V generator, `shader_calc_binding_indices`, and the
 /// host descriptor path alike (exactly the [`sampled_key_ordinal`] contract).
 pub const fn storage_key_ordinal(dim: SampledDim, format: StorageFormat) -> u32 {
-    dim.ordinal() * 3 + format.ordinal()
+    dim.ordinal() * 4 + format.ordinal()
 }
 
 /// SPIR-V identifier suffix distinguishing one (Dim, format) storage-image
@@ -3074,17 +3168,21 @@ pub(crate) const fn storage_key_suffix(dim: SampledDim, format: StorageFormat) -
         (SampledDim::Two, StorageFormat::Rgba8) => "_2D",
         (SampledDim::Two, StorageFormat::Rgba16f) => "_2D_16F",
         (SampledDim::Two, StorageFormat::Rgba32f) => "_2D_32F",
+        (SampledDim::Two, StorageFormat::R8ui) => "_2D_R8UI",
         (SampledDim::TwoArray, StorageFormat::Rgba8) => "_2DArray",
         (SampledDim::TwoArray, StorageFormat::Rgba16f) => "_2DArray_16F",
         (SampledDim::TwoArray, StorageFormat::Rgba32f) => "_2DArray_32F",
+        (SampledDim::TwoArray, StorageFormat::R8ui) => "_2DArray_R8UI",
         (SampledDim::Three, StorageFormat::Rgba8) => "_3D",
         (SampledDim::Three, StorageFormat::Rgba16f) => "_3D_16F",
         (SampledDim::Three, StorageFormat::Rgba32f) => "_3D_32F",
+        (SampledDim::Three, StorageFormat::R8ui) => "_3D_R8UI",
         // Unreachable today (`SampledDim::from_texture_type` never yields
         // Cube for a storage T#) but the key space is total by construction.
         (SampledDim::Cube, StorageFormat::Rgba8) => "_Cube",
         (SampledDim::Cube, StorageFormat::Rgba16f) => "_Cube_16F",
         (SampledDim::Cube, StorageFormat::Rgba32f) => "_Cube_32F",
+        (SampledDim::Cube, StorageFormat::R8ui) => "_Cube_R8UI",
     }
 }
 
@@ -3598,12 +3696,21 @@ impl<'a> Spirv<'a> {
     fn find_reloop_blocks(&mut self) -> Result<(), ShaderRecompileError> {
         use ShaderInstructionType as T;
         self.reloop_blocks = None;
-        let labels_present = self.code.get_labels().iter().any(|l| !l.is_disabled())
-            || self
-                .code
-                .get_indirect_labels()
-                .iter()
-                .any(|l| !l.is_disabled());
+        let direct_labels: Vec<_> = self
+            .code
+            .get_labels()
+            .iter()
+            .filter(|l| !l.is_disabled())
+            .copied()
+            .collect();
+        let indirect_labels: Vec<_> = self
+            .code
+            .get_indirect_labels()
+            .iter()
+            .filter(|l| !l.is_disabled())
+            .copied()
+            .collect();
+        let labels_present = !direct_labels.is_empty() || !indirect_labels.is_empty();
         if !labels_present {
             return Ok(());
         }
@@ -3611,6 +3718,32 @@ impl<'a> Spirv<'a> {
         let Some(first) = instructions.first() else {
             return Ok(());
         };
+        let is_conditional_branch = |type_| {
+            matches!(
+                type_,
+                T::SCbranchScc0
+                    | T::SCbranchScc1
+                    | T::SCbranchVccz
+                    | T::SCbranchVccnz
+                    | T::SCbranchExecz
+            )
+        };
+        let control_transfers = instructions
+            .iter()
+            .filter(|inst| inst.type_ == T::SBranch || is_conditional_branch(inst.type_))
+            .count();
+        let single_forward_skip = direct_labels.len() == 1
+            && indirect_labels.len() == 1
+            && indirect_labels[0].get_src() == direct_labels[0].get_src()
+            && indirect_labels[0].get_dst() == direct_labels[0].get_src().saturating_add(4)
+            && control_transfers == 1
+            && direct_labels[0].get_dst() > direct_labels[0].get_src()
+            && instructions.iter().any(|inst| {
+                inst.pc == direct_labels[0].get_src() && is_conditional_branch(inst.type_)
+            });
+        if single_forward_skip {
+            return Ok(());
+        }
         let pcs: std::collections::BTreeSet<u32> =
             instructions.iter().map(|inst| inst.pc).collect();
         let mut starts = std::collections::BTreeSet::new();
@@ -3983,6 +4116,13 @@ impl<'a> Spirv<'a> {
         }
 
         if let Some(bind) = self.bind {
+            if bind.textures2d.textures2d_storage_num > 0
+                && storage_key_layout(bind)
+                    .iter()
+                    .any(|layout| layout.format == StorageFormat::R8ui)
+            {
+                extensions.push("OpCapability StorageImageExtendedFormats".to_string());
+            }
             if bind.storage_buffers.buffers_num > 0 {
                 vars.push("%buf".to_string());
             }
@@ -4477,7 +4617,7 @@ impl<'a> Spirv<'a> {
         // measured on ASTRO.BOT); one instance per present (Dim, format)
         // key, see `storage_key_layout`.
         const TEXTURES_LOADED_TYPES: &str = r#"
-                                             %ImageL<L> = OpTypeImage %float <dim> 0 <arrayed> 0 2 <format>
+                                             %ImageL<L> = OpTypeImage <ltype> <dim> 0 <arrayed> 0 2 <format>
                     %textures2D_L<L>_uint_<buffers_num> = OpConstant %uint <buffers_num>
                      %_arr_ImageL<L>_uint_<buffers_num> = OpTypeArray %ImageL<L> %textures2D_L<L>_uint_<buffers_num>
 %_ptr_UniformConstant__arr_ImageL<L>_uint_<buffers_num> = OpTypePointer UniformConstant %_arr_ImageL<L>_uint_<buffers_num>
@@ -4567,6 +4707,7 @@ impl<'a> Spirv<'a> {
                     self.source += &TEXTURES_LOADED_TYPES
                         .replace("<L>", l.suffix)
                         .replace("<buffers_num>", &format!("{}", l.count))
+                        .replace("<ltype>", l.format.sampled_type_str())
                         .replace("<dim>", l.dim.dim_str())
                         .replace("<arrayed>", l.dim.arrayed_str())
                         .replace("<format>", l.format.format_str());
@@ -5493,7 +5634,10 @@ impl<'a> Spirv<'a> {
     }
 
     fn write_instructions(&mut self) -> Result<(), ShaderRecompileError> {
-        use super::recompile::{RecompileFn, SccCheck, recomp_func, recompile_inject_debug};
+        use super::recompile::{
+            RecompileFn, SccCheck, pin_sampled_mimg_descriptor_indices, recomp_func,
+            recompile_inject_debug,
+        };
 
         // Legacy linear emission only: the relooper needs no discard-block
         // duplication (each discard block is one case every branch can
@@ -5597,6 +5741,7 @@ impl<'a> Spirv<'a> {
                 tracing::error!("can't recompile: {src}\n{}", self.source);
                 return Err(ShaderRecompileError::CannotRecompile { instruction: src });
             }
+            pin_sampled_mimg_descriptor_indices(index as u32, &self.code, &mut dst, self)?;
 
             self.source += &format!("; {src}\n");
             self.source += &format!("{dst}\n");
@@ -6186,6 +6331,68 @@ mod tests {
             size,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn storage_key_ordinals_cover_four_dims_by_four_formats_without_aliasing() {
+        let dims = [
+            SampledDim::Two,
+            SampledDim::TwoArray,
+            SampledDim::Three,
+            SampledDim::Cube,
+        ];
+        let formats = [
+            StorageFormat::Rgba8,
+            StorageFormat::Rgba16f,
+            StorageFormat::Rgba32f,
+            StorageFormat::R8ui,
+        ];
+        let mut seen = [false; 16];
+        for dim in dims {
+            for format in formats {
+                let ordinal = storage_key_ordinal(dim, format) as usize;
+                assert!(ordinal < seen.len(), "ordinal {ordinal} exceeds key space");
+                assert!(!seen[ordinal], "ordinal {ordinal} aliases another key");
+                seen[ordinal] = true;
+            }
+        }
+        assert!(seen.into_iter().all(|present| present));
+    }
+
+    #[test]
+    fn flat_global_base_recovers_gta_vector_address_pair() {
+        let mut low = ShaderInstruction {
+            type_: ShaderInstructionType::VAddI32,
+            dst: vgpr(1),
+            src_num: 2,
+            ..Default::default()
+        };
+        low.src[0] = sgpr_n(12, 1);
+        low.src[1] = vgpr(6);
+
+        let mut high = ShaderInstruction {
+            type_: ShaderInstructionType::VAddCoCiU32,
+            dst: vgpr(2),
+            src_num: 3,
+            ..Default::default()
+        };
+        high.src[0] = ShaderOperand::default();
+        high.src[1] = sgpr_n(13, 1);
+        high.src[2] = ShaderOperand {
+            type_: ShaderOperandType::VccLo,
+            size: 1,
+            ..Default::default()
+        };
+
+        let mut flat = ShaderInstruction {
+            type_: ShaderInstructionType::FlatLoadUbyte,
+            src_num: 3,
+            uses_flat_address: true,
+            ..Default::default()
+        };
+        flat.src[0] = ShaderOperand { size: 2, ..vgpr(1) };
+
+        assert_eq!(flat_global_base_sgpr(&[low, high, flat]), Some(12));
     }
 
     #[test]

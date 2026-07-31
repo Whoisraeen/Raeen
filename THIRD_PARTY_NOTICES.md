@@ -81,7 +81,15 @@ SOFTWARE.
   KytyPS5's separate `PTHREAD_STACK_EXTRA` behavior. Raeen also follows
   KytyPS5's Gen5 vertex-attribute handling by carrying the AGC `fetch_index`
   selector into Vulkan's per-vertex/per-instance input rate; the Rust data
-  model, cache keys, and tests are original. AudioOut2's context-memory sizing
+  model, cache keys, and tests are original. The GTA V graphics batch
+  (2026-07-29) also behaviorally re-implements
+  `shader.cpp::VertexAttribFormatToBufferFormat` and
+  `ShaderApplyAttribSemantics`: known nonzero per-attribute metadata overrides
+  the shared V# format, while unknown metadata remains a named degradation.
+  The measured render-target subset follows
+  `textureCommon.cpp::TextureGetRenderTargetFormat` and
+  `hardware/gpu_defs.h`; its Rust mappings, safe fallback policy, and tests are
+  original, and no C++ was copied. AudioOut2's context-memory sizing
   and speaker-array lifecycle/coefficient behavior are likewise behaviorally
   re-implemented in Rust from `src/libs/libAudio2.cpp`; this closes GTA V's
   measured undersized-allocation and unresolved speaker-array initialization
@@ -327,6 +335,11 @@ SOFTWARE.
   because this generator has no per-body `NoContraction` decoration hook.
   The type-driven 3D-image `volume` flag in `crates/raeen-gpu/src/vulkan/`
   and `draw_translate.rs` completes the host half of PR #587 (`5228335`).
+- **GTA V format-5 storage image 2026-07-30:** SharpEmu's published
+  `Gfx10UnifiedFormat` table and `Gen5SpirvTranslator.DecodeImageFormat`
+  corroborate unified format 5 as one-channel `8_UINT`. Raeen's `R8ui` SPIR-V
+  storage type, raw-bit integer texel construction, Vulkan `R8_UINT` host
+  image, and one-byte transfer sizing are original Rust; no C# is copied.
 - **SMEM register-soffset batch 2026-07-28**
   (`docs/sharpemu-port/smem-register-soffset.md`): the RDNA2 scalar-load
   addressing rule Raeen implements is corroborated against
@@ -750,7 +763,14 @@ attribution as that license requires.
   hardware-interface facts used to name registers and place bits; the Rust
   tables, decode and tests in `crates/kyty-graphics/src/pm4.rs` and
   `crates/kyty-graphics/src/run.rs` are original, and no Mesa code, JSON or
-  generated header was copied into the tree.
+  generated header was copied into the tree. The GTA V linear-texture fix
+  (2026-07-30) additionally uses
+  `src/amd/addrlib/src/gfx10/gfx10addrlib.cpp::HwlComputeSurfaceInfoLinear`
+  as evidence that GFX10 linear rows are aligned to 256 bytes, and
+  `src/amd/registers/gfx10-rsrc.json` for the T# word-4 custom-pitch field.
+  Raeen's element-size-aware pitch selection, decoder integration, and tests
+  are original Rust; no Mesa implementation or generated register table was
+  copied.
 
 ---
 
@@ -782,6 +802,13 @@ Only licenses compatible with GPL-2.0-only are used.
 ---
 
 ## Algorithms implemented from published descriptions (no code copied)
+
+- **AMD RDNA 2 Shader Instruction Set Architecture** — AMD's public ISA
+  reference is used as hardware-interface evidence for typed buffer descriptor
+  formats and component counts. The GTA V shader batch (2026-07-29) uses the
+  published fact that unified format 20 is one-component `32_UINT` to lower a
+  measured `BufferStoreFormatXyzw` as an x-component store. The lowering and
+  tests are original Rust; no AMD source code or tables are copied.
 
 - **AMD FidelityFX Super Resolution 1.0 (FSR1)** — MIT (GPL-2.0 compatible).
   `raeen-upscale`'s `fsr` backend (`spatial::fsr1`) implements FSR1's two-pass

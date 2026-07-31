@@ -870,12 +870,30 @@ pub struct ShaderEudRawResources {
 /// past the bound length clamp to 0 and stores past it drop, matching RDNA
 /// out-of-bounds behaviour. `used`/`binding_index` are assigned by
 /// `shader_detect_flat_global_window` after every other resource group.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ShaderGlobalMemResources {
     /// A FLAT-class op is present: declare + bind the `%global_mem` SSBO.
     pub used: bool,
     /// Vulkan binding index of `%global_mem` (after the raw-EUD fallback).
     pub binding_index: i32,
+    /// Direct user-SGPR pair holding the guest window base, or -1 when the
+    /// address producer could not be recovered statically. The host may still
+    /// select a validated adjacent direct-SGPR pair in that case.
+    pub base_sgpr: i32,
+    /// At least one FLAT/GLOBAL store is present, so the host snapshot must be
+    /// copied back after a synchronous dispatch.
+    pub writable: bool,
+}
+
+impl Default for ShaderGlobalMemResources {
+    fn default() -> Self {
+        Self {
+            used: false,
+            binding_index: 0,
+            base_sgpr: -1,
+            writable: false,
+        }
+    }
 }
 
 /// Beyond Kyty: one `s_load_dword{,x2,x4,x8,x16}` whose base pointer is built

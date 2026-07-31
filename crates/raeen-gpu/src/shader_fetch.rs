@@ -46,15 +46,18 @@ use kyty_graphics::shader::recompile::{
     shader_recompile_cs, shader_recompile_ps, shader_recompile_vs,
 };
 use kyty_graphics::shader::resources::{
-    ShaderBindResources, ShaderComputeInputInfo, ShaderMappedData, ShaderPixelInputInfo,
-    ShaderVertexInputInfo,
+    ShaderBindResources, ShaderComputeInputInfo, ShaderEmbeddedConstantLoad, ShaderMappedData,
+    ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
-use kyty_graphics::shader::types::ShaderCode;
+use kyty_graphics::shader::types::{
+    ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
+};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info, warn};
 
 /// One fetch step: 4 KiB.
@@ -71,13 +74,14 @@ const MAX_CACHE_ENTRIES: usize = 256;
 /// finite because descriptor/EUD state can change without a shader-create call.
 const ANALYSIS_FAILURE_RETRY_BINDS: u16 = 255;
 /// Bump whenever generated SPIR-V or the binding-identity contract changes.
-// v2: guest Cube descriptors remain Vulkan 2D arrays, but their V_CUBE*
-// generated S/T coordinates are rebased from the guest [1, 2] convention to
-// Vulkan's [0, 1].  Reusing v1 modules silently restores Minecraft's flat
-// green panorama, so this codegen change must get a fresh namespace.
-const DISK_CACHE_VERSION: u32 = 2;
+// v7: V#/pointer dwords feeding a downstream scalar load that analysis already
+// captured are canonicalized like pinned sampled T#/S# operands. Reusing v6 is
+// safe but would retain GTA's one-module-per-buffer-address split.
+const DISK_CACHE_VERSION: u32 = 11;
 /// `s_endpgm` — identical encoding on GCN and RDNA2 (SOPP op 1).
 const S_ENDPGM: u32 = 0xBF81_0000;
+const BINDING_TRACE_LIMIT: usize = 64;
+static BINDING_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Which pipeline stage a fetched shader binds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -391,7 +395,7 @@ impl PreparedShader {
     fn binding_identity(&self) -> Box<[u32]> {
         let mut id = Vec::with_capacity(192);
         match self {
-            Self::Vs { info, .. } => {
+            Self::Vs { code, info } => {
                 id.extend([
                     info.fetch_external.into(),
                     info.fetch_embedded.into(),
@@ -430,9 +434,9 @@ impl PreparedShader {
                         id.extend([buffer.attr_indices[j] as u32, buffer.attr_offsets[j]]);
                     }
                 }
-                append_bind_identity(&mut id, &info.bind);
+                append_bind_identity(&mut id, &info.bind, code);
             }
-            Self::Ps { info, .. } => {
+            Self::Ps { code, info, .. } => {
                 id.extend([
                     info.input_num,
                     info.ps_pos_xy.into(),
@@ -445,9 +449,9 @@ impl PreparedShader {
                     .min(info.interpolator_settings.len());
                 id.extend_from_slice(&info.interpolator_settings[..inputs]);
                 id.extend(info.target_output_mode.map(u32::from));
-                append_bind_identity(&mut id, &info.bind);
+                append_bind_identity(&mut id, &info.bind, code);
             }
-            Self::Cs { info, .. } => {
+            Self::Cs { code, info } => {
                 id.extend([
                     info.workgroup_register as u32,
                     info.thread_ids_num as u32,
@@ -456,7 +460,7 @@ impl PreparedShader {
                 for i in 0..3 {
                     id.extend([info.threads_num[i], info.group_id[i].into()]);
                 }
-                append_bind_identity(&mut id, &info.bind);
+                append_bind_identity(&mut id, &info.bind, code);
             }
         }
         id.into_boxed_slice()
@@ -527,7 +531,7 @@ fn bounded_count(count: i32, capacity: usize) -> std::ops::Range<usize> {
 /// expanded recompiler introduced after that upstream function: texture
 /// dimension/format, sampler-less storage classification, EUD/global-memory
 /// declarations, and embedded shader constants.
-fn append_bind_identity(id: &mut Vec<u32>, bind: &ShaderBindResources) {
+fn append_bind_identity(id: &mut Vec<u32>, bind: &ShaderBindResources, code: &ShaderCode) {
     id.extend([
         bind.push_constant_offset,
         bind.push_constant_size,
@@ -608,6 +612,8 @@ fn append_bind_identity(id: &mut Vec<u32>, bind: &ShaderBindResources) {
         bind.eud_raw.required_dwords,
         bind.global_mem.used.into(),
         bind.global_mem.binding_index as u32,
+        bind.global_mem.base_sgpr as u32,
+        bind.global_mem.writable.into(),
     ]);
 
     id.push(bind.embedded_constant_loads.loads_num as u32);
@@ -621,7 +627,10 @@ fn append_bind_identity(id: &mut Vec<u32>, bind: &ShaderBindResources) {
         let count = usize::try_from(load.dwords_num)
             .unwrap_or(usize::MAX)
             .min(load.values.len());
-        id.extend_from_slice(&load.values[..count]);
+        let keep = embedded_capture_codegen_value_mask(code, load, &bind.embedded_constant_loads);
+        for (index, &value) in load.values[..count].iter().enumerate() {
+            id.push(if keep[index] { value } else { 0 });
+        }
     }
 
     id.push(bind.embedded_buffer_fetches.loads_num as u32);
@@ -637,6 +646,166 @@ fn append_bind_identity(id: &mut Vec<u32>, bind: &ShaderBindResources) {
             .min(load.window.len());
         id.extend_from_slice(&load.window[..count]);
     }
+}
+
+/// Which captured scalar-load dwords remain observable in generated SPIR-V.
+///
+/// The capture's descriptor payload still remains fresh in
+/// [`PreparedShader::into_translated`] for Vulkan view/sampler binding. Only
+/// its otherwise-dead baked SPIR-V constants are canonicalized out of the
+/// module key. GTA V commonly loads a 16-dword table containing two T#s (or a
+/// T# plus S#), and loads V# pointers solely to feed later scalar loads whose
+/// results analysis also captured, so this is deliberately per dword rather
+/// than per load. Any scalar/ALU use or unresolved memory operation keeps every
+/// overlapping live dword exact.
+fn embedded_capture_codegen_value_mask(
+    code: &ShaderCode,
+    load: &ShaderEmbeddedConstantLoad,
+    all_loads: &kyty_graphics::shader::resources::ShaderEmbeddedConstantLoads,
+) -> [bool; ShaderEmbeddedConstantLoad::VALUES_MAX] {
+    let mut keep = [true; ShaderEmbeddedConstantLoad::VALUES_MAX];
+    let dwords = usize::try_from(load.dwords_num)
+        .unwrap_or(usize::MAX)
+        .min(load.values.len());
+    if dwords == 0 {
+        return keep;
+    }
+    let instructions = code.get_instructions();
+    let Some((load_index, load_inst)) = instructions
+        .iter()
+        .enumerate()
+        .find(|(_, inst)| inst.pc == load.pc)
+    else {
+        return keep;
+    };
+    if load_inst.dst.type_ != ShaderOperandType::Sgpr
+        || load_inst.dst.size.max(1) as usize != dwords
+    {
+        return keep;
+    }
+
+    keep[..dwords].fill(false);
+    let first_reg = load_inst.dst.register_id;
+    let mut live = vec![true; dwords];
+    for inst in &instructions[load_index + 1..] {
+        let src_num = usize::try_from(inst.src_num.max(0))
+            .unwrap_or(0)
+            .min(inst.src.len());
+        for (src_index, operand) in inst.src[..src_num].iter().enumerate() {
+            if !operand_intersects_live_capture(operand, first_reg, &live) {
+                continue;
+            }
+            if !is_codegen_resolved_descriptor_operand(inst, src_index, all_loads) {
+                mark_observed_capture_dwords(&mut keep, &live, first_reg, operand);
+            }
+        }
+
+        clear_capture_writes(&mut live, first_reg, &inst.dst);
+        clear_capture_writes(&mut live, first_reg, &inst.dst2);
+        if !live.iter().any(|&is_live| is_live) {
+            break;
+        }
+    }
+    keep
+}
+
+fn operand_intersects_live_capture(operand: &ShaderOperand, first_reg: i32, live: &[bool]) -> bool {
+    if operand.type_ != ShaderOperandType::Sgpr {
+        return false;
+    }
+    let operand_end = operand.register_id.saturating_add(operand.size.max(1));
+    live.iter().enumerate().any(|(index, &is_live)| {
+        let reg = first_reg.saturating_add(index as i32);
+        is_live && reg >= operand.register_id && reg < operand_end
+    })
+}
+
+fn clear_capture_writes(live: &mut [bool], first_reg: i32, operand: &ShaderOperand) {
+    if operand.type_ != ShaderOperandType::Sgpr {
+        return;
+    }
+    let operand_end = operand.register_id.saturating_add(operand.size.max(1));
+    for (index, is_live) in live.iter_mut().enumerate() {
+        let reg = first_reg.saturating_add(index as i32);
+        if reg >= operand.register_id && reg < operand_end {
+            *is_live = false;
+        }
+    }
+}
+
+fn mark_observed_capture_dwords(
+    keep: &mut [bool],
+    live: &[bool],
+    first_reg: i32,
+    operand: &ShaderOperand,
+) {
+    let operand_end = operand.register_id.saturating_add(operand.size.max(1));
+    for (index, (&is_live, keep)) in live.iter().zip(keep.iter_mut()).enumerate() {
+        let reg = first_reg.saturating_add(index as i32);
+        if is_live && reg >= operand.register_id && reg < operand_end {
+            *keep = true;
+        }
+    }
+}
+
+fn is_codegen_resolved_descriptor_operand(
+    inst: &ShaderInstruction,
+    src_index: usize,
+    all_loads: &kyty_graphics::shader::resources::ShaderEmbeddedConstantLoads,
+) -> bool {
+    use ShaderInstructionType as T;
+
+    let captured_scalar_load = all_loads.find(inst.pc).is_some()
+        && src_index == 0
+        && matches!(
+            inst.type_,
+            T::SLoadDword
+                | T::SLoadDwordx2
+                | T::SLoadDwordx4
+                | T::SLoadDwordx8
+                | T::SLoadDwordx16
+                | T::SBufferLoadDword
+                | T::SBufferLoadDwordx2
+                | T::SBufferLoadDwordx4
+                | T::SBufferLoadDwordx8
+                | T::SBufferLoadDwordx16
+        );
+    if captured_scalar_load {
+        return true;
+    }
+
+    let sampled = matches!(
+        inst.type_,
+        T::ImageSample
+            | T::ImageSampleCLz
+            | T::ImageSampleL
+            | T::ImageSampleLz
+            | T::ImageSampleLzO
+            | T::ImageGather4Lz
+            | T::ImageLoad
+            | T::ImageGetResinfo
+    );
+    if !sampled {
+        return false;
+    }
+    let uses_sampler = matches!(
+        inst.type_,
+        T::ImageSample
+            | T::ImageSampleCLz
+            | T::ImageSampleL
+            | T::ImageSampleLz
+            | T::ImageSampleLzO
+            | T::ImageGather4Lz
+    );
+    let expected_size = match src_index {
+        1 => Some(8),
+        2 if uses_sampler => Some(4),
+        _ => None,
+    };
+    expected_size.is_some_and(|size| {
+        inst.src[src_index].type_ == ShaderOperandType::Sgpr
+            && inst.src[src_index].size.max(1) == size
+    })
 }
 
 /// Counters for the measurement report.
@@ -1257,8 +1426,29 @@ impl ShaderTranslateCache {
 
         self.stats.distinct_fetched += 1;
         self.dump_shader(stage, addr, &window.data);
+        trace_binding_identity(stage, addr, &key.binding);
 
         let result = prepared.recompile();
+
+        // Promote the translator's function-local guest-register model to SSA
+        // before the driver sees it. Optimization is semantics preserving and
+        // binding preserving; if SPIRV-Tools itself refuses a module, retain
+        // the original and let the validity gate below make the safety call.
+        let result = match result {
+            Ok(spirv) => match crate::spirv_gate::optimize_spirv(&spirv) {
+                Ok(optimized) => Ok(optimized),
+                Err(reason) => {
+                    warn!(
+                        stage = stage.as_str(),
+                        addr = format_args!("{addr:#x}"),
+                        %reason,
+                        "SPIR-V performance optimization failed — using validated original module"
+                    );
+                    Ok(spirv)
+                }
+            },
+            other => other,
+        };
 
         // Validity gate: an invalid module passes vkCreateShaderModule but
         // dispatching it is UB (measured: AMD driver access violation that
@@ -1481,6 +1671,34 @@ impl ShaderTranslateCache {
             Err(e) => warn!(error = %e, path = %path.display(), "SPIR-V dump failed"),
         }
     }
+}
+
+/// Emit a bounded full binding-key trace for one explicitly requested shader.
+///
+/// This is intentionally opt-in and process-local: commercial titles can
+/// produce hundreds of analyzed variants per second, while the full key is the
+/// only reliable way to prove which ABI field causes a cache split.
+fn trace_binding_identity(stage: Stage, addr: u64, binding: &[u32]) {
+    let Ok(filter) = std::env::var("RAEEN_TRACE_SHADER_BINDING") else {
+        return;
+    };
+    let matches = filter.split(',').any(|token| {
+        let token = token.trim();
+        let token = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .unwrap_or(token);
+        u64::from_str_radix(token, 16).ok() == Some(addr)
+    });
+    if !matches || BINDING_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= BINDING_TRACE_LIMIT {
+        return;
+    }
+    warn!(
+        stage = stage.as_str(),
+        addr = format_args!("{addr:#x}"),
+        binding = ?binding,
+        "TRACE_SHADER_BINDING module-cache miss"
+    );
 }
 
 const fn persistent_cache_enabled(config_enabled: bool, tracing_draws: bool) -> bool {
@@ -2099,6 +2317,204 @@ mod tests {
         assert_eq!(
             translated.cs_info.bind.storage_buffers.buffers[0].num_records(),
             4096
+        );
+    }
+
+    #[test]
+    fn module_identity_excludes_sampled_descriptor_only_scalar_payloads() {
+        use kyty_graphics::shader::types::{
+            ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
+        };
+
+        let sgpr = |register_id: i32, size: i32| ShaderOperand {
+            type_: ShaderOperandType::Sgpr,
+            register_id,
+            size,
+            ..Default::default()
+        };
+        let prepared = |descriptor_word: u32, scalar_use: bool| {
+            let mut code = ShaderCode::new();
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 0,
+                type_: ShaderInstructionType::SLoadDwordx8,
+                dst: sgpr(8, 8),
+                ..Default::default()
+            });
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 4,
+                type_: ShaderInstructionType::ImageSampleLz,
+                src: [
+                    Default::default(),
+                    sgpr(8, 8),
+                    sgpr(20, 4),
+                    Default::default(),
+                ],
+                src_num: 3,
+                ..Default::default()
+            });
+            if scalar_use {
+                code.get_instructions_mut().push(ShaderInstruction {
+                    pc: 8,
+                    type_: ShaderInstructionType::SMovB32,
+                    src: [
+                        sgpr(8, 1),
+                        Default::default(),
+                        Default::default(),
+                        Default::default(),
+                    ],
+                    src_num: 1,
+                    dst: sgpr(30, 1),
+                    ..Default::default()
+                });
+            }
+
+            let mut info = ShaderPixelInputInfo::default();
+            info.bind.textures2d.textures_num = 1;
+            info.bind.textures2d.textures2d_sampled_num = 1;
+            info.bind.textures2d.desc[0].start_register = 8;
+            info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+            info.bind.samplers.samplers_num = 1;
+            info.bind.samplers.start_register[0] = 20;
+            info.bind.embedded_constant_loads.loads_num = 1;
+            info.bind.embedded_constant_loads.loads[0].pc = 0;
+            info.bind.embedded_constant_loads.loads[0].dwords_num = 8;
+            info.bind.embedded_constant_loads.loads[0].values[0] = descriptor_word;
+            PreparedShader::Ps {
+                code: Arc::new(code),
+                vs_info: Arc::new(ShaderVertexInputInfo::default()),
+                info: Arc::new(info),
+            }
+        };
+
+        assert_eq!(
+            prepared(0x1111_2222, false).binding_identity(),
+            prepared(0xAAAA_BBBB, false).binding_identity(),
+            "a captured payload used only as a pinned sampled descriptor must not create modules"
+        );
+        assert_ne!(
+            prepared(0x1111_2222, true).binding_identity(),
+            prepared(0xAAAA_BBBB, true).binding_identity(),
+            "a captured dword also read by scalar ALU remains part of module identity"
+        );
+
+        let wide_prepared = |descriptor_word: u32, scalar_word: u32| {
+            let mut code = ShaderCode::new();
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 0,
+                type_: ShaderInstructionType::SLoadDwordx16,
+                dst: sgpr(8, 16),
+                ..Default::default()
+            });
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 4,
+                type_: ShaderInstructionType::ImageSampleLz,
+                src: [
+                    Default::default(),
+                    sgpr(8, 8),
+                    sgpr(24, 4),
+                    Default::default(),
+                ],
+                src_num: 3,
+                ..Default::default()
+            });
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 8,
+                type_: ShaderInstructionType::SMovB32,
+                src: [
+                    sgpr(20, 1),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ],
+                src_num: 1,
+                dst: sgpr(30, 1),
+                ..Default::default()
+            });
+
+            let mut info = ShaderPixelInputInfo::default();
+            info.bind.textures2d.textures_num = 1;
+            info.bind.textures2d.textures2d_sampled_num = 1;
+            info.bind.textures2d.desc[0].start_register = 8;
+            info.bind.textures2d.desc[0].texture.fields[3] |= 9 << 28;
+            info.bind.embedded_constant_loads.loads_num = 1;
+            info.bind.embedded_constant_loads.loads[0].pc = 0;
+            info.bind.embedded_constant_loads.loads[0].dwords_num = 16;
+            info.bind.embedded_constant_loads.loads[0].values[0] = descriptor_word;
+            info.bind.embedded_constant_loads.loads[0].values[12] = scalar_word;
+            PreparedShader::Ps {
+                code: Arc::new(code),
+                vs_info: Arc::new(ShaderVertexInputInfo::default()),
+                info: Arc::new(info),
+            }
+        };
+        assert_eq!(
+            wide_prepared(0x1111_2222, 7).binding_identity(),
+            wide_prepared(0xAAAA_BBBB, 7).binding_identity(),
+            "the T# half of a 16-dword table must not multiply modules"
+        );
+        assert_ne!(
+            wide_prepared(0x1111_2222, 7).binding_identity(),
+            wide_prepared(0x1111_2222, 9).binding_identity(),
+            "a scalar-observed dword beside the T# remains exact"
+        );
+
+        let captured_chain = |vsharp_base: u32, loaded_scalar: u32| {
+            let mut code = ShaderCode::new();
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 0,
+                type_: ShaderInstructionType::SLoadDwordx4,
+                dst: sgpr(8, 4),
+                ..Default::default()
+            });
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 4,
+                type_: ShaderInstructionType::SBufferLoadDword,
+                src: [
+                    sgpr(8, 4),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ],
+                src_num: 1,
+                dst: sgpr(20, 1),
+                ..Default::default()
+            });
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc: 8,
+                type_: ShaderInstructionType::SMovB32,
+                src: [
+                    sgpr(20, 1),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ],
+                src_num: 1,
+                dst: sgpr(30, 1),
+                ..Default::default()
+            });
+
+            let mut info = ShaderVertexInputInfo::default();
+            info.bind.embedded_constant_loads.loads_num = 2;
+            info.bind.embedded_constant_loads.loads[0].pc = 0;
+            info.bind.embedded_constant_loads.loads[0].dwords_num = 4;
+            info.bind.embedded_constant_loads.loads[0].values[0] = vsharp_base;
+            info.bind.embedded_constant_loads.loads[1].pc = 4;
+            info.bind.embedded_constant_loads.loads[1].dwords_num = 1;
+            info.bind.embedded_constant_loads.loads[1].values[0] = loaded_scalar;
+            PreparedShader::Vs {
+                code: Arc::new(code),
+                info: Arc::new(info),
+            }
+        };
+        assert_eq!(
+            captured_chain(0x1111_2222, 7).binding_identity(),
+            captured_chain(0xAAAA_BBBB, 7).binding_identity(),
+            "a V# used only by a captured downstream load must not multiply modules"
+        );
+        assert_ne!(
+            captured_chain(0x1111_2222, 7).binding_identity(),
+            captured_chain(0x1111_2222, 9).binding_identity(),
+            "the captured downstream scalar remains exact when shader ALU observes it"
         );
     }
 

@@ -27,8 +27,8 @@ use crate::vulkan::compute::{
 };
 use crate::vulkan::instance::VulkanDevice;
 use crate::vulkan::offscreen::{
-    BlendState, CLEAR_COLOR, DepthState, DrawState, EudRawBinding, RenderedImage, SampledGroup,
-    SamplerState, ShaderStageBinding, StorageBufferBinding, StorageImageBinding,
+    BlendState, CLEAR_COLOR, DepthState, DrawState, EudRawBinding, GlobalMemBinding, RenderedImage,
+    SampledGroup, SamplerState, ShaderStageBinding, StorageBufferBinding, StorageImageBinding,
     StorageImageUpload, TextureBinding, TextureUpload, VertexAttributeData, VertexBufferData,
 };
 use ash::vk;
@@ -149,8 +149,9 @@ fn color_output_disabled(ctx: &Context) -> bool {
 /// Opt-in shader-address filter for late-title draw forensics.
 ///
 /// `RAEEN_TRACE_SHADER_ADDR=0x1234,0x5678` selects a draw when either its VS
-/// or PS address matches. Keeping this separate from `RAEEN_TRACE_DRAWS`
-/// avoids consuming every rate limiter on boot clears before a UI shader is
+/// or PS address matches, or a compute dispatch when its CS address is passed
+/// as the first argument. Keeping this separate from `RAEEN_TRACE_DRAWS`
+/// avoids consuming every rate limiter on boot clears before a late shader is
 /// first bound.
 fn shader_addr_selected(variable: &str, vs: u64, ps: u64) -> bool {
     let env = crate::diagnostics::gpu_env();
@@ -179,6 +180,12 @@ fn shader_addr_list_contains(raw: &str, vs: u64, ps: u64) -> bool {
 
 fn trace_selected_shader(vs: u64, ps: u64) -> bool {
     shader_addr_selected("RAEEN_TRACE_SHADER_ADDR", vs, ps)
+}
+
+fn trace_vertex_count_selected(vertex_count: u32) -> bool {
+    crate::diagnostics::gpu_env()
+        .trace_shader_min_verts
+        .is_none_or(|minimum| vertex_count >= minimum)
 }
 
 /// Address-independent companion to [`trace_selected_shader`].
@@ -510,6 +517,9 @@ fn vulkan_format(
         // the two-byte layout and degrade through R16_UNORM instead of
         // rejecting the draw or creating an invalid float→UINT pipeline.
         (0x2, 4, 0..=3) => Ok(vk::Format::R16_UNORM),
+        // 16 FLOAT. This is the exact KytyPS5 mapping and the next measured GTA
+        // V target after its 32_32 UINT pass.
+        (0x2, 7, 0) => Ok(vk::Format::R16_SFLOAT),
         (0xa, 0, 0) => Ok(vk::Format::R8G8B8A8_UNORM),
         (0xa, 1, 0) => Ok(vk::Format::R8G8B8A8_SNORM),
         (0xa, 6, 0) => Ok(vk::Format::R8G8B8A8_SRGB),
@@ -523,6 +533,9 @@ fn vulkan_format(
         // KytyPS5 names layout 5 `k16_16`; SharpEmu maps the exact pair
         // `(5, 7)` to `R16G16Sfloat`.
         (0x5, 7, 0) => Ok(vk::Format::R16G16_SFLOAT),
+        // 16_16 UNORM. KytyPS5 maps this exact target class to R16G16_UNORM;
+        // GTA V reaches it after the scalar R16F target.
+        (0x5, 0, 0) => Ok(vk::Format::R16G16_UNORM),
         // 10_11_11 / 11_11_10 FLOAT (channel_type 7): the packed HDR
         // intermediate render target ASTRO.BOT draws into. SharpEmu maps both
         // CB formats 6 and 7 with channel_type 7 to B10G11R11_UFLOAT_PACK32.
@@ -532,6 +545,13 @@ fn vulkan_format(
         // GetRenderTargetFormat maps CB format 9 to the same Vulkan packed
         // layout (R in bits 0..9, A in 30..31).
         (0x9, 0, 0) => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
+        // 32_32 FLOAT/UINT (CB format 0xb). FLOAT maps exactly to
+        // R32G32_SFLOAT. KytyPS5 maps UINT to R32G32_UINT, but this translator
+        // currently exposes every pixel export as float and Vulkan requires
+        // integer attachment outputs to be integer-typed, so UINT uses the
+        // same-size float-class twin. This keeps both exported dwords
+        // addressable without creating an invalid float-to-UINT pipeline.
+        (0xb, 4 | 7, 0) => Ok(vk::Format::R32G32_SFLOAT),
         // 16_16_16_16 FLOAT (CB format 0xc, channel_type 7): the 64bpp HDR main
         // scene target ASTRO.BOT renders into before tone-mapping. The offscreen
         // readback is bpp-aware (8 bytes/pixel for this one).
@@ -1480,6 +1500,28 @@ fn alloc_zeroed(len: usize, kind: &str) -> Result<Vec<u8>, DrawError> {
     Ok(buf)
 }
 
+/// Row pitch for a GFX10 `SW_LINEAR` image, in format elements.
+///
+/// AMD AddrLib (`gfx10addrlib.cpp::HwlComputeSurfaceInfoLinear`) aligns linear
+/// rows to 256 bytes. GFX10.3 can override that for a plain 1D/2D image by
+/// storing `pitch - 1` in word 4's DEPTH + PITCH_MSB fields. Word 4 remains
+/// the actual depth for a volume, so callers disable the override there.
+fn gfx10_linear_pitch(
+    texture: &kyty_graphics::shader::ShaderTextureResource,
+    elements_wide: u32,
+    element_bytes: u32,
+    custom_pitch_allowed: bool,
+) -> u32 {
+    let encoded_pitch = texture.fields[4] & 0x3fff;
+    let custom_pitch = encoded_pitch + 1;
+    if custom_pitch_allowed && encoded_pitch != 0 && custom_pitch >= elements_wide {
+        return custom_pitch;
+    }
+
+    let pitch_alignment = (256 / element_bytes.max(1)).max(1);
+    elements_wide.next_multiple_of(pitch_alignment)
+}
+
 fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawError> {
     // Gen5 unified-format code → Vulkan, per SharpEmu's Gfx10UnifiedFormat
     // table (the RDNA2 authority): 64 → (11,7) = 32_32_FLOAT,
@@ -1487,6 +1529,7 @@ fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawErro
     // 56 → (10,0) = 8_8_8_8 UNORM, 71 → (12,7) = 16_16_16_16_FLOAT,
     // 5 → (1,4) = 8 UINT (measured: GTA V's first submitted DCB),
     // 11 → (2,4) = 16 UINT (measured: Minecraft's packed per-vertex value),
+    // 28 → (5,5) = 16_16 SINT (measured: GTA V's first post-intro draw),
     // 57 → (10,1) = 8_8_8_8 SNORM (same UI draw, next attribute).
     match format {
         74 => Ok((vk::Format::R32G32B32_SFLOAT, 12)),
@@ -1496,6 +1539,7 @@ fn gen5_vertex_format_and_size(format: u8) -> Result<(vk::Format, u64), DrawErro
         57 => Ok((vk::Format::R8G8B8A8_SNORM, 4)),
         71 => Ok((vk::Format::R16G16B16A16_SFLOAT, 8)),
         23 => Ok((vk::Format::R16G16_UNORM, 4)),
+        28 => Ok((vk::Format::R16G16_SINT, 4)),
         // Unified 5 is (FMT_8, UINT). GTA's shader consumes the raw integer
         // bits, so the Vulkan interface must be R8_UINT rather than a
         // normalized/float approximation.
@@ -1720,6 +1764,10 @@ fn texture_vk_format(
         // render target as a texture. SharpEmu Gfx10UnifiedFormat maps unified
         // 36 -> (dataFormat 6 = 10_11_11, numFormat 7 = FLOAT).
         36 => Ok((vk::Format::B10G11R11_UFLOAT_PACK32, 4)),
+        // 50 -> (9,0) = 10_10_10_2 UNORM. GTA V samples this packed
+        // 32-bit tile-27 resource immediately after the Rockstar intro.
+        // KytyPS5 and SharpEmu both bind it as A2B10G10R10_UNORM_PACK32.
+        50 => Ok((vk::Format::A2B10G10R10_UNORM_PACK32, 4)),
         // 0x0a = 8_8_8_8; channel type UNORM (measured on Minecraft's UI T#s).
         // NOTE: SharpEmu's table maps unified 10 -> (2,3) = 16_SSCALED, which
         // contradicts this arm. No 0x0a texture has appeared in a measured
@@ -1822,11 +1870,11 @@ fn texture_vk_format(
 /// detected: the cached image keeps being bound until any sampled byte
 /// changes. The window is bounded by the sample coverage — the hash is
 /// recomputed from guest memory on EVERY bind, so any write that touches a
-/// sampled chunk is picked up at the next draw. Writeback paths we control
-/// (compute storage writeback, DMA copies) do not proactively invalidate the
-/// texture cache — no cheap range index over it exists today — so they are
-/// covered by the same per-bind rehash. `RAEEN_NO_TEX_CACHE=1` restores
-/// per-draw decode + upload wholesale.
+/// sampled chunk is picked up at the next draw. Other controlled writeback
+/// paths use the same per-bind rehash, while completed compute storage images
+/// invalidate sampled views at the exact guest base because format aliases
+/// can change sparse texels without perturbing this probe.
+/// `RAEEN_NO_TEX_CACHE=1` restores per-draw decode + upload wholesale.
 fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
     const CHUNKS: u64 = 64;
     const CHUNK_BYTES: u64 = 64;
@@ -2127,9 +2175,9 @@ fn sampled_key_ordinal(t: &kyty_graphics::shader::ShaderTextureResource) -> usiz
     ) as usize
 }
 
-/// The number of distinct storage-array keys — 4 Dims x 3 storage formats
+/// The number of distinct storage-array keys — 4 Dims x 4 storage formats
 /// (`kyty_graphics::shader::storage_key_ordinal` is Dim-major).
-const STORAGE_KEYS: usize = 12;
+const STORAGE_KEYS: usize = 16;
 
 /// The canonical (Dim, storage format) key ordinal of a RW (storage) T#,
 /// matching `kyty_graphics::shader::storage_key_ordinal`. A mixed shader
@@ -2440,13 +2488,15 @@ fn decode_texture(
             ));
         }
         0 => {
+            // GFX10 `SW_LINEAR` rows are 256-byte aligned unless word 4
+            // explicitly carries a GFX10.3 custom pitch.
             // Linear: row-major at `pitch`, trimmed to tight rows below. A
             // volume is `depth` such slices back to back (slice pitch =
             // pitch * height for a linear T# — the measured ASTRO.BOT
             // volumes are tile 0).
             // A BC T#'s pitch is in texels like its width, so it converts to
             // elements the same way.
-            let pitch = u32::from(t.pitch()).max(width).div_ceil(block_extent);
+            let pitch = gfx10_linear_pitch(t, elements_wide, bpp, !volume && !cube && !array);
             let src_len =
                 u64::from(pitch) * u64::from(elements_high) * u64::from(depth) * u64::from(bpp);
             let (hash, hit) = texture_cache_probe(
@@ -2506,6 +2556,87 @@ fn decode_texture(
                 return Ok(upload);
             }
             let pixels = read_guest_bytes_unaligned(t.base40(), src_len, "texture")?;
+            (pixels, hash)
+        }
+        // SharpEmu's current Gen5 volume upload treats a tiled volume as one
+        // complete 2D swizzle allocation per Z slice and detiles each slice
+        // independently (`AgcExports.TryDetileTextureSource`). This closes
+        // GTA V's measured 32x32x32 format-50 SW_64KB_R_X resource without
+        // pretending that the still-unimplemented mipped-volume placement is
+        // known.
+        mode if volume && crate::texture::tiling::swizzle_table(mode).is_some() => {
+            if t.max_mip() != 0 {
+                return Err(err(format!(
+                    "mipped 3D texture tile mode {mode} not implemented \
+                     (base={:#x} {width}x{height}x{depth} format={} levels={})",
+                    t.base40(),
+                    t.format(),
+                    t.max_mip()
+                )));
+            }
+            if !bpp.is_power_of_two() {
+                return Err(err(format!(
+                    "3D texture tile mode {mode} has unsupported {bpp}-byte elements \
+                     (base={:#x} {width}x{height}x{depth} format={})",
+                    t.base40(),
+                    t.format()
+                )));
+            }
+            let bpp_log2 = bpp.trailing_zeros();
+            let Some(slice_tiled) = crate::texture::tiling::tiled_byte_count_for_mode(
+                mode,
+                elements_wide,
+                elements_high,
+                bpp_log2,
+            ) else {
+                return Err(err(format!(
+                    "3D texture tile mode {mode} with {bpp}-byte elements is not a supported \
+                     swizzle element size (base={:#x} {width}x{height}x{depth} format={})",
+                    t.base40(),
+                    t.format()
+                )));
+            };
+            let src_len = slice_tiled
+                .checked_mul(u64::from(depth))
+                .ok_or_else(|| err("3D texture tiled byte count overflow"))?;
+            let (hash, hit) = texture_cache_probe(
+                t.base40(),
+                src_len,
+                width,
+                height,
+                layers,
+                depth,
+                cube,
+                array,
+                volume,
+                mode,
+                format,
+            );
+            if let Some(upload) = hit {
+                return Ok(upload);
+            }
+            let tiled = read_guest_bytes_unaligned(t.base40(), src_len, "3D texture")?;
+            let slice_tiled = slice_tiled as usize;
+            let slice_linear = (elements_wide * elements_high * bpp) as usize;
+            let mut pixels = alloc_zeroed(slice_linear * depth as usize, "3D texture decode")?;
+            for z in 0..depth as usize {
+                let start = z * slice_tiled;
+                let Some(slice) = crate::texture::tiling::detile_64kb(
+                    mode,
+                    &tiled[start..start + slice_tiled],
+                    elements_wide,
+                    elements_high,
+                    bpp_log2,
+                ) else {
+                    return Err(err(format!(
+                        "3D texture tile mode {mode} detile failed for slice {z} \
+                         (base={:#x} {width}x{height}x{depth} format={})",
+                        t.base40(),
+                        t.format()
+                    )));
+                };
+                pixels[z * slice_linear..(z + 1) * slice_linear].copy_from_slice(&slice);
+            }
             (pixels, hash)
         }
         other if volume => {
@@ -2914,8 +3045,8 @@ fn storage_image_format_is_32bpp(format: u16) -> bool {
 /// 2D-array views spanning `BASE_ARRAY..=LAST_ARRAY` (the latter is exposed
 /// by `depth()`). Minecraft builds its panorama with six one-layer views:
 /// base/last 0/0 through 5/5.
-/// Format 71 uploads as
-/// `R16G16B16A16_SFLOAT` (8 B/texel), format 77 as
+/// Format 5 uploads as `R8_UINT` (1 B/texel), format 71 as
+/// `R16G16B16A16_SFLOAT` (8 B/texel), and format 77 as
 /// `R32G32B32A32_SFLOAT` (16 B/texel), matching the recompiled storage-image
 /// format. Everything else keeps the RGBA8 view. The content is a
 /// best-effort seed: a UAV is typically fully overwritten by the dispatch,
@@ -2951,9 +3082,10 @@ fn read_storage_image(
             "storage image extent {width}x{height}x{depth}x{layers} out of range"
         )));
     }
-    // Must agree with `kyty-graphics` `storage_texture_dim_format` (which
-    // declares `%ImageL` as Rgba16f for 71 and Rgba32f for 77).
+    // Must agree with `kyty-graphics` storage classification (which declares
+    // `%ImageL` as R8ui for 5, Rgba16f for 71, and Rgba32f for 77).
     let (format, texel) = match t.format() {
+        5 => (vk::Format::R8_UINT, 1u64),
         71 => (vk::Format::R16G16B16A16_SFLOAT, 8u64),
         77 => (vk::Format::R32G32B32A32_SFLOAT, 16u64),
         _ => (vk::Format::R8G8B8A8_UNORM, 4u64),
@@ -2974,7 +3106,7 @@ fn read_storage_image(
     };
     let base =
         allocation_base.saturating_add(guest_layer_bytes.saturating_mul(u64::from(base_array)));
-    let readable = matches!(t.format(), 71 | 77) || storage_image_format_is_32bpp(t.format());
+    let readable = matches!(t.format(), 5 | 71 | 77) || storage_image_format_is_32bpp(t.format());
     let pixels = if readable {
         if depth > 1 || t.tile_mode() == 0 {
             read_guest_bytes(base, size, "storage image").ok()
@@ -3430,8 +3562,8 @@ fn expected_sampled_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u
 }
 
 /// Expected linear byte size of one storage-image (UAV) T#:
-/// `width * height * depth * layers * texel` (`texel` = 8 for format 71
-/// RGBA16F, 16 for format 77 RGBA32F, else 4), matching
+/// `width * height * depth * layers * texel` (`texel` = 1 for format 5
+/// R8_UINT, 8 for format 71 RGBA16F, 16 for format 77 RGBA32F, else 4), matching
 /// `read_storage_image`.
 fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u64 {
     let width = u64::from(u32::from(t.width5()) + 1);
@@ -3451,6 +3583,7 @@ fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource
         1
     };
     let texel = match t.format() {
+        5 => 1,
         71 => 8,
         77 => 16,
         _ => 4,
@@ -3643,6 +3776,113 @@ fn prepare_eud_raw_binding(bind: &ShaderBindResources) -> EudRawBinding {
     }
     EudRawBinding {
         binding: bind.eud_raw.binding_index.max(0) as u32,
+        bytes,
+    }
+}
+
+fn direct_sgpr_field(bind: &ShaderBindResources, register: i32) -> Option<u32> {
+    let count = usize::try_from(bind.direct_sgprs.sgprs_num)
+        .ok()?
+        .min(bind.direct_sgprs.start_register.len())
+        .min(bind.direct_sgprs.sgprs.len());
+    bind.direct_sgprs.start_register[..count]
+        .iter()
+        .position(|&candidate| candidate == register)
+        .map(|index| bind.direct_sgprs.sgprs[index].field)
+}
+
+fn direct_sgpr_pair(bind: &ShaderBindResources, low_register: i32) -> Option<u64> {
+    let low = direct_sgpr_field(bind, low_register)?;
+    let high = direct_sgpr_field(bind, low_register.checked_add(1)?)?;
+    Some(u64::from(low) | (u64::from(high) << 32))
+}
+
+/// Select the recovered scalar base first, then validated adjacent direct
+/// SGPR pairs as a bounded fallback for more complex address dataflow.
+fn select_global_mem_base(bind: &ShaderBindResources) -> u64 {
+    let mut candidates = Vec::new();
+    if bind.global_mem.base_sgpr >= 0
+        && let Some(base) = direct_sgpr_pair(bind, bind.global_mem.base_sgpr)
+    {
+        candidates.push(base);
+    }
+    let count = usize::try_from(bind.direct_sgprs.sgprs_num)
+        .unwrap_or(0)
+        .min(bind.direct_sgprs.start_register.len());
+    for &register in &bind.direct_sgprs.start_register[..count] {
+        if let Some(base) = direct_sgpr_pair(bind, register)
+            && !candidates.contains(&base)
+        {
+            candidates.push(base);
+        }
+    }
+    candidates
+        .iter()
+        .copied()
+        .find(|&base| base != 0 && crate::guest_mem::readable_prefix(base, 4) == 4)
+        // Keep a recovered-but-unreadable base in the SSBO header. The short
+        // zero body then gives loads zero / drops stores through normal bounds
+        // checks, instead of accidentally rebasing to some unrelated address.
+        .or_else(|| candidates.first().copied())
+        .unwrap_or(0)
+}
+
+/// Snapshot up to SharpEmu's 16 MiB global-memory ceiling, halving until the
+/// process authority accepts a complete range. A missing/unreadable base still
+/// returns one zero dword so the descriptor ABI remains valid and FLAT reads
+/// degrade visibly instead of reaching Vulkan with a missing binding.
+fn snapshot_global_mem_window(base: u64) -> (Vec<u8>, bool) {
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    if base == 0 || !base.is_multiple_of(4) {
+        return (vec![0; 4], false);
+    }
+    let mut size = MAX_BYTES;
+    while size >= 4096 {
+        if crate::guest_mem::readable_prefix(base, size) == size
+            && let Some(bytes) = crate::guest_mem::read_bytes_validated(base, size)
+        {
+            return (bytes, true);
+        }
+        size /= 2;
+    }
+    if crate::guest_mem::readable_prefix(base, 4) == 4
+        && let Some(bytes) = crate::guest_mem::read_bytes_validated(base, 4)
+    {
+        return (bytes, true);
+    }
+    (vec![0; 4], false)
+}
+
+fn prepare_global_mem_binding(bind: &ShaderBindResources) -> GlobalMemBinding {
+    let guest_base = select_global_mem_base(bind);
+    let (body, readable) = snapshot_global_mem_window(guest_base);
+    if !readable {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static WARNED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+        let first = WARNED
+            .lock()
+            .map(|mut set| set.get_or_insert_with(HashSet::new).insert(guest_base))
+            .unwrap_or(false);
+        if first {
+            tracing::warn!(
+                guest_base = format_args!("{guest_base:#x}"),
+                base_sgpr = bind.global_mem.base_sgpr,
+                "FLAT/GLOBAL guest-memory base is unresolved or unreadable — binding a bounded \
+                 zero window (loads return zero, stores drop)"
+            );
+        }
+    }
+    let guest_size = if readable { body.len() } else { 0 };
+    let mut bytes = Vec::with_capacity(body.len().saturating_add(8));
+    bytes.extend_from_slice(&(guest_base as u32).to_le_bytes());
+    bytes.extend_from_slice(&((guest_base >> 32) as u32).to_le_bytes());
+    bytes.extend_from_slice(&body);
+    GlobalMemBinding {
+        binding: bind.global_mem.binding_index.max(0) as u32,
+        guest_base,
+        guest_size,
+        writable: bind.global_mem.writable && readable,
         bytes,
     }
 }
@@ -4310,6 +4550,10 @@ fn prepare_stage_binding_inner(
         // The raw EUD-window snapshot (SharpEmu port): read at dispatch time
         // from the captured EUD base pointer; unreadable degrades to zeros.
         eud_raw: bind.eud_raw.used.then(|| prepare_eud_raw_binding(bind)),
+        global_mem: bind
+            .global_mem
+            .used
+            .then(|| prepare_global_mem_binding(bind)),
     })
 }
 
@@ -5094,6 +5338,7 @@ impl OffscreenDrawSink<'_> {
                     || bind.gds_pointers.pointers_num != 0
                     || bind.direct_sgprs.sgprs_num != 0
                     || bind.extended.used
+                    || bind.global_mem.used
                 {
                     state
                         .stage_bindings
@@ -5141,8 +5386,9 @@ impl OffscreenDrawSink<'_> {
         let trace_minecraft_model = crate::diagnostics::gpu_env().trace_model
             && matches!(shaders.vs.len(), 16_848 | 16_852)
             && matches!(shaders.ps.len(), 5_184 | 5_187);
-        if trace_selected_shader(vs_addr, ps_addr)
-            || trace_shader_words_selected(shaders.vs.len(), shaders.ps.len())
+        if ((trace_selected_shader(vs_addr, ps_addr)
+            || trace_shader_words_selected(shaders.vs.len(), shaders.ps.len()))
+            && trace_vertex_count_selected(state.vertex_count))
             || trace_minecraft_model
         {
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -5246,6 +5492,34 @@ impl OffscreenDrawSink<'_> {
                             )
                         })
                         .collect();
+                let sampled_descriptor_summaries: Vec<_> =
+                    [("vs", &shaders.vs_info.bind), ("ps", &shaders.ps_info.bind)]
+                        .into_iter()
+                        .flat_map(|(stage, bind)| {
+                            let count = usize::try_from(bind.textures2d.textures_num)
+                                .unwrap_or_default()
+                                .min(bind.textures2d.desc.len());
+                            bind.textures2d.desc[..count].iter().enumerate().map(
+                                move |(index, descriptor)| {
+                                    let texture = descriptor.texture;
+                                    (
+                                        stage,
+                                        index,
+                                        texture.base40(),
+                                        texture.format(),
+                                        texture.type_(),
+                                        [
+                                            texture.dst_sel_x(),
+                                            texture.dst_sel_y(),
+                                            texture.dst_sel_z(),
+                                            texture.dst_sel_w(),
+                                        ],
+                                        texture.fields,
+                                    )
+                                },
+                            )
+                        })
+                        .collect();
                 let uv_alpha_samples: Vec<_> = state
                     .vertex_attributes
                     .iter()
@@ -5343,6 +5617,7 @@ impl OffscreenDrawSink<'_> {
                     vertex_heads = ?vertex_heads,
                     stage_resources = ?stage_resources,
                     texture_summaries = ?texture_summaries,
+                    sampled_descriptor_summaries = ?sampled_descriptor_summaries,
                     sampler_summaries = ?sampler_summaries,
                     uv_alpha_samples = ?uv_alpha_samples,
                     "TRACE_SHADER_ADDR: selected draw state"
@@ -5781,6 +6056,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
             &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_NS,
         );
         let bind = &translated.cs_info.bind;
+        let trace_compute = trace_selected_shader(cs.cs_regs.data_addr, 0);
         // The round-10 tex-no-sampler quarantine is GONE. The measured
         // device loss (0x5006c5f00: sampled textures + zero samplers +
         // runtime-loaded T# via `s_load_dwordx8`) was descriptor-array OOB
@@ -5800,7 +6076,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
             || bind.samplers.samplers_num != 0
             || bind.gds_pointers.pointers_num != 0
             || bind.direct_sgprs.sgprs_num != 0
-            || bind.extended.used;
+            || bind.extended.used
+            || bind.global_mem.used;
         let prepared = has_binding
             .then(|| {
                 prepare_compute_stage_binding(
@@ -5810,10 +6087,15 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 )
             })
             .transpose()?;
-        if crate::diagnostics::gpu_env().trace_draws && bind.textures2d.textures_num != 0 {
+        let trace_general_binding =
+            crate::diagnostics::gpu_env().trace_draws && bind.textures2d.textures_num != 0;
+        if trace_general_binding || trace_compute {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEEN: AtomicU32 = AtomicU32::new(0);
-            if SEEN.fetch_add(1, Ordering::Relaxed) < 24 {
+            static TARGETED_SEEN: AtomicU32 = AtomicU32::new(0);
+            let log_general = trace_general_binding && SEEN.fetch_add(1, Ordering::Relaxed) < 24;
+            let log_targeted = trace_compute && TARGETED_SEEN.fetch_add(1, Ordering::Relaxed) < 16;
+            if log_general || log_targeted {
                 let push_dwords = prepared
                     .as_ref()
                     .map(|binding| {
@@ -5824,8 +6106,44 @@ impl DrawSink for OffscreenDrawSink<'_> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let storage_image_abi = prepared
+                    .as_ref()
+                    .and_then(|binding| binding.storage_images.as_ref())
+                    .map(|images| {
+                        images
+                            .images
+                            .iter()
+                            .map(|image| {
+                                (
+                                    image.guest_base,
+                                    image.width,
+                                    image.height,
+                                    image.depth,
+                                    image.layers,
+                                    image.tile_mode,
+                                    image.format,
+                                    image.pixels.iter().any(|&byte| byte != 0),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let global_abi = prepared
+                    .as_ref()
+                    .and_then(|binding| binding.global_mem.as_ref())
+                    .map(|global| {
+                        let body = global.bytes.get(8..).unwrap_or_default();
+                        (
+                            global.binding,
+                            global.guest_base,
+                            global.guest_size,
+                            global.writable,
+                            body.iter().position(|&byte| byte != 0),
+                        )
+                    });
                 tracing::warn!(
                     cs_addr = format_args!("{:#x}", cs.cs_regs.data_addr),
+                    targeted = trace_compute,
                     mode = format_args!("{mode:#x}"),
                     packet_dimensions = ?packet_dimensions,
                     groups = format_args!("{}x{}x{}", groups[0], groups[1], groups[2]),
@@ -5844,6 +6162,8 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     samplers = bind.samplers.samplers_num,
                     direct_sgprs = bind.direct_sgprs.sgprs_num,
                     push_dwords = ?push_dwords,
+                    storage_image_abi = ?storage_image_abi,
+                    global_abi = ?global_abi,
                     "TRACE_DRAWS: compute binding ABI"
                 );
             }
@@ -5895,6 +6215,12 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let guest_global_output = prepared.as_ref().and_then(|binding| {
+            binding
+                .global_mem
+                .as_ref()
+                .map(|window| (window.guest_base, window.guest_size, window.writable))
+        });
         // Invalidate exactly what this dispatch can write. The old blanket
         // clear ran for every dispatch, including read-only compute, and made
         // the submission-local texture hash memo ineffective in Minecraft
@@ -5902,10 +6228,16 @@ impl DrawSink for OffscreenDrawSink<'_> {
         // binds). Storage-buffer ranges are known exactly; storage-image
         // swizzle padding is not carried by `StorageImageUpload`, so retain
         // the conservative full texture clear for any writable image.
-        let writable_buffer_ranges: Vec<(u64, u64)> = guest_outputs
+        let mut writable_buffer_ranges: Vec<(u64, u64)> = guest_outputs
             .iter()
             .filter_map(|&(base, len)| (base != 0 && len != 0).then_some((base, len as u64)))
             .collect();
+        if let Some((base, len, true)) = guest_global_output
+            && base != 0
+            && len != 0
+        {
+            writable_buffer_ranges.push((base, len as u64));
+        }
         let writes_guest_memory =
             !writable_buffer_ranges.is_empty() || !guest_image_outputs.is_empty();
         if writes_guest_memory {
@@ -5948,6 +6280,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 .as_ref()
                 .and_then(|p| p.storage_images.as_ref())
                 .map_or(0, |i| i.images.len());
+            let global_mem = prepared.as_ref().is_some_and(|p| p.global_mem.is_some());
             if trace {
                 tracing::warn!(
                     cs_addr,
@@ -5960,6 +6293,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     textures,
                     samplers,
                     images,
+                    global_mem,
                     "TRACE_DRAWS: compute dispatch submitting"
                 );
             } else {
@@ -5974,11 +6308,12 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     textures,
                     samplers,
                     images,
+                    global_mem,
                     "compute dispatch submitting"
                 );
             }
         };
-        log_submit(crate::diagnostics::gpu_env().trace_draws);
+        log_submit(crate::diagnostics::gpu_env().trace_draws || trace_compute);
         let compute_state = ComputeState {
             groups,
             spirv: &translated.spirv,
@@ -6003,7 +6338,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                         .storage_images
                         .as_ref()
                         .is_some_and(|images| !images.images.is_empty());
-                storage_ok && images_ok && has_guest_resource
+                storage_ok && images_ok && has_guest_resource && binding.global_mem.is_none()
             });
         drop(prepare_timer);
         let backend_timer = crate::vulkan::offscreen::StageTimer::start(
@@ -6055,6 +6390,15 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 "compute writeback returned {} images for {} guest image outputs",
                 outputs.images.len(),
                 guest_image_outputs.len()
+            )));
+        }
+        let expects_global_writeback =
+            guest_global_output.is_some_and(|(_, size, writable)| writable && size != 0);
+        if outputs.global_mem.is_some() != expects_global_writeback {
+            return Err(err(format!(
+                "compute FLAT/GLOBAL writeback presence ({}) does not match binding expectation \
+                 ({expects_global_writeback})",
+                outputs.global_mem.is_some()
             )));
         }
         // The Vulkan dispatch is fence-complete and all output identities were
@@ -6114,7 +6458,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
                 dirty_bytes,
                 "compute sparse storage writeback"
             );
-            if crate::diagnostics::gpu_env().trace_draws {
+            if crate::diagnostics::gpu_env().trace_draws || trace_compute {
                 tracing::warn!(
                     addr = format_args!("{addr:#x}"),
                     real_len,
@@ -6137,6 +6481,32 @@ impl DrawSink for OffscreenDrawSink<'_> {
                     return Err(err(format!(
                         "compute storage writeback range {span_addr:#x}..{:#x} is not writable \
                          guest memory",
+                        span_addr.saturating_add(bytes.len() as u64)
+                    )));
+                }
+            }
+        }
+        if let (Some((addr, real_len, true)), Some(output)) =
+            (guest_global_output, outputs.global_mem)
+        {
+            if output.size != real_len {
+                return Err(err(format!(
+                    "FLAT/GLOBAL writeback returned {} bytes for {real_len}-byte guest window",
+                    output.size
+                )));
+            }
+            for span in output.dirty {
+                if span.offset >= real_len {
+                    continue;
+                }
+                let bytes =
+                    &span.bytes[..span.bytes.len().min(real_len.saturating_sub(span.offset))];
+                let span_addr = addr.saturating_add(span.offset as u64);
+                crate::guest_mem::trace_scanout_fill(span_addr, bytes.len(), "compute-global");
+                if !crate::guest_mem::write_bytes_checked(span_addr, bytes) {
+                    return Err(err(format!(
+                        "FLAT/GLOBAL writeback range {span_addr:#x}..{:#x} is not writable guest \
+                         memory",
                         span_addr.saturating_add(bytes.len() as u64)
                     )));
                 }
@@ -6207,7 +6577,10 @@ impl DrawSink for OffscreenDrawSink<'_> {
             // A storage image can be GPU-only. The content-bearing result was
             // retained above for later sampling/presentation, so an unavailable
             // CPU guest mirror must not discard the dispatch.
-            crate::guest_mem::mirror_compute_image_to_guest(addr, &guest_bytes, "compute-image");
+            crate::guest_mem::mirror_compute_image_to_guest(addr, guest_bytes, "compute-image");
+            self.dev
+                .draw_caches()
+                .invalidate_textures_at_base(self.dev, addr);
         }
         self.dispatches += 1;
         Ok(())
@@ -7283,7 +7656,36 @@ mod tests {
         t.fields[2] = (w - 1) >> 2; // width5 high bits
         t.fields[2] |= (h - 1) << 14; // height5
         t.fields[3] |= 9 << 28; // type = Texture2D (tile mode stays 0 = linear)
+        // GFX10.3 puts a custom linear pitch-minus-one in word 4 for a plain
+        // 2D image. These fixtures store tight rows, so describe that pitch
+        // explicitly instead of accidentally relying on an unaligned default.
+        t.fields[4] = (w - 1) & 0x3fff;
         t
+    }
+
+    /// Pack tight texels into the GFX10 linear-default layout used when a
+    /// descriptor type cannot carry a custom pitch (for example, word 4 is
+    /// DEPTH for a 3D T#).
+    fn gfx10_linear_default_source(
+        tight: &[u8],
+        width: u32,
+        height: u32,
+        depth: u32,
+        element_bytes: u32,
+    ) -> Vec<u8> {
+        let row_bytes = (width * element_bytes) as usize;
+        let pitch_elements = width.next_multiple_of((256 / element_bytes).max(1));
+        let pitch_bytes = (pitch_elements * element_bytes) as usize;
+        let mut source = vec![0; pitch_bytes * height as usize * depth as usize];
+        for z in 0..depth as usize {
+            for y in 0..height as usize {
+                let tight_offset = (z * height as usize + y) * row_bytes;
+                let source_offset = (z * height as usize + y) * pitch_bytes;
+                source[source_offset..source_offset + row_bytes]
+                    .copy_from_slice(&tight[tight_offset..tight_offset + row_bytes]);
+            }
+        }
+        source
     }
 
     /// The pre-decode size estimates must match what `decode_texture` /
@@ -7452,13 +7854,15 @@ mod tests {
         const BYTES2D: usize = (W * H * 4) as usize;
         const BYTES3D: usize = (W * H * D * 4) as usize;
 
-        let mut arena = vec![0u8; 1024 + 255];
+        let volume_tight: Vec<u8> = (0..BYTES3D).map(|i| ((i * 5 + 11) % 251) as u8).collect();
+        let volume_source = gfx10_linear_default_source(&volume_tight, W, H, D, 4);
+        let mut arena = vec![0u8; 512 + volume_source.len() + 255];
         let base = (arena.as_ptr() as u64 + 255) & !255;
         let off = (base - arena.as_ptr() as u64) as usize;
-        for i in 0..BYTES3D {
+        for i in 0..BYTES2D {
             arena[off + i] = (i % 251) as u8; // 2D at +0
-            arena[off + 512 + i] = ((i * 5 + 11) % 251) as u8; // 3D volume at +512
         }
+        arena[off + 512..off + 512 + volume_source.len()].copy_from_slice(&volume_source);
         let content = |o: usize, n: usize| arena[off + o..off + o + n].to_vec();
 
         // A 3D volume T# (type 10) with `depth = D` slices, linear tile.
@@ -7486,7 +7890,7 @@ mod tests {
         let textures = binding.textures.expect("sampled textures");
         assert_eq!(textures.textures.len(), 2);
         assert_eq!(textures.textures[0].pixels, content(0, BYTES2D));
-        assert_eq!(textures.textures[1].pixels, content(512, BYTES3D));
+        assert_eq!(textures.textures[1].pixels, volume_tight);
 
         // Two per-Dim groups: 2D (ordinal 0) at binding 0, 3D (ordinal 2) at
         // binding 1, each holding its single view.
@@ -7524,16 +7928,18 @@ mod tests {
         const BYTES2D: usize = (W * H * 4) as usize;
         const BYTES3D: usize = (W * H * D * 4) as usize;
 
-        // 256-aligned arena: 2D A at +0, 3D volume at +512, 2D B at +1024.
-        let mut arena = vec![0u8; 1536 + 255];
+        // 256-aligned arena: 2D A at +0, 3D volume at +512, 2D B after
+        // the volume's GFX10-default padded rows.
+        const TEX_B_OFFSET: usize = 2816;
+        let volume_tight: Vec<u8> = (0..BYTES3D).map(|i| ((i * 5 + 11) % 251) as u8).collect();
+        let volume_source = gfx10_linear_default_source(&volume_tight, W, H, D, 4);
+        let mut arena = vec![0u8; TEX_B_OFFSET + BYTES2D + 255];
         let base = (arena.as_ptr() as u64 + 255) & !255;
         let off = (base - arena.as_ptr() as u64) as usize;
-        for i in 0..BYTES3D {
-            arena[off + 512 + i] = ((i * 5 + 11) % 251) as u8; // 3D volume
-        }
+        arena[off + 512..off + 512 + volume_source.len()].copy_from_slice(&volume_source);
         for i in 0..BYTES2D {
             arena[off + i] = (i % 251) as u8; // 2D A
-            arena[off + 1024 + i] = ((i * 3 + 7) % 251) as u8; // 2D B
+            arena[off + TEX_B_OFFSET + i] = ((i * 3 + 7) % 251) as u8; // 2D B
         }
         let content = |o: usize, n: usize| arena[off + o..off + o + n].to_vec();
 
@@ -7551,7 +7957,7 @@ mod tests {
         bind.textures2d.binding_storage_index = 2;
         bind.textures2d.desc[0].texture = rgba8_linear_tsharp(base, W, H); // 2D A
         bind.textures2d.desc[1].texture = vol; // 3D
-        bind.textures2d.desc[2].texture = rgba8_linear_tsharp(base + 1024, W, H); // 2D B
+        bind.textures2d.desc[2].texture = rgba8_linear_tsharp(base + TEX_B_OFFSET as u64, W, H); // 2D B
 
         let ranges = [(arena.as_ptr() as u64, arena.len())];
         let binding = crate::guest_mem::with_test_ranges(&ranges, || {
@@ -7562,8 +7968,8 @@ mod tests {
         let textures = binding.textures.expect("sampled textures");
         assert_eq!(textures.textures.len(), 3, "flat pool keeps analysis order");
         assert_eq!(textures.textures[0].pixels, content(0, BYTES2D));
-        assert_eq!(textures.textures[1].pixels, content(512, BYTES3D));
-        assert_eq!(textures.textures[2].pixels, content(1024, BYTES2D));
+        assert_eq!(textures.textures[1].pixels, volume_tight);
+        assert_eq!(textures.textures[2].pixels, content(TEX_B_OFFSET, BYTES2D));
 
         // Groups in dim-ordinal order; view_indices keep analysis order
         // WITHIN each dim.
@@ -7805,6 +8211,47 @@ mod tests {
         assert!(raw.bytes.iter().all(|&b| b == 0));
     }
 
+    /// A FLAT/GLOBAL shader must carry the guest-memory window declared by
+    /// `%global_mem` all the way to Vulkan. GTA V's transition compute shader
+    /// forms its byte address from direct SGPR pair s12:s13 plus a VGPR
+    /// offset; omitting this binding reaches vkCreateComputePipelines with an
+    /// incomplete layout and fast-fails AMD's Vulkan driver.
+    #[test]
+    fn compute_binding_carries_flat_global_window() {
+        let mut arena = vec![0u8; 16 * 1024 + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let off = (base - arena.as_ptr() as u64) as usize;
+        for (i, byte) in arena[off..off + 256].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+
+        let mut bind = ShaderBindResources::default();
+        bind.direct_sgprs.sgprs_num = 2;
+        bind.direct_sgprs.start_register[..2].copy_from_slice(&[12, 13]);
+        bind.direct_sgprs.sgprs[0].field = base as u32;
+        bind.direct_sgprs.sgprs[1].field = (base >> 32) as u32;
+        bind.push_constant_size = 16;
+        bind.global_mem.used = true;
+        bind.global_mem.binding_index = 2;
+        bind.global_mem.base_sgpr = 12;
+
+        let ranges = [(arena.as_ptr() as u64, arena.len())];
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("FLAT-only compute binding");
+        let global = binding.global_mem.expect("global window bound");
+        assert_eq!(global.binding, 2);
+        assert_eq!(global.guest_base, base);
+        assert_eq!(&global.bytes[..4], &(base as u32).to_le_bytes());
+        assert_eq!(&global.bytes[4..8], &((base >> 32) as u32).to_le_bytes());
+        assert_eq!(
+            &global.bytes[8..8 + 256],
+            &(0..256).map(|i| i as u8).collect::<Vec<_>>()[..],
+            "the SSBO header is followed by the authorized guest snapshot"
+        );
+    }
+
     /// A storage T# whose format is not 32-bpp must zero-fill its seed (warn
     /// once) instead of failing the dispatch — the UAV is typically fully
     /// overwritten by the shader anyway.
@@ -7820,6 +8267,39 @@ mod tests {
         assert_eq!((upload.width, upload.height), (4, 4));
         assert_eq!(upload.guest_base, 0x10000);
         assert_eq!(upload.pixels.as_ref(), &vec![0u8; 64]);
+    }
+
+    /// GTA V's legal-screen glyph compute uses unified format 5 (`8_UINT`).
+    /// It is a one-byte storage texel, not the historical four-byte RGBA8
+    /// fallback, and its guest seed/readback must retain the raw byte payload.
+    #[test]
+    fn gta_r8_uint_storage_image_uses_one_byte_texels() {
+        let (w, h) = (4u32, 4u32);
+        let bytes: Vec<u8> = (0..(w * h) as u8)
+            .map(|x| x.wrapping_mul(17).wrapping_add(1))
+            .collect();
+        let mut blob = vec![0u8; bytes.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + bytes.len()].copy_from_slice(&bytes);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 5 << 20; // unified 5 = 8_UINT
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 9 << 28; // 2D
+
+        let upload =
+            crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+                read_storage_image(&t)
+            })
+            .expect("R8_UINT storage image reads");
+        assert_eq!(upload.format, vk::Format::R8_UINT);
+        assert_eq!(upload.texel_bytes(), 1);
+        assert_eq!(upload.pixels.as_ref(), &bytes);
+        assert_eq!(expected_storage_image_bytes(&t), u64::from(w * h));
     }
 
     /// The classic alpha-over blend: SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD.
@@ -7908,6 +8388,10 @@ mod tests {
             vk::Format::R16G16B16A16_SFLOAT
         );
         assert_eq!(gen5_vertex_format(23).unwrap(), vk::Format::R16G16_UNORM);
+        // GTA V's first post-intro refusal. KytyPS5's BufferFormat enum and
+        // Vulkan table both identify unified 28 as two signed 16-bit integers.
+        assert_eq!(gen5_vertex_format(28).unwrap(), vk::Format::R16G16_SINT);
+        assert_eq!(gen5_vertex_format_and_size(28).unwrap().1, 4);
         // 11 → (2,4) = 16 UINT (Minecraft's packed bone index). Its shader
         // input is declared uint by kyty-graphics and bitcast into the
         // float-backed guest VGPR, preserving the raw integer value.
@@ -8363,6 +8847,35 @@ mod tests {
     }
 
     #[test]
+    fn gta_linear_r8_mask_uses_the_gfx10_256_byte_pitch_alignment() {
+        // Captured from GTA V's first fullscreen composite. Word 4 is zero,
+        // so the descriptor does not request a GFX10.3 custom pitch.
+        let texture = kyty_graphics::shader::ShaderTextureResource {
+            fields: [
+                0x1557_c000,
+                0xc010_0000,
+                0x021b_c3bf,
+                0x9000_0204,
+                0,
+                0x0070_0000,
+                0,
+                0,
+            ],
+        };
+        assert_eq!(u32::from(texture.width5()) + 1, 3840);
+        assert_eq!(
+            gfx10_linear_pitch(&texture, 1920, 1, false),
+            2048,
+            "1920 one-byte texels occupy rows aligned to 256 bytes"
+        );
+        assert_eq!(
+            gfx10_linear_pitch(&texture, 3840, 1, false),
+            3840,
+            "an already aligned 4K mask needs no padding"
+        );
+    }
+
+    #[test]
     fn sampled_render_target_matches_the_scaled_live_extent() {
         let format = vk::Format::R8G8B8A8_UNORM.as_raw();
         let live = [
@@ -8475,12 +8988,21 @@ mod tests {
             (0x1, 0, 0, vk::Format::R8_UNORM, 1u32),
             (0x1, 0, 3, vk::Format::R8_UNORM, 1u32),
             (0x2, 4, 0, vk::Format::R16_UNORM, 2u32),
+            (0x2, 7, 0, vk::Format::R16_SFLOAT, 2),
             (0xa, 0, 0, vk::Format::R8G8B8A8_UNORM, 4u32),
             (0xa, 1, 0, vk::Format::R8G8B8A8_SNORM, 4u32),
             (0x4, 7, 0, vk::Format::R32_SFLOAT, 4),
             (0x5, 7, 0, vk::Format::R16G16_SFLOAT, 4),
+            (0x5, 0, 0, vk::Format::R16G16_UNORM, 4),
             (0x6, 7, 0, vk::Format::B10G11R11_UFLOAT_PACK32, 4),
             (0x9, 0, 0, vk::Format::A2B10G10R10_UNORM_PACK32, 4),
+            // GTA V's first still-refused draw after the Gen5 vertex-format
+            // and typed-store fixes. CB 0xb is 32_32 and number type 4 is
+            // UINT. The current pixel translator exports floats, so the exact
+            // integer attachment would make an invalid Vulkan interface;
+            // preserve the two-dword layout with the float-class twin.
+            (0xb, 4, 0, vk::Format::R32G32_SFLOAT, 8),
+            (0xb, 7, 0, vk::Format::R32G32_SFLOAT, 8),
             (0xc, 7, 0, vk::Format::R16G16B16A16_SFLOAT, 8),
             (0xe, 7, 0, vk::Format::R32G32B32A32_SFLOAT, 16),
         ] {
@@ -8553,6 +9075,10 @@ mod tests {
         };
         assert_eq!(case(14).expect("format 14"), (vk::Format::R8G8_UNORM, 2));
         assert_eq!(case(29).expect("format 29"), (vk::Format::R16G16_SFLOAT, 4));
+        assert_eq!(
+            case(50).expect("format 50"),
+            (vk::Format::A2B10G10R10_UNORM_PACK32, 4)
+        );
         assert_eq!(
             case(65).expect("format 65"),
             (vk::Format::R16G16B16A16_UNORM, 8)
@@ -9106,10 +9632,11 @@ mod tests {
         let voxels: Vec<u8> = (0..(w * h * d) as usize)
             .map(|i| ((i * 7 + 3) % 251) as u8)
             .collect();
-        let mut blob = vec![0u8; voxels.len() + 255];
+        let source = gfx10_linear_default_source(&voxels, w, h, d, 1);
+        let mut blob = vec![0u8; source.len() + 255];
         let base = (blob.as_ptr() as u64 + 255) & !255;
         let off = (base - blob.as_ptr() as u64) as usize;
-        blob[off..off + voxels.len()].copy_from_slice(&voxels);
+        blob[off..off + source.len()].copy_from_slice(&source);
 
         let mut t = kyty_graphics::shader::ShaderTextureResource::default();
         t.update_address40(base >> 8);
@@ -9131,17 +9658,64 @@ mod tests {
         assert_eq!(tex.pixels, voxels, "all slices must decode in order");
     }
 
+    /// SharpEmu's Gen5 volume path detiles a non-linear T# as one complete
+    /// 2D swizzle allocation per depth slice. GTA V reaches this exact shape
+    /// after the Rockstar intro: format 50, tile mode 27, 32 cubed.
+    #[test]
+    fn decode_texture_3d_tile27_detiles_every_slice() {
+        let (w, h, d, bpp_log2) = (8u32, 8u32, 3u32, 2u32);
+        let slice_bytes = (w * h * (1 << bpp_log2)) as usize;
+        let slices: Vec<Vec<u8>> = (0..d)
+            .map(|z| {
+                (0..slice_bytes)
+                    .map(|i| ((i * 7 + z as usize * 41 + 3) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        let tiled: Vec<u8> = slices
+            .iter()
+            .flat_map(|slice| crate::texture::tiling::tile_64kb_r_x(slice, w, h, bpp_log2))
+            .collect();
+        let mut blob = vec![0u8; tiled.len() + 255];
+        let base = (blob.as_ptr() as u64 + 255) & !255;
+        let off = (base - blob.as_ptr() as u64) as usize;
+        blob[off..off + tiled.len()].copy_from_slice(&tiled);
+
+        let mut t = kyty_graphics::shader::ShaderTextureResource::default();
+        t.update_address40(base >> 8);
+        t.fields[1] |= 50 << 20; // 10_10_10_2 UNORM
+        t.fields[1] |= ((w - 1) & 3) << 30;
+        t.fields[2] = (w - 1) >> 2;
+        t.fields[2] |= (h - 1) << 14;
+        t.fields[3] |= 27 << 20; // SW_64KB_R_X
+        t.fields[3] |= 10 << 28; // type = 3D volume
+        t.fields[4] = (d - 1) & 0x1fff;
+
+        let tex = crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
+            decode_texture(&t)
+        })
+        .expect("tiled 3D volume decodes");
+        let expected: Vec<u8> = slices.into_iter().flatten().collect();
+        assert!(tex.volume);
+        assert_eq!((tex.width, tex.height, tex.depth), (w, h, d));
+        assert_eq!(tex.format, vk::Format::A2B10G10R10_UNORM_PACK32);
+        assert_eq!(tex.pixels, expected, "every detiled slice stays in order");
+    }
+
     /// GTA V's first non-linear 3D T# is a one-voxel RGBA8 texture in tile
-    /// mode 5. Every block layout places coordinate (0, 0, 0) at the source
-    /// base, so this trivial extent does not need (and must not pretend to
-    /// implement) the still-unknown general 3D tile-mode-5 equation.
+    /// mode 5. The fast origin case and SharpEmu's general per-slice volume
+    /// model must agree when the descriptor grows to two slices.
     #[test]
     fn gta_tile5_single_voxel_volume_reads_the_origin_texel() {
         let rgba = [0x12, 0x34, 0x56, 0x78];
-        let mut blob = vec![0u8; rgba.len() + 255];
+        let rgba_second = [0xab, 0xcd, 0xef, 0x90];
+        const TILED_SLICE_BYTES: usize = 4096;
+        let mut blob = vec![0u8; TILED_SLICE_BYTES * 2 + 255];
         let base = (blob.as_ptr() as u64 + 255) & !255;
         let off = (base - blob.as_ptr() as u64) as usize;
         blob[off..off + rgba.len()].copy_from_slice(&rgba);
+        blob[off + TILED_SLICE_BYTES..off + TILED_SLICE_BYTES + rgba_second.len()]
+            .copy_from_slice(&rgba_second);
 
         let mut t = kyty_graphics::shader::ShaderTextureResource::default();
         t.update_address40(base >> 8);
@@ -9159,15 +9733,16 @@ mod tests {
         assert_eq!(tex.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!(tex.pixels, rgba);
 
-        t.fields[4] = 1; // depth = 2: no longer the measured trivial extent
-        let refused =
+        t.fields[4] = 1; // depth = 2
+        let two_slices =
             crate::guest_mem::with_test_ranges(&[(blob.as_ptr() as u64, blob.len())], || {
                 decode_texture(&t)
             })
-            .expect_err("a nontrivial tiled volume still needs the real 3D equation");
-        assert!(
-            refused.0.contains("3D texture tile mode 5 not implemented"),
-            "the refusal must name the missing layout: {refused:?}"
+            .expect("the general tiled-volume path detiles both slices");
+        assert_eq!(two_slices.depth, 2);
+        assert_eq!(
+            two_slices.pixels,
+            [rgba.as_slice(), rgba_second.as_slice()].concat()
         );
     }
 
@@ -9185,7 +9760,10 @@ mod tests {
     #[test]
     fn one_slice_type10_volume_stays_a_3d_image_not_a_2d_one() {
         let rgba = [0x12, 0x34, 0x56, 0x78];
-        let mut blob = vec![0u8; rgba.len() + 255];
+        // The final plain-2D assertion uses GFX10's default 256-byte linear
+        // row because pitch-minus-one == 0 cannot distinguish width 1 from
+        // "no custom pitch".
+        let mut blob = vec![0u8; 256 + 255];
         let base = (blob.as_ptr() as u64 + 255) & !255;
         let off = (base - blob.as_ptr() as u64) as usize;
         blob[off..off + rgba.len()].copy_from_slice(&rgba);

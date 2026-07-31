@@ -232,6 +232,7 @@ fn gds_counter_persists_across_dispatches() {
         storage_images: None,
         gds_binding: Some(1),
         eud_raw: None,
+        global_mem: None,
     };
     let state = ComputeState {
         groups: [1, 1, 1],
@@ -326,6 +327,7 @@ fn sampled_texture_without_sampler_dispatches() {
         storage_images: None,
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     let outputs = dispatch_compute(
         dev,
@@ -399,6 +401,7 @@ fn default_nearest_sampler_binds_and_caches_across_dispatches() {
         storage_images: None,
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     let state = ComputeState {
         groups: [1, 1, 1],

@@ -46,7 +46,7 @@ use super::resources::{
     ShaderEmbeddedConstantLoads, ShaderGdsResources, ShaderId, ShaderMappedData,
     ShaderPixelInputInfo, ShaderSamplerResources, ShaderSemantic, ShaderSharp,
     ShaderStorageResources, ShaderStorageUsage, ShaderTextureResources, ShaderTextureUsage,
-    ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo,
+    ShaderUserData, ShaderVertexInputBuffer, ShaderVertexInputInfo, dst_sel,
 };
 use super::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
@@ -1463,11 +1463,13 @@ fn vsharp_size_bytes(resource: &super::resources::ShaderBufferResource) -> u64 {
 /// * **live-in** — no instruction before `at` writes any of the four
 ///   registers, so the captured user-data snapshot IS what the shader will
 ///   read;
-/// * **loaded from a descriptor table** — exactly one earlier instruction
-///   writes the quad, and that instruction's OWN dwords were already captured
-///   from guest memory by the pointer-load pass that runs before this one
-///   (`shader_capture_runtime_scalar_loads_shifted`). GTA V's vertex shaders
-///   use this shape: `s_load_dwordx4 s[20:23], s[12:13], 64` and then
+/// * **loaded from a descriptor table** — one captured earlier instruction is
+///   the last writer of all four dwords, and that instruction's OWN dwords were
+///   already captured from guest memory by the pointer-load pass that runs
+///   before this one (`shader_capture_runtime_scalar_loads_shifted`). An older
+///   write is irrelevant when the captured load fully kills it. GTA V uses
+///   both this overwrite shape and the simpler
+///   `s_load_dwordx4 s[20:23], s[12:13], 64` followed by
 ///   `s_buffer_load_dwordx8 s[24:31], s[20:23], 0`.
 ///
 /// The quad need not start at the producer's own base register. One
@@ -1477,9 +1479,10 @@ fn vsharp_size_bytes(resource: &super::resources::ShaderBufferResource) -> u64 {
 /// the same proved data, indexed correctly; a partial overlap, or an offset
 /// past the dwords the capture actually proved, still returns `None`.
 ///
-/// More than one writer returns `None`: which one reaches the use depends on
-/// control flow this pass does not model. A quad assembled by `s_mov`s, or a
-/// producer whose own dwords were never proved, also returns `None`.
+/// Reaching definitions are checked per dword. If the last writer differs
+/// across the quad (including any partial mutation after a full load), this
+/// returns `None`. A quad assembled by `s_mov`s, or a producer whose own
+/// dwords were never proved, also returns `None`.
 ///
 /// Finally the dwords must actually BE a usable buffer descriptor: nonzero,
 /// buffer-typed (SharpEmu's `word3 >> 30 != 0` type check, here
@@ -1492,13 +1495,27 @@ fn proved_vsharp_quad(
     shift: i32,
     embedded: &ShaderEmbeddedConstantLoads,
 ) -> Option<super::resources::ShaderBufferResource> {
-    let mut writers = instructions[..at.min(instructions.len())]
-        .iter()
-        .filter(|prior| (0..4).any(|d| writes_sgpr(prior, base_reg + d)));
-    let producer = writers.next();
-    if writers.next().is_some() {
-        return None;
+    let prefix = &instructions[..at.min(instructions.len())];
+    let mut reaching_writer = [None; 4];
+    for (index, prior) in prefix.iter().enumerate().rev() {
+        for (dword, writer) in reaching_writer.iter_mut().enumerate() {
+            if writer.is_none() && writes_sgpr(prior, base_reg + dword as i32) {
+                *writer = Some(index);
+            }
+        }
+        if reaching_writer.iter().all(Option::is_some) {
+            break;
+        }
     }
+    let producer = if reaching_writer.iter().all(Option::is_none) {
+        None
+    } else {
+        let index = reaching_writer[0]?;
+        if !reaching_writer.iter().all(|writer| *writer == Some(index)) {
+            return None;
+        }
+        Some(&prefix[index])
+    };
 
     let fields = if let Some(producer) = producer {
         if producer.dst.type_ != ShaderOperandType::Sgpr {
@@ -4273,6 +4290,48 @@ pub fn shader_parse_fetch(
 /// Kyty: Shader.cpp `ShaderParseAttrib` (L1095) — the PS5 embedded-fetch
 /// path: recover vertex resources from the `input_semantics` table plus the
 /// attribute and V# tables pointed to by user SGPRs.
+///
+/// KytyPS5: `VertexAttribFormatToBufferFormat` +
+/// `ShaderApplyAttribSemantics` (`src/graphics/shader/shader.cpp`). Prospero's
+/// 9-bit per-attribute enum is not the RDNA2 V# unified FORMAT enum. The
+/// encodings are grouped by component layout and advance in steps of four
+/// across numeric classes; map each exact public group back to its buffer
+/// format. A non-zero attribute format overrides the shared V#'s FORMAT and
+/// destination swizzle. GTA V uses one byte-addressable V# (FORMAT 5) for an
+/// interleaved float3/float4 stream and supplies the real formats here:
+/// 298 -> unified 74 and 311 -> unified 77.
+fn vertex_attrib_format_to_buffer_format(format: u32) -> Option<u8> {
+    if format == 0 {
+        return Some(0);
+    }
+
+    // (first VertexAttribFormat, last VertexAttribFormat, first BufferFormat).
+    // Every valid member is four apart; values between members are reserved.
+    const GROUPS: &[(u32, u32, u8)] = &[
+        (4, 52, 1),
+        (57, 77, 14),
+        (80, 88, 20),
+        (93, 117, 23),
+        (122, 146, 30),
+        (150, 174, 37),
+        (179, 199, 44),
+        (203, 223, 50),
+        (227, 247, 56),
+        (249, 257, 62),
+        (263, 287, 65),
+        (290, 298, 72),
+        (303, 311, 75),
+    ];
+
+    GROUPS.iter().find_map(|&(first, last, buffer_first)| {
+        let delta = format.checked_sub(first)?;
+        if format > last || delta % 4 != 0 {
+            return None;
+        }
+        Some(buffer_first + (delta / 4) as u8)
+    })
+}
+
 pub fn shader_parse_attrib(
     info: &mut ShaderVertexInputInfo,
     input_semantics: &[ShaderSemantic],
@@ -4351,13 +4410,6 @@ pub fn shader_parse_attrib(
             );
         }
 
-        // Gen5 AGC metadata carries a 9-bit source-language vertex format
-        // alongside the V# index. The V# itself is the hardware descriptor
-        // and already contains the RDNA2 unified format consumed by shader
-        // recompilation. For example, Minecraft's observed metadata format
-        // 0x12a accompanies V# unified format 74 (32_32_32 float). Preserve
-        // the V# verbatim rather than rejecting this valid redundant field.
-
         // Fold the per-attribute byte offset into the V# base. Interleaved
         // vertex data gives each attribute its own offset into a shared stride
         // (Minecraft: offset 16 into a 28-byte vertex), so base + offset is the
@@ -4366,6 +4418,25 @@ pub fn shader_parse_attrib(
         // is left untouched. The earlier code rejected any non-zero offset,
         // which failed the whole vertex shader.
         let mut folded = [sharp[0], sharp[1], sharp[2], sharp[3]];
+        if format != 0 {
+            if let Some(buffer_format) = vertex_attrib_format_to_buffer_format(format) {
+                // KytyPS5 resets the descriptor swizzle to identity when the
+                // per-attribute format wins. Preserve type/OOB/add-tid bits.
+                folded[3] = (folded[3] & !((0x7f << 12) | 0x0fff))
+                    | (u32::from(buffer_format) << 12)
+                    | dst_sel(4, 5, 6, 7);
+            } else {
+                // Keep the old V#-authoritative behavior for unknown/reserved
+                // metadata so this additive fix cannot regress a title that
+                // already renders. The unsupported value remains visible.
+                tracing::warn!(
+                    semantic = sem.semantic(),
+                    format,
+                    vsharp_format = ShaderBufferResource { fields: folded }.format(),
+                    "unknown Gen5 vertex-attribute format — preserving the V# format"
+                );
+            }
+        }
         if offset != 0 {
             let base = (ShaderBufferResource { fields: folded }
                 .base48()
@@ -5030,7 +5101,16 @@ pub fn shader_get_input_info_ps_decoded(
         ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
     }
 
-    ps_info.bind.descriptor_set_slot = u32::from(vs_info.bind.storage_buffers.buffers_num > 0);
+    // Kyty's original graphics path only admitted VS storage buffers, so that
+    // was sufficient to decide whether the PS had to advance to set 1. Raeen
+    // also translates sampled vertex textures and samplers. Those declarations
+    // consume set 0 just as surely as an SSBO: leaving the PS at set 0 makes
+    // otherwise-valid per-stage binding indices collide in the Vulkan pipeline
+    // layout (measured on GTA V VS 0x148d69c00 / PS 0x148d83400).
+    let vs_uses_descriptor_set = vs_info.bind.storage_buffers.buffers_num > 0
+        || vs_info.bind.textures2d.textures_num > 0
+        || vs_info.bind.samplers.samplers_num > 0;
+    ps_info.bind.descriptor_set_slot = u32::from(vs_uses_descriptor_set);
     ps_info.bind.push_constant_offset =
         vs_info.bind.push_constant_offset + vs_info.bind.push_constant_size;
     ps_info.bind.push_constant_size = 0;
@@ -5548,9 +5628,10 @@ pub fn shader_measure_constant_buffer_accesses_shifted(
 /// DELIBERATE deviation from that contents-blind rule, one T# field pair:
 /// the generated SPIR-V depends on each texture descriptor's `type_()`
 /// nibble (it picks the per-Dim sampled array/coordinate arity and the
-/// storage image Dim) and on `format()` (the storage format selects Rgba8,
-/// Rgba16f, or Rgba32f; sampled formats select numeric class). Two binds identical except
-/// there produce DIFFERENT modules, so they must not share one cache id —
+/// storage image Dim) and on `format()` (the storage format selects R8ui,
+/// Rgba8, Rgba16f, or Rgba32f; sampled formats select numeric class). Two
+/// binds identical except there produce DIFFERENT modules, so they must not
+/// share one cache id —
 /// with the upstream id they silently aliased (wrong-Dim sampling from a
 /// cached module). Every other descriptor-content field stays out of the id,
 /// exactly as upstream.
@@ -6322,10 +6403,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_attrib_accepts_measured_gen5_metadata_format() {
+    fn parse_attrib_applies_measured_gen5_metadata_format() {
         // Minecraft PPSA17221: semantic 0, V# index 0, AGC metadata format
-        // 0x12a. The hardware V# is authoritative and carries RDNA2 unified
-        // format 74 (32_32_32 float), so it must be preserved verbatim.
+        // 0x12a. It maps to RDNA2 unified format 74 (32_32_32 float).
         let sem = ShaderSemantic {
             raw: (9 << 8) | (3 << 16),
         };
@@ -6336,10 +6416,90 @@ mod tests {
         shader_parse_attrib(&mut info, &[sem], &attrib, &sharp).unwrap();
 
         assert_eq!(info.resources_num, 1);
-        assert_eq!(info.resources[0].fields, sharp);
+        assert_eq!(info.resources[0].fields[..3], sharp[..3]);
         assert_eq!(info.resources[0].format(), 74);
+        assert_eq!(
+            [
+                info.resources[0].dst_sel_x(),
+                info.resources[0].dst_sel_y(),
+                info.resources[0].dst_sel_z(),
+                info.resources[0].dst_sel_w(),
+            ],
+            [4, 5, 6, 7]
+        );
         assert_eq!(info.resources_dst[0].register_start, 9);
         assert_eq!(info.resources_dst[0].registers_num, 3);
+    }
+
+    #[test]
+    fn parse_attrib_overrides_gta_byte_address_vsharp_with_float_formats() {
+        // GTA V's measured embedded-attrib table. Both attributes share a
+        // generic FORMAT=5 byte-addressable V#, while metadata supplies the
+        // real float3 at offset 0 and float4 at offset 12.
+        let sems = [
+            ShaderSemantic {
+                raw: (9 << 8) | (3 << 16),
+            },
+            ShaderSemantic {
+                raw: 1 | (12 << 8) | (4 << 16),
+            },
+        ];
+        let attrib = [0x0000_2540, 0x0003_26e0];
+        let sharp = [0x43c4_ef80, 0x001c_0001, 146, 0x0000_5204];
+        let mut info = ShaderVertexInputInfo::default();
+
+        shader_parse_attrib(&mut info, &sems, &attrib, &sharp).unwrap();
+
+        assert_eq!(info.resources_num, 2);
+        assert_eq!(info.resources[0].format(), 74);
+        assert_eq!(info.resources[1].format(), 77);
+        assert_eq!(info.resources[0].base48(), 0x0001_43c4_ef80);
+        assert_eq!(info.resources[1].base48(), 0x0001_43c4_ef8c);
+        assert_eq!(
+            [
+                info.resources[0].dst_sel_x(),
+                info.resources[0].dst_sel_y(),
+                info.resources[0].dst_sel_z(),
+                info.resources[0].dst_sel_w(),
+            ],
+            [4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn vertex_attrib_format_table_covers_every_known_group_boundary() {
+        let groups = [
+            (4, 52, 1, 13),
+            (57, 77, 14, 19),
+            (80, 88, 20, 22),
+            (93, 117, 23, 29),
+            (122, 146, 30, 36),
+            (150, 174, 37, 43),
+            (179, 199, 44, 49),
+            (203, 223, 50, 55),
+            (227, 247, 56, 61),
+            (249, 257, 62, 64),
+            (263, 287, 65, 71),
+            (290, 298, 72, 74),
+            (303, 311, 75, 77),
+        ];
+        assert_eq!(vertex_attrib_format_to_buffer_format(0), Some(0));
+        for (vertex_first, vertex_last, buffer_first, buffer_last) in groups {
+            assert_eq!(
+                vertex_attrib_format_to_buffer_format(vertex_first),
+                Some(buffer_first)
+            );
+            assert_eq!(
+                vertex_attrib_format_to_buffer_format(vertex_last),
+                Some(buffer_last)
+            );
+            assert_eq!(
+                vertex_attrib_format_to_buffer_format(vertex_first + 1),
+                None,
+                "reserved values between four-wide enum members stay invalid"
+            );
+        }
+        assert_eq!(vertex_attrib_format_to_buffer_format(312), None);
     }
 
     #[test]
@@ -6386,6 +6546,99 @@ mod tests {
         };
         r.update_address44(base);
         r
+    }
+
+    #[test]
+    fn proved_vsharp_uses_the_last_full_quad_definition() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        // Measured GTA V VS 0x148d6b000:
+        //   pc 0x0c: writes s0
+        //   pc 0x5c: s_load_dwordx4 s[0:3], ... (captured)
+        //   pc 0xdc: s_buffer_load_dwordx16 ..., s[0:3], ...
+        //
+        // The x4 load kills the old s0 value and is the reaching definition
+        // for every descriptor dword at the buffer load.
+        let mut early_partial = ShaderInstruction {
+            pc: 0x0c,
+            type_: T::SAndB32,
+            ..Default::default()
+        };
+        early_partial.dst = sgpr_op(0, 1);
+
+        let mut full_quad = ShaderInstruction {
+            pc: 0x5c,
+            type_: T::SLoadDwordx4,
+            ..Default::default()
+        };
+        full_quad.dst = sgpr_op(0, 4);
+
+        let use_quad = ShaderInstruction {
+            pc: 0xdc,
+            type_: T::SBufferLoadDwordx16,
+            ..Default::default()
+        };
+        let expected = vsharp(0x1234_5000, 16, 64);
+        let mut embedded = ShaderEmbeddedConstantLoads::default();
+        embedded.loads_num = 1;
+        embedded.loads[0] = ShaderEmbeddedConstantLoad {
+            pc: full_quad.pc,
+            dwords_num: 4,
+            values: {
+                let mut values = [0; ShaderEmbeddedConstantLoad::VALUES_MAX];
+                values[..4].copy_from_slice(&expected.fields);
+                values
+            },
+        };
+
+        let instructions = [early_partial, full_quad, use_quad];
+        assert_eq!(
+            proved_vsharp_quad(&instructions, 2, 0, &UserSgprInfo::default(), 0, &embedded,),
+            Some(expected),
+            "a captured full-quad load must kill an older partial definition"
+        );
+    }
+
+    #[test]
+    fn proved_vsharp_refuses_a_partial_write_after_the_full_quad() {
+        use crate::shader::types::ShaderInstructionType as T;
+
+        let mut full_quad = ShaderInstruction {
+            pc: 0x5c,
+            type_: T::SLoadDwordx4,
+            ..Default::default()
+        };
+        full_quad.dst = sgpr_op(0, 4);
+        let mut late_partial = ShaderInstruction {
+            pc: 0xd8,
+            type_: T::SAndB32,
+            ..Default::default()
+        };
+        late_partial.dst = sgpr_op(0, 1);
+        let use_quad = ShaderInstruction {
+            pc: 0xdc,
+            type_: T::SBufferLoadDwordx16,
+            ..Default::default()
+        };
+        let descriptor = vsharp(0x1234_5000, 16, 64);
+        let mut embedded = ShaderEmbeddedConstantLoads::default();
+        embedded.loads_num = 1;
+        embedded.loads[0] = ShaderEmbeddedConstantLoad {
+            pc: full_quad.pc,
+            dwords_num: 4,
+            values: {
+                let mut values = [0; ShaderEmbeddedConstantLoad::VALUES_MAX];
+                values[..4].copy_from_slice(&descriptor.fields);
+                values
+            },
+        };
+
+        let instructions = [full_quad, late_partial, use_quad];
+        assert!(
+            proved_vsharp_quad(&instructions, 2, 0, &UserSgprInfo::default(), 0, &embedded,)
+                .is_none(),
+            "a later partial mutation makes the descriptor provenance ambiguous"
+        );
     }
 
     #[test]
@@ -6762,6 +7015,25 @@ mod tests {
         assert_eq!(ps_info.bind.textures2d.binding_storage_index, 2);
         assert_eq!(ps_info.bind.samplers.binding_index, 3);
         assert_eq!(ps_info.bind.push_constant_size, 16 + 32 + 16);
+    }
+
+    #[test]
+    fn input_info_ps_uses_next_descriptor_set_after_vertex_textures() {
+        let (regs, sh, mem) = ps_setup();
+        let map = ShaderMap::new();
+        let mut vs_info = ShaderVertexInputInfo::default();
+        vs_info.bind.textures2d.textures_num = 1;
+        vs_info.bind.textures2d.textures2d_sampled_num = 1;
+        shader_calc_binding_indices(&mut vs_info.bind);
+
+        let mut ps_info = ShaderPixelInputInfo::default();
+        shader_get_input_info_ps(&regs, &sh, &vs_info, &mem, &map, false, &mut ps_info)
+            .expect("pixel input info");
+
+        assert_eq!(
+            ps_info.bind.descriptor_set_slot, 1,
+            "a sampled vertex texture already occupies descriptor set 0"
+        );
     }
 
     fn cs_setup() -> (ComputeShaderInfo, TestMem) {

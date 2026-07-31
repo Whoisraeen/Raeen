@@ -37,6 +37,7 @@ pub(crate) struct GpuEnv {
     pub skip_shader_addr: Option<String>,
     pub solid_ps_addr: Option<String>,
     pub trace_shader_addr: Option<String>,
+    pub trace_shader_min_verts: Option<u32>,
     pub trace_shader_words: Option<String>,
 }
 
@@ -114,6 +115,9 @@ impl GpuEnv {
             skip_shader_addr: std::env::var("RAEEN_SKIP_SHADER_ADDR").ok(),
             solid_ps_addr: std::env::var("RAEEN_SOLID_PS_ADDR").ok(),
             trace_shader_addr: std::env::var("RAEEN_TRACE_SHADER_ADDR").ok(),
+            trace_shader_min_verts: std::env::var("RAEEN_TRACE_SHADER_MIN_VERTS")
+                .ok()
+                .and_then(|raw| raw.parse().ok()),
             trace_shader_words: std::env::var("RAEEN_TRACE_SHADER_WORDS").ok(),
         }
     }

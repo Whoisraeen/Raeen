@@ -14,7 +14,7 @@
 use crate::{HleContext, HleRegistry};
 use raeen_core::frame_path::{self, Stage};
 use std::sync::atomic::Ordering;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// `SCE_OK`.
 const SCE_OK: u64 = 0;
@@ -582,13 +582,19 @@ fn hle_submit_flip(ctx: &HleContext, args: &[u64]) -> u64 {
     {
         // Thread the buffer's layout to the GPU so a CPU-drawn 2D buffer (no
         // GPU render target) can be presented straight from guest memory (M3).
-        // The Gen5 attribute carries no separate pitch, so a tightly-packed
-        // linear row (pitch == width) is assumed.
+        //
+        // The pitch comes from the guest's `pitchInPixel`, not from the width.
+        // Assuming `pitch == width` reads a padded buffer diagonally: with a
+        // real stride of 2*width, presented row 0 is the left half of guest row
+        // 0, row 1 the right half of guest row 0, row 2 the left half of guest
+        // row 1 — so if the padding is unwritten, every other row comes out
+        // uniformly dark. `effective_scanout_pitch` falls back to the width for
+        // an unset or implausible value, which is the previous behavior.
         let attr = buffer.attribute;
         let descriptor = raeen_core::subsystems::ScanoutDescriptor {
             width: attr.width,
             height: attr.height,
-            pitch_pixels: attr.width,
+            pitch_pixels: effective_scanout_pitch(attr.pitch_pixels, attr.width),
             pixel_format: attr.pixel_format,
             tiling_mode: attr.tiling_mode,
         };
@@ -745,15 +751,68 @@ fn read_buffer_attribute2(
     if address == 0 || !ctx.mem.read(address, &mut bytes) {
         return None;
     }
+    let width = u32::from_le_bytes(bytes[0x0C..0x10].try_into().ok()?);
+    // `pitchInPixel` at 0x14 — the one gap this decoder used to leave. Offsets
+    // 0x04 (tilingMode), 0x0C (width), 0x10 (height) and 0x18 (option) match
+    // the documented `SceVideoOutBufferAttribute` layout exactly, and in that
+    // layout 0x14 is `pitchInPixel`. Skipping it and assuming `pitch == width`
+    // is only correct for a tightly-packed buffer; for a padded one it makes
+    // every row read start mid-row, which presents as horizontal striping.
+    let pitch_pixels = u32::from_le_bytes(bytes[0x14..0x18].try_into().ok()?);
+    if pitch_pixels != 0 && pitch_pixels != width {
+        // Bounded: this runs on buffer registration, not per flip. Logged
+        // because a pitch that differs from the width is exactly the condition
+        // that used to be invisible, and naming it makes the next run decisive.
+        info!(
+            width,
+            pitch_pixels,
+            accepted = effective_scanout_pitch(pitch_pixels, width),
+            "VideoOut buffer declares a row pitch wider than its visible width"
+        );
+    }
     Some(raeen_kernel::VideoOutBufferAttribute {
         tiling_mode: u32::from_le_bytes(bytes[0x04..0x08].try_into().ok()?),
-        width: u32::from_le_bytes(bytes[0x0C..0x10].try_into().ok()?),
+        width,
         height: u32::from_le_bytes(bytes[0x10..0x14].try_into().ok()?),
+        pitch_pixels,
         option: u64::from_le_bytes(bytes[0x18..0x20].try_into().ok()?),
         pixel_format: u64::from_le_bytes(bytes[0x20..0x28].try_into().ok()?),
         dcc_clear_color: u64::from_le_bytes(bytes[0x28..0x30].try_into().ok()?),
         dcc_control: u32::from_le_bytes(bytes[0x30..0x34].try_into().ok()?),
     })
+}
+
+/// Force the old `pitch == width` assumption: set to `width` to ignore the
+/// guest's declared `pitchInPixel` entirely.
+///
+/// Exists so a suspected pitch regression can be A/B'd against a single run
+/// without a rebuild — the scanout stride is not something a screenshot lets
+/// you infer, so being able to toggle it is worth an env var.
+pub const SCANOUT_PITCH_ENV: &str = "RAEEN_SCANOUT_PITCH";
+
+/// The row stride, in pixels, to read a display buffer with.
+///
+/// Prefers the guest's declared `pitchInPixel`, but only when it is *plausible*
+/// as a stride: at least the visible width (a shorter row cannot hold one) and
+/// no more than four times it. The upper bound is deliberate — this field was
+/// previously never decoded, so a title that leaves garbage there must not be
+/// able to turn a working present into a failed read. Anything implausible
+/// falls back to `width`, which is exactly the previous behavior, so a buffer
+/// that really is tightly packed is bit-for-bit unaffected.
+fn effective_scanout_pitch(declared: u32, width: u32) -> u32 {
+    // Cached: this runs per flip, and an env lookup allocates and takes a lock.
+    static FORCED_TO_WIDTH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let forced = *FORCED_TO_WIDTH.get_or_init(|| {
+        std::env::var(SCANOUT_PITCH_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("width"))
+    });
+    if forced {
+        return width;
+    }
+    if declared >= width && declared <= width.saturating_mul(4) {
+        declared
+    } else {
+        width
+    }
 }
 
 /// Build a Gen5 `SceVideoOutBufferAttribute2` in guest memory.
@@ -1611,6 +1670,159 @@ mod tests {
             hle_submit_change_buffer_attribute2(&ctx, &[3, 0, 0x300]),
             VIDEO_OUT_ERROR_INVALID_HANDLE
         );
+    }
+
+    /// Captures the `ScanoutDescriptor` a flip publishes. The pitch is not
+    /// observable any other way — it leaves the HLE only through this call.
+    struct RecordingGpu(std::sync::Mutex<Vec<raeen_core::subsystems::ScanoutDescriptor>>);
+
+    impl RecordingGpu {
+        fn new() -> Self {
+            Self(std::sync::Mutex::new(Vec::new()))
+        }
+
+        fn only_descriptor(&self) -> raeen_core::subsystems::ScanoutDescriptor {
+            let seen = self.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "expected exactly one flip: {seen:?}");
+            seen[0]
+        }
+    }
+
+    impl crate::GpuSubmissionSubsystem for RecordingGpu {
+        fn submit(&self, _words: Vec<u32>, _queue: raeen_core::subsystems::GpuQueue) {}
+        fn map_shader_metadata(
+            &self,
+            _code_address: u64,
+            _data: raeen_core::subsystems::ShaderMappedData,
+        ) {
+        }
+        fn present_scanout(
+            &self,
+            _address: u64,
+            descriptor: Option<raeen_core::subsystems::ScanoutDescriptor>,
+        ) {
+            if let Some(descriptor) = descriptor {
+                self.0.lock().unwrap().push(descriptor);
+            }
+        }
+        fn wait_idle(&self) {}
+        fn stats(&self) -> raeen_core::subsystems::GpuSubmissionStats {
+            raeen_core::subsystems::GpuSubmissionStats::default()
+        }
+    }
+
+    /// Register one 1920x1080 buffer whose guest attribute declares
+    /// `pitchInPixel = declared_pitch` at offset 0x14, flip it, and return the
+    /// descriptor that reached the GPU.
+    ///
+    /// The struct is written byte-by-byte rather than through
+    /// `hle_set_buffer_attribute2` because that filler takes no pitch argument
+    /// — a retail title fills the struct itself, which is exactly the path
+    /// under test.
+    fn flip_with_declared_pitch(declared_pitch: u32) -> raeen_core::subsystems::ScanoutDescriptor {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0);
+        let gpu = RecordingGpu::new();
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+
+        let mut attribute = [0u8; 0x50];
+        attribute[0x04..0x08].copy_from_slice(&1u32.to_le_bytes()); // tilingMode = linear
+        attribute[0x0C..0x10].copy_from_slice(&1920u32.to_le_bytes()); // width
+        attribute[0x10..0x14].copy_from_slice(&1080u32.to_le_bytes()); // height
+        attribute[0x14..0x18].copy_from_slice(&declared_pitch.to_le_bytes()); // pitchInPixel
+        attribute[0x20..0x28].copy_from_slice(&0x8000_2000u64.to_le_bytes()); // pixelFormat
+        assert!(mem.write(0x100, &attribute));
+
+        assert!(mem.write(0x200, &0x4000u64.to_le_bytes()));
+        assert!(mem.write(0x208, &0u64.to_le_bytes()));
+        assert_eq!(
+            hle_register_buffers2(&ctx, &[1, 0, 0, 0x200, 1, 0x100, 0, 0]),
+            0
+        );
+        assert_eq!(hle_submit_flip(&ctx, &[1, 0, 1, 0xABCD]), SCE_OK);
+        gpu.only_descriptor()
+    }
+
+    /// A padded display buffer must be presented at the stride the guest
+    /// declared, not at its visible width.
+    ///
+    /// Assuming `pitch == width` reads such a buffer diagonally: presented row 0
+    /// is the left half of guest row 0, row 1 the RIGHT half of guest row 0, row
+    /// 2 the left half of guest row 1. When the padding is unwritten that is
+    /// exactly "every other row uniformly dark" across the whole frame.
+    #[test]
+    fn a_padded_display_buffer_keeps_the_guest_declared_row_pitch() {
+        let descriptor = flip_with_declared_pitch(3840);
+        assert_eq!(descriptor.width, 1920);
+        assert_eq!(descriptor.height, 1080);
+        assert_eq!(
+            descriptor.pitch_pixels, 3840,
+            "the declared pitch must survive to the scanout descriptor; \
+             substituting the width here is what stripes the frame"
+        );
+    }
+
+    /// The row mapping a pitch implies, stated as the arithmetic the present
+    /// path performs — so the *consequence* of the pitch is pinned here, not
+    /// just the value.
+    ///
+    /// Guards the case no scanout test covered: a stride wider than the visible
+    /// width, over more than one row.
+    #[test]
+    fn a_wider_pitch_maps_each_presented_row_to_a_whole_guest_row() {
+        let descriptor = flip_with_declared_pitch(3840);
+        let row_bytes = descriptor.pitch_pixels as usize * 4;
+        // Presented row y must start exactly y whole guest rows in.
+        assert_eq!(row_bytes, 15_360);
+        for y in 0..descriptor.height as usize {
+            assert_eq!(y * row_bytes, y * 15_360, "row {y} start");
+        }
+        // The wrong stride aliases row 1 onto the middle of guest row 0 — the
+        // striping signature. Assert the two mappings genuinely differ, so this
+        // test fails if the pitch silently collapses back to the width.
+        let wrong_row_bytes = descriptor.width as usize * 4;
+        assert_ne!(
+            row_bytes, wrong_row_bytes,
+            "a padded buffer must not map rows at the visible width"
+        );
+        assert_eq!(wrong_row_bytes * 2, row_bytes, "the 2x aliasing");
+    }
+
+    /// A guest that leaves `pitchInPixel` unset gets the tightly-packed
+    /// assumption — the previous behavior, bit for bit. This is what keeps
+    /// already-working titles unaffected.
+    #[test]
+    fn an_unset_pitch_falls_back_to_a_tightly_packed_row() {
+        assert_eq!(flip_with_declared_pitch(0).pitch_pixels, 1920);
+    }
+
+    /// This field was never decoded before, so a title with garbage there must
+    /// not be able to turn a working present into a failed read.
+    #[test]
+    fn an_implausible_pitch_falls_back_to_the_width() {
+        // Narrower than the visible width: cannot hold a row.
+        assert_eq!(flip_with_declared_pitch(64).pitch_pixels, 1920);
+        // Absurdly wide: would size a read no buffer can satisfy.
+        assert_eq!(flip_with_declared_pitch(0xDEAD_BEEF).pitch_pixels, 1920);
+    }
+
+    /// The pitch policy in isolation, including the exact acceptance boundary.
+    #[test]
+    fn effective_scanout_pitch_accepts_only_plausible_strides() {
+        // Equal, and the whole plausible range up to 4x, are taken verbatim.
+        assert_eq!(effective_scanout_pitch(1920, 1920), 1920);
+        assert_eq!(effective_scanout_pitch(1984, 1920), 1984);
+        assert_eq!(effective_scanout_pitch(3840, 1920), 3840);
+        assert_eq!(effective_scanout_pitch(7680, 1920), 7680);
+        // Just past 4x is rejected.
+        assert_eq!(effective_scanout_pitch(7681, 1920), 1920);
+        // Unset and short are rejected.
+        assert_eq!(effective_scanout_pitch(0, 1920), 1920);
+        assert_eq!(effective_scanout_pitch(1919, 1920), 1920);
+        // A zero width cannot overflow the 4x bound.
+        assert_eq!(effective_scanout_pitch(0, 0), 0);
+        assert_eq!(effective_scanout_pitch(u32::MAX, 0), 0);
     }
 
     #[test]

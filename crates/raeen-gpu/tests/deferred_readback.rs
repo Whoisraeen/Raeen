@@ -340,6 +340,7 @@ fn sampled_render_target_binds_the_gpu_image_within_a_batch() {
             storage_images: None,
             gds_binding: None,
             eud_raw: None,
+            global_mem: None,
         }],
         ..DrawState::new(W, H, &vs, &ps_sample)
     };

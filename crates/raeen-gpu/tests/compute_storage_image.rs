@@ -182,6 +182,7 @@ fn compute_shader_writes_are_visible_in_storage_image_readback() {
         }),
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
 
     let outputs = dispatch_compute(
@@ -260,6 +261,7 @@ fn compute_storage_image_allocations_are_reused_across_dispatches() {
         }),
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     let state = ComputeState {
         groups: [1, 1, 1],
@@ -337,6 +339,7 @@ fn deferred_storage_image_publication_reuses_the_persistent_mapping() {
         }),
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     dispatch_compute_deferred(
         dev,
@@ -395,6 +398,7 @@ fn synchronous_compute_flushes_deferred_uav_creator_before_reuse() {
         }),
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     let state = ComputeState {
         groups: [1, 1, 1],
@@ -447,6 +451,7 @@ fn compute_shader_writes_every_2d_array_layer() {
         }),
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     let outputs = dispatch_compute(
         dev,
@@ -496,6 +501,7 @@ fn compute_shader_writes_every_2d_array_layer() {
         }),
         gds_binding: None,
         eud_raw: None,
+        global_mem: None,
     };
     let one_layer = dispatch_compute(
         dev,

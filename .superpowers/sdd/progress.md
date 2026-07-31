@@ -5782,3 +5782,171 @@ does not justify the append-only arena (and its `unsafe`) that a `&self`
 read-through cache would need. `backend_us=17`/draw (Vulkan command recording)
 remains untouched and is now the largest per-draw term.
 >>>>>>> perf/shader-resolve-share-program
+
+## 2026-07-29 — GTA V first recognizable graphics; measured shader/CB refusal chain closed
+
+RETAIL MEASUREMENT — release build from **`e2bdfac+dirty`** (the result does
+not belong to commit `e2bdfac` alone), compatibility run
+`run-1785387413846`, recorded in
+`artifacts/compat/gta-final-e2bdfac-dirty.json`:
+
+- GTA V stayed alive for the 12.681 s capture window, published 256 frames,
+  reported 29.7 observed FPS, used 3,235,020,800 bytes peak RAM, and had zero
+  counted shader errors, GPU errors, unresolved NIDs, or compatibility
+  `first_blocker` entries.
+- The frame is now recognizably animated GTA output: the wanted-level star
+  sprites render, and fragment invocations changed from zero to 518,400 on the
+  first affected draw (then 2,073,600 on full-screen draws). This is **not** a
+  gameplay or correct-rendering claim: broad horizontal stripe corruption
+  remains.
+- `ShaderApplyAttribSemantics`/`VertexAttribFormatToBufferFormat` behavior from
+  the local GPL-2.0 KytyPS5 reference was re-implemented for Gen5
+  per-attribute metadata. GTA's shared byte-address V# now binds attribute 0
+  as `R32G32B32_SFLOAT` and attribute 1 as `R32G32B32A32_SFLOAT`, instead of
+  incorrectly treating both as `R8_UINT`.
+- The measured `BufferStoreFormatXyzw` refusal through unified format 20 was
+  fixed from AMD's published RDNA 2 descriptor semantics: format 20 is
+  `32_UINT`, so this one-component typed resource consumes and stores only
+  `vdata.x`. Four-component typed resources retain the existing XYZW helper.
+- The subsequent measured colour-target refusal chain is closed for
+  `R16_SFLOAT`, `R16G16_UNORM`, and `R32G32_SFLOAT`. The measured
+  `format=0xb/type=4` integer target uses a same-size float-class degradation
+  because Raeen's current fragment ABI exports floats; binding a Vulkan UINT
+  attachment would make the pipeline interface invalid.
+
+VERIFICATION:
+
+- `cargo test -p kyty-graphics --lib`: 711 passed, 0 failed.
+- `cargo test -p raeen-gpu --lib`: 370 passed, 0 failed, 3 ignored.
+- `cargo test -p raeen-hle --lib`: 647 passed, 0 failed.
+- `cargo clippy -p kyty-graphics --all-targets -- -D warnings`: green.
+- `cargo clippy -p raeen-gpu --all-targets -- -D warnings`: green.
+- `cargo fmt --all -- --check`: green. The full HLE run includes the VideoOut
+  pitch regressions present in the concurrent working tree. The only HLE edit
+  in this slice is the missing `info` import required by that concurrent code;
+  its substantive pitch work is not claimed here.
+
+NEXT MEASURED BLOCKER — the stripe corruption exists in decoded GPU render
+targets themselves, before shell upload/presentation. The raw log retains a
+deduplicated `sampled-render-target-unmatched` warning for a 3840x2160
+`R8_UNORM` resource at guest base `0x1557c00000` (descriptor words start
+`1557c000 c0100000 021bc3bf 90000204`). It falls back to zero-filled guest
+memory. Target-census proof is under
+`scratch/gta-target-census32-e2bdfac-dirty/`; the representative displayed
+frame is `scratch/gta-final-e2bdfac-dirty/frame_000256.png`. Diagnose that
+resource's producer/alias or tiling contract next; do not spend this evidence
+on the swapchain.
+
+## 2026-07-30 — GTA V Vulkan crash and linear-pitch corruption closed
+
+All title measurements below are release builds from **`e2bdfac+dirty`**; they
+do not belong to commit `e2bdfac` alone. They are boot/idle liveness and intro
+rendering evidence, not gameplay-input or universal-compatibility claims.
+
+VULKAN/SHADER BLOCKER:
+
+- The measured compute SPIR-V declared set 0 binding 2 (`%global_mem`) while
+  the Vulkan pipeline layout omitted it, producing
+  `VUID-VkComputePipelineCreateInfo-layout-07988` followed by an
+  `amdvlk64.dll` stack-buffer-overrun exit. The active shader path now carries
+  the recovered direct FLAT base SGPR pair, declares binding 2, uploads a
+  bounded guest snapshot with the base-address header ABI, and sparsely writes
+  writable results back. Graphics stages still reject writable global memory
+  by name.
+- Validation soak `artifacts/soak/soak-1785390960781`: 45.9 s, 544 flips,
+  20.8 FPS average active window, 5.7 s worst no-flip window, 3294 MiB peak
+  process-tree RAM, zero VUID/AMD-driver/device-loss matches, and zero deadlock
+  warnings.
+
+VISIBLE TEXTURE BLOCKER:
+
+- GTA's full-screen intro passes sample linear R8 masks whose T# word 4 has no
+  custom pitch. The old mode-0 decoder used width 1920 as pitch. Mesa AddrLib's
+  GFX10 linear rule is 256-byte row alignment, so R8 requires 2048 elements.
+  The decoder now uses a valid GFX10 custom pitch for plain 2D descriptors and
+  otherwise derives the aligned pitch from element size. This is an
+  engine-wide hardware rule, not a GTA address/extent exception.
+- Before: `scratch/gta-display-frames-20260730-a/frame_000128.png` contains
+  repeated horizontal stripes and the Rockstar tile does not resolve.
+  After: `scratch/gta-display-frames-20260730-b/frame_000256.png` and
+  `frame_000352.png` show clean yellow and blue Rockstar tiles matching the
+  reference intro. Diagnostic capture soak
+  `scratch/gta-display-capture-20260730-b/soak-1785392542044`: 20.1 s,
+  352 flips, 26.5 FPS average active window, 2.1 s worst stall, 3201 MiB peak.
+
+PERFORMANCE AND STABILITY:
+
+- The Shell no longer uploads the same native 4K frame on every egui paint:
+  refresh is keyed to native displayed-frame presence plus epoch advancement,
+  with `native_frame_is_not_reuploaded_until_its_epoch_advances` pinning the
+  behavior.
+- A read-only `%global_mem` deferred-batching experiment was measured and
+  **rejected/reverted**. Baseline
+  `scratch/gta-retail-fixed-20260730-a/soak-1785391218079` was 576 flips,
+  21.8 FPS average active window, 3219 MiB peak; experiment
+  `scratch/gta-retail-deferred-global-20260730-a/soak-1785391643483` was also
+  576 flips but 20.9 FPS and 3757 MiB. It regressed both average window FPS and
+  peak RAM, so synchronous global-memory ordering remains the production path.
+- Final trace-free retail soak
+  `scratch/gta-retail-final-20260730-a/soak-1785393317098`: 45.8 s, 480 flips,
+  windows 5.8/21.0/29.9 FPS min/avg/max, 5.2 s worst no-flip window, zero
+  deadlock warnings, 3210 MiB peak RAM. Passed the configured 10 s freeze gate.
+
+VERIFICATION: `raeen-gpu` 372 unit tests plus every Vulkan integration suite,
+`kyty-graphics` 712, `raeen-gui` 216, `raeen-hle` 647, and `raeen-kernel` 95
+all green. `cargo fmt --all -- --check` and scoped all-target Clippy with
+`-D warnings` are green. Final test binary:
+`../Raeen-target-gta-main/release/raeen.exe`.
+
+## 2026-07-30 — GTA V glyph-atlas R8_UINT rendering unblock
+
+All retail observations below are from a release build of
+**`e2bdfac+dirty`**. They do not belong to commit `e2bdfac` alone and are
+intro/legal-screen evidence, not a gameplay or universal-compatibility claim.
+
+ROOT CAUSE AND FIX:
+
+- GTA compute shader `0x148d47200` builds the legal-screen glyph atlas through
+  a storage T# with unified format 5 (`8_UINT`). The old translator declared a
+  float `Rgba8` storage image and the host allocated four-byte UNORM texels.
+  Raw byte bits loaded by `flat_load_ubyte` therefore became float subnormals
+  and quantized to zero. The measured 2048x4096 output was an all-zero 32 MiB
+  shadow, so the post-logo legal copy could not render.
+- Storage format 5 now has an end-to-end integer contract:
+  `OpTypeImage %uint ... R8ui`, `OpImageWrite` with a `%v4uint` texel built by
+  raw bitcast, Vulkan `R8_UINT`, and one-byte upload/readback/budget sizing.
+  `StorageImageExtendedFormats` is emitted only when that format is present.
+  The storage descriptor key space is now 4 dimensions × 4 formats, with an
+  exhaustive no-alias regression, and the disk shader-cache version is 11.
+
+MEASURED RESULT:
+
+- Diagnostic run
+  `scratch/gta-retail-v8-reaching-def-20260730-a/font-atlas-r8ui-v14`
+  rendered the animated star background, complete yellow and blue Rockstar
+  logos, the full Rockstar EULA/legal copy and build string, then the
+  bottom-right `Continue` prompt. Representative captures:
+  `frames/frame_000200.png`, `frame_000300.png`, and `frame_000400.png`.
+- The capture remained alive for roughly 400 seconds while frame dumping and a
+  helper build deliberately perturbed timing; dumps reached index 12,700 at
+  1920x1080 and the last periodic census reported 10,551 published frames at
+  six minutes. Peak process-tree RAM was 3281.9 MiB. This run is not an FPS
+  baseline because PNG/PPM capture dominated its frame pacing.
+- No shader-translation failure, VUID, device-loss, frozen-window, deadlock,
+  fatal, or panic record occurred. One startup black-frame diagnostic and the
+  known 3840x2160 sampled-render-target fallback at `0x1557c00000` remain.
+- Follow-up
+  `scratch/gta-retail-v8-reaching-def-20260730-a/post-legal-cross-v15`
+  preserved rendering but scripted Cross presses did not advance the
+  `Continue` screen. That is now a separate input/timing blocker; it is not
+  evidence of a remaining glyph-atlas rendering failure.
+
+VERIFICATION:
+
+- `kyty-graphics`: 720 unit tests plus all executed integration tests green;
+  one measurement probe remains explicitly ignored.
+- `raeen-gpu`: 378 unit tests plus every executed Vulkan integration test
+  green, including compute storage-image readback; four diagnostic/measurement
+  probes remain explicitly ignored across the full run.
+- Scoped all-target Clippy for both crates with `-D warnings`, formatting, and
+  `git diff --check` are green.

@@ -158,6 +158,7 @@ fn draw_state<'a>(vs: &'a [u32], ps: &'a [u32], texture: TextureUpload) -> DrawS
             storage_images: None,
             gds_binding: None,
             eud_raw: None,
+            global_mem: None,
         }],
         ..DrawState::new(W, H, vs, ps)
     }
