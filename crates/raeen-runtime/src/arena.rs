@@ -36,7 +36,7 @@
 
 use core::ffi::c_void;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::System::Memory::{
@@ -708,7 +708,7 @@ fn commit_region(base: u64, addr: u64, len: u64, protect: u32) -> Result<(), Run
     Ok(())
 }
 
-/// The allocator's interior-mutable state, guarded by [`GuestArena`]'s `Mutex`.
+/// The allocator's interior-mutable state, guarded by [`GuestArena`]'s `RwLock`.
 ///
 /// # Why there is one map and not three bumps
 ///
@@ -870,7 +870,12 @@ pub(crate) struct GuestArena {
     /// `entry_ptr`'s bounds check. The committed image *region* is always
     /// the full `IMAGE_SIZE`, page-aligned and larger than this.
     image_len: u64,
-    state: Mutex<AllocState>,
+    // Address-space metadata is read on every HLE/GPU guest-memory copy but
+    // mutated only by map/unmap/commit operations. An exclusive mutex here
+    // serialized unrelated reads and produced a measured priority inversion:
+    // Minecraft's Streaming Pool owner held a title mutex while parked in
+    // `GuestArena::read`, behind renderer memory reads, for 21-26 seconds.
+    state: RwLock<AllocState>,
     /// When set, the code image is `PAGE_EXECUTE_READ` (W^X): a stray data
     /// write into code faults at the store instead of silently corrupting an
     /// instruction. Instrumentation code writes go through [`patch_code`], which
@@ -1026,7 +1031,7 @@ impl GuestArena {
         Ok(Self {
             base,
             image_len,
-            state: Mutex::new(AllocState::new(base)),
+            state: RwLock::new(AllocState::new(base)),
             wx_image: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1044,9 +1049,20 @@ impl GuestArena {
         Ok((self.base + entry_offset) as *const u8)
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, AllocState> {
+    /// Exclusive address-space access for allocation, mapping and commit.
+    fn lock_state(&self) -> std::sync::RwLockWriteGuard<'_, AllocState> {
         self.state
-            .lock()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Shared address-space access for validation and host copies. The guard
+    /// remains held through the copy so an exclusive `munmap` cannot release
+    /// the identity-mapped pages underneath it, while unrelated reads proceed
+    /// concurrently.
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, AllocState> {
+        self.state
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -1245,7 +1261,7 @@ impl GuestArena {
     /// exactly the kinds that are not host-backed, so a wild pointer is still
     /// refused.
     fn range_is_committed(&self, start: u64, end: u64) -> bool {
-        let state = self.lock_state();
+        let state = self.read_state();
         Self::range_is_committed_locked(&state, start, end)
     }
 
@@ -1395,6 +1411,66 @@ impl GuestArena {
             false,
         );
         Some((addr, committed_len))
+    }
+
+    /// Reserve one kernel-selected range in the PS5's low virtual-address
+    /// windows without committing it. Direct-memory identities are physical
+    /// offsets in the guest ABI; placing them in the general reservation arena
+    /// above 1 TiB breaks native libc's range checks even if the pages are later
+    /// mapped correctly.
+    fn reserve_console_va(
+        &self,
+        state: &mut AllocState,
+        length: u64,
+        align: u64,
+        name: &str,
+    ) -> Option<u64> {
+        let addr =
+            reserve_guest_address_space(SYSTEM_MANAGED_MIN, SYSTEM_MANAGED_LIMIT, length, align)
+                .or_else(|| {
+                    reserve_guest_address_space(USER_MAPPING_MIN, USER_MAPPING_LIMIT, length, align)
+                });
+        let Some(addr) = addr else {
+            let (sm_largest, sm_free) = survey_free_space(SYSTEM_MANAGED_MIN, SYSTEM_MANAGED_LIMIT);
+            let (um_largest, um_free) = survey_free_space(USER_MAPPING_MIN, USER_MAPPING_LIMIT);
+            tracing::warn!(
+                want = format_args!("{length:#x}"),
+                align = format_args!("{align:#x}"),
+                system_managed_largest_free = format_args!("{sm_largest:#x}"),
+                system_managed_total_free = format_args!("{sm_free:#x}"),
+                user_mapping_largest_free = format_args!("{um_largest:#x}"),
+                user_mapping_total_free = format_args!("{um_free:#x}"),
+                "direct-memory reservation failed - no free block in either console-VA window"
+            );
+            return None;
+        };
+
+        let end = addr.checked_add(length)?;
+        if !range_all(&state.vmm, addr, end, |vma| vma.kind == VmaType::Foreign) {
+            tracing::warn!(
+                addr = format_args!("{addr:#x}"),
+                len = format_args!("{length:#x}"),
+                "direct-memory reservation rejected: range is not Foreign in the VMM map"
+            );
+            // SAFETY: `addr` is this helper's fresh, unpublished reservation.
+            unsafe {
+                VirtualFree(addr as *mut c_void, 0, MEM_RELEASE);
+            }
+            return None;
+        }
+
+        state.os_reservations.push(addr);
+        state.external_mappings.insert(addr, length);
+        state.vmm.map_range(
+            addr,
+            length,
+            VmaType::Reserved,
+            prot::NO_ACCESS,
+            None,
+            name,
+            false,
+        );
+        Some(addr)
     }
 
     /// Reserve and commit one kernel-selected mapping in the PS5 virtual
@@ -1858,7 +1934,7 @@ impl GuestMemory for GuestArena {
         let mut any = false;
         while page < end {
             let committed = {
-                let state = self.lock_state();
+                let state = self.read_state();
                 Self::range_is_committed_locked(&state, page, page + PAGE_SIZE)
             };
             let is_guard = page == self.base + IMAGE_SIZE - PAGE_SIZE
@@ -1889,7 +1965,7 @@ impl GuestMemory for GuestArena {
         // No `< self.base` reject: a guest address below the arena is legal now
         // that `reserve`/`map_at` honor OS-placed and guest-chosen addresses.
         // `range_is_committed` is the real gate.
-        let state = self.lock_state();
+        let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end) {
             return false;
         }
@@ -1925,7 +2001,7 @@ impl GuestMemory for GuestArena {
         // Demand-commit above may take the state lock repeatedly. Reacquire it
         // once and revalidate before dereferencing; a mapping may have been
         // removed between the final commit/check and this point.
-        let state = self.lock_state();
+        let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end) {
             return false;
         }
@@ -1954,7 +2030,7 @@ impl GuestMemory for GuestArena {
         if !self.ensure_range_backed_for_write(guest_addr, end) {
             return None;
         }
-        let state = self.lock_state();
+        let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end) {
             return None;
         }
@@ -1967,6 +2043,13 @@ impl GuestMemory for GuestArena {
         let out = unsafe { core::slice::from_raw_parts_mut(guest_addr as *mut u8, len) };
         let written = fill(out);
         (written <= len).then_some(written)
+    }
+
+    fn prepare_write(&self, range: GuestRange) -> bool {
+        let Some(end) = range.end() else {
+            return false;
+        };
+        self.ensure_range_backed_for_write(range.start().raw(), end)
     }
 
     fn validate_range(&self, range: GuestRange, _access: GuestAccess) -> bool {
@@ -2004,7 +2087,7 @@ impl GuestMemory for GuestArena {
 
     fn atomic_load_u32(&self, guest_addr: u64) -> Option<u32> {
         let end = guest_addr.checked_add(4)?;
-        let state = self.lock_state();
+        let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
@@ -2021,7 +2104,7 @@ impl GuestMemory for GuestArena {
 
     fn atomic_compare_exchange_u32(&self, guest_addr: u64, current: u32, new: u32) -> Option<u32> {
         let end = guest_addr.checked_add(4)?;
-        let state = self.lock_state();
+        let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
@@ -2046,7 +2129,7 @@ impl GuestMemory for GuestArena {
             Some(end) => end,
             None => return false,
         };
-        let state = self.lock_state();
+        let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
@@ -2186,7 +2269,7 @@ impl GuestAllocator for GuestArena {
 
     fn realloc(&self, addr: u64, new_size: u64) -> Option<u64> {
         let old_size = {
-            let state = self.lock_state();
+            let state = self.read_state();
             state.heap_sizes.get(&addr).copied()
         };
 
@@ -2241,6 +2324,13 @@ impl GuestAllocator for GuestArena {
         self.reserve_with_hint(0, length, align, false)
     }
 
+    fn reserve_direct(&self, length: u64, align: u64) -> Option<u64> {
+        let align = normalize_align(align.max(PAGE_SIZE))?;
+        let length = align_up(length.max(1), align)?;
+        let mut state = self.lock_state();
+        self.reserve_console_va(&mut state, length, align, "direct-memory")
+    }
+
     fn reserve_with_hint(&self, hint: u64, length: u64, align: u64, fixed: bool) -> Option<u64> {
         let align = normalize_align(align.max(PAGE_SIZE))?;
         let length = align_up(length.max(1), align)?;
@@ -2290,7 +2380,7 @@ impl GuestAllocator for GuestArena {
         // idempotent successful carve. The VMA is already Reserved and later
         // fixed maps commit pages inside the parent normally.
         if fixed {
-            let state = self.lock_state();
+            let state = self.read_state();
             let inside_owned_reservation = state.external_mappings.iter().any(|(&base, &span)| {
                 base.checked_add(span)
                     .is_some_and(|end| start >= base && requested_end <= end)
@@ -2404,7 +2494,7 @@ impl GuestAllocator for GuestArena {
     /// `0x8`) is *not* reported as host-owned, so the existing guest-fault path
     /// keeps every case it used to handle.
     fn address_is_host_owned(&self, addr: u64) -> bool {
-        let state = self.lock_state();
+        let state = self.read_state();
         state
             .vmm
             .find(addr)
@@ -2673,6 +2763,46 @@ impl GuestAllocator for GuestArena {
         Some(addr)
     }
 
+    fn map_direct_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
+        let align = normalize_align(align.max(PAGE_SIZE))?;
+        if addr % align != 0 {
+            return None;
+        }
+        let length = align_up(length.max(1), PAGE_SIZE)?;
+        let end = addr.checked_add(length)?;
+        if addr < VMM_MIN || end > VMM_MAX {
+            return None;
+        }
+
+        // A fresh direct mapping is address space first, physical pages later.
+        // Keep ranges that are wholly unowned/reserved sparse and let the VEH,
+        // HLE write path, or GPU visibility check commit only pages the title
+        // actually reaches. This is the common streaming-pool path and avoids
+        // charging Windows for every byte in a 13.5 GiB guest pool up front.
+        //
+        // If any part is already backed, preserve `map_at`'s established remap
+        // behavior (including zeroing a fully-backed remap). ASTRO.BOT reuses a
+        // fixed direct-memory window between levels, so weakening that path to
+        // an idempotent reservation would expose stale bytes.
+        let can_stay_sparse = {
+            let state = self.read_state();
+            range_all(&state.vmm, addr, end, |vma| {
+                matches!(
+                    vma.kind,
+                    VmaType::Foreign | VmaType::Free | VmaType::Reserved
+                )
+            })
+        };
+        if can_stay_sparse
+            && <Self as GuestAllocator>::reserve_with_hint(self, addr, length, align, true)
+                == Some(addr)
+        {
+            return Some(addr);
+        }
+
+        <Self as GuestAllocator>::map_at(self, addr, length, align)
+    }
+
     fn munmap(&self, addr: u64, length: u64) {
         let Some(length) = align_up(length.max(1), PAGE_SIZE) else {
             return;
@@ -2834,6 +2964,56 @@ mod tests {
         assert!(a + 64 <= b || b + 64 <= a, "allocations must not overlap");
     }
 
+    /// Read/copy operations need to pin the address map against `munmap`, but
+    /// they must not exclude one another. Minecraft's renderer held the old
+    /// exclusive state mutex across guest-memory reads while a Streaming Pool
+    /// owner waited behind it and still held a title mutex; the resulting
+    /// inversion stopped presentation for 21-26 seconds.
+    #[test]
+    fn independent_guest_memory_copies_share_the_address_map_lock() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = std::sync::Arc::new(
+            GuestArena::new(&[]).expect("fixed-base reservation should succeed"),
+        );
+        let held_addr = arena.alloc(64, 16).expect("held allocation");
+        let read_addr = arena.alloc(64, 16).expect("read allocation");
+        assert!(arena.write(read_addr, &[0xA5]));
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_arena = std::sync::Arc::clone(&arena);
+        let writer = std::thread::spawn(move || {
+            let mut fill = |out: &mut [u8]| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                out.fill(0x5A);
+                out.len()
+            };
+            writer_arena.fill_write(held_addr, 64, &mut fill)
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first copy must hold the shared map guard");
+
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader_arena = std::sync::Arc::clone(&arena);
+        let reader = std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            read_tx
+                .send((reader_arena.read(read_addr, &mut byte), byte))
+                .unwrap();
+        });
+        let (read_ok, byte) = read_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("an unrelated read must not wait for another copy to finish");
+        assert!(read_ok);
+        assert_eq!(byte, [0xA5]);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(writer.join().unwrap(), Some(64));
+        reader.join().unwrap();
+    }
+
     #[test]
     fn heap_grows_into_sparse_tail_after_committed_fast_path_fills() {
         let _lock = crate::dispatch::call_lock();
@@ -2904,6 +3084,82 @@ mod tests {
             addr + 0x2000 <= USER_MAPPING_LIMIT,
             "native libc rejects the mapping end"
         );
+    }
+
+    /// Direct-memory identities are physical-offset stand-ins and must remain
+    /// in the same low PS5 address windows as the historical mmap path. They
+    /// must not consume host commit until mapped or touched.
+    #[test]
+    fn direct_memory_reservation_is_low_and_uncommitted_until_mapped() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let len = 0x0080_0000;
+
+        let addr = arena
+            .reserve_direct(len, raeen_core::PS5_PAGE_SIZE as u64)
+            .expect("direct-memory reservation should succeed");
+        assert!(
+            (SYSTEM_MANAGED_MIN..SYSTEM_MANAGED_LIMIT).contains(&addr)
+                || (USER_MAPPING_MIN..USER_MAPPING_LIMIT).contains(&addr),
+            "direct-memory identity {addr:#x} is outside PS5 VA windows"
+        );
+        let mut byte = [0u8; 1];
+        assert!(
+            !arena.read(addr, &mut byte),
+            "physical reservation must not eagerly consume host commit"
+        );
+
+        assert_eq!(
+            arena.map_at(addr, len, raeen_core::PS5_PAGE_SIZE as u64),
+            Some(addr)
+        );
+        assert!(arena.write(addr, &[0xA5]));
+        assert!(arena.read(addr, &mut byte));
+        assert_eq!(byte, [0xA5]);
+    }
+
+    /// A fresh virtual view of direct memory must not commit its whole span.
+    /// Minecraft maps almost the entire physical pool but touches only a
+    /// fraction; eager fixed maps pushed a 14 GiB host to 19 GiB private commit
+    /// and induced paging while the working set remained near 3 GiB.
+    #[test]
+    fn fresh_direct_mapping_is_demand_backed_until_touched() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[]).expect("fixed-base reservation should succeed");
+        let addr = 0x20_0000_0000;
+        let len = 0x0080_0000;
+
+        assert_eq!(
+            arena.map_direct_at(addr, len, raeen_core::PS5_PAGE_SIZE as u64),
+            Some(addr)
+        );
+        let mut byte = [0u8; 1];
+        assert!(
+            !arena.read(addr, &mut byte),
+            "fresh direct map must remain uncommitted"
+        );
+
+        assert!(arena.write(addr, &[0xA5]));
+        assert!(arena.read(addr, &mut byte));
+        assert_eq!(byte, [0xA5]);
+        let untouched = addr + len - PAGE_SIZE;
+        assert!(
+            !arena.read(untouched, &mut byte),
+            "touching one page must not commit the whole direct map"
+        );
+        let range = GuestRange::new(GuestAddress::new(untouched), PAGE_SIZE)
+            .expect("one page is a valid guest destination");
+        assert!(
+            arena.prepare_write(range),
+            "host I/O must be able to materialize a sparse direct-map destination"
+        );
+        assert!(arena.read(untouched, &mut byte));
+        assert_eq!(
+            byte,
+            [0],
+            "preparing a transfer may commit backing but must not change guest bytes"
+        );
+        arena.munmap(addr, len);
     }
 
     /// ASTRO.BOT's opening `sceKernelAllocateDirectMemory(0x7980_0000)` — 1.94

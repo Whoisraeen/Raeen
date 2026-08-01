@@ -245,21 +245,33 @@ fn normalize_type(ty: i32) -> i32 {
     }
 }
 
-/// Resolve the mutex state key for a guest `pthread_mutex_t` address: the
-/// address itself if registered, else the handle it points at if that is
-/// registered. Returns `None` if neither is known.
-fn resolve_key(ctx: &HleContext, mutex_addr: u64) -> Option<u64> {
-    if ctx.kernel.pthread_mutexes.contains_key(&mutex_addr) {
-        return Some(mutex_addr);
+/// Resolve a guest `pthread_mutex_t` address and clone its shared state in one
+/// map probe: the address itself if registered, else the handle it points at.
+/// Lock/unlock are among Minecraft's hottest imports, so resolving a key with
+/// `contains_key` and then probing the same DashMap again doubled the lookup
+/// work on every uncontended acquisition.
+fn resolve_mutex(
+    ctx: &HleContext,
+    mutex_addr: u64,
+) -> Option<(u64, Arc<raeen_kernel::PthreadMutexShared>)> {
+    if let Some(entry) = ctx.kernel.pthread_mutexes.get(&mutex_addr) {
+        return Some((mutex_addr, Arc::clone(entry.value())));
     }
     let mut buf = [0u8; 8];
     if ctx.mem.read(mutex_addr, &mut buf) {
         let handle = u64::from_le_bytes(buf);
-        if handle != 0 && ctx.kernel.pthread_mutexes.contains_key(&handle) {
-            return Some(handle);
+        if handle != 0
+            && let Some(entry) = ctx.kernel.pthread_mutexes.get(&handle)
+        {
+            return Some((handle, Arc::clone(entry.value())));
         }
     }
     None
+}
+
+#[cfg(test)]
+fn resolve_key(ctx: &HleContext, mutex_addr: u64) -> Option<u64> {
+    resolve_mutex(ctx, mutex_addr).map(|(key, _)| key)
 }
 
 /// `scePthreadMutexInit(mutex, attr, name)`: allocate an opaque mutex object,
@@ -310,7 +322,7 @@ fn hle_mutex_destroy(ctx: &HleContext, args: &[u64]) -> u64 {
         .read(mutex_addr, &mut handle_bytes)
         .then(|| u64::from_le_bytes(handle_bytes))
         .filter(|handle| *handle != 0);
-    let Some(key) = resolve_key(ctx, mutex_addr) else {
+    let Some((key, _shared)) = resolve_mutex(ctx, mutex_addr) else {
         return EINVAL;
     };
     ctx.kernel.pthread_mutexes.remove(&key);
@@ -457,9 +469,42 @@ fn format_guest_thread_site(kernel: &raeen_kernel::OrbisKernel, thread: u64) -> 
         return "<unavailable>".to_owned();
     };
     kernel.unwind_module_for_addr(rip).map_or_else(
-        || format!("{rip:#x}"),
+        || format_host_module_site(rip).unwrap_or_else(|| format!("host:{rip:#x}")),
         |module| format!("{}+{:#x}", module.name, rip - module.start),
     )
+}
+
+/// Resolve a sampled host PC to its image and offset without symbol loading.
+/// This stays local to HLE because HLE cannot depend on `raeen-runtime` (the
+/// runtime already depends on HLE). It runs only after three seconds of mutex
+/// contention, never on the lock hot path.
+#[cfg(windows)]
+fn format_host_module_site(addr: u64) -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr as *const u16,
+            &mut module,
+        )
+    };
+    if ok == 0 || module.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 260];
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+    Some(format!("{name}+{:#x}", addr.wrapping_sub(module as u64)))
+}
+
+#[cfg(not(windows))]
+fn format_host_module_site(_addr: u64) -> Option<String> {
+    None
 }
 
 /// Resolve a bounded set of guest return addresses retained in the owner's
@@ -508,8 +553,8 @@ fn lock_core(
     if mutex_addr == 0 {
         return EINVAL;
     }
-    let key = if let Some(key) = resolve_key(ctx, mutex_addr) {
-        key
+    let (key, shared) = if let Some(resolved) = resolve_mutex(ctx, mutex_addr) {
+        resolved
     } else {
         // Implicit creation for a statically-initialized mutex, and it MUST be
         // atomic. Two guest threads first-touching the same static mutex both
@@ -526,8 +571,8 @@ fn lock_core(
         // Orbis mutexes are opaque pointer slots, so success must also
         // materialize *mutex; guest libc checks that pointer directly between
         // pthread calls. Only the thread that wins the vacant entry does this.
-        let new_handle = match ctx.kernel.pthread_mutexes.entry(mutex_addr) {
-            dashmap::mapref::entry::Entry::Occupied(_) => None,
+        let (new_handle, shared) = match ctx.kernel.pthread_mutexes.entry(mutex_addr) {
+            dashmap::mapref::entry::Entry::Occupied(slot) => (None, Arc::clone(slot.get())),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 let Some(handle) = ctx.alloc.alloc(MUTEX_OBJECT_SIZE, 0x10) else {
                     return EINVAL;
@@ -537,7 +582,7 @@ fn lock_core(
                     return EINVAL;
                 }
                 slot.insert(Arc::clone(&state));
-                Some(handle)
+                (Some(handle), Arc::clone(&state))
             }
         };
         // Keep a fallback alias for callers that pass the opaque handle itself
@@ -546,18 +591,10 @@ fn lock_core(
         if let Some(handle) = new_handle {
             ctx.kernel.pthread_mutexes.insert(handle, state);
         }
-        mutex_addr
+        (mutex_addr, shared)
     };
 
     let current = ctx.guest_threads.current_thread();
-    let Some(shared) = ctx
-        .kernel
-        .pthread_mutexes
-        .get(&key)
-        .map(|entry| Arc::clone(entry.value()))
-    else {
-        return EINVAL;
-    };
     // Parked waiting, not spinning: the guard is held across the condvar
     // wait, which releases it while parked and reacquires on wake. The old
     // `yield_now()` spin loop burned a full host core per blocked guest
@@ -799,15 +836,7 @@ fn hle_mutex_unlock(ctx: &HleContext, args: &[u64]) -> u64 {
     if mutex_addr == 0 {
         return EINVAL;
     }
-    let Some(key) = resolve_key(ctx, mutex_addr) else {
-        return EINVAL;
-    };
-    let Some(shared) = ctx
-        .kernel
-        .pthread_mutexes
-        .get(&key)
-        .map(|entry| Arc::clone(entry.value()))
-    else {
+    let Some((_key, shared)) = resolve_mutex(ctx, mutex_addr) else {
         return EINVAL;
     };
     let mut state = shared.state.lock();
@@ -2142,6 +2171,38 @@ mod tests {
         let shared = Arc::clone(kernel.pthread_mutexes.get(&key).unwrap().value());
         let state = shared.state.lock();
         assert_eq!(state.owner, 0);
+        assert_eq!(state.waiter_count(), 0);
+    }
+
+    /// Manual release probe for Minecraft's malloc-class mutex workload. The
+    /// title executes millions of uncontended lock/unlock pairs while entering
+    /// a world; keep this ignored so host timing never makes ordinary CI
+    /// flaky, but print one stable apples-to-apples number for retail A/B work.
+    #[test]
+    #[ignore = "manual mutex hot-path performance probe"]
+    fn benchmark_one_million_uncontended_mutex_pairs() {
+        const ITERATIONS: u64 = 1_000_000;
+        const MUTEX: u64 = 0x200;
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        assert_eq!(hle_mutex_init(&ctx, &[MUTEX, 0, 0]), OK);
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            assert_eq!(hle_mutex_lock(&ctx, &[MUTEX]), OK);
+            assert_eq!(hle_mutex_unlock(&ctx, &[MUTEX]), OK);
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "mutex probe: {ITERATIONS} uncontended pairs in {:.3} ms ({:.1} ns/pair)",
+            elapsed.as_secs_f64() * 1_000.0,
+            elapsed.as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64,
+        );
+
+        let shared = mutex_state(&ctx, MUTEX);
+        let state = shared.state.lock();
+        assert_eq!(state.owner, 0);
+        assert_eq!(state.recursion, 0);
         assert_eq!(state.waiter_count(), 0);
     }
 }

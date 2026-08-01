@@ -6388,3 +6388,125 @@ VERIFICATION SO FAR:
   received OS error 1455 while mapping an LTO bitcode file. A clean full rerun
   and release retail A/B after that process exits remain required before
   claiming the fix accepted.
+
+## 2026-07-31 — Minecraft Prospero mode-27 terrain-atlas correction
+
+BUILD/EVIDENCE IDENTITY: release `96da89e90acf+dirty`. Retail inputs and raw
+captures remain machine-local and ignored.
+
+MEASURED DIAGNOSIS:
+
+- The late world texture at guest base `0x7ec00000` is a 2048x1024, RGBA8,
+  mode-27 surface with four mip levels. `RAEEN_NO_MIP_CHAIN=1` did not repair
+  it, so mip-base placement was refuted as the primary cause.
+- A new non-mutating `RAEEN_DUMP_TILED_TEXTURES` probe preserved the 8 MiB
+  first-layer source before detiling. The guest bytes viewed linearly were
+  striped; Raeen's prior SharpEmu-derived Navi/RB+ mode-27 table produced a
+  scrambled/smeared atlas. Offline replay through KytyPS5's PS5-specific
+  `Gen5RenderTargetOffsetInBlock` shift/mask equation produced a coherent
+  terrain atlas from those same immutable bytes.
+
+IMPLEMENTATION:
+
+- Replaced only mode 27's generic Navi/RB+ table with the Prospero equation for
+  all five supported element sizes. Modes 5, 9, and 24 are unchanged.
+- Added an independent 300x300-coordinate cross-check for every row and kept
+  tile/detile round trips as a separate inverse-consistency gate. The
+  production mode-27 output and independent replay are byte-identical:
+  SHA-256 `B2A92477761E3F7CF95B21488801CB22B81549683FC0F983610DE7DE710F328D`.
+- `cargo test -p raeen-gpu --lib sw_64kb_r_x` passes 5/5 focused tests. The
+  raw-capture diagnostic and offline `detile_probe` example do not change
+  production rendering when their environment variable/tool is unused.
+
+RETAIL RESULT:
+
+- `scratch/mc-prospero-mode27-visual-ab/soak-1785573475484`: release, 193.6 s,
+  9,312 flips, 48.5 flips/s overall, 2.7/76.2/129.9 ten-second-window
+  min/avg/max, 11.6 s longest no-flip, zero probable deadlocks, 333.3% average
+  CPU, 781.5% peak CPU, and 2,805 MiB peak RAM. The frame-dump probe was active,
+  so this is rendering evidence rather than a clean performance result.
+- Frame 9216 visibly contains coherent grass, trees, water, a mob, HUD, and
+  lighting. No shader refusal, Vulkan validation error, or device loss was
+  observed after world entry. The startup black-frame marker predates draws.
+- Honest gate status: graphics materially improved, but Phase 2 remains red.
+  The diagnostic run's 11.6-second frozen window still exceeds the 10-second
+  gate. Waiters again formed a convoy behind a stable Streaming Pool owner in
+  guest code; presentation and the corrected detile are not the long-stall
+  mechanism. A clean no-dump timing run and owner-RIP sample are next.
+
+## 2026-08-01 - Minecraft sparse-read world-load correction and measured FPS rejects
+
+BUILD/EVIDENCE IDENTITY: release `96da89e90acf+dirty`. Game files, firmware,
+keys, shader caches, raw logs, and captures remain machine-local and outside
+git. This closes one loading failure and preserves the mode-27 visual fix; it
+does not close the Phase 2 60 FPS or 30-minute stability gates.
+
+ROOT CAUSE AND RETAINED FIX:
+
+- The first strict run after the texture correction reached the saved-world
+  transition and then emitted 315,470 `read: guest buffer ... not writable -
+  EFAULT` warnings in approximately 11 seconds. LevelDB retried the same read
+  indefinitely while the main thread waited behind the Streaming Pool.
+- A sparse direct mapping is a valid writable reservation whose pages are
+  committed on first write. `hle_read` and `hle_pread` incorrectly called the
+  committed-only `validate_range` before `fill_write`, so the demand-commit
+  path was never reached and the file cursor could never advance.
+- `GuestMemory::prepare_write` now establishes writable backing before host
+  I/O. `GuestArena` overrides it with the existing bounded sparse-page commit
+  path; the default remains the old write validation for other memory
+  implementations. Reads still validate before consuming the host file.
+- Repeated read-EFAULT diagnostics are rate-limited to the first eight and
+  powers of two. The focused regressions prove that a sparse destination is
+  prepared before the cursor advances, that only the requested page becomes
+  backed and remains zero until the read, and that a genuine EFAULT still does
+  not consume file data.
+
+STRICT RETAIL RESULT:
+
+- Final retained-code run
+  `scratch/mc-sparse-read-final-ab/soak-1785578167729`: release, scripted
+  nine-event saved-world route, 193.8 s, first present 2.6 s, 9,504 flips,
+  49.7 flips/s overall, 3.3/79.7/112.4 ten-second-window min/avg/max, 9.6 s
+  longest no-flip window, zero probable-deadlock warnings, 371.0% average CPU,
+  855.4% peak CPU, and 2,852 MiB peak process-tree RAM. It passed the strict
+  short-run rule of no observed frozen window over 10 seconds.
+- The final log contains zero repeated read-EFAULTs, shader refusals, Vulkan
+  validation errors, device losses, direct-memory allocation failures,
+  fatals, or panics. One recovered 3.006-second contention sample remained:
+  `Streaming Pool(1)` waited for `Streaming Pool(0)` on the title mutex
+  acquired at `libc.prx+0x5ec9`.
+- Visual acceptance remains the earlier immutable-source frame 9216: coherent
+  grass, trees, water, mob, HUD, and lighting after the Prospero mode-27
+  detile. This run did not enable frame dumping, so its timing is clean.
+
+MEASURED PERFORMANCE REJECTS:
+
+- A reaching-definition tracker intended to replace repeated shader-analysis
+  scans passed 731 `kyty-graphics` tests and 385 `raeen-gpu` tests, but the
+  identical retail profile worsened shader-analysis p50/p95 from 9/17 to
+  11/19 us and shader-resolve p50/p95 from 21/40 to 25/45 us. It was fully
+  reverted.
+- A collision-safe `DefaultHasher` prefilter for the 256-entry exact shader
+  memo also passed its forced-collision regression, but the retail profile
+  worsened shader-resolve p50/p95 from 21/40 to 22/43 us, draw-common p50/p95
+  from 60/121 to 62/127 us, and worker p95 from 54.8 to 66.3 ms. It was fully
+  reverted. Neither rejected experiment remains in the source.
+- The retained profile still identifies the FPS wall: approximately 470 draws
+  and 23-29 dispatches per in-world frame, with draw-common p50/p95 60/121 us
+  per draw and compute-dispatch p50/p95 153/440 us. Shader resolve, resource
+  binding, and Vulkan backend work are all material; presentation remains only
+  a few milliseconds and is not the active wall. The next performance slice
+  must subdivide resource binding or safely split structural shader ABI data
+  from per-draw SGPR payloads, then keep/reject by retail p95/p99.
+
+VERIFICATION:
+
+- Final retained source: `raeen-gpu` 388 tests passed (3 measurement probes
+  ignored), `raeen-hle` 650 passed (1 manual benchmark ignored), and
+  `raeen-runtime` 106 passed. All executed Vulkan integration suites passed.
+- Strict all-target Clippy for those crates, formatting, and `git diff --check`
+  passed. The mandatory 30-minute Minecraft soak remains pending; Phase 2 is
+  not claimed green.
+- Final isolated release:
+  `../Raeen-target-memfix/release/raeen.exe`, 39,491,584 bytes, SHA-256
+  `DF8C8FA39685CE60164CC0270B39A8A8EFFB5FA0B03154152B1C055AAB511860`.

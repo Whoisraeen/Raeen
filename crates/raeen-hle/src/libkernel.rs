@@ -597,6 +597,17 @@ fn hle_open(ctx: &HleContext, args: &[u64]) -> u64 {
 /// buffer, returning the byte count actually read (0 at EOF). Large valid
 /// requests are streamed in bounded chunks instead of being silently
 /// truncated. Bad fd → `EBADF`; unwritable buffer → `EFAULT`.
+fn warn_read_efault(operation: &'static str, fd: i32, buf: u64, count: u64) {
+    static OCCURRENCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let occurrence = OCCURRENCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if occurrence <= 8 || occurrence.is_power_of_two() {
+        warn!(
+            "{operation}: fd {fd} guest buffer {buf:#x} (+{count}) not writable; EFAULT \
+             (occurrence {occurrence}; repeated failures are rate-limited)"
+        );
+    }
+}
+
 fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     let fd = args.first().copied().unwrap_or(0) as i32;
     let buf = args.get(1).copied().unwrap_or(0);
@@ -629,8 +640,8 @@ fn hle_read(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(range) = GuestRange::new(GuestAddress::new(buf), count) else {
         return FILE_EFAULT;
     };
-    if !ctx.mem.validate_range(range, GuestAccess::Write) {
-        warn!("read: guest buffer {buf:#x} (+{count}) not writable — EFAULT");
+    if !ctx.mem.prepare_write(range) {
+        warn_read_efault("read", fd, buf, count);
         return FILE_EFAULT;
     }
 
@@ -822,8 +833,8 @@ fn hle_pread(ctx: &HleContext, args: &[u64]) -> u64 {
     let Some(range) = GuestRange::new(GuestAddress::new(buf), count) else {
         return FILE_EFAULT;
     };
-    if !ctx.mem.validate_range(range, GuestAccess::Write) {
-        warn!("pread: guest buffer {buf:#x} (+{count}) not writable — EFAULT");
+    if !ctx.mem.prepare_write(range) {
+        warn_read_efault("pread", fd, buf, count);
         return FILE_EFAULT;
     }
 
@@ -2800,11 +2811,11 @@ fn trace_guest_vmm(message: std::fmt::Arguments<'_>) {
 /// is out of bounds (bounds-checked, never a panic/OOB) — in the latter case
 /// the just-recorded metadata is rolled back via `remove_mapping` so no
 /// dangling record is left behind.
-/// The direct-memory budget reported to and enforced on titles: ~13.375 GiB,
-/// the commonly-measured game-usable direct memory of a retail PS5. Titles
+/// The direct-memory budget reported to and enforced on titles: 13.5 GiB,
+/// matching KytyPS5's PS5 physical-memory model. Titles
 /// size their pools by allocating until the kernel refuses, so both the
 /// refusal and the reported size must model the console, not the host.
-pub(crate) const PS5_DIRECT_MEMORY_SIZE: u64 = 0x3_5800_0000;
+pub(crate) const PS5_DIRECT_MEMORY_SIZE: u64 = 0x3_6000_0000;
 
 /// `SCE_KERNEL_ERROR_EAGAIN` — what the real allocator returns when the
 /// direct-memory budget cannot satisfy the request.
@@ -2851,7 +2862,7 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
                 .checked_add(len)
                 .filter(|n| *n <= PS5_DIRECT_MEMORY_SIZE)
             else {
-                debug!(
+                warn!(
                     "sceKernelAllocateDirectMemory: budget exhausted \
                      (allocated={current:#x} + len={len:#x} > {PS5_DIRECT_MEMORY_SIZE:#x}) — EAGAIN"
                 );
@@ -2868,7 +2879,7 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
             }
         }
     }
-    let Some(addr) = ctx.alloc.reserve(len, alignment) else {
+    let Some(addr) = ctx.alloc.reserve_direct(len, alignment) else {
         // Same code as the budget refusal above, and for the same reason: the
         // real allocator answers "I could not give you this memory" with
         // `EAGAIN` (shadPS4 `sceKernelAllocateDirectMemory`). A title sizing its
@@ -2911,8 +2922,12 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         return SCE_KERNEL_ERROR_EFAULT;
     }
     if std::env::var_os("RAEEN_TRACE_DIRECT_MEMORY").is_some() {
+        let allocated = ctx
+            .kernel
+            .direct_memory_allocated
+            .load(std::sync::atomic::Ordering::Relaxed);
         warn!(
-            "direct-memory trace: allocate len={len:#x} alignment={alignment:#x} type={memory_type} -> phys={addr:#x}"
+            "direct-memory trace: allocate len={len:#x} alignment={alignment:#x} type={memory_type} -> phys={addr:#x}; allocated={allocated:#x}/{PS5_DIRECT_MEMORY_SIZE:#x}"
         );
     }
     SCE_OK
@@ -2946,9 +2961,6 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     );
     let start = args.first().copied().unwrap_or(0);
     let len = args.get(1).copied().unwrap_or(0);
-    if std::env::var_os("RAEEN_TRACE_DIRECT_MEMORY").is_some() {
-        warn!("direct-memory trace: release phys={start:#x} len={len:#x}");
-    }
     trace_guest_vmm(format_args!("release-direct phys={start:#x} len={len:#x}"));
     // `start` is a physical-memory OFFSET; 0 is a perfectly valid one (a title
     // whose direct-memory pool begins at physical 0 releases [0, len)). Only a
@@ -2965,11 +2977,17 @@ fn hle_release_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     // Return the bytes to the direct-memory budget. Saturating: release is
     // best-effort/idempotent (see above), so an untracked or double release
     // must not underflow the counter.
-    let _ = ctx.kernel.direct_memory_allocated.fetch_update(
+    let remaining = ctx.kernel.direct_memory_allocated.fetch_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |v| Some(v.saturating_sub(len)),
     );
+    if std::env::var_os("RAEEN_TRACE_DIRECT_MEMORY").is_some() {
+        let allocated = remaining.map_or(0, |before| before.saturating_sub(len));
+        warn!(
+            "direct-memory trace: released phys={start:#x} len={len:#x}; allocated={allocated:#x}/{PS5_DIRECT_MEMORY_SIZE:#x}"
+        );
+    }
     SCE_OK
 }
 
@@ -3067,13 +3085,14 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     //
     // With no requested address there is nothing to honor, and the answer is
     // NOT a fresh region: `sceKernelAllocateDirectMemory` has already reserved
-    // the identity address. Publishing it keeps the mapping and direct memory
-    // as one demand-backed storage range; a fresh region would detach the
-    // guest's writes from its own direct memory and leak when
-    // `sceKernelReleaseDirectMemory` freed the physical range.
+    // the identity address. `map_at` backs that exact reservation so native
+    // guest accesses AND host-side HLE reads observe ordinary mapped memory.
+    // (HLE reads deliberately reject an untouched reservation.) Publishing a
+    // fresh region would detach the guest's writes from its own direct memory
+    // and leak when `sceKernelReleaseDirectMemory` freed the physical range.
     //
-    // GAP: when an address IS requested, the mapping is backed by its own
-    // memory rather than aliasing `direct_memory_start`. True aliasing needs
+    // GAP: when an address IS requested, the mapping has its own demand-backed
+    // storage rather than aliasing `direct_memory_start`. True aliasing needs
     // file-backed sections; reservations cannot do it. Harmless while a title
     // reaches direct memory only through the mapping it asked for (all four
     // measured titles do), wrong the day one writes via the mapping and reads
@@ -3086,7 +3105,7 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
             );
             return SCE_KERNEL_ERROR_EINVAL;
         }
-        Some(direct_memory_start)
+        ctx.alloc.map_at(direct_memory_start, len, alignment)
     } else {
         // A requested address is mandatory only under `MAP_FIXED`. Without that
         // flag Orbis treats it as a hint and is free to place the mapping
@@ -3094,16 +3113,18 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
         // serve must not sink the call. Falling back to `direct_memory_start`
         // is exactly the answer the no-hint branch above gives, which keeps the
         // mapping and the direct memory one storage rather than detaching them.
-        ctx.alloc.map_at(requested, len, alignment).or_else(|| {
-            if fixed || !direct_memory_start.is_multiple_of(alignment) {
-                return None;
-            }
-            warn!(
-                "sceKernelMapDirectMemory: hint {requested:#x} unavailable for len={len:#x}; \
+        ctx.alloc
+            .map_direct_at(requested, len, alignment)
+            .or_else(|| {
+                if fixed || !direct_memory_start.is_multiple_of(alignment) {
+                    return None;
+                }
+                warn!(
+                    "sceKernelMapDirectMemory: hint {requested:#x} unavailable for len={len:#x}; \
                  MAP_FIXED is clear, so publishing {direct_memory_start:#x} instead"
-            );
-            Some(direct_memory_start)
-        })
+                );
+                ctx.alloc.map_direct_at(direct_memory_start, len, alignment)
+            })
     };
     let Some(mapped) = mapped else {
         // `ENOMEM` is what the real kernel reports for a fixed mapping it
@@ -7889,6 +7910,37 @@ mod tests {
         );
     }
 
+    /// Minecraft's measured in-world high-water mark is 0x357194000 bytes.
+    /// Its streaming pool then requests one more 32 MiB block. KytyPS5 models
+    /// the PS5 physical pool as 13.5 GiB, where that request fits; the older
+    /// 13.375 GiB cap refused it and the title deliberately poison-faulted.
+    #[test]
+    fn minecraft_streaming_request_fits_the_ps5_direct_memory_pool() {
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = crate::TestMemory::new(0x1000);
+        let alloc = crate::TestAllocator::new(0x10_0000);
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        const MEASURED_LIVE_BYTES: u64 = 0x3_5719_4000;
+        const STREAMING_BLOCK: u64 = 0x0200_0000;
+        kernel
+            .direct_memory_allocated
+            .store(MEASURED_LIVE_BYTES, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            hle_allocate_main_direct_memory(
+                &ctx,
+                &[STREAMING_BLOCK, raeen_core::PS5_PAGE_SIZE as u64, 12, 0x600],
+            ),
+            SCE_OK
+        );
+        assert_eq!(
+            kernel
+                .direct_memory_allocated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            MEASURED_LIVE_BYTES + STREAMING_BLOCK
+        );
+    }
+
     /// Direct memory allocated 2 MiB-aligned, plus an `addrOut` in-value the
     /// test allocator cannot serve at that alignment. Shared by the two
     /// hint-failure tests below so both exercise the same refusal.
@@ -8351,6 +8403,59 @@ mod tests {
     /// guest→guest read the nested acquisition would **hang the thread**, and a
     /// hanging test is useless. `try_lock` converts that hang into a detectable
     /// `false`, so this fixture fails loudly instead of never finishing.
+    /// A writable mapping whose address space exists before its host pages do.
+    /// This is the production `GuestArena::map_direct_at` contract in a small
+    /// fixture: validation alone refuses the range, while `prepare_write`
+    /// materializes it without consuming the following file read.
+    struct DemandCommitMemory {
+        inner: crate::TestMemory,
+        destination: std::ops::Range<u64>,
+        prepared: std::sync::atomic::AtomicBool,
+    }
+
+    impl DemandCommitMemory {
+        fn new(len: usize, destination: std::ops::Range<u64>) -> Self {
+            Self {
+                inner: crate::TestMemory::new(len),
+                destination,
+                prepared: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn is_destination(&self, range: GuestRange) -> bool {
+            range.end().is_some_and(|end| {
+                range.start().raw() >= self.destination.start && end <= self.destination.end
+            })
+        }
+    }
+
+    impl GuestMemory for DemandCommitMemory {
+        fn read(&self, guest_addr: u64, out: &mut [u8]) -> bool {
+            self.inner.read(guest_addr, out)
+        }
+
+        fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
+            self.inner.write(guest_addr, data)
+        }
+
+        fn validate_range(&self, range: GuestRange, access: GuestAccess) -> bool {
+            if self.is_destination(range)
+                && !self.prepared.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return false;
+            }
+            self.inner.validate_range(range, access)
+        }
+
+        fn prepare_write(&self, range: GuestRange) -> bool {
+            if self.is_destination(range) {
+                self.prepared
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.validate_range(range, GuestAccess::Write)
+        }
+    }
+
     struct ArenaLikeMemory {
         base: u64,
         bytes: std::sync::Mutex<Vec<u8>>,
@@ -8495,6 +8600,44 @@ mod tests {
         );
 
         assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+    }
+
+    #[test]
+    fn read_prepares_a_sparse_destination_before_advancing_the_file() {
+        const DEST: u64 = 0x800;
+
+        let kernel = raeen_kernel::OrbisKernel::new();
+        let mem = DemandCommitMemory::new(0x1000, DEST..DEST + 0x100);
+        let alloc = crate::TestAllocator::new(0);
+        let ctx = crate::test_ctx_over_memory(&kernel, &mem, &alloc);
+        let tmp = std::env::temp_dir().join(format!(
+            "raeen-hle-read-demand-commit-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("data.bin"), b"SPARSE").unwrap();
+        kernel.filesystem.set_game_directory(&tmp);
+
+        assert!(mem.write(0x20, b"/app0/data.bin\0"));
+        let fd = hle_open(&ctx, &[0x20, 0, 0]);
+        assert!((fd as i64) >= 3);
+        let range = GuestRange::new(GuestAddress::new(DEST), 6).unwrap();
+        assert!(
+            !mem.validate_range(range, GuestAccess::Write),
+            "the destination begins reserved but not host-backed"
+        );
+
+        assert_eq!(hle_read(&ctx, &[fd, DEST, 6]), 6);
+        assert!(
+            mem.prepared.load(std::sync::atomic::Ordering::Relaxed),
+            "sceKernelRead must ask the backend to materialize sparse backing"
+        );
+        let mut landed = [0u8; 6];
+        assert!(mem.read(DEST, &mut landed));
+        assert_eq!(&landed, b"SPARSE");
+
+        assert_eq!(hle_close(&ctx, &[fd]), SCE_OK);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -9211,6 +9354,16 @@ mod tests {
         assert!(mem.read(0x108, &mut bytes));
         assert_eq!(u64::from_le_bytes(bytes), physical);
         assert!(kernel.memory.is_mapped(physical));
+        assert_eq!(
+            alloc.map_at_calls(),
+            1,
+            "publishing an identity direct map must make the reserved range host-readable"
+        );
+        assert_eq!(
+            alloc.mmap_calls(),
+            0,
+            "identity mapping must not allocate a detached second range"
+        );
 
         assert_eq!(
             registry.call(

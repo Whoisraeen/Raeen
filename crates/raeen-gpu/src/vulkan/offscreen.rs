@@ -3063,6 +3063,28 @@ pub(crate) static DRAW_STAGE_PARSE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_PARSE_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Graphics shader-analysis substages. These are incremented only under
+/// `RAEEN_TIME_DRAW`; compute has its own translate timer below.
+pub(crate) static DRAW_STAGE_ANALYZE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_TOTAL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_PARSE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_INPUT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_CAPTURE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_RUNTIME_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_EMBEDDED_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_SYNTH_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_MEASURE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_ANALYZE_KEY_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_SETUP_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_CENSUS_NS: std::sync::atomic::AtomicU64 =
@@ -3149,6 +3171,16 @@ fn draw_stage_tick() {
     let resolve_misses_same_program = DRAW_STAGE_RESOLVE_MISS_SAME_PROGRAM.swap(0, Relaxed);
     let parse_hits = DRAW_STAGE_PARSE_HITS.swap(0, Relaxed);
     let parse_misses = DRAW_STAGE_PARSE_MISSES.swap(0, Relaxed);
+    let analyze_calls = DRAW_STAGE_ANALYZE_CALLS.swap(0, Relaxed);
+    let analyze_total = DRAW_STAGE_ANALYZE_TOTAL_NS.swap(0, Relaxed);
+    let analyze_parse = DRAW_STAGE_ANALYZE_PARSE_NS.swap(0, Relaxed);
+    let analyze_input = DRAW_STAGE_ANALYZE_INPUT_NS.swap(0, Relaxed);
+    let analyze_capture = DRAW_STAGE_ANALYZE_CAPTURE_NS.swap(0, Relaxed);
+    let analyze_runtime = DRAW_STAGE_ANALYZE_RUNTIME_NS.swap(0, Relaxed);
+    let analyze_embedded = DRAW_STAGE_ANALYZE_EMBEDDED_NS.swap(0, Relaxed);
+    let analyze_synth = DRAW_STAGE_ANALYZE_SYNTH_NS.swap(0, Relaxed);
+    let analyze_measure = DRAW_STAGE_ANALYZE_MEASURE_NS.swap(0, Relaxed);
+    let analyze_key = DRAW_STAGE_ANALYZE_KEY_NS.swap(0, Relaxed);
     let setup = DRAW_STAGE_SETUP_NS.swap(0, Relaxed);
     let census = DRAW_STAGE_CENSUS_NS.swap(0, Relaxed);
     let bind = DRAW_STAGE_BIND_NS.swap(0, Relaxed);
@@ -3178,6 +3210,7 @@ fn draw_stage_tick() {
     let dpct = |x: u64| x.saturating_mul(100).checked_div(drawcommon).unwrap_or(0);
     let per_draw_us = |x: u64| x / 1000 / 512;
     let per_disp_us = |x: u64| (x / 1000).checked_div(dispatches).unwrap_or(0);
+    let per_analysis_us = |x: u64| (x / 1000).checked_div(analyze_calls).unwrap_or(0);
     tracing::warn!(
         draws = 512,
         drawcommon_us = per_draw_us(drawcommon),
@@ -3215,6 +3248,27 @@ fn draw_stage_tick() {
         other_of_draw_pct = dpct(other),
         predraw_us = per_draw_us(predraw),
         "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, Vulkan backend (record = backend minus build), the untimed remainder, and the pre-draw_common index/compute work. `miss_*` names WHICH part of a too-wide key churned: `_beyond` is outside the analysis's live user-SGPR window and can be masked out of the key; `_inside` is a register the analysis latches, which needs the per-program ABI split instead"
+    );
+    tracing::warn!(
+        analyze_calls,
+        total_us = per_analysis_us(analyze_total),
+        parse_us = per_analysis_us(analyze_parse),
+        input_us = per_analysis_us(analyze_input),
+        capture_us = per_analysis_us(analyze_capture),
+        runtime_us = per_analysis_us(analyze_runtime),
+        embedded_us = per_analysis_us(analyze_embedded),
+        synth_us = per_analysis_us(analyze_synth),
+        measure_us = per_analysis_us(analyze_measure),
+        key_us = per_analysis_us(analyze_key),
+        other_us = per_analysis_us(
+            analyze_total.saturating_sub(
+                analyze_parse
+                    .saturating_add(analyze_input)
+                    .saturating_add(analyze_capture)
+                    .saturating_add(analyze_key)
+            )
+        ),
+        "SHADER ANALYSIS STAGES: per graphics-stage bind; capture is further split into live-pointer runtime loads, embedded-data detection, null-descriptor synthesis, and constant-buffer extent measurement"
     );
     tracing::warn!(
         dispatches,

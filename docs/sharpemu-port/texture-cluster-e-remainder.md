@@ -71,14 +71,17 @@ even if a row were transcribed wrong), and its known-answer pins covered only
 the 4 B/element row. The 2 B/element row of `RB_PLUS_64K_RENDER_X` therefore
 had no independent check.
 
-**Closed this session:**
-`tiling.rs::sw_64kb_r_x_2bpp_matches_an_independent_re_derivation` — the
-`RbPlus64KRenderX2Bpp` mask table ported verbatim from SharpEmu's test, laying
-out a tiled buffer at 384x200 (partial blocks) and 768x512 (3x4 block grid,
-wrapping u16 indices) and asserting `detile_64kb(27, …)` reconstructs ascending
-element indices byte-for-byte. It also pins the 256x128 block split the
-derivation assumes. The test passed first run: the transcription was verified
-correct, now provably so in-tree.
+**Correction from a retail capture (2026-07-31):** this test proved that Raeen
+matched SharpEmu's generic Navi/RB+ equation; it did not prove that the equation
+was the PS5/Prospero equation. A captured Minecraft mode-27, 2048x1024 RGBA8
+terrain atlas decoded into repeated stripes with that table. Replaying the same
+immutable bytes through KytyPS5's independently written
+`Gen5RenderTargetOffsetInBlock` equation produced a coherent atlas. Raeen now
+uses the Prospero equation for all five element sizes, cross-checks every
+coordinate in a 300x300 grid against the shift/mask form, and keeps the
+tile/detile round trips as a separate inverse-consistency test. The production
+mode-27 output and independent offline replay are byte-identical (SHA-256
+`B2A92477761E3F7CF95B21488801CB22B81549683FC0F983610DE7DE710F328D`).
 
 ### 0ae785c (#475) — padded row pitch in guest image uploads
 
@@ -148,11 +151,14 @@ If Raeen later grows a GPU detile pass (worth it — SharpEmu measured CPU
 detile at 568-879 ms/s on one title before memoization), #620 must be part of
 that port from day one.
 
-## What is most likely still breaking Minecraft's block textures
+## What was breaking Minecraft's block textures
 
-Nothing in this cluster: the detile math is independently verified, arrays and
-mip chains are ported, sRGB present is ported. The most recent in-game capture
-(`logs/raeen.log.mc_asyncflip_42fps`, 2026-07-23) points elsewhere:
+The previous conclusion below was refuted by better evidence. The table was
+self-consistent and equivalent to SharpEmu, but wrong for the captured PS5
+mode-27 atlas. The Prospero equation correction now yields recognizable grass,
+trees, water, mobs, HUD, and lighting in the retail in-world frame. The older
+shader/synchronization observations remain useful as historical evidence, but
+they were not the cause of this texture scramble:
 
 * **6x `guest shader translation failed — draws binding it will be skipped`,
   all `stage="vs"`, all `SLoadDwordx2 … s[14:15], <imm>`** — the SMEM
@@ -165,13 +171,14 @@ mip chains are ported, sRGB present is ported. The most recent in-game capture
   refused by the 96 MiB per-stage texture cap, `RAEEN_MAX_STAGE_TEXTURE_MIB`) —
   if in-game runs still hit this, whole draws (blocks included) vanish legally.
 
-Recommended next evidence pass, in order: re-capture an in-game log on current
-main (post-`a192cf1`); check `translate_failed`, `texture_cap_skips`, and the
-`MIP_CHAIN_PLACEMENT_UNKNOWN` counter; A/B `RAEEN_NO_MIP_CHAIN=1` only if the
-mip counter is non-zero.
+The strict performance gate remains separate: the post-fix diagnostic retail
+run still contained an 11.6-second no-flip window owned by guest streaming code.
+Presentation and the corrected atlas decode are not evidence that this guest
+critical section is fixed.
 
 ## Tests
 
-* New: `raeen-gpu texture::tiling::sw_64kb_r_x_2bpp_matches_an_independent_re_derivation`.
+* New: `raeen-gpu texture::tiling::sw_64kb_r_x_matches_kytyps5_prospero_equations`.
+* Updated: `raeen-gpu texture::tiling::sw_64kb_r_x_2bpp_matches_an_independent_re_derivation` now uses the Prospero equation.
 * Gate: `cargo test -p raeen-gpu` and `cargo test -p kyty-graphics` green (counts
   in the session report); `cargo fmt --all --check` clean.

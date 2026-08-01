@@ -265,106 +265,110 @@ const RB_PLUS_64K_DEPTH_X: [[AddressBit; 16]; 5] = [
     ],
 ];
 
-/// PS5/Oberon (16-pipe, 8-packer, "RB+") single-sample `SW_64KB_R_X`
-/// (SWIZZLE_MODE 27) equations, one row per bytes-per-element log2
-/// (1/2/4/8/16-byte elements). Transcribed from SharpEmu's
-/// `RbPlus64KRenderX`, verified there against AMD AddrLib's
-/// `GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO` rows.
-const RB_PLUS_64K_RENDER_X: [[AddressBit; 16]; 5] = [
-    // 1 byte/element: nibble01=0, nibble2=307, nibble3=379.
+/// PS5/Prospero single-sample `SW_64KB_R_X` (SWIZZLE_MODE 27) equations, one
+/// row per bytes-per-element log2 (1/2/4/8/16-byte elements).
+///
+/// Behaviorally transcribed from KytyPS5
+/// `guest_gpu/tile.cpp::Gen5RenderTargetOffsetInBlock`. This deliberately does
+/// not use SharpEmu's Navi/RB+ pattern: a retail Minecraft capture whose T# is
+/// mode 27 decodes coherently with the Prospero equation and is visibly
+/// scrambled by that generic RB+ table. The high coordinate bits below are
+/// the per-block XOR; callers must pass full-surface coordinates.
+const PROSPERO_64K_RENDER_X: [[AddressBit; 16]; 5] = [
+    // 1 byte/element.
     [
         ab_x(0),
         ab_x(1),
         ab_x(2),
-        ab_x(3),
-        ab_y(0),
         ab_y(1),
+        ab_y(0),
         ab_y(2),
-        ab_y(3),
-        ab_xyy(7, 4, 7),
+        ab_x(3),
+        ab_y(4),
+        ab_xy(3, 3),
         ab_xy(4, 4),
         ab_xy(6, 5),
         ab_xy(5, 6),
+        ab_y(6),
+        ab_x(6),
+        ab_y(7),
+        ab_x(7),
+    ],
+    // 2 bytes/element.
+    [
+        AB_ZERO,
+        ab_x(0),
+        ab_x(1),
+        ab_x(2),
+        ab_y(0),
+        ab_y(1),
+        ab_y(2),
+        ab_x(3),
+        ab_xy(3, 3),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_y(4),
         ab_x(6),
         ab_y(6),
-        ab_xy(7, 8),
-        ab_xy(8, 7),
+        ab_x(7),
     ],
-    // 2 bytes/element: nibble01=1, nibble2=307, nibble3=389.
+    // 4 bytes/element.
     [
+        AB_ZERO,
         AB_ZERO,
         ab_x(0),
         ab_x(1),
-        ab_x(2),
         ab_y(0),
         ab_y(1),
         ab_y(2),
-        ab_x(3),
-        ab_xyy(7, 4, 7),
+        ab_x(2),
+        ab_xy(3, 3),
         ab_xy(4, 4),
         ab_xy(6, 5),
         ab_xy(5, 6),
         ab_y(3),
+        ab_x(4),
+        ab_y(6),
         ab_x(6),
-        ab_xy(7, 7),
-        ab_xy(8, 6),
     ],
-    // 4 bytes/element: nibble01=39, nibble2=307, nibble3=381.
+    // 8 bytes/element.
     [
         AB_ZERO,
         AB_ZERO,
+        AB_ZERO,
         ab_x(0),
-        ab_x(1),
         ab_y(0),
-        ab_y(1),
+        ab_x(1),
         ab_x(2),
-        ab_y(2),
-        ab_xyy(7, 4, 7),
+        ab_y(1),
+        ab_xy(3, 3),
         ab_xy(4, 4),
         ab_xy(6, 5),
         ab_xy(5, 6),
+        ab_y(2),
         ab_x(3),
+        ab_y(4),
+        ab_x(6),
+    ],
+    // 16 bytes/element.
+    [
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        AB_ZERO,
+        ab_x(0),
+        ab_y(0),
+        ab_x(1),
+        ab_y(1),
+        ab_xy(3, 3),
+        ab_xy(4, 4),
+        ab_xy(6, 5),
+        ab_xy(5, 6),
+        ab_y(2),
+        ab_x(2),
         ab_y(3),
-        ab_xy(6, 7),
-        ab_xy(7, 6),
-    ],
-    // 8 bytes/element: nibble01=6, nibble2=307, nibble3=382.
-    [
-        AB_ZERO,
-        AB_ZERO,
-        AB_ZERO,
-        ab_x(0),
-        ab_y(0),
-        ab_x(1),
-        ab_x(2),
-        ab_y(1),
-        ab_xyy(7, 4, 7),
-        ab_xy(4, 4),
-        ab_xy(6, 5),
-        ab_xy(5, 6),
-        ab_y(2),
-        ab_x(3),
-        ab_xy(7, 3),
-        ab_xy(6, 6),
-    ],
-    // 16 bytes/element: nibble01=7, nibble2=307, nibble3=390.
-    [
-        AB_ZERO,
-        AB_ZERO,
-        AB_ZERO,
-        AB_ZERO,
-        ab_x(0),
-        ab_y(0),
-        ab_x(1),
-        ab_y(1),
-        ab_xyy(7, 4, 7),
-        ab_xy(4, 4),
-        ab_xy(6, 5),
-        ab_xy(5, 6),
-        ab_x(2),
-        ab_y(2),
-        ab_xy(6, 3),
-        ab_xy(3, 6),
+        ab_x(4),
     ],
 ];
 
@@ -582,7 +586,7 @@ pub const fn swizzle_table(mode: u8) -> Option<(&'static [[AddressBit; 16]; 5], 
         5 => Some((&STANDARD_4K, 4096)),
         9 => Some((&RB_PLUS_64K_STANDARD, 65536)),
         24 => Some((&RB_PLUS_64K_DEPTH_X, 65536)),
-        27 => Some((&RB_PLUS_64K_RENDER_X, 65536)),
+        27 => Some((&PROSPERO_64K_RENDER_X, 65536)),
         _ => None,
     }
 }
@@ -593,7 +597,7 @@ pub const fn swizzle_64kb_table(mode: u8) -> Option<&'static [[AddressBit; 16]; 
     match mode {
         9 => Some(&RB_PLUS_64K_STANDARD),
         24 => Some(&RB_PLUS_64K_DEPTH_X),
-        27 => Some(&RB_PLUS_64K_RENDER_X),
+        27 => Some(&PROSPERO_64K_RENDER_X),
         _ => None,
     }
 }
@@ -656,7 +660,14 @@ pub fn tiled_byte_count_64kb(width: u32, height: u32, bpp_log2: u32) -> u64 {
 /// linear rows. `tiled` must cover the whole block grid (see
 /// [`tiled_byte_count_64kb`]); pixels beyond it (never fetched) stay zero.
 pub fn detile_64kb_r_x(tiled: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
-    detile_64kb_with(tiled, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X, 65536)
+    detile_64kb_with(
+        tiled,
+        width,
+        height,
+        bpp_log2,
+        &PROSPERO_64K_RENDER_X,
+        65536,
+    )
 }
 
 /// Detile a `SW_64KB_S` (SWIZZLE_MODE 9) surface — the Standard (non-XOR)
@@ -787,7 +798,7 @@ pub fn tiled_byte_count_for_mode(mode: u8, width: u32, height: u32, bpp_log2: u3
 /// [`detile_64kb_with`]. Production storage-image writeback uses
 /// [`tile_64kb_into`]; this allocating wrapper is convenient for tests.
 pub fn tile_64kb_r_x(linear: &[u8], width: u32, height: u32, bpp_log2: u32) -> Vec<u8> {
-    tile_64kb_with(linear, width, height, bpp_log2, &RB_PLUS_64K_RENDER_X)
+    tile_64kb_with(linear, width, height, bpp_log2, &PROSPERO_64K_RENDER_X)
 }
 
 /// `SW_64KB_S` twin of [`tile_64kb_r_x`].
@@ -1205,29 +1216,112 @@ mod tests {
         );
     }
 
-    /// Known-answer pins for the PS5/Oberon `SW_64KB_R_X` equation at 4 B/el
-    /// (AddrLib `GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO` nibble01=39).
-    /// Element offsets within/between the 128x128 blocks.
+    /// Known-answer pins for the PS5/Prospero `SW_64KB_R_X` equation at 4 B/el.
+    /// These are independently readable from KytyPS5's shift/mask equation.
     #[test]
     fn sw_64kb_r_x_equation_pins() {
-        let p = &RB_PLUS_64K_RENDER_X[2]; // 4 bytes/element
+        let p = &PROSPERO_64K_RENDER_X[2]; // 4 bytes/element
         let at = |x: u32, y: u32| gfx10_pattern_offset(x, y, p);
         assert_eq!(at(0, 0), 0);
         assert_eq!(at(1, 0), 4, "x0 -> bit2");
         assert_eq!(at(2, 0), 8, "x1 -> bit3");
         assert_eq!(at(0, 1), 16, "y0 -> bit4");
         assert_eq!(at(0, 2), 32, "y1 -> bit5");
-        assert_eq!(at(4, 0), 64, "x2 -> bit6");
-        assert_eq!(at(0, 4), 128, "y2 -> bit7");
-        assert_eq!(at(8, 0), 4096, "x3 -> bit12");
-        assert_eq!(at(0, 8), 8192, "y3 -> bit13");
-        assert_eq!(at(16, 0), 512, "x4 -> bit9 (x4^y4)");
-        assert_eq!(at(0, 16), 768, "y4 -> bit8 + bit9");
-        // The pipe/bank XOR: entering block column 2 (x=128, so x7=1) flips
-        // bit8 (x7^y4^y7) AND bit15 (x7^y6); block row 2 (y=128, y7=1) flips
-        // bit8 AND bit14 (x6^y7).
-        assert_eq!(at(128, 0), 256 + 32768, "x7 -> bit8 + bit15");
-        assert_eq!(at(0, 128), 256 + 16384, "y7 -> bit8 + bit14");
+        assert_eq!(at(0, 4), 64, "y2 -> bit6");
+        assert_eq!(at(4, 0), 128, "x2 -> bit7");
+        assert_eq!(at(8, 0), 256, "x3 -> bit8");
+        assert_eq!(at(0, 8), 256 + 4096, "y3 -> bit8 + bit12");
+        assert_eq!(at(16, 0), 512 + 8192, "x4 -> bit9 + bit13");
+        assert_eq!(at(0, 16), 512, "y4 -> bit9");
+        assert_eq!(at(64, 0), 1024 + 32768, "x6 -> bit10 + bit15");
+        assert_eq!(at(0, 64), 2048 + 16384, "y6 -> bit11 + bit14");
+    }
+
+    /// Cross-check every Prospero row against KytyPS5's independently written
+    /// shift/mask equations. This catches a transcription error that a
+    /// tile-then-detile round trip cannot, because that round trip shares one
+    /// table in both directions.
+    #[test]
+    fn sw_64kb_r_x_matches_kytyps5_prospero_equations() {
+        fn reference(x: u32, y: u32, bpp_log2: u32) -> u64 {
+            let mut offset = 0u32;
+            match bpp_log2 {
+                0 => {
+                    offset ^= (y << 2) & 0x0008;
+                    offset ^= (y << 4) & 0x0010;
+                    offset ^= (y << 3) & 0x00a0;
+                    offset ^= (y << 5) & 0x0f00;
+                    offset ^= (y << 6) & 0x1000;
+                    offset ^= (y << 7) & 0x4000;
+                    offset ^= x & 0x0007;
+                    offset ^= (x << 3) & 0x0040;
+                    offset ^= (x << 5) & 0x0300;
+                    offset ^= (x << 4) & 0x0400;
+                    offset ^= (x << 6) & 0x0800;
+                    offset ^= (x << 7) & 0x2000;
+                    offset ^= (x << 8) & 0x8000;
+                }
+                1 => {
+                    offset ^= (y << 4) & 0x0070;
+                    offset ^= (y << 5) & 0x0f00;
+                    offset ^= (y << 8) & 0x5000;
+                    offset ^= (x << 1) & 0x000e;
+                    offset ^= (x << 4) & 0x0480;
+                    offset ^= (x << 5) & 0x0300;
+                    offset ^= (x << 6) & 0x0800;
+                    offset ^= (x << 7) & 0x2000;
+                    offset ^= (x << 8) & 0x8000;
+                }
+                2 => {
+                    offset ^= (y << 4) & 0x0070;
+                    offset ^= (y << 5) & 0x0f00;
+                    offset ^= (y << 9) & 0x1000;
+                    offset ^= (y << 8) & 0x4000;
+                    offset ^= (x << 2) & 0x000c;
+                    offset ^= (x << 5) & 0x0380;
+                    offset ^= (x << 4) & 0x0400;
+                    offset ^= (x << 6) & 0x0800;
+                    offset ^= (x << 9) & 0xa000;
+                }
+                3 => {
+                    offset ^= (y << 4) & 0x0010;
+                    offset ^= (y << 6) & 0x0080;
+                    offset ^= (y << 5) & 0x0f00;
+                    offset ^= (y << 10) & 0x5000;
+                    offset ^= (x << 3) & 0x0008;
+                    offset ^= (x << 4) & 0x0460;
+                    offset ^= (x << 5) & 0x0300;
+                    offset ^= (x << 6) & 0x0800;
+                    offset ^= (x << 10) & 0x2000;
+                    offset ^= (x << 9) & 0x8000;
+                }
+                4 => {
+                    offset ^= (x << 4) & 0x0410;
+                    offset ^= (x << 5) & 0x0340;
+                    offset ^= (x << 6) & 0x0800;
+                    offset ^= (x << 11) & 0xa000;
+                    offset ^= (y << 5) & 0x0f20;
+                    offset ^= (y << 6) & 0x0080;
+                    offset ^= (y << 10) & 0x1000;
+                    offset ^= (y << 11) & 0x4000;
+                }
+                _ => unreachable!(),
+            }
+            u64::from(offset)
+        }
+
+        for (bpp_log2, pattern) in PROSPERO_64K_RENDER_X.iter().enumerate() {
+            for y in 0..300 {
+                for x in 0..300 {
+                    assert_eq!(
+                        gfx10_pattern_offset(x, y, pattern),
+                        reference(x, y, bpp_log2 as u32),
+                        "{} B/el at ({x}, {y})",
+                        1 << bpp_log2
+                    );
+                }
+            }
+        }
     }
 
     /// The factored `x_term ^ y_term` offset (SharpEmu #483) must stay
@@ -1261,21 +1355,19 @@ mod tests {
         }
     }
 
-    /// The 2 B/element mode-27 row checked against an INDEPENDENT
-    /// re-derivation of the equation — not this file's own tables.
+    /// The 2 B/element mode-27 row checked against an INDEPENDENT Prospero
+    /// equation — not this file's own tables.
     ///
     /// The round-trip tests above tile with the inverse of the same table, so
     /// they are self-consistent even if a table row were transcribed wrong; and
     /// the known-answer pins cover the 4 B/element row only. This mask table is
-    /// ported verbatim from SharpEmu's `GnmTilingDetileTests.cs`
-    /// (`RbPlus64KRenderX2Bpp`, #483 / commit 1f3963c, GPL-2.0-or-later), which
-    /// re-derived it straight from AMD AddrLib's
-    /// `GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO` — an independent source for the
-    /// same equation. A tiled buffer laid out by this table must detile into
-    /// ascending element indices byte-for-byte.
+    /// independently expanded from KytyPS5
+    /// `guest_gpu/tile.cpp::Gen5RenderTargetOffsetInBlock<uint16_t>` (GPL-2.0
+    /// with Kyty/MIT lineage). A tiled buffer laid out by this table must detile
+    /// into ascending element indices byte-for-byte.
     #[test]
     fn sw_64kb_r_x_2bpp_matches_an_independent_re_derivation() {
-        // (x_mask, y_mask) per output bit, 64 KiB RB+ R_X at 2 B/element.
+        // (x_mask, y_mask) per output bit, Prospero 64 KiB R_X at 2 B/element.
         const REFERENCE: [(u32, u32); 16] = [
             (0, 0),
             (1 << 0, 0),
@@ -1285,14 +1377,14 @@ mod tests {
             (0, 1 << 1),
             (0, 1 << 2),
             (1 << 3, 0),
-            (1 << 7, (1 << 4) | (1 << 7)),
+            (1 << 3, 1 << 3),
             (1 << 4, 1 << 4),
             (1 << 6, 1 << 5),
             (1 << 5, 1 << 6),
-            (0, 1 << 3),
+            (0, 1 << 4),
             (1 << 6, 0),
-            (1 << 7, 1 << 7),
-            (1 << 8, 1 << 6),
+            (0, 1 << 6),
+            (1 << 7, 0),
         ];
         fn reference_offset(x: u32, y: u32) -> u64 {
             let mut offset = 0u64;

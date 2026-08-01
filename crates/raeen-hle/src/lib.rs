@@ -144,6 +144,17 @@ pub trait GuestMemory {
         }
     }
 
+    /// Make a guest destination writable for a following host-side transfer.
+    ///
+    /// The default accepts only an already-backed writable range. Native
+    /// sparse address-space backends may override this to materialize lazy
+    /// backing without changing any guest-visible bytes. Callers use this
+    /// before advancing file or device state, preserving `EFAULT`'s
+    /// no-side-effect contract while still supporting demand-mapped memory.
+    fn prepare_write(&self, range: GuestRange) -> bool {
+        self.validate_range(range, GuestAccess::Write)
+    }
+
     /// Write into the guest CODE image (instrumentation patches: export-trap
     /// `int3`, `native_trap` prologues, one-shot restores). Distinct from
     /// [`write`] because a W^X backend makes the code image read-only, so a
@@ -435,6 +446,12 @@ pub trait GuestAllocator {
     fn reserve(&self, length: u64, align: u64) -> Option<u64> {
         self.mmap(length, align)
     }
+    /// Reserve an uncommitted physical/direct-memory identity range in the
+    /// console's kernel-selected address window. Backends that do not model
+    /// separate console and general-reservation windows retain `reserve`.
+    fn reserve_direct(&self, length: u64, align: u64) -> Option<u64> {
+        self.reserve(length, align)
+    }
     /// Reserve address space while honoring an optional placement hint. With
     /// `fixed`, `hint` is mandatory and the returned address must equal it.
     /// Native runtimes override this; small test allocators retain the old
@@ -454,6 +471,13 @@ pub trait GuestAllocator {
         } else {
             None
         }
+    }
+    /// Map direct memory at an exact guest address. Native backends may keep a
+    /// fresh mapping demand-backed so a multi-GiB pool consumes host commit
+    /// only for pages the title actually touches. Other allocators retain the
+    /// ordinary eager fixed-map behavior.
+    fn map_direct_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
+        self.map_at(addr, length, align)
     }
     /// Back `addr` with memory if it falls in a range the guest reserved but
     /// that carries no memory yet, returning whether the faulting access should
@@ -1237,6 +1261,7 @@ pub(crate) struct TestAllocator {
     next: std::cell::Cell<u64>,
     mmap_calls: std::cell::Cell<u64>,
     reserve_calls: std::cell::Cell<u64>,
+    map_at_calls: std::cell::Cell<u64>,
 }
 
 #[cfg(test)]
@@ -1246,6 +1271,7 @@ impl TestAllocator {
             next: std::cell::Cell::new(base),
             mmap_calls: std::cell::Cell::new(0),
             reserve_calls: std::cell::Cell::new(0),
+            map_at_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -1264,6 +1290,10 @@ impl TestAllocator {
 
     pub(crate) fn reserve_calls(&self) -> u64 {
         self.reserve_calls.get()
+    }
+
+    pub(crate) fn map_at_calls(&self) -> u64 {
+        self.map_at_calls.get()
     }
 }
 
@@ -1294,6 +1324,7 @@ impl GuestAllocator for TestAllocator {
     /// address, which would make a caller that honors a guest's requested
     /// address look like a caller that ignores it.
     fn map_at(&self, addr: u64, length: u64, align: u64) -> Option<u64> {
+        self.map_at_calls.set(self.map_at_calls.get() + 1);
         if addr == 0 {
             return self.mmap(length, align);
         }

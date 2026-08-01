@@ -13,6 +13,7 @@ pub(crate) struct GpuEnv {
     pub dump_draw_target: Option<String>,
     pub dump_frames: Option<String>,
     pub dump_gpu_resources: Option<String>,
+    pub dump_tiled_textures: Option<String>,
     pub follow_ib_chains: bool,
     pub force_clear: bool,
     pub init_undefined_sampled_target: bool,
@@ -51,6 +52,10 @@ impl GpuEnv {
             dump_draw_target: std::env::var("RAEEN_DUMP_DRAW_TARGET").ok(),
             dump_frames: std::env::var("RAEEN_DUMP_FRAMES").ok(),
             dump_gpu_resources: std::env::var("RAEEN_DUMP_GPU_RESOURCES").ok(),
+            // Preserve the guest bytes before detiling. This is an offline
+            // correctness oracle for separating a bad swizzle equation from a
+            // bad upload/format interpretation; it never changes rendering.
+            dump_tiled_textures: std::env::var("RAEEN_DUMP_TILED_TEXTURES").ok(),
             // Walk `IT_INDIRECT_BUFFER` chain targets instead of only counting
             // them. Default OFF: it dereferences guest-supplied addresses and
             // changes which command stream executes, so the working titles

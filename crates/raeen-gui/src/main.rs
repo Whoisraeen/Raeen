@@ -13,6 +13,8 @@ mod crash_report;
 mod crashdump;
 mod launcher;
 mod library;
+#[cfg(target_os = "windows")]
+mod rip_profile;
 mod session_report;
 mod shell;
 mod splash;
@@ -1755,6 +1757,13 @@ fn main() -> anyhow::Result<()> {
                 }
             });
         }
+        // A much cheaper alternative to `RAEEN_STALL_DUMP` for CPU-heavy
+        // stretches between frames. It samples only guest instruction pointers;
+        // it deliberately does not arm per-HLE timing or capture host stacks.
+        // This keeps the diagnostic suitable for a retail timing A/B where the
+        // full stall dump can become the thing being measured.
+        #[cfg(target_os = "windows")]
+        rip_profile::spawn_if_enabled(std::sync::Arc::clone(&kernel));
         // Poll-gate diagnosis: with RAEEN_CALL_STATS set, the dispatch path
         // counts every HLE call per function, split into a boot window (first
         // 30 s) and steady state. Dump the top of each ranking periodically —

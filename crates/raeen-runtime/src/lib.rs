@@ -48,6 +48,7 @@ pub use thread::{GuestProcess, GuestProcessHandle, GuestProcessSnapshot};
 #[cfg(target_os = "windows")]
 pub use thread::{
     HostThreadSample, host_module_for_addr, host_wait_primitive, sample_host_backtraces,
+    symbolize_host_addr,
 };
 #[cfg(target_os = "windows")]
 mod tls;

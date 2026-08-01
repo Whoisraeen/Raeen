@@ -2971,6 +2971,13 @@ fn decode_texture(
                 }
                 Err(e) => return Err(e),
             };
+            dump_tiled_texture_source(
+                t,
+                width,
+                height,
+                format,
+                &tiled[..face_tiled.min(tiled.len())],
+            );
             let mut pixels = alloc_zeroed(face_linear * layers as usize, "texture decode")?;
             for layer in 0..layers as usize {
                 let start = layer * layer_stride;
@@ -3073,6 +3080,61 @@ fn decode_texture(
     ))
 }
 
+/// Diagnostic companion to `RAEEN_DUMP_TEXTURES`: preserve the first guest
+/// layer *before* detiling, and emit a raw-linear PPM preview when the format is
+/// four-byte RGBA/BGRA. The `.bin` is the authoritative capture; the preview is
+/// intentionally only a hypothesis that makes "the guest already wrote this
+/// linearly" visible without changing the emulated render path.
+fn dump_tiled_texture_source(
+    t: &kyty_graphics::shader::ShaderTextureResource,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    source: &[u8],
+) {
+    let Some(dir) = crate::diagnostics::gpu_env().dump_tiled_textures.as_deref() else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let stem = format!(
+        "tiled_{:012x}_{width}x{height}_m{}_f{}",
+        t.base40(),
+        t.tile_mode(),
+        t.format()
+    );
+    let dir = std::path::Path::new(dir);
+    let bin = dir.join(format!("{stem}.bin"));
+    if bin.exists() || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if std::fs::write(&bin, source).is_err() {
+        return;
+    }
+
+    if !matches!(
+        format,
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+    ) {
+        return;
+    }
+    let pixel_count = width as usize * height as usize;
+    if source.len() < pixel_count * 4 {
+        return;
+    }
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+    let bgra = format == vk::Format::B8G8R8A8_UNORM;
+    for px in source[..pixel_count * 4].chunks_exact(4) {
+        if bgra {
+            out.extend_from_slice(&[px[2], px[1], px[0]]);
+        } else {
+            out.extend_from_slice(&[px[0], px[1], px[2]]);
+        }
+    }
+    let _ = std::fs::write(dir.join(format!("{stem}_raw-linear.ppm")), out);
+}
+
 /// Build a CPU-staged [`TextureUpload`] from already-decoded linear pixels.
 /// Shared by the array-upload OOM fall-back (SharpEmu #476), which returns a
 /// single base layer, and any other path that has finished the guest read and
@@ -3123,7 +3185,7 @@ fn texture_upload_from(
                         out.extend_from_slice(&[px[0], px[1], px[2]]);
                     }
                 }
-                let _ = std::fs::write(&path, out);
+                let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, out));
             }
         }
     }

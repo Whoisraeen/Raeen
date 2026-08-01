@@ -2729,42 +2729,173 @@ fn read_u64_or_zero(ctx: &HleContext, addr: u64) -> u64 {
     }
 }
 
+fn interpolant_default_value(mut value: u32, ps_word: u32) -> u32 {
+    value &= !0x0000_0300;
+    value |= ((ps_word >> 28) & 0x3) << 8;
+    value
+}
+
+fn interpolant_default_value_hi(mut value: u32, ps_word: u32) -> u32 {
+    value &= !0x0060_0000;
+    value |= ((ps_word >> 30) & 0x3) << 21;
+    value
+}
+
+fn interpolant_f16_value(ps_word: u32, gs_word: Option<u32>) -> u32 {
+    let mut value = (ps_word << 4) & 0x0300_0000;
+    if let Some(gs_word) = gs_word {
+        let common_word = ps_word & gs_word;
+        value &= 0xfff7_ffdf;
+        value |= (common_word >> 15) & 0x20;
+        value ^= 0x0008_0020;
+        value &= !0x0010_0000;
+        value |= (!common_word >> 1) & 0x0010_0000;
+    } else {
+        value |= 0x0018_0020;
+    }
+    interpolant_default_value_hi(value, ps_word)
+}
+
+fn interpolant_non_f16_value(ps_word: u32, has_gs_semantic: bool) -> u32 {
+    if (ps_word & 0x0100_0000) != 0 || !has_gs_semantic {
+        0x20
+    } else {
+        0
+    }
+}
+
+fn interpolant_mapping_value(mut value: u32, ps_word: u32, gs_word: u32) -> u32 {
+    // A custom interpolant uses the flat path just like an explicitly flat
+    // one. The hardware output mapping, not either metadata-array index, is
+    // the Vulkan interface location selected by SPI_PS_INPUT_CNTL.
+    let flat = if (ps_word & (0x0040_0000 | 0x0100_0000)) != 0 {
+        0x400
+    } else {
+        0
+    };
+    value = (value & !0x1f) | ((gs_word >> 8) & 0x1f);
+    value = (value & !0x400) | flat;
+    interpolant_default_value(value, ps_word)
+}
+
+fn interpolant_missing_value(mut value: u32, ps_word: u32) -> u32 {
+    value &= !0x1f;
+    value &= !0x400;
+    interpolant_default_value(value, ps_word)
+}
+
+fn write_interpolant_register(ctx: &HleContext, registers: u64, index: u32, value: u32) -> bool {
+    let dst = registers + u64::from(index) * 8;
+    ctx.mem
+        .write(dst, &(SPI_PS_INPUT_CNTL0 + index).to_le_bytes())
+        && ctx.mem.write(dst + 4, &value.to_le_bytes())
+}
+
 /// `sceAgcCreateInterpolantMapping(registers, geometryShader, pixelShader)`:
-/// build the 32 `SPI_PS_INPUT_CNTL` interpolant registers. Each slot below the
-/// geometry shader's output-semantic count maps to interpolant `i`, with the
-/// flat-shading bit (`0x400`) taken from the matching pixel-shader input
-/// semantic (bit 22). Faithful to SharpEmu's layout.
+/// build the 32 `SPI_PS_INPUT_CNTL` interpolant registers from the shader
+/// semantic tables. A PS VINTRP attribute selects a PS input slot; that slot
+/// must be matched by semantic id to the producer's hardware output mapping.
+/// Mapping by array index corrupts UV/color varyings whenever the producer
+/// packs or reorders its exports.
 fn hle_create_interpolant_mapping(ctx: &HleContext, args: &[u64]) -> u64 {
     let registers = args.first().copied().unwrap_or(0);
     let geometry = args.get(1).copied().unwrap_or(0);
     let pixel = args.get(2).copied().unwrap_or(0);
-    if registers == 0 || geometry == 0 {
+    if registers == 0 {
         return SCE_ERROR_INVALID_ARGUMENT;
     }
-    let output_semantics = read_u64_or_zero(ctx, geometry + SHADER_OUTPUT_SEMANTICS_OFFSET);
-    let output_count = read_u32_or_zero(ctx, geometry + SHADER_NUM_OUTPUT_SEMANTICS_OFFSET);
-    let input_semantics = if pixel != 0 {
-        // The presence read also validates the pixel shader's semantics fields.
-        let _ = read_u32_or_zero(ctx, pixel + SHADER_NUM_INPUT_SEMANTICS_OFFSET);
-        read_u64_or_zero(ctx, pixel + SHADER_INPUT_SEMANTICS_OFFSET)
+
+    let (input_semantics, input_count) = if pixel == 0 {
+        (0, 0)
     } else {
-        0
+        let mut address = [0u8; 8];
+        let mut count = [0u8; 4];
+        if !ctx
+            .mem
+            .read(pixel + SHADER_INPUT_SEMANTICS_OFFSET, &mut address)
+            || !ctx
+                .mem
+                .read(pixel + SHADER_NUM_INPUT_SEMANTICS_OFFSET, &mut count)
+        {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        (u64::from_le_bytes(address), u32::from_le_bytes(count))
     };
 
-    for i in 0..32u32 {
-        let mut value = 0u32;
-        if i < output_count && output_semantics != 0 {
-            let mut flat = false;
-            if pixel != 0 && input_semantics != 0 {
-                let input_semantic = read_u32_or_zero(ctx, input_semantics + u64::from(i) * 4);
-                flat = (input_semantic >> 22) & 0x1 != 0;
+    // A PS with no semantic table requests the hardware identity mapping. The
+    // producer shader may legally be null in this case.
+    if input_count == 0 || input_semantics == 0 {
+        for i in 0..32 {
+            if !write_interpolant_register(ctx, registers, i, i) {
+                return SCE_ERROR_MEMORY_FAULT;
             }
-            value = i | if flat { 0x400 } else { 0 };
         }
-        let dst = registers + u64::from(i) * 8;
-        if !ctx.mem.write(dst, &(SPI_PS_INPUT_CNTL0 + i).to_le_bytes())
-            || !ctx.mem.write(dst + 4, &value.to_le_bytes())
+        return 0;
+    }
+    if geometry == 0 {
+        return SCE_ERROR_INVALID_ARGUMENT;
+    }
+
+    let mut output_address = [0u8; 8];
+    let mut output_count = [0u8; 2];
+    if !ctx.mem.read(
+        geometry + SHADER_OUTPUT_SEMANTICS_OFFSET,
+        &mut output_address,
+    ) || !ctx.mem.read(
+        geometry + SHADER_NUM_OUTPUT_SEMANTICS_OFFSET,
+        &mut output_count,
+    ) {
+        return SCE_ERROR_MEMORY_FAULT;
+    }
+    let output_semantics = u64::from_le_bytes(output_address);
+    let output_count = u16::from_le_bytes(output_count) as u32;
+    let input_count = input_count.min(32);
+
+    for ps_index in 0..input_count {
+        let mut ps_bytes = [0u8; 4];
+        if !ctx
+            .mem
+            .read(input_semantics + u64::from(ps_index) * 4, &mut ps_bytes)
         {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+        let ps_word = u32::from_le_bytes(ps_bytes);
+        let semantic = ps_word & 0xff;
+        let mut gs_word = None;
+        if output_semantics != 0 {
+            for gs_index in 0..output_count {
+                let mut gs_bytes = [0u8; 4];
+                if !ctx
+                    .mem
+                    .read(output_semantics + u64::from(gs_index) * 4, &mut gs_bytes)
+                {
+                    return SCE_ERROR_MEMORY_FAULT;
+                }
+                let candidate = u32::from_le_bytes(gs_bytes);
+                if candidate & 0xff == semantic {
+                    gs_word = Some(candidate);
+                    break;
+                }
+            }
+        }
+
+        let mut value = if (ps_word & 0x0030_0000) != 0 {
+            interpolant_f16_value(ps_word, gs_word)
+        } else {
+            interpolant_non_f16_value(ps_word, gs_word.is_some())
+        };
+        value = if let Some(gs_word) = gs_word {
+            interpolant_mapping_value(value, ps_word, gs_word)
+        } else {
+            interpolant_missing_value(value, ps_word)
+        };
+        if !write_interpolant_register(ctx, registers, ps_index, value) {
+            return SCE_ERROR_MEMORY_FAULT;
+        }
+    }
+
+    for i in input_count..32 {
+        if !write_interpolant_register(ctx, registers, i, i) {
             return SCE_ERROR_MEMORY_FAULT;
         }
     }
@@ -8582,39 +8713,72 @@ mod tests {
         let registers: u64 = 0x100;
         let geometry: u64 = 0x200;
         let pixel: u64 = 0x280;
-        // GS: 2 output semantics at 0x300.
+        // GS semantic ids are deliberately reordered and map to non-identity
+        // hardware locations. Mapping by array index would silently bind the
+        // PS's UV/color varyings to the wrong VS outputs.
         assert!(ctx.mem.write(
             geometry + SHADER_OUTPUT_SEMANTICS_OFFSET,
             &0x300u64.to_le_bytes()
         ));
         assert!(ctx.mem.write(
             geometry + SHADER_NUM_OUTPUT_SEMANTICS_OFFSET,
-            &2u32.to_le_bytes()
+            &3u16.to_le_bytes()
         ));
-        // PS: input semantics at 0x340; slot 1 has the flat bit (bit 22) set.
+        let gs_semantics: [u32; 3] = [7 | (5 << 8), 9 | (12 << 8), 10 | (4 << 8) | (1 << 20)];
+        for (index, word) in gs_semantics.into_iter().enumerate() {
+            assert!(ctx.mem.write(0x300 + index as u64 * 4, &word.to_le_bytes()));
+        }
+
+        // PS slot 1 has no matching producer semantic and selects default 2;
+        // slot 2 is flat/custom; slot 3 exercises the f16 packing path.
         assert!(ctx.mem.write(
             pixel + SHADER_INPUT_SEMANTICS_OFFSET,
             &0x340u64.to_le_bytes()
         ));
-        assert!(ctx.mem.write(0x340, &0u32.to_le_bytes())); // slot 0: not flat
-        assert!(ctx.mem.write(0x344, &(1u32 << 22).to_le_bytes())); // slot 1: flat
+        assert!(ctx.mem.write(
+            pixel + SHADER_NUM_INPUT_SEMANTICS_OFFSET,
+            &4u32.to_le_bytes()
+        ));
+        let ps_semantics: [u32; 4] = [
+            7,
+            8 | (2 << 28),
+            9 | (1 << 22) | (1 << 24) | (1 << 28),
+            10 | (1 << 20) | (3 << 28) | (2 << 30),
+        ];
+        for (index, word) in ps_semantics.into_iter().enumerate() {
+            assert!(ctx.mem.write(0x340 + index as u64 * 4, &word.to_le_bytes()));
+        }
         assert_eq!(
             hle_create_interpolant_mapping(&ctx, &[registers, geometry, pixel]),
             0
         );
-        // Slot 0: cntl register 0x191, value = 0 (i=0, not flat).
-        assert_eq!(read_u32(&ctx, registers), SPI_PS_INPUT_CNTL0);
-        assert_eq!(read_u32(&ctx, registers + 4), 0);
-        // Slot 1: cntl 0x192, value = 1 | 0x400 (flat).
-        assert_eq!(read_u32(&ctx, registers + 8), SPI_PS_INPUT_CNTL0 + 1);
-        assert_eq!(read_u32(&ctx, registers + 12), 1 | 0x400);
-        // Slot 2 (>= count): cntl 0x193, value = 0.
-        assert_eq!(read_u32(&ctx, registers + 16), SPI_PS_INPUT_CNTL0 + 2);
-        assert_eq!(read_u32(&ctx, registers + 20), 0);
+        assert_eq!(read_u32(&ctx, registers + 4), 0x0000_0005);
+        assert_eq!(read_u32(&ctx, registers + 12), 0x0000_0220);
+        assert_eq!(read_u32(&ctx, registers + 20), 0x0000_052c);
+        assert_eq!(read_u32(&ctx, registers + 28), 0x0158_0304);
+        // The unused tail is identity, not location zero for every slot.
+        assert_eq!(read_u32(&ctx, registers + 32), SPI_PS_INPUT_CNTL0 + 4);
+        assert_eq!(read_u32(&ctx, registers + 36), 4);
         assert_eq!(
             hle_create_interpolant_mapping(&ctx, &[0, geometry, pixel]),
             SCE_ERROR_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn create_interpolant_mapping_without_pixel_semantics_is_identity() {
+        let (kernel, mem, alloc) = ctx_env();
+        let ctx = test_ctx(&kernel, &mem, &alloc);
+        let registers = 0x100;
+
+        assert_eq!(hle_create_interpolant_mapping(&ctx, &[registers, 0, 0]), 0);
+        for i in 0..32u32 {
+            assert_eq!(
+                read_u32(&ctx, registers + u64::from(i) * 8),
+                SPI_PS_INPUT_CNTL0 + i
+            );
+            assert_eq!(read_u32(&ctx, registers + u64::from(i) * 8 + 4), i);
+        }
     }
 
     #[test]

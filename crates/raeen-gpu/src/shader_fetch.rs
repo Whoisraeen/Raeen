@@ -998,10 +998,17 @@ impl ShaderTranslateCache {
         let sh_regs = *sh_regs;
         self.translate(Stage::Vs, addr, move |mem, parsed_code| {
             attempt_generations(|next_gen| {
+                let parse_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_PARSE_NS,
+                );
                 let code = parsed_code
                     .parse_vs(&vs, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_vs", &e))?;
+                drop(parse_timer);
                 let mut vs_info = ShaderVertexInputInfo::default();
+                let input_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_INPUT_NS,
+                );
                 shader_get_input_info_vs_decoded(
                     &vs,
                     &sh_regs,
@@ -1012,6 +1019,10 @@ impl ShaderTranslateCache {
                     &mut vs_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_vs", &e))?;
+                drop(input_timer);
+                let capture_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_CAPTURE_NS,
+                );
                 // The vertex stage was the ONLY stage that never ran this pass
                 // (the pixel-stage call site even claimed it did). Measured
                 // consequence on build 2741d21: every Avatar: Frontiers of
@@ -1029,6 +1040,9 @@ impl ShaderTranslateCache {
                 // `shader_measure_constant_buffer_accesses_shifted` and the
                 // recompiler's `shift_regs` all apply), hence the shifted entry
                 // point and the gs/vs user-SGPR file selection below.
+                let runtime_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_RUNTIME_NS,
+                );
                 kyty_graphics::shader::shader_capture_runtime_scalar_loads_shifted(
                     &code,
                     mem,
@@ -1040,11 +1054,15 @@ impl ShaderTranslateCache {
                     if vs_info.gs_prolog { 8 } else { 0 },
                     &mut vs_info.bind,
                 );
+                drop(runtime_timer);
                 // Beyond Kyty: capture PC-relative embedded-constant scalar
                 // loads (the shader reading its own baked constant table) so the
                 // recompiler materializes them as SPIR-V constants instead of
                 // refusing the non-EUD base. Measured on ASTRO.BOT vertex
                 // shaders (`s_getpc_b64` + `s_add_u32` + `s_load_dwordx8`).
+                let embedded_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_EMBEDDED_NS,
+                );
                 kyty_graphics::shader::shader_detect_embedded_constant_loads(
                     &code,
                     mem,
@@ -1060,11 +1078,17 @@ impl ShaderTranslateCache {
                     mem,
                     &mut vs_info.bind,
                 );
+                drop(embedded_timer);
+                let measure_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_MEASURE_NS,
+                );
                 kyty_graphics::shader::shader_measure_constant_buffer_accesses_shifted(
                     &code,
                     &mut vs_info.bind,
                     if vs_info.gs_prolog { 8 } else { 0 },
                 );
+                drop(measure_timer);
+                drop(capture_timer);
                 Ok(PreparedShader::Vs {
                     code,
                     info: Arc::new(vs_info),
@@ -1092,10 +1116,17 @@ impl ShaderTranslateCache {
         let vs_info = Arc::clone(vs_info);
         self.translate(Stage::Ps, addr, move |mem, parsed_code| {
             attempt_generations(|next_gen| {
+                let parse_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_PARSE_NS,
+                );
                 let code = parsed_code
                     .parse_ps(&ps, &sh_regs, mem, next_gen)
                     .map_err(|e| AttemptError::from_analysis("shader_parse_ps", &e))?;
+                drop(parse_timer);
                 let mut ps_info = ShaderPixelInputInfo::default();
+                let input_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_INPUT_NS,
+                );
                 shader_get_input_info_ps_decoded(
                     &ps,
                     &sh_regs,
@@ -1107,6 +1138,10 @@ impl ShaderTranslateCache {
                     &mut ps_info,
                 )
                 .map_err(|e| AttemptError::from_analysis("shader_get_input_info_ps", &e))?;
+                drop(input_timer);
+                let capture_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_CAPTURE_NS,
+                );
                 // Minecraft gameplay resolves its material T# with
                 // `s_load_dwordx8 s[14:21], s[12:13], 0` while declaring no
                 // EUD window. Evaluate bounded constant-offset loads through
@@ -1114,27 +1149,38 @@ impl ShaderTranslateCache {
                 // so the real texture descriptor reaches both codegen and the
                 // Vulkan binding table. (Pixel user SGPRs are not rebased, so
                 // this is the unshifted entry point — cf. `translate_vs`.)
+                let runtime_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_RUNTIME_NS,
+                );
                 kyty_graphics::shader::shader_capture_runtime_scalar_loads(
                     &code,
                     mem,
                     &ps.ps_user_sgpr,
                     &mut ps_info.bind,
                 );
+                drop(runtime_timer);
                 // PC-relative scalar constant tables are stage-agnostic. VS
                 // and CS already run this capture; omitting it here left PS
                 // `s_load_dwordx8` instructions to the EUD-only fallback,
                 // which correctly refused their non-EUD base register.
+                let embedded_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_EMBEDDED_NS,
+                );
                 kyty_graphics::shader::shader_detect_embedded_constant_loads(
                     &code,
                     mem,
                     &mut ps_info.bind,
                 );
+                drop(embedded_timer);
                 // A title can supply a sampled T# through a runtime/bindless
                 // path that static usage-table analysis cannot capture. The
                 // compute stage already degrades that shape to a real bound
                 // 1x1 descriptor; pixel shaders need the same guard-safe
                 // fallback or one missing material texture drops the entire
                 // draw (measured on Minecraft world PS 0x16ff8c00).
+                let synth_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_SYNTH_NS,
+                );
                 kyty_graphics::shader::shader_synthesize_placeholder_sampled_texture(
                     &code,
                     &mut ps_info.bind,
@@ -1142,10 +1188,16 @@ impl ShaderTranslateCache {
                 // SharpEmu port (see `translate_cs`): default nearest/wrap S#
                 // for a PS that samples with zero captured samplers.
                 kyty_graphics::shader::shader_synthesize_default_sampler(&code, &mut ps_info.bind);
+                drop(synth_timer);
+                let measure_timer = crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_MEASURE_NS,
+                );
                 kyty_graphics::shader::shader_measure_constant_buffer_accesses(
                     &code,
                     &mut ps_info.bind,
                 );
+                drop(measure_timer);
+                drop(capture_timer);
                 Ok(PreparedShader::Ps {
                     code,
                     vs_info: Arc::clone(&vs_info),
@@ -1331,6 +1383,14 @@ impl ShaderTranslateCache {
         addr: u64,
         run: impl Fn(&WindowMem, &mut ParsedCodeCache) -> Result<PreparedShader, AttemptError>,
     ) -> Result<TranslatedShader, Arc<str>> {
+        let profiling = !matches!(stage, Stage::Cs) && crate::diagnostics::gpu_env().time_draw;
+        let _total_timer = profiling.then(|| {
+            crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::vulkan::offscreen::StageTimer::start(
+                &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_TOTAL_NS,
+            )
+        });
         if addr == 0 || !addr.is_multiple_of(4) {
             // Unkeyable (no head bytes to read) — not cached, but the command
             // processor's draw path rate-limits per draw batch upstream.
@@ -1414,6 +1474,11 @@ impl ShaderTranslateCache {
         self.analysis_failure_order
             .retain(|key| *key != analysis_key);
 
+        let key_timer = profiling.then(|| {
+            crate::vulkan::offscreen::StageTimer::start(
+                &crate::vulkan::offscreen::DRAW_STAGE_ANALYZE_KEY_NS,
+            )
+        });
         let parsed_dwords = prepared.parsed_code_dwords();
         // Embedded shaders have no fetched instruction list; retain the small
         // head identity for them. Normal title shaders hash only the exact
@@ -1428,7 +1493,9 @@ impl ShaderTranslateCache {
             code: code_key,
             binding: prepared.binding_identity(),
         };
-        if let Some(cached) = self.entries.get(&key).cloned() {
+        let cached = self.entries.get(&key).cloned();
+        drop(key_timer);
+        if let Some(cached) = cached {
             self.stats.hits += 1;
             return match cached {
                 Ok(spirv) => Ok(prepared.into_translated(spirv)),

@@ -269,6 +269,7 @@ fn hle_sync_save_data_memory(ctx: &HleContext, args: &[u64]) -> u64 {
 /// mount. The VFS normally persists writable files on close; commit is the
 /// stronger durability boundary used while those descriptors are still open.
 fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
+    let started = std::time::Instant::now();
     let mount_point = args.first().copied().unwrap_or(0);
     if mount_point == 0 {
         return ERROR_PARAMETER;
@@ -343,7 +344,20 @@ fn hle_commit(ctx: &HleContext, args: &[u64]) -> u64 {
             }
         }
     }
-    ctx.kernel.save_data_transaction_resources.clear();
+    // A transaction resource is reusable working memory, not a one-shot
+    // commit token. Keep it alive until sceSaveDataDeleteTransactionResource;
+    // clearing the whole process table here made Minecraft's next prepare
+    // reject its still-live resource and forced later commits down the broad
+    // unknown-layout fallback.
+    if std::env::var_os("RAEEN_TRACE_SAVEDATA_COMMIT").is_some() {
+        info!(
+            mounts = ?mounts,
+            flushed,
+            elapsed_ms = started.elapsed().as_millis(),
+            resource,
+            "save-data commit timing"
+        );
+    }
     debug!("sceSaveDataCommit({mounts:?}) -> flushed {flushed} descriptor(s)");
     SCE_OK
 }
@@ -1428,6 +1442,12 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join("slot/level.dat")).unwrap(),
             b"FRAME TWO"
+        );
+        assert!(
+            kernel
+                .save_data_transaction_resources
+                .contains_key(&(resource as i32)),
+            "commit must not delete a reusable transaction resource; the ABI has an explicit delete call"
         );
         kernel.filesystem.close(fd).unwrap();
 

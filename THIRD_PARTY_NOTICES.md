@@ -81,7 +81,12 @@ SOFTWARE.
   KytyPS5's separate `PTHREAD_STACK_EXTRA` behavior. Raeen also follows
   KytyPS5's Gen5 vertex-attribute handling by carrying the AGC `fetch_index`
   selector into Vulkan's per-vertex/per-instance input rate; the Rust data
-  model, cache keys, and tests are original. The GTA V graphics batch
+  model, cache keys, and tests are original. Raeen's PS5 mode-27
+  `SW_64KB_R_X` equation is a behavioral Rust reimplementation of
+  `src/graphics/guest_gpu/tile.cpp::Gen5RenderTargetOffsetInBlock` for all five
+  supported element sizes. The Rust table representation, independent
+  shift/mask cross-check, raw-capture replay tool, and retail validation are
+  original; no C++ is vendored. The GTA V graphics batch
   (2026-07-29) also behaviorally re-implements
   `shader.cpp::VertexAttribFormatToBufferFormat` and
   `ShaderApplyAttribSemantics`: known nonzero per-attribute metadata overrides
@@ -480,9 +485,11 @@ SOFTWARE.
   the row-parallel split of the CPU detile loop in
   `crates/raeen-gpu/src/texture/tiling.rs` follows SharpEmu's `Parallel.For`
   over the same loop in `Agc/GnmTiling.cs`, and the non-power-of-two
-  element-size guard mirrors its `BitLog2` refusal. Raeen's swizzle-equation
-  tables were verified independently equivalent to SharpEmu's for the modes
-  both implement (5/9/24/27) and were **not** changed by that comparison.
+  element-size guard mirrors its `BitLog2` refusal. Raeen's mode 5/9/24
+  swizzle-equation tables were verified independently equivalent to SharpEmu's
+  corresponding equations. Mode 27 deliberately differs: a captured retail
+  PS5 terrain atlas refuted SharpEmu's generic Navi/RB+ row for this hardware,
+  while the KytyPS5 Prospero equation decoded it coherently.
   From upstream `6ee445f` (PR #470, "[AGC] Read mip 0 from its GFX10 mip-chain
   offset"): the GFX10 smallest-first mip-chain arithmetic that locates mip 0 at
   the END of a mipped allocation — `GnmTiling.TryGetBaseMipPlacement`'s mip-tail
