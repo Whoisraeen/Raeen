@@ -39,7 +39,7 @@ use crate::shader::resources::{
     ShaderPixelInputInfo, ShaderVertexInputInfo,
 };
 use crate::shader::types::{
-    ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType, ShaderOperand,
+    DppMode, ShaderCode, ShaderConstant, ShaderInstruction, ShaderInstructionType, ShaderOperand,
     ShaderOperandType, ShaderType, shader_instruction_format::Format,
 };
 
@@ -2359,12 +2359,17 @@ pub fn shader_detect_eud_raw_window(code: &ShaderCode, bind: &mut ShaderBindReso
 }
 
 /// Beyond Kyty (SharpEmu PR #587): decide whether a stage needs the
-/// `%global_mem` window (a FLAT-class direct-address op is present) and place
-/// its descriptor binding after every other group, including the raw-EUD
-/// fallback. Mirrors the standalone-pass shape of
+/// `%global_mem` window (a FLAT-class direct-address op or a scalar load
+/// through a direct user-SGPR pointer is present) and place its descriptor
+/// binding after every other group, including the raw-EUD fallback. Mirrors
+/// the standalone-pass shape of
 /// [`shader_detect_eud_raw_window`] and must run AFTER it so the binding index
 /// follows `eud_raw`'s.
-pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBindResources) {
+pub fn shader_detect_flat_global_window(
+    code: &ShaderCode,
+    bind: &mut ShaderBindResources,
+    user_sgpr: Option<&UserSgprInfo>,
+) {
     use ShaderInstructionType as T;
 
     bind.global_mem = ShaderGlobalMemResources::default();
@@ -2383,7 +2388,8 @@ pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBind
                 | T::FlatStoreDwordX4
         )
     });
-    if !uses_flat {
+    let scalar_base_sgpr = scalar_global_base_sgpr(instructions, bind);
+    if !uses_flat && scalar_base_sgpr.is_none() {
         return;
     }
     let writable = instructions.iter().any(|inst| {
@@ -2392,7 +2398,19 @@ pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBind
             T::FlatStoreDword | T::FlatStoreDwordX2 | T::FlatStoreDwordX4
         )
     });
-    let base_sgpr = flat_global_base_sgpr(instructions).unwrap_or(-1);
+    let base_sgpr = flat_global_base_sgpr(instructions)
+        .or(scalar_base_sgpr)
+        .unwrap_or(-1);
+    let guest_base = user_sgpr
+        .and_then(|user| {
+            let low = usize::try_from(base_sgpr).ok()?;
+            let high = low.checked_add(1)?;
+            let count = usize::try_from(user.count)
+                .unwrap_or(0)
+                .min(user.value.len());
+            (high < count).then(|| u64::from(user.value[low]) | (u64::from(user.value[high]) << 32))
+        })
+        .unwrap_or(0);
 
     // Next binding index after every group `shader_calc_binding_indices`
     // assigned, then the raw-EUD fallback (GDS takes the last index without
@@ -2417,14 +2435,167 @@ pub fn shader_detect_flat_global_window(code: &ShaderCode, bind: &mut ShaderBind
         used: true,
         binding_index,
         base_sgpr,
+        guest_base,
         writable,
     };
     tracing::debug!(
         binding_index,
         base_sgpr,
         writable,
-        "flat/global window: FLAT-class op reads guest memory directly"
+        "global memory window: shader reads guest memory through a runtime pointer"
     );
+}
+
+/// Re-anchor the shared guest-memory window at the BVH base used by an
+/// `IMAGE_BVH*_INTERSECT_RAY` instruction when the shader constructs the AMD
+/// BVH descriptor from a pointer loaded through live user data.
+///
+/// RDNA2 ISA 70648 defines descriptor bits 39:0 as `base_address[47:8]`.
+/// Astro emits the canonical construction directly: `s_load_dwordx2` obtains
+/// the 64-bit pointer, then `s_bfe_u64 ..., 0x280008` extracts those forty
+/// bits into the descriptor's first two dwords. The runtime-load capture owns
+/// the exact dispatch-time pointer, so the host can snapshot the actual BVH
+/// allocation rather than the outer pointer table. Multiple different bases
+/// are deliberately left unresolved: one `%global_mem` binding cannot
+/// represent two disjoint windows soundly.
+pub fn shader_rebase_global_window_for_bvh(code: &ShaderCode, bind: &mut ShaderBindResources) {
+    use ShaderInstructionType as T;
+
+    if !bind.global_mem.used {
+        return;
+    }
+
+    let instructions = code.get_instructions();
+    let mut recovered: Option<u64> = None;
+    for (at, bvh) in instructions.iter().enumerate().filter(|(_, inst)| {
+        matches!(
+            inst.type_,
+            T::ImageBvhIntersectRay | T::ImageBvh64IntersectRay
+        )
+    }) {
+        let resource = bvh.src[1];
+        if resource.type_ != ShaderOperandType::Sgpr || resource.size != 4 {
+            return;
+        }
+        let Some(extract) = instructions[..at].iter().rev().find(|inst| {
+            inst.type_ == T::SBfeU64
+                && inst.dst.type_ == ShaderOperandType::Sgpr
+                && inst.dst.register_id == resource.register_id
+                && inst.dst.size == 2
+                && inst.src[0].type_ == ShaderOperandType::Sgpr
+                && inst.src[0].size == 2
+                && operand_is_constant(inst.src[1])
+                && inst.src[1].constant.u == 0x0028_0008
+        }) else {
+            return;
+        };
+        let source_reg = extract.src[0].register_id;
+        let Some((load, capture)) = instructions[..at].iter().rev().find_map(|candidate| {
+            if candidate.dst.type_ != ShaderOperandType::Sgpr
+                || source_reg < candidate.dst.register_id
+                || source_reg + 1 >= candidate.dst.register_id + candidate.dst.size
+            {
+                return None;
+            }
+            bind.embedded_constant_loads
+                .find(candidate.pc)
+                .map(|capture| (candidate, capture))
+        }) else {
+            return;
+        };
+        let offset = usize::try_from(source_reg - load.dst.register_id).unwrap_or(usize::MAX);
+        if offset + 1 >= capture.dwords_num as usize {
+            return;
+        }
+        let pointer =
+            u64::from(capture.values[offset]) | (u64::from(capture.values[offset + 1]) << 32);
+        let base = pointer & !0xff;
+        if base == 0 {
+            return;
+        }
+        match recovered {
+            None => recovered = Some(base),
+            Some(previous) if previous == base => {}
+            Some(_) => {
+                tracing::warn!(
+                    shader = format_args!("{:#x}", code.get_base_address()),
+                    "multiple BVH base windows in one shader are unsupported; keeping the existing global-memory base"
+                );
+                return;
+            }
+        }
+    }
+
+    if let Some(base) = recovered {
+        bind.global_mem.guest_base = base;
+        tracing::debug!(
+            shader = format_args!("{:#x}", code.get_base_address()),
+            guest_base = format_args!("{base:#x}"),
+            "global memory window rebased to the captured RDNA2 BVH descriptor base"
+        );
+    }
+}
+
+/// Find the live-in scalar pointer of an SMEM load which is not the EUD. Only
+/// a pair captured in `direct_sgprs` is eligible: the host must know the exact
+/// dispatch-time address in order to snapshot the bounded guest-memory window.
+/// Loads through SGPR pairs produced later by the shader then remain valid
+/// pointer-chasing accesses into that same window.
+fn scalar_global_base_sgpr(
+    instructions: &[ShaderInstruction],
+    bind: &ShaderBindResources,
+) -> Option<i32> {
+    use ShaderInstructionType as T;
+    use ShaderOperandType as O;
+
+    let count = usize::try_from(bind.direct_sgprs.sgprs_num)
+        .unwrap_or(0)
+        .min(bind.direct_sgprs.start_register.len());
+    let is_direct = |register: i32| bind.direct_sgprs.start_register[..count].contains(&register);
+    // Resource analysis can consume a live-in pointer pair before this pass.
+    // ASTRO.BOT's exact shape is an invalid format-0 storage T# at s0 which
+    // becomes a safe placeholder, while the ISA still performs
+    // `s_load_dwordx2 ..., s[0:1], 0`. Matching the resource's START register
+    // proves where the original pair came from without re-introducing a
+    // duplicate direct-SGPR seed.
+    let is_non_extended_resource_start = |register: i32| {
+        let storage_count = usize::try_from(bind.storage_buffers.buffers_num)
+            .unwrap_or(0)
+            .min(bind.storage_buffers.start_register.len());
+        let storage_match = (0..storage_count).any(|i| {
+            !bind.storage_buffers.extended[i] && bind.storage_buffers.start_register[i] == register
+        });
+        let texture_count = usize::try_from(bind.textures2d.textures_num)
+            .unwrap_or(0)
+            .min(bind.textures2d.desc.len());
+        storage_match
+            || bind.textures2d.desc[..texture_count]
+                .iter()
+                .any(|desc| !desc.extended && desc.start_register == register)
+    };
+
+    instructions
+        .iter()
+        .filter(|inst| {
+            matches!(
+                inst.type_,
+                T::SLoadDword
+                    | T::SLoadDwordx2
+                    | T::SLoadDwordx4
+                    | T::SLoadDwordx8
+                    | T::SLoadDwordx16
+            )
+        })
+        .filter_map(|inst| {
+            let base = inst.src[0];
+            (base.type_ == O::Sgpr
+                && base.size >= 2
+                && (!bind.extended.used || base.register_id != bind.extended.start_register)
+                && ((is_direct(base.register_id) && is_direct(base.register_id.saturating_add(1)))
+                    || is_non_extended_resource_start(base.register_id)))
+            .then_some(base.register_id)
+        })
+        .next()
 }
 
 /// Recover the scalar base pair which feeds a FLAT/GLOBAL address when the
@@ -3498,6 +3669,82 @@ fn max_exp_param(code: &ShaderCode) -> i32 {
         .unwrap_or(-1)
 }
 
+fn code_uses_dpp(code: &ShaderCode) -> bool {
+    code.get_instructions().iter().any(|inst| {
+        inst.src[..inst.src_num.max(0) as usize]
+            .iter()
+            .any(|op| op.dpp.is_some())
+    })
+}
+
+/// Lower the measured DPP16 quad-permutation source forms to a subgroup
+/// shuffle. The quad control contains four 2-bit source-lane selectors, one
+/// for each destination lane in a group of four. ASTRO.BOT uses controls
+/// 0x00/0x55/0xaa with full row/bank masks; other DPP families remain named
+/// refusals until their write-mask and out-of-bounds behavior is modeled.
+fn dpp_quad_perm_uint_load(
+    spirv: &Spirv<'_>,
+    op: ShaderOperand,
+    input: &str,
+    output: &str,
+) -> Result<String, ShaderRecompileError> {
+    let Some(dpp) = op.dpp else {
+        return Ok(String::new());
+    };
+    let DppMode::Dpp16 { ctrl } = dpp.mode else {
+        return Err(not_supported(
+            "operand_load_float",
+            "DPP8 cross-lane selection",
+        ));
+    };
+    if ctrl > 0xff {
+        return Err(not_supported(
+            "operand_load_float",
+            format!("DPP16 control 0x{ctrl:x} is not a quad permutation"),
+        ));
+    }
+    if dpp.row_mask != 0xf || dpp.bank_mask != 0xf {
+        return Err(not_supported(
+            "operand_load_float",
+            format!(
+                "DPP16 write masks row=0x{:x} bank=0x{:x}",
+                dpp.row_mask, dpp.bank_mask
+            ),
+        ));
+    }
+
+    let ctrl_id = spirv.get_constant_uint(u32::from(ctrl));
+    let mut text = format!(
+        concat!(
+            "%dpp_lid_{output} = OpLoad %uint %gl_SubgroupLocalInvocationID\n",
+            "%dpp_quad_{output} = OpBitwiseAnd %uint %dpp_lid_{output} %uint_0xfffffffc\n",
+            "%dpp_lane_{output} = OpBitwiseAnd %uint %dpp_lid_{output} %uint_3\n",
+            "%dpp_shift_{output} = OpShiftLeftLogical %uint %dpp_lane_{output} %uint_1\n",
+            "%dpp_pick0_{output} = OpShiftRightLogical %uint %{ctrl_id} %dpp_shift_{output}\n",
+            "%dpp_pick_{output} = OpBitwiseAnd %uint %dpp_pick0_{output} %uint_3\n",
+            "%dpp_target_{output} = OpBitwiseOr %uint %dpp_quad_{output} %dpp_pick_{output}\n",
+            "%dpp_value_{output} = OpGroupNonUniformShuffle %uint %uint_3 %{input} %dpp_target_{output}\n"
+        ),
+        output = output,
+        input = input,
+        ctrl_id = ctrl_id,
+    );
+    if dpp.fetch_inactive {
+        text += &format!("%{output} = OpBitwiseOr %uint %dpp_value_{output} %uint_0\n");
+    } else {
+        text += &format!(
+            concat!(
+                "%dpp_exec_{output} = OpLoad %uint %exec_lo\n",
+                "%dpp_src_exec_{output} = OpGroupNonUniformShuffle %uint %uint_3 %dpp_exec_{output} %dpp_target_{output}\n",
+                "%dpp_src_active_{output} = OpINotEqual %bool %dpp_src_exec_{output} %uint_0\n",
+                "%{output} = OpSelect %uint %dpp_src_active_{output} %dpp_value_{output} %uint_0\n"
+            ),
+            output = output,
+        );
+    }
+    Ok(text)
+}
+
 pub(crate) fn operand_load_float(
     spirv: &Spirv<'_>,
     op: ShaderOperand,
@@ -3507,12 +3754,6 @@ pub(crate) fn operand_load_float(
 ) -> Result<bool, ShaderRecompileError> {
     let mut l: String;
 
-    if op.dpp.is_some() {
-        return Err(not_supported(
-            "operand_load_float",
-            "dpp cross-lane selection",
-        ));
-    }
     if op.lane_sel != 6 && operand_is_constant(op) {
         return Err(not_supported(
             "operand_load_float",
@@ -3525,38 +3766,62 @@ pub(crate) fn operand_load_float(
         l = "%<result_id> = OpBitcast %float %<id>".replace("<id>", &id);
     } else if operand_is_variable(op) {
         let value = operand_variable_to_str(op);
-        // SDWA lane select: the hardware extracts the selected byte/word of
-        // the raw register (zero-extended to 32 bits) and the operation then
-        // consumes that dword as its operand type — so extract in uint space
-        // and bitcast. The non-SDWA path keeps Kyty's exact load text.
-        if let Some(sel) = lane_sel_snippet(op.lane_sel, "r<result_id>", "e<result_id>") {
-            let raw = if value.type_ == SpirvType::Float {
-                concat!(
-                    "%f<result_id> = OpLoad %float %<id>\n",
-                    "          ",
-                    "%r<result_id> = OpBitcast %uint %f<result_id>\n"
+        if op.dpp.is_some() {
+            if op.lane_sel != 6 {
+                return Err(not_supported(
+                    "operand_load_float",
+                    "combined DPP and SDWA lane selection",
+                ));
+            }
+            let raw = format!("dpp_raw_{result_id}");
+            let bits = format!("dpp_bits_{result_id}");
+            l = if value.type_ == SpirvType::Float {
+                format!(
+                    "%dpp_float_{result_id} = OpLoad %float %{}\n\
+                     %dpp_raw_{result_id} = OpBitcast %uint %dpp_float_{result_id}\n",
+                    value.value
                 )
             } else if value.type_ == SpirvType::Uint {
-                "%r<result_id> = OpLoad %uint %<id>\n"
+                format!("%dpp_raw_{result_id} = OpLoad %uint %{}\n", value.value)
             } else {
                 return Ok(false);
             };
-            l = format!(
-                "{raw}          {sel}          \
-                 %<result_id> = OpBitcast %float %e<result_id>\n"
-            )
-            .replace("<id>", &value.value);
-        } else if value.type_ == SpirvType::Float {
-            l = "%<result_id> = OpLoad %float %<id>\n".replace("<id>", &value.value);
-        } else if value.type_ == SpirvType::Uint {
-            l = concat!(
-                "%t<result_id> = OpLoad %uint %<id>\n",
-                "          ",
-                "%<result_id> = OpBitcast %float %t<result_id>\n"
-            )
-            .replace("<id>", &value.value);
+            l += &dpp_quad_perm_uint_load(spirv, op, &raw, &bits)?;
+            l += &format!("%<result_id> = OpBitcast %float %{bits}\n");
         } else {
-            return Ok(false);
+            // SDWA lane select: the hardware extracts the selected byte/word of
+            // the raw register (zero-extended to 32 bits) and the operation then
+            // consumes that dword as its operand type — so extract in uint space
+            // and bitcast. The non-SDWA path keeps Kyty's exact load text.
+            if let Some(sel) = lane_sel_snippet(op.lane_sel, "r<result_id>", "e<result_id>") {
+                let raw = if value.type_ == SpirvType::Float {
+                    concat!(
+                        "%f<result_id> = OpLoad %float %<id>\n",
+                        "          ",
+                        "%r<result_id> = OpBitcast %uint %f<result_id>\n"
+                    )
+                } else if value.type_ == SpirvType::Uint {
+                    "%r<result_id> = OpLoad %uint %<id>\n"
+                } else {
+                    return Ok(false);
+                };
+                l = format!(
+                    "{raw}          {sel}          \
+                 %<result_id> = OpBitcast %float %e<result_id>\n"
+                )
+                .replace("<id>", &value.value);
+            } else if value.type_ == SpirvType::Float {
+                l = "%<result_id> = OpLoad %float %<id>\n".replace("<id>", &value.value);
+            } else if value.type_ == SpirvType::Uint {
+                l = concat!(
+                    "%t<result_id> = OpLoad %uint %<id>\n",
+                    "          ",
+                    "%<result_id> = OpBitcast %float %t<result_id>\n"
+                )
+                .replace("<id>", &value.value);
+            } else {
+                return Ok(false);
+            }
         }
     } else {
         return Ok(false);
@@ -4096,15 +4361,28 @@ impl<'a> Spirv<'a> {
 
         imports.push("%GLSL_std_450 = OpExtInstImport \"GLSL.std.450\"".to_string());
 
-        if self.code.has_any_of(&[
+        let uses_lane_broadcast = self.code.has_any_of(&[
             ShaderInstructionType::VReadfirstlaneB32,
             ShaderInstructionType::VReadlaneB32,
             ShaderInstructionType::VWritelaneB32,
-        ]) {
+        ]);
+        let uses_dpp = code_uses_dpp(&self.code);
+        if uses_dpp && self.code.get_type() != ShaderType::Compute {
+            return Err(not_supported(
+                "Spirv::WriteHeader",
+                "DPP subgroup lowering is currently enabled only for compute shaders",
+            ));
+        }
+        if uses_lane_broadcast || uses_dpp {
             // The subgroup broadcast instructions require these SPIR-V 1.3
             // capabilities. Vulkan exposes them as subgroup ballot support.
             extensions.push("OpCapability GroupNonUniform".to_string());
+        }
+        if uses_lane_broadcast {
             extensions.push("OpCapability GroupNonUniformBallot".to_string());
+        }
+        if uses_dpp {
+            extensions.push("OpCapability GroupNonUniformShuffle".to_string());
         }
 
         if self.debug_printf_enabled {
@@ -4220,6 +4498,7 @@ impl<'a> Spirv<'a> {
                 if self
                     .code
                     .has_any_of(&[ShaderInstructionType::VWritelaneB32])
+                    || code_uses_dpp(&self.code)
                 {
                     vars.push("%gl_SubgroupLocalInvocationID".to_string());
                 }
@@ -4336,6 +4615,7 @@ impl<'a> Spirv<'a> {
                 if self
                     .code
                     .has_any_of(&[ShaderInstructionType::VWritelaneB32])
+                    || code_uses_dpp(&self.code)
                 {
                     vars.push(
                         "OpDecorate %gl_SubgroupLocalInvocationID BuiltIn \
@@ -4961,6 +5241,7 @@ impl<'a> Spirv<'a> {
                 if self
                     .code
                     .has_any_of(&[ShaderInstructionType::VWritelaneB32])
+                    || code_uses_dpp(&self.code)
                 {
                     vars.push(
                         "%gl_SubgroupLocalInvocationID = OpVariable %_ptr_Input_uint Input"
@@ -5819,7 +6100,6 @@ impl<'a> Spirv<'a> {
         ]) {
             self.source += FUNC_LSHL_ADD;
         }
-
         if self.code.has_any_of(&[T::ImageStoreMip]) {
             self.source += FUNC_MIPMAP;
         }
@@ -5997,6 +6277,35 @@ impl<'a> Spirv<'a> {
             self.add_constant_int(i);
             self.add_constant_uint(i as u32);
         }
+        if self.code.has_any_of(&[
+            ShaderInstructionType::ImageBvhIntersectRay,
+            ShaderInstructionType::ImageBvh64IntersectRay,
+        ]) {
+            // RDNA2 BVH descriptor masks, node-address mask and IEEE
+            // +infinity. The 0..31 unrolled node indices were seeded above.
+            for value in [255, 1 << 24, 1 << 31, 0x7f80_0000, 0xffff_fff8, u32::MAX] {
+                self.add_constant_uint(value);
+            }
+        }
+        if code_uses_dpp(&self.code) {
+            // DPP16 quad-permutation lane math. Controls 0x55/0xaa are the
+            // measured ASTRO.BOT selectors; register every control present so
+            // the textual lowering never references an undeclared constant.
+            self.add_constant_uint(0xffff_fffc);
+            let controls: Vec<u32> = self
+                .code
+                .get_instructions()
+                .iter()
+                .flat_map(|inst| inst.src[..inst.src_num.max(0) as usize].iter())
+                .filter_map(|op| match op.dpp.map(|d| d.mode) {
+                    Some(DppMode::Dpp16 { ctrl }) => Some(u32::from(ctrl)),
+                    _ => None,
+                })
+                .collect();
+            for ctrl in controls {
+                self.add_constant_uint(ctrl);
+            }
+        }
         let operands: Vec<ShaderOperand> = self
             .code
             .get_instructions()
@@ -6153,6 +6462,45 @@ impl<'a> Spirv<'a> {
                 }
             }
         }
+        // Scalar guest-pointer loads lowered through `%global_mem` use their
+        // byte offsets (plus 4 bytes per extra dword) in the UINT domain.
+        // Next-gen SMEM immediates are otherwise registered only as Int, so
+        // explicitly materialize every derived uint constant used by the
+        // bounded pointer-chain lowering.
+        if let Some(bind) = self.bind
+            && bind.global_mem.used
+        {
+            let eud_base = bind.extended.used.then_some(bind.extended.start_register);
+            let scalar_loads: Vec<(u32, u32)> = self
+                .code
+                .get_instructions()
+                .iter()
+                .filter_map(|inst| {
+                    let n = match inst.type_ {
+                        ShaderInstructionType::SLoadDword => 1u32,
+                        ShaderInstructionType::SLoadDwordx2 => 2,
+                        ShaderInstructionType::SLoadDwordx4 => 4,
+                        ShaderInstructionType::SLoadDwordx8 => 8,
+                        ShaderInstructionType::SLoadDwordx16 => 16,
+                        _ => return None,
+                    };
+                    (inst.src[0].type_ == ShaderOperandType::Sgpr
+                        && eud_base != Some(inst.src[0].register_id)
+                        && matches!(
+                            inst.src[1].type_,
+                            ShaderOperandType::LiteralConstant
+                                | ShaderOperandType::IntegerInlineConstant
+                        )
+                        && inst.src[1].constant.i() >= 0)
+                        .then_some((inst.src[1].constant.u, n))
+                })
+                .collect();
+            for (base, n) in scalar_loads {
+                for i in 0..n {
+                    self.add_constant_uint(base.wrapping_add(i.wrapping_mul(4)));
+                }
+            }
+        }
         // Beyond Kyty: the combined SMEM addressing mode (register soffset AND
         // a non-zero immediate) adds the two byte offsets at runtime, in the
         // UINT domain (`sbuffer_load_dwords`). `add_constant` files an
@@ -6218,6 +6566,19 @@ impl<'a> Spirv<'a> {
             self.add_variable(inst.dst2);
             for i in 0..inst.src_num.max(0) as usize {
                 self.add_variable(inst.src[i]);
+            }
+            // GFX10 MIMG NSA components 1+ may name arbitrary VGPRs rather
+            // than the consecutive range represented by src[0]. The parser
+            // retains those registers separately; declare them here so an
+            // exact wide-NSA instruction never emits references to undefined
+            // `%vN` ids (ASTRO.BOT's BVH payload names v61..v71).
+            if inst.mimg_nsa_dwords != 0 {
+                let count = usize::try_from(inst.src[0].size.saturating_sub(1))
+                    .unwrap_or(0)
+                    .min(inst.mimg_nsa_addr.len());
+                for component in &inst.mimg_nsa_addr[..count] {
+                    self.add_variable(*component);
+                }
             }
         }
 
@@ -6393,6 +6754,61 @@ mod tests {
         flat.src[0] = ShaderOperand { size: 2, ..vgpr(1) };
 
         assert_eq!(flat_global_base_sgpr(&[low, high, flat]), Some(12));
+    }
+
+    #[test]
+    fn astro_bvh_window_rebases_from_captured_descriptor_pointer() {
+        let pointer = 0x0000_0005_1234_5678u64;
+        let mut load = ShaderInstruction {
+            pc: 0,
+            type_: ShaderInstructionType::SLoadDwordx2,
+            dst: sgpr_n(8, 2),
+            ..Default::default()
+        };
+        load.src[0] = sgpr_n(0, 2);
+        load.src_num = 2;
+
+        let mut extract = ShaderInstruction {
+            pc: 8,
+            type_: ShaderInstructionType::SBfeU64,
+            dst: sgpr_n(16, 2),
+            ..Default::default()
+        };
+        extract.src[0] = sgpr_n(8, 2);
+        extract.src[1] = ShaderOperand {
+            type_: ShaderOperandType::LiteralConstant,
+            constant: ShaderConstant::from_u(0x0028_0008),
+            ..Default::default()
+        };
+        extract.src_num = 2;
+
+        let mut bvh = ShaderInstruction {
+            pc: 16,
+            type_: ShaderInstructionType::ImageBvhIntersectRay,
+            dst: vgpr(6),
+            ..Default::default()
+        };
+        bvh.dst.size = 4;
+        bvh.src[0] = ShaderOperand {
+            size: 11,
+            ..vgpr(6)
+        };
+        bvh.src[1] = sgpr_n(16, 4);
+        bvh.src_num = 2;
+
+        let mut code = ShaderCode::new();
+        code.get_instructions_mut().extend([load, extract, bvh]);
+        let mut bind = ShaderBindResources::default();
+        bind.global_mem.used = true;
+        bind.global_mem.guest_base = 0x0000_0005_0000_1000;
+        bind.embedded_constant_loads.loads_num = 1;
+        bind.embedded_constant_loads.loads[0].pc = 0;
+        bind.embedded_constant_loads.loads[0].dwords_num = 2;
+        bind.embedded_constant_loads.loads[0].values[0] = pointer as u32;
+        bind.embedded_constant_loads.loads[0].values[1] = (pointer >> 32) as u32;
+
+        shader_rebase_global_window_for_bvh(&code, &mut bind);
+        assert_eq!(bind.global_mem.guest_base, pointer & !0xff);
     }
 
     #[test]

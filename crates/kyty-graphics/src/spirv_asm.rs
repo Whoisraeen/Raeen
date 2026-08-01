@@ -231,6 +231,7 @@ fn enum_value(kind: EKind, tok: &str) -> Option<u32> {
         (E::Capability, "ImageQuery") => 50,
         (E::Capability, "GroupNonUniform") => 61,
         (E::Capability, "GroupNonUniformBallot") => 64,
+        (E::Capability, "GroupNonUniformShuffle") => 65,
         // `OpEntryPoint <Type>` where <Type> ∈ Fragment/Vertex/GLCompute.
         (E::ExecutionModel, "Vertex") => 0,
         (E::ExecutionModel, "Fragment") => 4,
@@ -477,6 +478,7 @@ fn op_info(name: &str) -> Option<OpInfo> {
         "OpCapability" => op(17, false, false, &[Enum(E::Capability)]),
         "OpGroupNonUniformBroadcast" => op(337, true, true, &[Id, Id, Id]),
         "OpGroupNonUniformBroadcastFirst" => op(338, true, true, &[Id, Id]),
+        "OpGroupNonUniformShuffle" => op(345, true, true, &[Id, Id, Id]),
         // --- Types ---------------------------------------------------------
         "OpTypeVoid" => op(19, false, true, &[]),
         "OpTypeBool" => op(20, false, true, &[]),

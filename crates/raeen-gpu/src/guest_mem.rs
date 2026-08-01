@@ -289,15 +289,36 @@ pub(crate) const MAX_RESOURCE_READ_DWORDS: u32 = 0x0400_0000;
 /// Committed-readable prefix of a guest range, for naming a failed fetch
 /// precisely (wild base ≈ 0; lazy tail ≈ a page-aligned interior cut).
 pub(crate) fn readable_prefix(addr: u64, size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
     if gpu_image_shadow_covers(addr, size) {
         return size;
     }
     with_active_memory(|memory| {
         if memory.validate_gpu_range(addr, size, false) {
-            size
-        } else {
-            0
+            return size;
         }
+
+        // `validate_gpu_range` answers only an all-or-nothing question, but
+        // callers need the committed prefix when a bounded speculative read
+        // crosses the end of an allocation. Range validity is monotonic for a
+        // fixed base, so find the largest valid byte count without probing or
+        // dereferencing memory outside the process-provided authority.
+        if !memory.validate_gpu_range(addr, 1, false) {
+            return 0;
+        }
+        let mut valid = 1;
+        let mut invalid = size;
+        while valid + 1 < invalid {
+            let candidate = valid + (invalid - valid) / 2;
+            if memory.validate_gpu_range(addr, candidate, false) {
+                valid = candidate;
+            } else {
+                invalid = candidate;
+            }
+        }
+        valid
     })
     .unwrap_or(0)
 }
@@ -803,6 +824,20 @@ mod tests {
         with_guest_memory(&memory, || {
             assert_eq!(IdentityGuestMemory.read_dwords(addr, 4), None);
             assert!(IdentityGuestMemory.read_dwords(addr, 2).is_some());
+        });
+    }
+
+    #[test]
+    fn reports_the_exact_readable_prefix_before_authority_ends() {
+        let mut data = vec![1u32, 2, 3];
+        let addr = data.as_ptr() as u64;
+        let bytes = std::mem::size_of_val(data.as_slice()) as u64;
+        let memory = memory_for(&mut data);
+        with_guest_memory(&memory, || {
+            assert_eq!(readable_prefix(addr, bytes + 4096), bytes);
+            assert_eq!(readable_prefix(addr + 4, bytes + 4096), bytes - 4);
+            assert_eq!(readable_prefix(addr + bytes, 4096), 0);
+            assert_eq!(readable_prefix(addr, 0), 0);
         });
     }
 }

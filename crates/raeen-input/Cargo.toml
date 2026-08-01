@@ -1,6 +1,6 @@
 [package]
 name = "raeen-input"
-description = "DualSense controller emulation with haptic feedback and adaptive triggers"
+description = "PlayStation controller emulation with native DualSense and DualShock 4 input"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ gilrs = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 
-# Native, mapping-DB-free readers (XInput + raw-HID DualSense). Windows-only;
+# Native, mapping-DB-free readers (XInput + raw-HID DualSense / DualShock 4). Windows-only;
 # the modules are #[cfg(windows)]-gated so non-Windows targets still build.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

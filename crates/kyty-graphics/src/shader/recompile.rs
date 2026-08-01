@@ -2330,6 +2330,75 @@ fn descriptor_seeded_register(
     crate::shader::analysis::storage_binding_owns_register(bind, dst.register_id + i, shift_regs)
 }
 
+/// Lower a scalar guest-pointer load into the bounded `%global_mem` snapshot.
+/// The first two dwords of the buffer are its 64-bit guest base; the body
+/// begins at dword two. Both halves of the address are checked so an unrelated
+/// pointer with the same low 32 bits cannot alias the window. Each read is
+/// clamped before the physical SSBO access and selects zero when out of bounds.
+fn sload_dword_global(
+    index: u32,
+    inst: &ShaderInstruction,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    n: i32,
+    func: &'static str,
+) -> Result<bool, ShaderRecompileError> {
+    let src_lo = operand_variable_to_str_shift(inst.src[0], 0);
+    let src_hi = operand_variable_to_str_shift(inst.src[0], 1);
+    if src_lo.type_ != SpirvType::Uint || src_hi.type_ != SpirvType::Uint {
+        return Err(not_supported(func, "unexpected global s_load base type"));
+    }
+    let byte_offset = inst.src[1].constant.u;
+    if byte_offset % 4 != 0 {
+        return Err(not_supported(func, "unaligned global s_load offset"));
+    }
+
+    let tag = format!("{index}");
+    *dst_source += &format!(
+        "        %sload_bp_lo_{tag} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_0
+        %sload_bp_hi_{tag} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_1
+        %sload_base_lo_{tag} = OpLoad %uint %sload_bp_lo_{tag}
+        %sload_base_hi_{tag} = OpLoad %uint %sload_bp_hi_{tag}
+        %sload_addr_src_lo_{tag} = OpLoad %uint %{src_lo}
+        %sload_addr_src_hi_{tag} = OpLoad %uint %{src_hi}
+        %sload_len_{tag} = OpArrayLength %uint %global_mem 0
+        %sload_lenm1_{tag} = OpISub %uint %sload_len_{tag} %uint_1
+",
+        src_lo = src_lo.value,
+        src_hi = src_hi.value,
+    );
+
+    for i in 0..n {
+        let dst = operand_variable_to_str_shift(inst.dst, i);
+        if dst.type_ != SpirvType::Uint {
+            return Err(not_supported(func, "unexpected global s_load dst type"));
+        }
+        let offset = byte_offset.wrapping_add(u32::try_from(i).unwrap_or(0).wrapping_mul(4));
+        let offset_id = spirv.get_constant_uint(offset);
+        *dst_source += &format!(
+            "        %sload_addr_lo_{tag}_{i} = OpIAdd %uint %sload_addr_src_lo_{tag} %{offset_id}
+        %sload_carry_b_{tag}_{i} = OpULessThan %bool %sload_addr_lo_{tag}_{i} %sload_addr_src_lo_{tag}
+        %sload_carry_{tag}_{i} = OpSelect %uint %sload_carry_b_{tag}_{i} %uint_1 %uint_0
+        %sload_addr_hi_{tag}_{i} = OpIAdd %uint %sload_addr_src_hi_{tag} %sload_carry_{tag}_{i}
+        %sload_hi_ok_{tag}_{i} = OpIEqual %bool %sload_addr_hi_{tag}_{i} %sload_base_hi_{tag}
+        %sload_byte_{tag}_{i} = OpISub %uint %sload_addr_lo_{tag}_{i} %sload_base_lo_{tag}
+        %sload_dword_{tag}_{i} = OpShiftRightLogical %uint %sload_byte_{tag}_{i} %uint_2
+        %sload_idx_{tag}_{i} = OpIAdd %uint %sload_dword_{tag}_{i} %uint_2
+        %sload_cidx_{tag}_{i} = OpExtInst %uint %GLSL_std_450 UMin %sload_idx_{tag}_{i} %sload_lenm1_{tag}
+        %sload_ptr_{tag}_{i} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %sload_cidx_{tag}_{i}
+        %sload_val_{tag}_{i} = OpLoad %uint %sload_ptr_{tag}_{i}
+        %sload_range_ok_{tag}_{i} = OpULessThan %bool %sload_idx_{tag}_{i} %sload_len_{tag}
+        %sload_inb_{tag}_{i} = OpLogicalAnd %bool %sload_hi_ok_{tag}_{i} %sload_range_ok_{tag}_{i}
+        %sload_res_{tag}_{i} = OpSelect %uint %sload_inb_{tag}_{i} %sload_val_{tag}_{i} %uint_0
+               OpStore %{dst} %sload_res_{tag}_{i}
+",
+            dst = dst.value,
+        );
+    }
+
+    Ok(true)
+}
+
 fn sload_dword_extended(
     index: u32,
     code: &ShaderCode,
@@ -2395,10 +2464,6 @@ fn sload_dword_extended(
         ));
     }
 
-    if !bind_info.extended.used {
-        return Ok(false);
-    }
-
     // Kyty accepts only `LiteralConstant` here, but this codebase's next-gen
     // SMEM parser (`shader_parse_smem`) materializes a NULL soffset as the
     // sign-extended 21-bit immediate in an `IntegerInlineConstant` operand.
@@ -2411,6 +2476,24 @@ fn sload_dword_extended(
         ShaderOperandType::LiteralConstant | ShaderOperandType::IntegerInlineConstant
     ) {
         return Err(not_supported(func, "src1 is not a constant offset"));
+    }
+
+    // ASTRO.BOT's runtime scene kernels use a direct live-in pointer pair
+    // (`s0:s1`) and then chase pointers returned into other SGPR pairs. This
+    // is guest memory, not the EUD descriptor table. Once analysis has bound a
+    // `%global_mem` snapshot, every non-EUD scalar base can address that
+    // bounded window; out-of-range pointer targets return zero by construction.
+    let is_eud_base =
+        bind_info.extended.used && inst.src[0].register_id == bind_info.extended.start_register;
+    if bind_info.global_mem.used && !is_eud_base {
+        if inst.src[1].constant.i() < 0 {
+            return Err(not_supported(func, "negative global s_load offset"));
+        }
+        return sload_dword_global(index, inst, dst_source, spirv, n, func);
+    }
+
+    if !bind_info.extended.used {
+        return Ok(false);
     }
     if inst.src[0].register_id != bind_info.extended.start_register {
         let prior = code
@@ -4302,9 +4385,6 @@ fn recompile_vcvt_f32_xxx(
     if inst.dst.clamp {
         return Err(not_supported(FUNC, "clamp"));
     }
-    if inst.dst.multiplier != 1.0 {
-        return Err(not_supported(FUNC, "multiplier"));
-    }
 
     let dst_value = operand_variable_to_str(inst.dst);
 
@@ -4320,15 +4400,31 @@ fn recompile_vcvt_f32_xxx(
     // TODO() check VSKIP
     // TODO() check SP_ROUND
 
+    // SDWA omod scales the converted floating-point result. Apply it before
+    // the EXEC select so an inactive lane preserves its prior destination
+    // instead of multiplying that old value as a post-store pass would.
+    let (multiply, converted) = if inst.dst.multiplier != 1.0 {
+        (
+            format!(
+                "%tm_<index> = OpFMul %float %t_<index> %{}",
+                spirv.get_constant_float(inst.dst.multiplier)
+            ),
+            "%tm_<index>",
+        )
+    } else {
+        (String::new(), "%t_<index>")
+    };
+
     const TEXT: &str = r#"
     <load0>
     <param0>
     <param1>
+    <multiply>
         %exec_lo_u_<index> = OpLoad %uint %exec_lo
         %exec_hi_u_<index> = OpLoad %uint %exec_hi ; unused
         %exec_lo_b_<index> = OpINotEqual %bool %exec_lo_u_<index> %uint_0
         %tdst_<index> = OpLoad %float %<dst>
-        %tval_<index> = OpSelect %float %exec_lo_b_<index> %t_<index> %tdst_<index>
+        %tval_<index> = OpSelect %float %exec_lo_b_<index> <converted> %tdst_<index>
                OpStore %<dst> %tval_<index>
 "#;
     *dst_source += &TEXT
@@ -4336,6 +4432,8 @@ fn recompile_vcvt_f32_xxx(
         .replace("<load0>", &load0)
         .replace("<param0>", param[0].unwrap_or(""))
         .replace("<param1>", param[1].unwrap_or(""))
+        .replace("<multiply>", &multiply)
+        .replace("<converted>", converted)
         .replace("<index>", &index_str);
 
     Ok(true)
@@ -8373,6 +8471,351 @@ fn recompile_image_sample_lzo_dmask7(
 ) -> Result<bool, ShaderRecompileError> {
     const FUNC: &str = "Recompile_ImageSampleLzO_Vdata3Vaddr4StSsDmask7";
     image_sample_lzo_channels(index, code, dst_source, spirv, FUNC, &[0, 1, 2])
+}
+
+/// RDNA2 `IMAGE_BVH_INTERSECT_RAY` software lowering for the full-precision
+/// eleven-VGPR address form measured in ASTRO.BOT.
+///
+/// AMD ISA 70648 defines the payload as `{node, tmax, origin.xyz, dir.xyz,
+/// inv_dir.xyz}` and descriptor bits 39:0 as `base_address[47:8]`. Vulkan has
+/// no operation that consumes a guest-native RDNA BVH, so this performs the
+/// same two primitive tests over the bounded `%global_mem` snapshot:
+///
+/// * type 4/5 nodes: four ray/AABB slab tests, optional closest-distance sort,
+///   four child pointers (Mesa's MIT software fallback shape);
+/// * type 0..3 nodes: Moller-Trumbore triangle test, with AMD return mode 0/1
+///   selected from descriptor bit 120.
+///
+/// Type 6/7 and out-of-window nodes return the documented invalid child/miss
+/// values. The narrower A16 and 64-bit-node forms keep their named refusal
+/// until their different payload layouts are implemented.
+fn recompile_image_bvh_intersect_ray(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_ImageBvhIntersectRay_Vdata4Vaddr11Srsrc4";
+    let inst = inst_at(code, index, FUNC)?;
+    let Some(bind) = spirv.get_bind_info() else {
+        return Ok(false);
+    };
+    if !bind.global_mem.used {
+        return Err(not_supported(FUNC, "global_mem BVH window not declared"));
+    }
+    if inst.type_ != ShaderInstructionType::ImageBvhIntersectRay || inst.src[0].size != 11 {
+        return Err(not_supported(
+            FUNC,
+            "only the RDNA2 32-bit-node, A16=0 payload is implemented",
+        ));
+    }
+
+    let addr: Vec<SpirvValue> = (0..11)
+        .map(|component| mimg_address_value(&inst, component))
+        .collect();
+    if addr.iter().any(|value| value.type_ != SpirvType::Float) {
+        return Err(not_supported(FUNC, "unexpected BVH address operand type"));
+    }
+    let resource: Vec<SpirvValue> = (0..4)
+        .map(|component| operand_variable_to_str_shift(inst.src[1], component))
+        .collect();
+    if resource.iter().any(|value| value.type_ != SpirvType::Uint) {
+        return Err(not_supported(
+            FUNC,
+            "unexpected BVH descriptor operand type",
+        ));
+    }
+    let dst: Vec<SpirvValue> = (0..4)
+        .map(|component| operand_variable_to_str_shift(inst.dst, component))
+        .collect();
+    if dst.iter().any(|value| value.type_ != SpirvType::Float) {
+        return Err(not_supported(
+            FUNC,
+            "unexpected BVH destination operand type",
+        ));
+    }
+
+    let i = index;
+    let node_mask = spirv.get_constant_uint(0xffff_fff8);
+    let invalid_node = spirv.get_constant_uint(u32::MAX);
+    let sort_mask = spirv.get_constant_uint(1 << 31);
+    let return_mode_mask = spirv.get_constant_uint(1 << 24);
+    let positive_infinity = spirv.get_constant_uint(0x7f80_0000);
+    let mut body = String::new();
+    for (component, value) in addr.iter().enumerate() {
+        body += &format!(
+            "        %bvh_a_{i}_{component} = OpLoad %float %{name}\n",
+            name = value.value
+        );
+    }
+    for (component, value) in resource.iter().enumerate() {
+        body += &format!(
+            "        %bvh_r_{i}_{component} = OpLoad %uint %{name}\n",
+            name = value.value
+        );
+    }
+
+    // Descriptor base[47:8] -> byte address, then add (node & ~7) << 3.
+    body += &format!(
+        "        %bvh_node_{i} = OpBitcast %uint %bvh_a_{i}_0
+        %bvh_node_type_{i} = OpBitwiseAnd %uint %bvh_node_{i} %uint_7
+        %bvh_node_clean_{i} = OpBitwiseAnd %uint %bvh_node_{i} %{node_mask}
+        %bvh_desc_lo_{i} = OpShiftLeftLogical %uint %bvh_r_{i}_0 %uint_8
+        %bvh_desc_hi0_{i} = OpBitwiseAnd %uint %bvh_r_{i}_1 %uint_255
+        %bvh_desc_hi1_{i} = OpShiftLeftLogical %uint %bvh_desc_hi0_{i} %uint_8
+        %bvh_desc_hi2_{i} = OpShiftRightLogical %uint %bvh_r_{i}_0 %uint_24
+        %bvh_desc_hi_{i} = OpBitwiseOr %uint %bvh_desc_hi1_{i} %bvh_desc_hi2_{i}
+        %bvh_node_off_lo_{i} = OpShiftLeftLogical %uint %bvh_node_clean_{i} %uint_3
+        %bvh_node_off_hi_{i} = OpShiftRightLogical %uint %bvh_node_clean_{i} %uint_29
+        %bvh_addr_lo_{i} = OpIAdd %uint %bvh_desc_lo_{i} %bvh_node_off_lo_{i}
+        %bvh_addr_carry_b_{i} = OpULessThan %bool %bvh_addr_lo_{i} %bvh_desc_lo_{i}
+        %bvh_addr_carry_{i} = OpSelect %uint %bvh_addr_carry_b_{i} %uint_1 %uint_0
+        %bvh_addr_hi0_{i} = OpIAdd %uint %bvh_desc_hi_{i} %bvh_node_off_hi_{i}
+        %bvh_addr_hi_{i} = OpIAdd %uint %bvh_addr_hi0_{i} %bvh_addr_carry_{i}
+        %bvh_bp_lo_{i} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_0
+        %bvh_bp_hi_{i} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_1
+        %bvh_base_lo_{i} = OpLoad %uint %bvh_bp_lo_{i}
+        %bvh_base_hi_{i} = OpLoad %uint %bvh_bp_hi_{i}
+        %bvh_hi_ok_{i} = OpIEqual %bool %bvh_addr_hi_{i} %bvh_base_hi_{i}
+        %bvh_byte_{i} = OpISub %uint %bvh_addr_lo_{i} %bvh_base_lo_{i}
+        %bvh_dword_{i} = OpShiftRightLogical %uint %bvh_byte_{i} %uint_2
+        %bvh_first_{i} = OpIAdd %uint %bvh_dword_{i} %uint_2
+        %bvh_len_{i} = OpArrayLength %uint %global_mem 0
+        %bvh_lenm1_{i} = OpISub %uint %bvh_len_{i} %uint_1
+"
+    );
+
+    // A full box32 node is 128 bytes. Loading the bounded 32-dword footprint
+    // once also covers box16 and triangle layouts and keeps all later math SSA.
+    for dword in 0..32u32 {
+        let constant = spirv.get_constant_uint(dword);
+        body += &format!(
+            "        %bvh_idx_{i}_{dword} = OpIAdd %uint %bvh_first_{i} %{constant}
+        %bvh_cidx_{i}_{dword} = OpExtInst %uint %GLSL_std_450 UMin %bvh_idx_{i}_{dword} %bvh_lenm1_{i}
+        %bvh_ptr_{i}_{dword} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %bvh_cidx_{i}_{dword}
+        %bvh_load_{i}_{dword} = OpLoad %uint %bvh_ptr_{i}_{dword}
+        %bvh_range_{i}_{dword} = OpULessThan %bool %bvh_idx_{i}_{dword} %bvh_len_{i}
+        %bvh_inb_{i}_{dword} = OpLogicalAnd %bool %bvh_hi_ok_{i} %bvh_range_{i}_{dword}
+        %bvh_raw_{i}_{dword} = OpSelect %uint %bvh_inb_{i}_{dword} %bvh_load_{i}_{dword} %uint_0
+"
+        );
+    }
+
+    body += &format!(
+        "        %bvh_is_box16_{i} = OpIEqual %bool %bvh_node_type_{i} %uint_4
+        %bvh_is_box32_{i} = OpIEqual %bool %bvh_node_type_{i} %uint_5
+        %bvh_is_box_{i} = OpLogicalOr %bool %bvh_is_box16_{i} %bvh_is_box32_{i}
+        %bvh_is_tri_{i} = OpULessThan %bool %bvh_node_type_{i} %uint_4
+        %bvh_sort_mask_{i} = OpBitwiseAnd %uint %bvh_r_{i}_1 %{sort_mask}
+        %bvh_sort_{i} = OpINotEqual %bool %bvh_sort_mask_{i} %uint_0
+        %bvh_retmode_mask_{i} = OpBitwiseAnd %uint %bvh_r_{i}_3 %{return_mode_mask}
+        %bvh_retmode_{i} = OpINotEqual %bool %bvh_retmode_mask_{i} %uint_0
+        %bvh_inf_{i} = OpBitcast %float %{positive_infinity}
+"
+    );
+
+    // Four box children. FP16 nodes pack (minx,miny), (minz,maxx),
+    // (maxy,maxz); FP32 nodes store six consecutive floats per child.
+    let mut child_ids = Vec::new();
+    let mut distances = Vec::new();
+    for child in 0..4u32 {
+        let h0 = 4 + child * 3;
+        let h1 = h0 + 1;
+        let h2 = h0 + 2;
+        let f0 = 4 + child * 6;
+        body += &format!(
+            "        %bvh_h0_{i}_{child} = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %bvh_raw_{i}_{h0}
+        %bvh_h1_{i}_{child} = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %bvh_raw_{i}_{h1}
+        %bvh_h2_{i}_{child} = OpExtInst %v2float %GLSL_std_450 UnpackHalf2x16 %bvh_raw_{i}_{h2}
+"
+        );
+        let half_sources = [
+            ("h0", 0),
+            ("h0", 1),
+            ("h1", 0),
+            ("h1", 1),
+            ("h2", 0),
+            ("h2", 1),
+        ];
+        for (component, (pack, lane)) in half_sources.iter().enumerate() {
+            let raw = f0 + component as u32;
+            body += &format!(
+                "        %bvh_hf_{i}_{child}_{component} = OpCompositeExtract %float %bvh_{pack}_{i}_{child} {lane}
+        %bvh_ff_{i}_{child}_{component} = OpBitcast %float %bvh_raw_{i}_{raw}
+        %bvh_coord_{i}_{child}_{component} = OpSelect %float %bvh_is_box16_{i} %bvh_hf_{i}_{child}_{component} %bvh_ff_{i}_{child}_{component}
+"
+            );
+        }
+        for axis in 0..3u32 {
+            body += &format!(
+                "        %bvh_b0_{i}_{child}_{axis} = OpFSub %float %bvh_coord_{i}_{child}_{axis} %bvh_a_{i}_{origin}
+        %bvh_b1_{i}_{child}_{axis} = OpFSub %float %bvh_coord_{i}_{child}_{max_axis} %bvh_a_{i}_{origin}
+        %bvh_t0_{i}_{child}_{axis} = OpFMul %float %bvh_b0_{i}_{child}_{axis} %bvh_a_{i}_{inv}
+        %bvh_t1_{i}_{child}_{axis} = OpFMul %float %bvh_b1_{i}_{child}_{axis} %bvh_a_{i}_{inv}
+        %bvh_tlo_{i}_{child}_{axis} = OpExtInst %float %GLSL_std_450 FMin %bvh_t0_{i}_{child}_{axis} %bvh_t1_{i}_{child}_{axis}
+        %bvh_thi_{i}_{child}_{axis} = OpExtInst %float %GLSL_std_450 FMax %bvh_t0_{i}_{child}_{axis} %bvh_t1_{i}_{child}_{axis}
+",
+                origin = 2 + axis,
+                max_axis = 3 + axis,
+                inv = 8 + axis,
+            );
+        }
+        body += &format!(
+            "        %bvh_tmin01_{i}_{child} = OpExtInst %float %GLSL_std_450 FMax %bvh_tlo_{i}_{child}_0 %bvh_tlo_{i}_{child}_1
+        %bvh_tmin_{i}_{child} = OpExtInst %float %GLSL_std_450 FMax %bvh_tmin01_{i}_{child} %bvh_tlo_{i}_{child}_2
+        %bvh_tmin0_{i}_{child} = OpExtInst %float %GLSL_std_450 FMax %bvh_tmin_{i}_{child} %float_0_000000
+        %bvh_tmax01_{i}_{child} = OpExtInst %float %GLSL_std_450 FMin %bvh_thi_{i}_{child}_0 %bvh_thi_{i}_{child}_1
+        %bvh_tmax_{i}_{child} = OpExtInst %float %GLSL_std_450 FMin %bvh_tmax01_{i}_{child} %bvh_thi_{i}_{child}_2
+        %bvh_box_overlap_{i}_{child} = OpFOrdGreaterThanEqual %bool %bvh_tmax_{i}_{child} %bvh_tmin0_{i}_{child}
+        %bvh_box_extent_{i}_{child} = OpFOrdLessThan %bool %bvh_tmin_{i}_{child} %bvh_a_{i}_1
+        %bvh_box_nan_{i}_{child} = OpIsNan %bool %bvh_coord_{i}_{child}_0
+        %bvh_box_notnan_{i}_{child} = OpLogicalNot %bool %bvh_box_nan_{i}_{child}
+        %bvh_box_child_valid_{i}_{child} = OpINotEqual %bool %bvh_raw_{i}_{child} %{invalid_node}
+        %bvh_box_hit0_{i}_{child} = OpLogicalAnd %bool %bvh_box_overlap_{i}_{child} %bvh_box_extent_{i}_{child}
+        %bvh_box_hit1_{i}_{child} = OpLogicalAnd %bool %bvh_box_hit0_{i}_{child} %bvh_box_notnan_{i}_{child}
+        %bvh_box_hit_{i}_{child} = OpLogicalAnd %bool %bvh_box_hit1_{i}_{child} %bvh_box_child_valid_{i}_{child}
+        %bvh_box_child_{i}_{child} = OpSelect %uint %bvh_box_hit_{i}_{child} %bvh_raw_{i}_{child} %{invalid_node}
+        %bvh_box_dist_{i}_{child} = OpSelect %float %bvh_box_hit_{i}_{child} %bvh_tmin_{i}_{child} %bvh_inf_{i}
+"
+        );
+        child_ids.push(format!("%bvh_box_child_{i}_{child}"));
+        distances.push(format!("%bvh_box_dist_{i}_{child}"));
+    }
+
+    // AMD closest-distance sorting network, matching Mesa's MIT fallback.
+    for (step, (a, b)) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)]
+        .into_iter()
+        .enumerate()
+    {
+        body += &format!(
+            "        %bvh_sort_lt_{i}_{step} = OpFOrdLessThan %bool {db} {da}
+        %bvh_sort_do_{i}_{step} = OpLogicalAnd %bool %bvh_sort_{i} %bvh_sort_lt_{i}_{step}
+        %bvh_sort_da_{i}_{step} = OpSelect %float %bvh_sort_do_{i}_{step} {db} {da}
+        %bvh_sort_db_{i}_{step} = OpSelect %float %bvh_sort_do_{i}_{step} {da} {db}
+        %bvh_sort_ca_{i}_{step} = OpSelect %uint %bvh_sort_do_{i}_{step} {cb} {ca}
+        %bvh_sort_cb_{i}_{step} = OpSelect %uint %bvh_sort_do_{i}_{step} {ca} {cb}
+",
+            da = distances[a],
+            db = distances[b],
+            ca = child_ids[a],
+            cb = child_ids[b],
+        );
+        distances[a] = format!("%bvh_sort_da_{i}_{step}");
+        distances[b] = format!("%bvh_sort_db_{i}_{step}");
+        child_ids[a] = format!("%bvh_sort_ca_{i}_{step}");
+        child_ids[b] = format!("%bvh_sort_cb_{i}_{step}");
+    }
+
+    // Triangle: a compact Moller-Trumbore test. The first nine node dwords are
+    // three float3 vertices. Numerator/denominator outputs preserve AMD return
+    // mode 1; mode 0 returns the node's triangle id and hit boolean.
+    for component in 0..9u32 {
+        body += &format!(
+            "        %bvh_tri_p_{i}_{component} = OpBitcast %float %bvh_raw_{i}_{component}\n"
+        );
+    }
+    for axis in 0..3u32 {
+        body += &format!(
+            "        %bvh_tri_e1_{i}_{axis} = OpFSub %float %bvh_tri_p_{i}_{b} %bvh_tri_p_{i}_{axis}
+        %bvh_tri_e2_{i}_{axis} = OpFSub %float %bvh_tri_p_{i}_{c} %bvh_tri_p_{i}_{axis}
+        %bvh_tri_tv_{i}_{axis} = OpFSub %float %bvh_a_{i}_{origin} %bvh_tri_p_{i}_{axis}
+",
+            b = 3 + axis,
+            c = 6 + axis,
+            origin = 2 + axis,
+        );
+    }
+    body += &format!(
+        "        %bvh_tri_px0_{i} = OpFMul %float %bvh_a_{i}_6 %bvh_tri_e2_{i}_2
+        %bvh_tri_px1_{i} = OpFMul %float %bvh_a_{i}_7 %bvh_tri_e2_{i}_1
+        %bvh_tri_pv0_{i} = OpFSub %float %bvh_tri_px0_{i} %bvh_tri_px1_{i}
+        %bvh_tri_py0_{i} = OpFMul %float %bvh_a_{i}_7 %bvh_tri_e2_{i}_0
+        %bvh_tri_py1_{i} = OpFMul %float %bvh_a_{i}_5 %bvh_tri_e2_{i}_2
+        %bvh_tri_pv1_{i} = OpFSub %float %bvh_tri_py0_{i} %bvh_tri_py1_{i}
+        %bvh_tri_pz0_{i} = OpFMul %float %bvh_a_{i}_5 %bvh_tri_e2_{i}_1
+        %bvh_tri_pz1_{i} = OpFMul %float %bvh_a_{i}_6 %bvh_tri_e2_{i}_0
+        %bvh_tri_pv2_{i} = OpFSub %float %bvh_tri_pz0_{i} %bvh_tri_pz1_{i}
+        %bvh_tri_det0_{i} = OpFMul %float %bvh_tri_e1_{i}_0 %bvh_tri_pv0_{i}
+        %bvh_tri_det1_{i} = OpFMul %float %bvh_tri_e1_{i}_1 %bvh_tri_pv1_{i}
+        %bvh_tri_det2_{i} = OpFMul %float %bvh_tri_e1_{i}_2 %bvh_tri_pv2_{i}
+        %bvh_tri_det01_{i} = OpFAdd %float %bvh_tri_det0_{i} %bvh_tri_det1_{i}
+        %bvh_tri_det_{i} = OpFAdd %float %bvh_tri_det01_{i} %bvh_tri_det2_{i}
+        %bvh_tri_un0_{i} = OpFMul %float %bvh_tri_tv_{i}_0 %bvh_tri_pv0_{i}
+        %bvh_tri_un1_{i} = OpFMul %float %bvh_tri_tv_{i}_1 %bvh_tri_pv1_{i}
+        %bvh_tri_un2_{i} = OpFMul %float %bvh_tri_tv_{i}_2 %bvh_tri_pv2_{i}
+        %bvh_tri_un01_{i} = OpFAdd %float %bvh_tri_un0_{i} %bvh_tri_un1_{i}
+        %bvh_tri_un_{i} = OpFAdd %float %bvh_tri_un01_{i} %bvh_tri_un2_{i}
+        %bvh_tri_qx0_{i} = OpFMul %float %bvh_tri_tv_{i}_1 %bvh_tri_e1_{i}_2
+        %bvh_tri_qx1_{i} = OpFMul %float %bvh_tri_tv_{i}_2 %bvh_tri_e1_{i}_1
+        %bvh_tri_qv0_{i} = OpFSub %float %bvh_tri_qx0_{i} %bvh_tri_qx1_{i}
+        %bvh_tri_qy0_{i} = OpFMul %float %bvh_tri_tv_{i}_2 %bvh_tri_e1_{i}_0
+        %bvh_tri_qy1_{i} = OpFMul %float %bvh_tri_tv_{i}_0 %bvh_tri_e1_{i}_2
+        %bvh_tri_qv1_{i} = OpFSub %float %bvh_tri_qy0_{i} %bvh_tri_qy1_{i}
+        %bvh_tri_qz0_{i} = OpFMul %float %bvh_tri_tv_{i}_0 %bvh_tri_e1_{i}_1
+        %bvh_tri_qz1_{i} = OpFMul %float %bvh_tri_tv_{i}_1 %bvh_tri_e1_{i}_0
+        %bvh_tri_qv2_{i} = OpFSub %float %bvh_tri_qz0_{i} %bvh_tri_qz1_{i}
+        %bvh_tri_vn0_{i} = OpFMul %float %bvh_a_{i}_5 %bvh_tri_qv0_{i}
+        %bvh_tri_vn1_{i} = OpFMul %float %bvh_a_{i}_6 %bvh_tri_qv1_{i}
+        %bvh_tri_vn2_{i} = OpFMul %float %bvh_a_{i}_7 %bvh_tri_qv2_{i}
+        %bvh_tri_vn01_{i} = OpFAdd %float %bvh_tri_vn0_{i} %bvh_tri_vn1_{i}
+        %bvh_tri_vn_{i} = OpFAdd %float %bvh_tri_vn01_{i} %bvh_tri_vn2_{i}
+        %bvh_tri_tn0_{i} = OpFMul %float %bvh_tri_e2_{i}_0 %bvh_tri_qv0_{i}
+        %bvh_tri_tn1_{i} = OpFMul %float %bvh_tri_e2_{i}_1 %bvh_tri_qv1_{i}
+        %bvh_tri_tn2_{i} = OpFMul %float %bvh_tri_e2_{i}_2 %bvh_tri_qv2_{i}
+        %bvh_tri_tn01_{i} = OpFAdd %float %bvh_tri_tn0_{i} %bvh_tri_tn1_{i}
+        %bvh_tri_tn_{i} = OpFAdd %float %bvh_tri_tn01_{i} %bvh_tri_tn2_{i}
+        %bvh_tri_u_{i} = OpFDiv %float %bvh_tri_un_{i} %bvh_tri_det_{i}
+        %bvh_tri_v_{i} = OpFDiv %float %bvh_tri_vn_{i} %bvh_tri_det_{i}
+        %bvh_tri_t_{i} = OpFDiv %float %bvh_tri_tn_{i} %bvh_tri_det_{i}
+        %bvh_tri_uv_{i} = OpFAdd %float %bvh_tri_u_{i} %bvh_tri_v_{i}
+        %bvh_tri_det_ok_{i} = OpFOrdNotEqual %bool %bvh_tri_det_{i} %float_0_000000
+        %bvh_tri_u0_{i} = OpFOrdGreaterThanEqual %bool %bvh_tri_u_{i} %float_0_000000
+        %bvh_tri_v0_{i} = OpFOrdGreaterThanEqual %bool %bvh_tri_v_{i} %float_0_000000
+        %bvh_tri_uv1_{i} = OpFOrdLessThanEqual %bool %bvh_tri_uv_{i} %float_1_000000
+        %bvh_tri_t0_{i} = OpFOrdGreaterThanEqual %bool %bvh_tri_t_{i} %float_0_000000
+        %bvh_tri_te_{i} = OpFOrdLessThan %bool %bvh_tri_t_{i} %bvh_a_{i}_1
+        %bvh_tri_hit0_{i} = OpLogicalAnd %bool %bvh_tri_det_ok_{i} %bvh_tri_u0_{i}
+        %bvh_tri_hit1_{i} = OpLogicalAnd %bool %bvh_tri_hit0_{i} %bvh_tri_v0_{i}
+        %bvh_tri_hit2_{i} = OpLogicalAnd %bool %bvh_tri_hit1_{i} %bvh_tri_uv1_{i}
+        %bvh_tri_hit3_{i} = OpLogicalAnd %bool %bvh_tri_hit2_{i} %bvh_tri_t0_{i}
+        %bvh_tri_hit_{i} = OpLogicalAnd %bool %bvh_tri_hit3_{i} %bvh_tri_te_{i}
+        %bvh_tri_tn_out_{i} = OpSelect %float %bvh_tri_hit_{i} %bvh_tri_tn_{i} %bvh_inf_{i}
+        %bvh_tri_det_out_{i} = OpSelect %float %bvh_tri_hit_{i} %bvh_tri_det_{i} %float_1_000000
+        %bvh_tri_un_out_{i} = OpSelect %float %bvh_tri_hit_{i} %bvh_tri_un_{i} %float_0_000000
+        %bvh_tri_vn_out_{i} = OpSelect %float %bvh_tri_hit_{i} %bvh_tri_vn_{i} %float_0_000000
+        %bvh_tri_hit_u_{i} = OpSelect %uint %bvh_tri_hit_{i} %uint_1 %uint_0
+        %bvh_tri_tn_u_{i} = OpBitcast %uint %bvh_tri_tn_out_{i}
+        %bvh_tri_det_u_{i} = OpBitcast %uint %bvh_tri_det_out_{i}
+        %bvh_tri_un_u_{i} = OpBitcast %uint %bvh_tri_un_out_{i}
+        %bvh_tri_vn_u_{i} = OpBitcast %uint %bvh_tri_vn_out_{i}
+        %bvh_tri_r2_{i} = OpSelect %uint %bvh_retmode_{i} %bvh_tri_un_u_{i} %bvh_raw_{i}_12
+        %bvh_tri_r3_{i} = OpSelect %uint %bvh_retmode_{i} %bvh_tri_vn_u_{i} %bvh_tri_hit_u_{i}
+"
+    );
+
+    let tri = [
+        format!("%bvh_tri_tn_u_{i}"),
+        format!("%bvh_tri_det_u_{i}"),
+        format!("%bvh_tri_r2_{i}"),
+        format!("%bvh_tri_r3_{i}"),
+    ];
+    for component in 0..4usize {
+        body += &format!(
+            "        %bvh_nontri_{i}_{component} = OpSelect %uint %bvh_is_box_{i} {boxv} %{invalid_node}
+        %bvh_result_u_{i}_{component} = OpSelect %uint %bvh_is_tri_{i} {triv} %bvh_nontri_{i}_{component}
+        %bvh_result_f_{i}_{component} = OpBitcast %float %bvh_result_u_{i}_{component}
+               OpStore %{dst} %bvh_result_f_{i}_{component}
+",
+            boxv = child_ids[component],
+            triv = tri[component],
+            dst = dst[component].value,
+        );
+    }
+
+    *dst_source += &body;
+    Ok(true)
 }
 
 /// ASTRO.BOT's `image_get_resinfo` dmask=xy form. Query the selected mip's
@@ -13157,6 +13600,7 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_exp_prim,                           T::Exp, F::PrimVsrc0OffOffOffDone,         p1("")),
 
     f(recompile_image_get_resinfo_dmask3, T::ImageGetResinfo, F::Vdata2VaddrStDmask3, p1("")),
+    f(recompile_image_bvh_intersect_ray,  T::ImageBvhIntersectRay, F::Vdata4Vaddr11Srsrc4, p1("")),
     f(recompile_image_load_dmask_f,        T::ImageLoad,      F::Vdata4Vaddr3StDmaskF,   p1("")),
     f(recompile_image_load_dmask1,         T::ImageLoad,      F::Vdata1Vaddr3StDmask1,   p1("")),
     f(recompile_image_load_dmask3,         T::ImageLoad,      F::Vdata2Vaddr3StDmask3,   p1("")),
@@ -14145,7 +14589,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            457,
+            458,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -14190,7 +14634,7 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 457,
+            implemented, 458,
             "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
@@ -17982,6 +18426,67 @@ mod tests {
     }
 
     #[test]
+    fn astro_vcvt_f32_sdwa_omod_recompiles_as_lane_safe_multiply() {
+        // v_cvt_f32_i32 v1, v5 SDWA omod=1 (mul:2). Four ASTRO.BOT scene
+        // compute shaders reach this exact recompile family after their Gen5
+        // image tables are admitted. The scale applies to the converted value
+        // before EXEC selects between it and the prior destination.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0x7E02_0AF9, 0x0006_4605, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse V_CVT_F32_I32 SDWA omod");
+        assert_eq!(
+            code.get_instructions()[0].type_,
+            ShaderInstructionType::VCvtF32I32
+        );
+        assert_eq!(code.get_instructions()[0].dst.multiplier, 2.0);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile V_CVT_F32_I32 SDWA omod");
+        assert!(source.contains("OpFMul %float %t_0"), "{source}");
+        let words = spirv_run(&source).expect("assemble V_CVT_F32_I32 SDWA omod");
+        naga_parse_and_validate(&words, "V_CVT_F32_I32 SDWA omod");
+    }
+
+    #[test]
+    fn astro_dpp16_quad_perm_move_uses_subgroup_shuffle() {
+        // Exact ASTRO.BOT scene-compute instruction at pc 0x1408:
+        // v_mov_b32 v5, v28 quad_perm:[0,0,0,0] row/bank=0xf bound_ctrl=1.
+        // The three related shaders also use controls 0x55 and 0xaa.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0x7E0A_02FA, 0xFF08_001C, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse ASTRO DPP16 quad permutation");
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [64, 1, 1];
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ASTRO DPP16 quad permutation");
+        assert!(
+            source.contains("OpCapability GroupNonUniformShuffle"),
+            "{source}"
+        );
+        assert!(
+            source.contains("OpGroupNonUniformShuffle %uint"),
+            "{source}"
+        );
+        let words = spirv_run(&source).expect("assemble ASTRO DPP16 quad permutation");
+        naga_parse_and_validate(&words, "ASTRO DPP16 quad permutation");
+    }
+
+    #[test]
     fn astro_address_only_buffer_load_uses_zero_index() {
         let mut code = ShaderCode::new();
         code.set_type(ShaderType::Compute);
@@ -18404,6 +18909,45 @@ mod tests {
         // false-negative class its dmask1/7/F siblings ship under; real
         // Vulkan accepts it. The real-driver gate is the --run-eboot render.
         let _ = spirv_run(&source).expect("assemble image_load dmask3");
+    }
+
+    #[test]
+    fn astro_bvh_intersect_ray_recompiles_against_guest_bvh_window() {
+        // Exact five-dword instruction from ASTRO.BOT compute shader
+        // 0x50059c200 at pc 0x25f0. AMD RDNA2 ISA 70648 defines the address
+        // payload as node, tmax, origin.xyz, dir.xyz, inv_dir.xyz and the
+        // four-SGPR operand as a BVH resource descriptor.
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                V_MOV_V0_0,
+                V_MOV_V0_0,
+                0xF198_9F07,
+                0x0004_0606,
+                0x4442_413D,
+                0x4543_403E,
+                0x0000_4746,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse ASTRO.BOT IMAGE_BVH_INTERSECT_RAY");
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.global_mem.used = true;
+        input_info.bind.global_mem.binding_index = 0;
+
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile ASTRO.BOT IMAGE_BVH_INTERSECT_RAY");
+        assert!(source.contains("%global_mem"), "{source}");
+        assert!(source.contains("bvh_node_type"), "{source}");
+        assert!(source.contains("bvh_box_child"), "{source}");
+        assert!(source.contains("bvh_tri_t"), "{source}");
+        let words = spirv_run(&source).expect("assemble IMAGE_BVH_INTERSECT_RAY");
+        spirv_val_ok(&words, "IMAGE_BVH_INTERSECT_RAY");
     }
 
     #[test]
@@ -21333,6 +21877,103 @@ mod tests {
 
     // ---- FLAT-class recompile (SharpEmu PR #587 `Gen5FlatMemoryTests`) ----
 
+    /// ASTRO.BOT compute 0x500570500 performs a scalar pointer chase through
+    /// guest memory:
+    ///
+    /// `s_load_dwordx2 s[8:9], s[0:1], 0`
+    /// `s_load_dwordx2 s[6:7], s[8:9], 0x58`
+    ///
+    /// The live-in pointer pair is direct user data, not the EUD. It must use
+    /// the same bounded `%global_mem` snapshot as FLAT/GLOBAL instructions so
+    /// the second load consumes the runtime pointer returned by the first.
+    #[test]
+    fn astro_scalar_pointer_chain_recompiles_to_global_window() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
+                0xFA00_0000,
+                0xBF8C_C07F, // s_waitcnt
+                0xF404_0184, // s_load_dwordx2 s[6:7], s[8:9], 0x58
+                0xFA00_0058,
+                0x7E02_0280,
+                0x7E02_0280,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured Astro scalar pointer chain");
+        assert_eq!(code.get_instructions()[0].type_, T::SLoadDwordx2);
+        assert_eq!(code.get_instructions()[2].type_, T::SLoadDwordx2);
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [64, 1, 1];
+        cs.bind.push_constant_size = 16;
+        cs.bind.direct_sgprs.sgprs_num = 2;
+        cs.bind.direct_sgprs.start_register[0] = 0;
+        cs.bind.direct_sgprs.start_register[1] = 1;
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind, None);
+        assert!(
+            cs.bind.global_mem.used,
+            "the direct scalar base must declare the guest-memory window"
+        );
+        assert_eq!(cs.bind.global_mem.base_sgpr, 0);
+
+        let source = spirv_generate_source(&code, None, None, Some(&cs))
+            .expect("recompile Astro scalar pointer chain");
+        assert!(
+            source.contains("%global_mem = OpVariable %_ptr_StorageBuffer_GlobalMem StorageBuffer"),
+            "declares the window SSBO:\n{source}"
+        );
+        assert!(
+            source.contains("%sload_ptr_0_0") && source.contains("%sload_ptr_2_1"),
+            "both scalar loads read the bounded runtime window:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble Astro scalar pointer chain");
+        spirv_val_ok(&words, "astro_scalar_pointer_chain_global_window");
+    }
+
+    /// Production Astro analysis consumes s0..s7 as an unresolved storage T#
+    /// before this pass runs. The ISA still proves that s0:s1 is a scalar
+    /// guest pointer, so detection must recover the raw dispatch-time pair
+    /// even though it no longer appears in the direct-SGPR table.
+    #[test]
+    fn astro_scalar_pointer_survives_resource_consumption() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[
+                0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
+                0xFA00_0000,
+                0x7E02_0280,
+                0x7E02_0280,
+                S_ENDPGM,
+            ],
+            &mut code,
+            true,
+        )
+        .expect("parse measured Astro scalar load");
+
+        let mut cs = ShaderComputeInputInfo::default();
+        cs.threads_num = [64, 1, 1];
+        cs.bind.textures2d.textures_num = 1;
+        cs.bind.textures2d.desc[0].start_register = 0;
+        cs.bind.textures2d.desc[0].extended = false;
+        let mut user = crate::hw_regs::UserSgprInfo::default();
+        user.count = 2;
+        user.value[0] = 0x1234_5000;
+        user.value[1] = 0x0000_0005;
+
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind, Some(&user));
+        assert!(cs.bind.global_mem.used);
+        assert_eq!(cs.bind.global_mem.base_sgpr, 0);
+        assert_eq!(cs.bind.global_mem.guest_base, 0x0000_0005_1234_5000);
+    }
+
     /// A FLAT-segment `flat_load_dword v5, v[2:3]` lowers to a `%global_mem`
     /// window access: the VGPR pair is the whole address, converted to a dword
     /// index and read with an out-of-bounds clamp.
@@ -21353,7 +21994,7 @@ mod tests {
 
         let mut cs = ShaderComputeInputInfo::default();
         cs.threads_num = [1, 1, 1];
-        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind, None);
         assert!(cs.bind.global_mem.used, "detection declares the window");
 
         let source =
@@ -21395,7 +22036,7 @@ mod tests {
 
         let mut cs = ShaderComputeInputInfo::default();
         cs.threads_num = [64, 1, 1];
-        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind, None);
 
         let source =
             spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile flat byte load");
@@ -21425,7 +22066,7 @@ mod tests {
 
         let mut cs = ShaderComputeInputInfo::default();
         cs.threads_num = [1, 1, 1];
-        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind, None);
 
         let source =
             spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile global load");
@@ -21455,7 +22096,7 @@ mod tests {
 
         let mut cs = ShaderComputeInputInfo::default();
         cs.threads_num = [1, 1, 1];
-        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind);
+        crate::shader::spirv::shader_detect_flat_global_window(&code, &mut cs.bind, None);
 
         let source =
             spirv_generate_source(&code, None, None, Some(&cs)).expect("recompile flat store");

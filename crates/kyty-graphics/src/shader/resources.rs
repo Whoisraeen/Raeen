@@ -761,7 +761,14 @@ pub struct ShaderTextureResources {
 }
 
 impl ShaderTextureResources {
-    pub const RES_MAX: usize = 16;
+    /// Maximum distinct images tracked for one shader stage.
+    ///
+    /// Legacy Kyty used 16. Current KytyPS5's Gen5 resource tracker admits 32
+    /// images (`ShaderInfo::MaxImages`), which matches retail usage tables such
+    /// as ASTRO.BOT's compute passes. The host Vulkan path allocates descriptor
+    /// arrays from the populated count, so this is an analysis-capacity limit,
+    /// not a fixed host descriptor allocation.
+    pub const RES_MAX: usize = 32;
 }
 
 /// Kyty: Shader.h `ShaderSamplerResources` (L810).
@@ -880,6 +887,10 @@ pub struct ShaderGlobalMemResources {
     /// address producer could not be recovered statically. The host may still
     /// select a validated adjacent direct-SGPR pair in that case.
     pub base_sgpr: i32,
+    /// Dispatch-time guest address captured before resource analysis rewrites
+    /// or replaces the user-SGPR fields. Bind-time data only: this must not be
+    /// part of the translated-module cache identity.
+    pub guest_base: u64,
     /// At least one FLAT/GLOBAL store is present, so the host snapshot must be
     /// copied back after a synchronous dispatch.
     pub writable: bool,
@@ -891,6 +902,7 @@ impl Default for ShaderGlobalMemResources {
             used: false,
             binding_index: 0,
             base_sgpr: -1,
+            guest_base: 0,
             writable: false,
         }
     }

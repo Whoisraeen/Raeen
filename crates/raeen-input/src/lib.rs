@@ -1,8 +1,8 @@
 //! # Raeen Input
 //!
-//! DualSense controller emulation and generic gamepad support.
-//! Provides haptic feedback, adaptive trigger translation, and
-//! fallback to XInput/SDL for non-DualSense controllers.
+//! PlayStation controller emulation and generic gamepad support.
+//! Provides native DualSense / DualShock 4 input, DualSense haptic feedback,
+//! adaptive-trigger translation, and XInput/SDL fallback for other pads.
 
 pub mod adaptive_triggers;
 pub mod dualsense;

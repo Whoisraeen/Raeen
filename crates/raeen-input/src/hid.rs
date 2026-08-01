@@ -1,17 +1,19 @@
-//! DualSense controller reader over raw HID (Windows).
+//! Native Sony controller reader over raw HID (Windows).
 //!
 //! Clean-room port of SharpEmu's `WindowsDualSenseReader.cs` +
-//! `WindowsHidNative.cs` (GPL-2.0-or-later, © SharpEmu Emulator Project).
+//! `WindowsHidNative.cs`, extended to the v0.0.3 SDL controller behavior from
+//! PR #670 (GPL-2.0-or-later, © SharpEmu Emulator Project).
 //! Zero external dependencies: the device is found by `SetupDi*` enumeration
 //! filtered on Sony's VID/PID, opened with `CreateFileW`, and read with
 //! `ReadFile`; the fixed input report is parsed at documented offsets. Handles
-//! both USB (report id `0x01`) and Bluetooth (extended report id `0x31`).
+//! DualSense/Edge and both DualShock 4 revisions over USB and Bluetooth.
 //!
-//! Input **and rumble output** are implemented; haptics / adaptive triggers /
+//! Input is implemented for both pad generations. Rumble output remains
+//! DualSense-only; DS4 output, advanced haptics / adaptive triggers, and
 //! lightbar output remain follow-ups. Output reports go out on a dedicated
 //! writer thread over a second handle to the same device path (SharpEmu's
 //! design), so the blocking reader never serializes against a write. The
-//! transport (USB vs Bluetooth) is detected from the first parsed input
+//! transport (USB vs Bluetooth) is detected from the first parsed DualSense
 //! report; Bluetooth output frames carry the required CRC-32.
 //!
 //! The pure [`parse_report`] / [`build_output_report`] functions carry the
@@ -26,6 +28,24 @@ const SONY_VID: u16 = 0x054C;
 const DUALSENSE_PID: u16 = 0x0CE6;
 /// DualSense Edge (CFI-ZCT1) product id.
 const DUALSENSE_EDGE_PID: u16 = 0x0DF2;
+/// DualShock 4 first revision (CUH-ZCT1) product id.
+const DUALSHOCK4_V1_PID: u16 = 0x05C4;
+/// DualShock 4 second revision (CUH-ZCT2) product id.
+const DUALSHOCK4_V2_PID: u16 = 0x09CC;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SonyControllerKind {
+    DualSense,
+    DualShock4,
+}
+
+fn sony_controller_kind(product_id: u16) -> Option<SonyControllerKind> {
+    match product_id {
+        DUALSENSE_PID | DUALSENSE_EDGE_PID => Some(SonyControllerKind::DualSense),
+        DUALSHOCK4_V1_PID | DUALSHOCK4_V2_PID => Some(SonyControllerKind::DualShock4),
+        _ => None,
+    }
+}
 
 /// Decode the 4-bit hat/D-pad value (`0`=N … `7`=NW, `8`=centered) into the
 /// four discrete D-pad booleans, as `(up, down, left, right)`.
@@ -48,6 +68,49 @@ fn hat_to_dpad(hat: u8) -> (bool, bool, bool, bool) {
 /// DualSense byte of `0` and this crate's `-1.0` both mean "up/left".
 fn byte_to_axis(b: u8) -> f32 {
     ((b as f32 - 128.0) / 127.0).clamp(-1.0, 1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sony_controller_state(
+    left_x: u8,
+    left_y: u8,
+    right_x: u8,
+    right_y: u8,
+    l2: u8,
+    r2: u8,
+    buttons0: u8,
+    buttons1: u8,
+    buttons2: u8,
+) -> ControllerState {
+    let (dpad_up, dpad_down, dpad_left, dpad_right) = hat_to_dpad(buttons0);
+
+    ControllerState {
+        square: buttons0 & 0x10 != 0,
+        cross: buttons0 & 0x20 != 0,
+        circle: buttons0 & 0x40 != 0,
+        triangle: buttons0 & 0x80 != 0,
+        l1: buttons1 & 0x01 != 0,
+        r1: buttons1 & 0x02 != 0,
+        // buttons1 bits 0x04 / 0x08 are the digital L2/R2; use the analog
+        // axes so both supported pad generations share one trigger contract.
+        create: buttons1 & 0x10 != 0,
+        options: buttons1 & 0x20 != 0,
+        l3: buttons1 & 0x40 != 0,
+        r3: buttons1 & 0x80 != 0,
+        ps_button: buttons2 & 0x01 != 0,
+        touchpad_click: buttons2 & 0x02 != 0,
+        dpad_up,
+        dpad_down,
+        dpad_left,
+        dpad_right,
+        left_stick_x: byte_to_axis(left_x),
+        left_stick_y: byte_to_axis(left_y),
+        right_stick_x: byte_to_axis(right_x),
+        right_stick_y: byte_to_axis(right_y),
+        l2_trigger: l2 as f32 / 255.0,
+        r2_trigger: r2 as f32 / 255.0,
+        ..Default::default()
+    }
 }
 
 /// Parse a DualSense HID input report into a [`ControllerState`].
@@ -83,35 +146,43 @@ pub fn parse_report(report: &[u8]) -> Option<ControllerState> {
     let buttons1 = report[offset + 8];
     let buttons2 = report[offset + 9];
 
-    let (dpad_up, dpad_down, dpad_left, dpad_right) = hat_to_dpad(buttons0);
+    Some(sony_controller_state(
+        left_x, left_y, right_x, right_y, l2, r2, buttons0, buttons1, buttons2,
+    ))
+}
 
-    Some(ControllerState {
-        square: buttons0 & 0x10 != 0,
-        cross: buttons0 & 0x20 != 0,
-        circle: buttons0 & 0x40 != 0,
-        triangle: buttons0 & 0x80 != 0,
-        l1: buttons1 & 0x01 != 0,
-        r1: buttons1 & 0x02 != 0,
-        // buttons1 bits 0x04 / 0x08 are the digital L2/R2; we drive L2/R2 from
-        // the analog axes below so the whole pipeline is analog-consistent.
-        create: buttons1 & 0x10 != 0, // Share / Create (richer than SharpEmu)
-        options: buttons1 & 0x20 != 0,
-        l3: buttons1 & 0x40 != 0,
-        r3: buttons1 & 0x80 != 0,
-        ps_button: buttons2 & 0x01 != 0, // PS / Home (richer than SharpEmu)
-        touchpad_click: buttons2 & 0x02 != 0,
-        dpad_up,
-        dpad_down,
-        dpad_left,
-        dpad_right,
-        left_stick_x: byte_to_axis(left_x),
-        left_stick_y: byte_to_axis(left_y),
-        right_stick_x: byte_to_axis(right_x),
-        right_stick_y: byte_to_axis(right_y),
-        l2_trigger: l2 as f32 / 255.0,
-        r2_trigger: r2 as f32 / 255.0,
-        ..Default::default()
-    })
+/// Parse a native DualShock 4 HID input report.
+///
+/// The DS4 uses report id `0x01` over USB and for its minimal Bluetooth report,
+/// with the common payload beginning at byte 1. Its full Bluetooth report is id
+/// `0x11`; two transport bytes precede the same payload, so it begins at byte 3.
+/// The common bytes are four stick axes, three button bytes, then the two analog
+/// triggers. DS4 Share maps to the guest's Create button and its touchpad click
+/// remains distinct.
+#[must_use]
+pub fn parse_dualshock4_report(report: &[u8]) -> Option<ControllerState> {
+    let offset = if report.len() >= 10 && report[0] == 0x01 {
+        1usize
+    } else if report.len() >= 12 && report[0] == 0x11 {
+        3usize
+    } else {
+        return None;
+    };
+    if report.len() < offset + 9 {
+        return None;
+    }
+
+    Some(sony_controller_state(
+        report[offset],
+        report[offset + 1],
+        report[offset + 2],
+        report[offset + 3],
+        report[offset + 7],
+        report[offset + 8],
+        report[offset + 4],
+        report[offset + 5],
+        report[offset + 6],
+    ))
 }
 
 /// One step of the standard reflected CRC-32 (poly `0xEDB88320`), ported from
@@ -177,8 +248,8 @@ pub fn build_output_report(bluetooth: bool, bt_seq: u8, large: u8, small: u8) ->
 #[cfg(windows)]
 mod imp {
     use super::{
-        ControllerState, DUALSENSE_EDGE_PID, DUALSENSE_PID, SONY_VID, build_output_report,
-        parse_report,
+        ControllerState, SONY_VID, SonyControllerKind, build_output_report,
+        parse_dualshock4_report, parse_report, sony_controller_kind,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -200,7 +271,7 @@ mod imp {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
 
-    /// Latest DualSense snapshot, or `None` when none is connected.
+    /// Latest native Sony-pad snapshot, or `None` when none is connected.
     pub type Shared = Arc<Mutex<Option<ControllerState>>>;
 
     /// The connected device as the writer thread needs it: its path (for a
@@ -229,7 +300,8 @@ mod imp {
         }
     }
 
-    /// The DualSense backend: latest input snapshot + rumble output target.
+    /// Native Sony-pad input plus the existing DualSense rumble target.
+    /// DualShock 4 output reports are deliberately not guessed yet.
     pub struct DualSense {
         pub input: Shared,
         rumble: RumbleTx,
@@ -237,7 +309,8 @@ mod imp {
 
     impl DualSense {
         /// Set the desired motor state; a no-op (beyond an atomic store) when
-        /// no DualSense is connected or the value is unchanged.
+        /// no DualSense is connected or the value is unchanged. A connected
+        /// DualShock 4 receives input only, so this remains a no-op for it.
         pub fn set_rumble(&self, large: u8, small: u8) {
             self.rumble.set(large, small);
         }
@@ -253,11 +326,11 @@ mod imp {
         let reader_shared = shared.clone();
         let reader_route = route.clone();
         let _ = std::thread::Builder::new()
-            .name("dualsense-hid-reader".into())
+            .name("sony-hid-reader".into())
             .spawn(move || read_loop(&reader_shared, &reader_route));
         let writer_target = rumble.0.clone();
         let _ = std::thread::Builder::new()
-            .name("dualsense-hid-writer".into())
+            .name("sony-hid-writer".into())
             .spawn(move || write_loop(&writer_target, &route));
         DualSense {
             input: shared,
@@ -266,20 +339,17 @@ mod imp {
     }
 
     fn read_loop(shared: &Shared, route: &SharedRoute) {
-        let mut announced = false;
         let mut generation = 0u64;
         loop {
-            if let Some((handle, path)) = open_dualsense() {
-                if !announced {
-                    tracing::info!("DualSense controller connected (raw HID)");
-                    announced = true;
-                }
+            if let Some((handle, path, kind)) = open_sony_controller() {
+                let controller = match kind {
+                    SonyControllerKind::DualSense => "DualSense",
+                    SonyControllerKind::DualShock4 => "DualShock 4",
+                };
+                tracing::info!(controller, "Sony controller connected (raw HID)");
                 generation += 1;
-                read_device(handle, shared, route, path, generation);
-                if announced {
-                    tracing::info!("DualSense controller disconnected");
-                    announced = false;
-                }
+                read_device(handle, shared, route, path, kind, generation);
+                tracing::info!(controller, "Sony controller disconnected");
             }
             *route.lock().unwrap() = None;
             *shared.lock().unwrap() = None;
@@ -296,16 +366,19 @@ mod imp {
         shared: &Shared,
         route: &SharedRoute,
         path: Vec<u16>,
+        kind: SonyControllerKind,
         generation: u64,
     ) {
         // Bluetooth quirk: requesting feature report 0x05 switches the pad into
         // the full 0x31 input report. Harmless (and ignored) over USB.
-        let mut feature = [0u8; 41];
-        feature[0] = 0x05;
-        // SAFETY: `handle` is a live HID handle; `feature` is a valid buffer of
-        // the passed length. Result is intentionally ignored.
-        unsafe {
-            HidD_GetFeature(handle, feature.as_mut_ptr().cast(), feature.len() as u32);
+        if kind == SonyControllerKind::DualSense {
+            let mut feature = [0u8; 41];
+            feature[0] = 0x05;
+            // SAFETY: `handle` is a live HID handle; `feature` is a valid
+            // buffer of the passed length. Result is intentionally ignored.
+            unsafe {
+                HidD_GetFeature(handle, feature.as_mut_ptr().cast(), feature.len() as u32);
+            }
         }
 
         let mut buffer = [0u8; 256];
@@ -326,23 +399,29 @@ mod imp {
             if ok == 0 || read == 0 {
                 break;
             }
-            let parsed = parse_report(&buffer[..read as usize]);
-            // Diagnostic (once per connect): the report id + length + whether it
-            // parsed pins BT-minimal (0x01, len<11 → None) vs USB (0x01/64) vs
-            // full BT (0x31). If it never parses, no input reaches the guest.
+            let parsed = match kind {
+                SonyControllerKind::DualSense => parse_report(&buffer[..read as usize]),
+                SonyControllerKind::DualShock4 => parse_dualshock4_report(&buffer[..read as usize]),
+            };
+            // Diagnostic (once per connect): kind + report id + length + parse
+            // result distinguish the DS5 0x01/0x31 and DS4 0x01/0x11 layouts.
+            // If it never parses, no input reaches the guest.
             if !logged {
                 logged = true;
                 tracing::info!(
+                    ?kind,
                     report_id = buffer[0],
                     len = read,
                     parsed = parsed.is_some(),
-                    "DualSense first HID input report"
+                    "Sony controller first HID input report"
                 );
             }
             if let Some(state) = parsed {
                 // First parsed report: the transport is now known, so the
-                // rumble writer can build correctly-framed output reports.
-                if route.lock().unwrap().is_none() {
+                // DualSense rumble writer can build correctly-framed output
+                // reports. DS4 input is supported independently; publishing a
+                // DS5 output shape to it would be unsafe, so it gets no route.
+                if kind == SonyControllerKind::DualSense && route.lock().unwrap().is_none() {
                     let bluetooth = buffer[0] == 0x31;
                     tracing::info!(bluetooth, "DualSense rumble output route ready");
                     *route.lock().unwrap() = Some(Route {
@@ -433,10 +512,12 @@ mod imp {
         }
     }
 
-    /// Enumerate present HID interfaces, returning the first whose VID/PID is
-    /// a DualSense (opened read+write, falling back to read-only) along with
-    /// its device path, which the rumble writer uses for its own handle.
-    fn open_dualsense() -> Option<(HANDLE, Vec<u16>)> {
+    /// Enumerate present HID interfaces and open a supported Sony controller,
+    /// preferring DualSense over DualShock 4 regardless of SetupDi ordering.
+    /// A write-capable handle is preferred for the DualSense rumble route;
+    /// input-only access is sufficient for either controller generation.
+    fn open_sony_controller() -> Option<(HANDLE, Vec<u16>, SonyControllerKind)> {
+        let mut ds4_fallbacks: Vec<Vec<u16>> = Vec::new();
         for path in enumerate_hid_paths() {
             // Probe VID/PID with a query-only (access = 0) handle.
             let probe = create_file(&path, 0);
@@ -451,10 +532,15 @@ mod imp {
             unsafe {
                 CloseHandle(probe);
             }
-            if ok == 0
-                || attrs.VendorID != SONY_VID
-                || (attrs.ProductID != DUALSENSE_PID && attrs.ProductID != DUALSENSE_EDGE_PID)
-            {
+            if ok == 0 || attrs.VendorID != SONY_VID {
+                continue;
+            }
+            let Some(kind) = sony_controller_kind(attrs.ProductID) else {
+                continue;
+            };
+
+            if kind == SonyControllerKind::DualShock4 {
+                ds4_fallbacks.push(path);
                 continue;
             }
 
@@ -463,7 +549,17 @@ mod imp {
                 handle = create_file(&path, GENERIC_READ);
             }
             if handle != INVALID_HANDLE_VALUE {
-                return Some((handle, path));
+                return Some((handle, path, kind));
+            }
+        }
+
+        for path in ds4_fallbacks {
+            let mut handle = create_file(&path, GENERIC_READ | GENERIC_WRITE);
+            if handle == INVALID_HANDLE_VALUE {
+                handle = create_file(&path, GENERIC_READ);
+            }
+            if handle != INVALID_HANDLE_VALUE {
+                return Some((handle, path, SonyControllerKind::DualShock4));
             }
         }
         None
@@ -763,5 +859,93 @@ mod tests {
         let s = parse_report(&r).expect("valid BT report");
         assert!(s.options, "BT Options at shifted offset");
         assert_eq!(s.left_stick_x, 0.0, "BT centered stick");
+    }
+
+    #[test]
+    fn dualshock4_usb_report_maps_native_playstation_controls() {
+        let mut report = vec![0u8; 64];
+        report[0] = 0x01;
+        report[1] = 0; // left X
+        report[2] = 255; // left Y
+        report[3] = 128; // right X
+        report[4] = 128; // right Y
+        report[5] = 0xF0 | 0x02; // all face buttons + D-pad right
+        report[6] = 0x01 | 0x02 | 0x10 | 0x20 | 0x40 | 0x80;
+        report[7] = 0x01 | 0x02; // PS + touchpad click
+        report[8] = 255; // analog L2
+        report[9] = 64; // analog R2
+
+        let state = parse_dualshock4_report(&report).expect("valid DS4 USB report");
+        assert!(state.square && state.cross && state.circle && state.triangle);
+        assert!(state.dpad_right && !state.dpad_up && !state.dpad_down && !state.dpad_left);
+        assert!(state.l1 && state.r1 && state.create && state.options);
+        assert!(state.l3 && state.r3 && state.ps_button && state.touchpad_click);
+        assert!((state.left_stick_x + 1.0).abs() < 1e-2);
+        assert!((state.left_stick_y - 1.0).abs() < 1e-2);
+        assert_eq!(state.l2_trigger, 1.0);
+        assert!((state.r2_trigger - 64.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dualshock4_bluetooth_report_uses_the_extended_payload_offset() {
+        let mut report = vec![0u8; 78];
+        report[0] = 0x11;
+        report[3] = 128; // left X
+        report[4] = 128; // left Y
+        report[5] = 128; // right X
+        report[6] = 128; // right Y
+        report[7] = 0x08; // centered hat
+        report[8] = 0x20; // Options
+        report[9] = 0x01; // PS
+        report[10] = 32; // L2
+        report[11] = 224; // R2
+
+        let state = parse_dualshock4_report(&report).expect("valid DS4 Bluetooth report");
+        assert!(state.options && state.ps_button);
+        assert_eq!(state.left_stick_x, 0.0);
+        assert!((state.l2_trigger - 32.0 / 255.0).abs() < 1e-6);
+        assert!((state.r2_trigger - 224.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dualshock4_minimal_bluetooth_report_uses_the_common_payload() {
+        let mut report = vec![0u8; 10];
+        report[0] = 0x01;
+        report[1] = 128; // left X
+        report[2] = 128; // left Y
+        report[3] = 128; // right X
+        report[4] = 128; // right Y
+        report[5] = 0x20 | 0x08; // Cross + centered hat
+        report[6] = 0x10; // Share/Create
+        report[7] = 0x02; // touchpad click
+        report[8] = 16; // L2
+        report[9] = 240; // R2
+
+        let state = parse_dualshock4_report(&report).expect("valid minimal DS4 BT report");
+        assert!(state.cross && state.create && state.touchpad_click);
+        assert_eq!(state.left_stick_x, 0.0);
+        assert!((state.l2_trigger - 16.0 / 255.0).abs() < 1e-6);
+        assert!((state.r2_trigger - 240.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sony_product_ids_classify_both_controller_generations() {
+        assert_eq!(
+            sony_controller_kind(DUALSENSE_PID),
+            Some(SonyControllerKind::DualSense)
+        );
+        assert_eq!(
+            sony_controller_kind(DUALSENSE_EDGE_PID),
+            Some(SonyControllerKind::DualSense)
+        );
+        assert_eq!(
+            sony_controller_kind(DUALSHOCK4_V1_PID),
+            Some(SonyControllerKind::DualShock4)
+        );
+        assert_eq!(
+            sony_controller_kind(DUALSHOCK4_V2_PID),
+            Some(SonyControllerKind::DualShock4)
+        );
+        assert_eq!(sony_controller_kind(0x1234), None);
     }
 }

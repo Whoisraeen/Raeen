@@ -301,13 +301,22 @@ SOFTWARE.
 - **Upstream:** https://github.com/sharpemu/sharpemu (formerly par274/sharpemu)
 - **License:** GPL-2.0-or-later (compatible with Raeen's GPL-2.0-only)
 - **Copyright:** © SharpEmu authors
-- **Reference synced:** 2026-07-26 to upstream `main` @ `0535783` (the
-  `v0.0.2-beta.5` work is included) — brings working AudioOut2 audio (GTA V),
-  AGC cross-queue
+- **Reference synced:** 2026-07-31 to release `v0.0.3-hotfix-2` @ `d5108e8`
+  (the earlier `v0.0.2-beta.5` work is included) — adds the SDL3 host backend,
+  native DualSense/DS4 controller coverage, the separately MIT-licensed
+  LibAtrac9 decoder, and the restored GTA V path, alongside working AudioOut2
+  audio and AGC cross-queue
   `WAIT_REG_MEM` label work (`Agc/GpuWaitRegistry.cs`), and PR #587's Gen5 flat
   (global) memory + 3D-texture shader support (`Shader/*`, PSSL SEG-field
   FLAT-address decode → SPIR-V global-memory access). Ports cite the
   originating SharpEmu `file:line` in doc comments.
+- **Native DualShock 4 input 2026-07-31:** SharpEmu v0.0.3 PR #670's native
+  DualSense/DS4 controller behavior was adapted to Raeen's existing Windows
+  raw-HID backend rather than importing SDL3. `crates/raeen-input/src/hid.rs`
+  recognizes both official DS4 revisions and decodes their USB/Bluetooth
+  input reports into Raeen's existing `ControllerState`; DualSense remains
+  preferred. The Rust parser, discovery policy, and tests are original. DS4
+  rumble is deliberately not claimed or implemented.
 - **`DRAW_INDEX_2` packet layout 2026-07-29**: `hle_dcb_draw_index` in
   `crates/raeen-hle/src/libsce_agc.rs` emitted a five-DWORD `IT_DRAW_INDEX_2`
   whose body zeroed the 64-bit index-buffer base, so the PM4 walker refused

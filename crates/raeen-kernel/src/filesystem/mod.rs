@@ -123,6 +123,36 @@ pub mod open_flags {
     pub const O_TRUNC: i32 = 0x0400;
 }
 
+/// One host metadata snapshot used to classify an `open` target.
+///
+/// Keep this deliberately smaller than `std::fs::Metadata`: the VFS needs only
+/// existence, directory-vs-file, and the immutable length captured for a
+/// read-only descriptor. The old path asked the host for the same metadata via
+/// `Path::exists`, then again via `Path::is_dir`, and a third time through the
+/// newly-opened file handle. Commercial titles can open thousands of small
+/// assets during one streaming transition, so those duplicate queries become
+/// real mechanical seeks on an external hard disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPathKind {
+    Missing,
+    Directory,
+    File { len: u64 },
+}
+
+fn host_path_kind(path: &Path) -> HostPathKind {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => HostPathKind::Directory,
+        Ok(metadata) => HostPathKind::File {
+            len: metadata.len(),
+        },
+        // Preserve `Path::exists()`'s prior contract: an inaccessible target
+        // is not considered present by the VFS and follows the same ENOENT
+        // path as a missing target. The resolver has already emitted a named
+        // refusal for sandbox/canonicalization failures.
+        Err(_) => HostPathKind::Missing,
+    }
+}
+
 /// An open file descriptor.
 ///
 /// Fields split by mutability: the immutable-after-open ones live directly on
@@ -933,8 +963,13 @@ impl VirtualFileSystem {
             std::io::Error::new(std::io::ErrorKind::NotFound, "path is not mounted")
         })?;
 
-        let exists = host_path.exists();
-        let is_directory = host_path.is_dir();
+        // One metadata snapshot replaces `exists()` + `is_dir()` and supplies
+        // the read-only file length below. This is a hot-path optimization,
+        // not a cache: every open still revalidates the host target and still
+        // passes through `resolve_path`'s symlink/reparse containment checks.
+        let host_kind = host_path_kind(&host_path);
+        let exists = host_kind != HostPathKind::Missing;
+        let is_directory = host_kind == HostPathKind::Directory;
         if !exists && !create {
             debug!("VFS: file not found on host: {}", host_path.display());
             return Err(std::io::Error::new(
@@ -991,7 +1026,10 @@ impl VirtualFileSystem {
             None
         } else if exists && !truncate && !writable {
             let handle = std::fs::File::open(&host_path)?;
-            let len = handle.metadata().map(|m| m.len()).unwrap_or(0);
+            let len = match host_kind {
+                HostPathKind::File { len } => len,
+                HostPathKind::Missing | HostPathKind::Directory => 0,
+            };
             reader = Some((handle, len));
             None
         } else if exists && !truncate {
@@ -2648,6 +2686,27 @@ mod tests {
         let fd2 = vfs.open("/app0/save.bin", O_RDONLY, 0).unwrap();
         assert_eq!(vfs.read(fd2, 8).unwrap(), b"SAVEDATA");
         vfs.close(fd2).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_path_kind_classifies_with_the_metadata_snapshot_used_by_open() {
+        let dir = temp_dir("host-path-kind");
+        let file = dir.join("asset.bin");
+        let subdir = dir.join("pack");
+        std::fs::write(&file, b"asset-data").unwrap();
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert!(matches!(
+            host_path_kind(&file),
+            HostPathKind::File { len: 10 }
+        ));
+        assert!(matches!(host_path_kind(&subdir), HostPathKind::Directory));
+        assert!(matches!(
+            host_path_kind(&dir.join("missing.bin")),
+            HostPathKind::Missing
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

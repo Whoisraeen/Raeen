@@ -478,6 +478,15 @@ type PresentEncodeCache = Vec<(usize, Weak<RenderedImage>, Arc<RenderedImage>)>;
 /// most one later flip to a live read (the pre-async behaviour), never leaking.
 const MAX_SCANOUT_SNAPSHOTS: usize = 8;
 
+fn should_report_black_frame(
+    gpu_work_submitted: bool,
+    flip_address_hit: bool,
+    guest_preferred: bool,
+    fallback_hit: bool,
+) -> bool {
+    gpu_work_submitted && !flip_address_hit && !guest_preferred && !fallback_hit
+}
+
 /// Count pixels with visible colour, optionally sampling every `stride`th
 /// pixel. Alpha alone is not visible over the Shell's black background and
 /// must not make a cleared RGBA target look content-bearing.
@@ -1669,7 +1678,6 @@ impl AgcGpuSession {
             composed_present.or_else(|| {
                 let desc = *self.scanout_descriptor.lock();
                 desc.and_then(|desc| self.present_from_guest_memory(address, &desc))
-                    .map(Arc::new)
             })
         } else {
             None
@@ -1739,7 +1747,12 @@ impl AgcGpuSession {
                 },
             );
         }
-        if !flip_address_hit && !guest_preferred && !fallback_hit {
+        if should_report_black_frame(
+            self.submission_count.load(Ordering::Relaxed) != 0,
+            flip_address_hit,
+            guest_preferred,
+            fallback_hit,
+        ) {
             static BLACK_FRAME_WARNINGS: AtomicU64 = AtomicU64::new(0);
             let occurrence = BLACK_FRAME_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
             if occurrence <= 8 || occurrence.is_power_of_two() {
@@ -1997,7 +2010,7 @@ impl AgcGpuSession {
         &self,
         address: u64,
         desc: &raeen_core::subsystems::ScanoutDescriptor,
-    ) -> Option<RenderedImage> {
+    ) -> Option<Arc<RenderedImage>> {
         if address == 0 || desc.width == 0 || desc.height == 0 {
             return None;
         }
@@ -2079,9 +2092,8 @@ impl AgcGpuSession {
             let snap = self
                 .guest_scanout_snapshots
                 .lock()
-                .get(&address)
-                .filter(|b| b.len() == total as usize)
-                .cloned();
+                .remove(&address)
+                .filter(|b| b.len() == total as usize);
             match snap {
                 Some(bytes) => bytes,
                 None => Arc::new(self.read_scanout_bytes(address, desc)?),
@@ -2091,18 +2103,27 @@ impl AgcGpuSession {
             .checked_mul(height as usize)?
             .checked_mul(4)?;
         // GTA V's Gen5 scanouts are already tightly packed RGBA8
-        // (`2R8G8B8A8`, pitch == width). Walking an 8.3-million-pixel 4K
-        // image and issuing one four-byte slice copy per texel cost roughly
-        // 400 ms per flip in a measured release run. Preserve the general
-        // swizzle/unpack path below, but make the identity conversion one
-        // bounded bulk copy.
+        // (`2R8G8B8A8`, pitch == width). The flip thread already copied the
+        // complete frame into an owned snapshot before the title could reuse
+        // its display buffer. Transfer that allocation into the published
+        // frame instead of cloning another 33 MiB at 4K. `try_unwrap` succeeds
+        // on the production path because removing the single-use snapshot from
+        // the map leaves this as its sole owner; the fallback preserves correct
+        // behaviour for a diagnostic/test holder with another Arc.
         if matches!(conv, ScanoutConv::Rgba8) && pitch == width {
-            return Some(RenderedImage {
+            let pixels = match Arc::try_unwrap(src) {
+                Ok(mut pixels) => {
+                    pixels.truncate(output_len);
+                    pixels
+                }
+                Err(shared) => shared.get(..output_len)?.to_vec(),
+            };
+            return Some(Arc::new(RenderedImage {
                 width,
                 height,
-                pixels: src.get(..output_len)?.to_vec(),
+                pixels,
                 bytes_per_pixel: 4,
-            });
+            }));
         }
         let mut pixels = Vec::<u8>::new();
         pixels.try_reserve_exact(output_len).ok()?;
@@ -2144,12 +2165,12 @@ impl AgcGpuSession {
                 }
             }
         }
-        Some(RenderedImage {
+        Some(Arc::new(RenderedImage {
             width,
             height,
             pixels,
             bytes_per_pixel: 4,
-        })
+        }))
     }
 
     fn ensure_backend(&self) -> Result<(), GpuError> {
@@ -4575,6 +4596,21 @@ mod tests {
         assert_eq!(session.last_image().unwrap().pixels, content.pixels);
     }
 
+    #[test]
+    fn pre_submission_empty_present_is_startup_not_a_black_frame() {
+        assert!(
+            !should_report_black_frame(false, false, false, false),
+            "a flip before the first DCB cannot diagnose a graphics failure"
+        );
+        assert!(
+            should_report_black_frame(true, false, false, false),
+            "an empty present after submitted GPU work remains actionable"
+        );
+        assert!(!should_report_black_frame(true, true, false, false));
+        assert!(!should_report_black_frame(true, false, true, false));
+        assert!(!should_report_black_frame(true, false, false, true));
+    }
+
     /// A render-target entry at the flip address is not automatically a valid
     /// frame. Minecraft keeps cleared scanout targets while drawing its UI to
     /// an intermediate target; existence-only routing presented the cleared
@@ -4936,10 +4972,12 @@ mod tests {
         };
         // The flip thread captured the frame the title had just finished.
         let frame_a = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let snapshot = Arc::new(frame_a.clone());
+        let snapshot_pixels = snapshot.as_ptr();
         session
             .guest_scanout_snapshots
             .lock()
-            .insert(BASE, Arc::new(frame_a.clone()));
+            .insert(BASE, snapshot);
 
         let img = session
             .present_from_guest_memory(BASE, &desc)
@@ -4947,6 +4985,15 @@ mod tests {
         assert_eq!(
             img.pixels, frame_a,
             "present reads the flip-time snapshot, never the reused (cleared) live buffer"
+        );
+        assert_eq!(
+            img.pixels.as_ptr(),
+            snapshot_pixels,
+            "a tightly packed RGBA snapshot must transfer its allocation into the published frame"
+        );
+        assert!(
+            session.guest_scanout_snapshots.lock().is_empty(),
+            "a flip-time snapshot is single-use and must be consumed by its queued present"
         );
 
         // With no snapshot it falls back to a live read (the pre-async path) —

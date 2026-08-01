@@ -3,9 +3,10 @@
 //!
 //! Two backends run on their own background threads (SharpEmu design): the
 //! XInput reader ([`crate::xinput`]) for Xbox / Steam-Input / generic-HID
-//! pads, and the raw-HID reader ([`crate::hid`]) for the DualSense. Both cache
+//! pads, and the raw-HID reader ([`crate::hid`]) for DualSense / DualShock 4.
+//! Both cache
 //! their latest snapshot behind a `Mutex`; [`NativeGamepads::poll`] returns one
-//! per frame, DualSense preferred (it is the real PS5 pad).
+//! per frame, native Sony HID preferred (DualSense is the real PS5 pad).
 //!
 //! On non-Windows targets the whole thing degrades to a no-op so the crate
 //! still builds; the native readers are Windows-only today.
@@ -17,7 +18,7 @@ use crate::ControllerState;
 #[cfg(windows)]
 pub struct NativeGamepads {
     xinput: crate::xinput::XInputPads,
-    dualsense: crate::hid::DualSense,
+    sony_hid: crate::hid::DualSense,
 }
 
 #[cfg(windows)]
@@ -29,28 +30,29 @@ impl NativeGamepads {
     pub fn start() -> Self {
         Self {
             xinput: crate::xinput::spawn(),
-            dualsense: crate::hid::spawn(),
+            sony_hid: crate::hid::spawn(),
         }
     }
 
-    /// Latest native snapshot — DualSense preferred over XInput — or `None`
+    /// Latest native snapshot — Sony HID preferred over XInput — or `None`
     /// when no native controller is connected. Sticks are raw (`-1..=1`); the
     /// caller applies its configured deadzone.
     #[must_use]
     pub fn poll(&self) -> Option<ControllerState> {
-        if let Some(ds) = self.dualsense.input.lock().ok().and_then(|g| g.clone()) {
-            return Some(ds);
+        if let Some(sony) = self.sony_hid.input.lock().ok().and_then(|g| g.clone()) {
+            return Some(sony);
         }
         self.xinput.input.lock().ok().and_then(|g| g.clone())
     }
 
     /// Route a rumble command (Orbis `0..=255` motor bytes; large =
     /// low-frequency/strong, small = high-frequency/weak) to whatever native
-    /// controller is connected: the DualSense gets a HID output report, an
-    /// XInput pad gets `XInputSetState`. Both sinks no-op when their device
-    /// is absent, so this is safe to call unconditionally.
+    /// controller is connected: the DualSense gets a HID output report, a
+    /// DualShock 4 remains input-only, and an XInput pad gets
+    /// `XInputSetState`. All sinks no-op when their device is absent, so this
+    /// is safe to call unconditionally.
     pub fn set_rumble(&self, large: u8, small: u8) {
-        self.dualsense.set_rumble(large, small);
+        self.sony_hid.set_rumble(large, small);
         self.xinput.set_rumble(large, small);
     }
 }

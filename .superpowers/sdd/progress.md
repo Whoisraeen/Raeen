@@ -5950,3 +5950,326 @@ VERIFICATION:
   probes remain explicitly ignored across the full run.
 - Scoped all-target Clippy for both crates with `-D warnings`, formatting, and
   `git diff --check` are green.
+
+## 2026-07-30 — GTA V exact-tail shader fetch
+
+The title evidence below is from a release build of **`8131051+dirty`**. The
+change is not present in commit `8131051` alone. This was a shader-traced,
+scripted-input diagnostic run, not a clean FPS baseline or gameplay claim.
+
+ROOT CAUSE AND FIX:
+
+- GTA compute shader `0x148d47200` occupies 284 readable bytes, but shader
+  fetch first probed 16 bytes and then required the entire following 4 KiB
+  speculative window to be readable. The exact allocation legitimately ended
+  inside that window, so the second read failed and the parser received only
+  16 bytes (`truncated instruction at 0x10`).
+- `readable_prefix` now finds the exact process-authorized prefix of a bounded
+  range. `WindowMem::grow_to` falls back to that dword-aligned prefix when a
+  full speculative chunk crosses an allocation end. It never dereferences or
+  copies beyond the guest-memory authority.
+- The accompanying 284-byte regression proves that a 16-byte probe grows to
+  all 71 authorized dwords, while the lower-level test pins exact prefix,
+  interior-prefix, invalid-base, and zero-size behavior.
+
+MEASURED RESULT:
+
+- Scripted Cross replay was genuinely active: the runner logged all four
+  `0x00004000` press states and neutral releases between 28 and 46 seconds.
+- `scratch/gta-post-continue-trace-20260730/soak-1785465930243`: 2m30.9s,
+  7,040 frames, 48.3 overall flips/s, 55.2 average window FPS, 4.6s worst
+  no-flip window, 3,270 MiB peak process-tree RAM, and zero deadlock warnings.
+- The fixed compute shader translated repeatedly to 1,362-word SPIR-V modules;
+  there were zero truncated-shader or shader-translation failures. Targeted
+  V# tracing also proved GTA's later vertex chain: the `s_load_dwordx4` at
+  PC `0x5c` captured the buffer descriptor and the
+  `s_buffer_load_dwordx16` at PC `0xdc` captured its 16 matrix dwords. The
+  earlier reported x16 refusal did not reproduce in the corrected release.
+- Zero VUID, device-loss, or frozen-window records occurred. The one startup
+  black-frame diagnostic and the known unmatched 3840x2160 sampled target at
+  `0x1557c00000` remain.
+
+VERIFICATION:
+
+- `cargo test -p raeen-gpu`: 380 unit tests passed, 3 measurement tests
+  ignored; every executed Vulkan integration test passed.
+- `cargo clippy -p raeen-gpu --all-targets -- -D warnings`,
+  `cargo fmt --all -- --check`, and `git diff --check`: green.
+
+## 2026-07-31 — GTA V video-plane and startup-flip diagnostics corrected
+
+This slice is from **`8131051+dirty`** and is diagnostic-quality work, not a
+new visual-stage or gameplay claim. A retail rerun of the modified binary is
+pending because a separately launched full compatibility sweep owns the GPU
+and `logs/raeen.log`; it was preserved rather than perturbed.
+
+MEASURED ROOT CAUSES:
+
+- The reported `black-frame` occurred at +3212 ms, while GTA's first DCB was
+  not submitted until +3226 ms. The empty flip preceded all GPU work by 14 ms,
+  so it was startup ordering rather than evidence that submitted rendering
+  produced black.
+- The supposed unmatched render target at `0x1557c00000` is a guest-backed
+  3840x2160 `R8_UNORM` video plane. The retained trace in
+  `scratch/gta-post-continue-trace-20260730/soak-1785465930243/stdout.log`
+  shows the full-screen `0x148d83000` fragment shader sampling it alongside two
+  populated 1920x1080 R8 planes. A later 4K ring slot at `0x1558c00000`
+  transitions from zero to 1,408,965 non-zero bytes. Plain 2D/single-level
+  shape therefore did not prove a render-target alias; the texture was
+  legitimate guest memory.
+
+FIX:
+
+- `black-frame` is now reported only after the session has accepted at least
+  one GPU submission. Empty pre-DCB flips remain present-path events but no
+  longer poison compatibility blocker clustering.
+- `sampled-render-target-unmatched` is now emitted only when a colour target at
+  the same guest base actually exists and neither the live GPU image nor its
+  CPU snapshot can satisfy the T#. Ordinary guest-backed 2D textures retain
+  the same decode and sampling path without being mislabeled.
+
+VERIFICATION:
+
+- Two focused regressions passed:
+  `pre_submission_empty_present_is_startup_not_a_black_frame` and
+  `guest_backed_sampled_texture_is_not_an_unmatched_target`.
+- `cargo test -p raeen-gpu`: 382 unit tests passed, 3 measurement probes
+  ignored; every executed Vulkan integration suite passed.
+- `cargo clippy -p raeen-gpu --all-targets -- -D warnings`,
+  `cargo fmt --all -- --check`, and `git diff --check`: green.
+- Release `raeen.exe` built at
+  `../Raeen-target-gta-main/release/raeen.exe`, SHA-256
+  `CEAFC3A3F3F5C723C18F5552AAA72BF9D4815C33C769C5C2131FB6CBCDAA0649`.
+
+## 2026-07-31 — GTA V 4K Shell-path diagnosis and scanout ownership
+
+The attached interactive Shell evidence and the retail soak below are from
+**`8131051+dirty`**. The changes are not present in commit `8131051` alone.
+This is a performance/diagnostic slice, not a new visual-stage claim.
+
+MEASURED ROOT CAUSE:
+
+- The interactive Shell run published 3840x2160 RGBA8 frames (33,177,600
+  bytes). Its frame-IPC seqlock epoch advanced from 2 to 2048 between
+  +100.581 s and +188.089 s: 1,024 complete frames in 87.508 s, or about
+  11.7 completed frames/s. The run emitted no shader refusal, descriptor
+  refusal, Vulkan error, device loss, crash, or >10 s stall.
+- The executable-local
+  `../Raeen-target-gta-main/release/config.toml` still selected
+  `resolution_scale = 1.0`, even though the repository config selected 0.5.
+  The Shell was therefore transporting and uploading native 4K frames. The
+  machine-local test config is now 0.5; it remains outside git.
+- The current frame is copied runner readback -> IPC slot -> Shell-owned frame
+  -> wgpu upload. At 4K, each CPU hop is 33.2 MB. This is the measured active
+  Shell-path wall; no swapchain work was started.
+
+ADDITIVE FIX:
+
+- A tightly packed RGBA guest-scanout snapshot is now removed from its
+  single-use map and its allocation transferred directly into the published
+  `RenderedImage`. The worker no longer clones that complete snapshot (33.2 MB
+  at 4K) before IPC. The fallback still copies when another `Arc` owner exists.
+- The regression pins pixel identity, allocation identity, and one-time
+  consumption. This path is a deterministic copy removal, but the GTA steady
+  state draws directly into its flip target, so no GTA FPS gain is attributed
+  to it.
+
+RETAIL MEASUREMENT:
+
+- `scratch/gta-zero-copy-20260731/soak-1785506543233`: scripted 9-event Cross
+  replay, 2m30.8s, first present 6.6s, 6,784 flip high-water, 47.1 overall
+  flips/s, 52.4 average window FPS (7.2/52.4/57.8 min/avg/max), 3.6s worst
+  no-flip window, zero deadlock warnings, 3,279 MiB peak process-tree RAM.
+  The 10-second stability gate passed.
+- The prior comparable run was 48.3 overall / 55.2 average with a 4.6s worst
+  window. Because the new ownership path was used only for the first fallback
+  present (`scanout_hit=false` at present 1; true from present 2 onward), the
+  mixed FPS delta is ordinary run variance and is not claimed as a speedup.
+
+VERIFICATION:
+
+- `cargo test -p raeen-gpu`: 382 unit tests passed, 3 measurement probes
+  ignored; all executed Vulkan integration suites passed.
+- `cargo clippy -p raeen-gpu --all-targets -- -D warnings`, formatting, and
+  `git diff --check`: green.
+- Release `raeen.exe` rebuilt at
+  `../Raeen-target-gta-main/release/raeen.exe`, SHA-256
+  `1E243F13E2C33F12204F10A61AF9A6C2ECB45FBF45D969B6F0D1A3DE99AC3C90`.
+
+## 2026-07-31 - External-HDD streaming I/O diagnosis and open-path query reduction
+
+This slice is from **`8131051+dirty`**. It reduces redundant host metadata
+work, but the short retail samples are mixed and do not close the Phase 2
+30-minute stability gate or establish a general FPS improvement.
+
+MEASURED ROOT CAUSE:
+
+- The configured `E:\PS5` library is on a `Seagate BUP Slim BL SCSI Disk
+  Device`, reported by Windows as `External hard disk media` with normal seeks.
+  It is a mechanical external HDD, not an SSD/NVMe device.
+- A 38-second Minecraft file trace contained 13,280 file operations covering
+  6,826 unique paths. A 3.136-second worker/no-flip window overlapped 748
+  operations across 375 paths; the longer transition overlapped 7,325
+  operations across 3,819 paths; and a 4.341-second window overlapped 1,748
+  operations across 847 paths. The traffic is dominated by thousands of small
+  resource, configuration, font, and texture files under `/app0/data`.
+- The trace proves that the external-HDD small-file/metadata storm coincides
+  with transition stalls. Trace logging adds overhead, so its raw FPS is not a
+  performance baseline. It also does not supersede the independently measured
+  guest mutex convoy at `module+0x8dc58ca`; storage is not the only stall source.
+
+ADDITIVE FIX:
+
+- `VirtualFileSystem::open` now takes one host metadata snapshot to classify a
+  target and capture its read-only length. This replaces `Path::exists`,
+  `Path::is_dir`, and `File::metadata` on every successful read-only open: three
+  post-resolution metadata queries become one.
+- This is not a stale path cache. Every open still revalidates the target and
+  retains `resolve_path`'s symlink/reparse-point and canonical-containment
+  checks. Missing/inaccessible targets preserve the prior fail-closed behavior.
+
+RETAIL A/B:
+
+- Two release binaries were produced from the same current tree and differed
+  only in the metadata snapshot change. The first control/optimized pair was
+  cold/warm asymmetric (`process_loaded` 5,090/702 ms), so it is not used to
+  claim a speedup.
+- In the subsequent warm 60-second control/optimized pair, 32-flip worker
+  windows measured p50 385/401 ms, p95 1,288/1,204 ms, p99 2,065/1,977 ms, and
+  maxima 4,529/4,314 ms. The last periodic samples reported 4,193/4,059 frames.
+  Tail windows improved by roughly 4-7%, while median throughput and sampled
+  frame count moved roughly 3-4% the other way. That is mixed run variance, not
+  evidence for a retail FPS claim. Neither run emitted a fatal, panic, or
+  device-loss record.
+
+VERIFICATION:
+
+- `cargo test -p raeen-kernel`: 96 unit, 4 guest-stack, and 2 loader tests
+  passed.
+- `cargo test -p raeen-hle`: 647 tests passed earlier in this slice.
+- `cargo clippy -p raeen-kernel -p raeen-hle --all-targets -- -D warnings`,
+  `cargo fmt --all -- --check`, and `git diff --check`: green.
+- Isolated optimized release: `../Raeen-target-dev/release/raeen.exe`, SHA-256
+  `433A6A8C33D54BA56987345BEB7DA79CFA347D3CC9C9E27C0B9F315A924C86B3`.
+
+## 2026-07-31 — SharpEmu v0.0.3 audit and native DualShock 4 input
+
+This slice is from **`8131051+dirty`**. It adapts one missing host-input
+capability from SharpEmu v0.0.3 without replacing Raeen's existing egui/winit,
+cpal, Vulkan, vblank, or DualSense paths.
+
+REFERENCE/CLEAN-ROOM:
+
+- `reference/sharpemu` is checked out at signed release
+  `v0.0.3-hotfix-2` (`d5108e8`) and remains gitignored. SharpEmu is
+  GPL-2.0-or-later; its bundled LibAtrac9 core is separately MIT licensed.
+- The release audit found that Raeen already covers borderless
+  fullscreen/windowed switching (including F11), resolution scaling/window
+  dimensions, selectable vblank rate, native DualSense input and rumble, HDR
+  target conversion/present encoding, and persistent Vulkan pipeline caching.
+  Those were not duplicated. SDL3 does not replace Raeen's host stack.
+- Full ATRAC9 decoding, true host HDR output, and exclusive display-mode
+  switching remain open and are recorded honestly in the reference ledger.
+  Raeen's current AJM decode path is still a silence stub, not an AT9 decoder.
+
+IMPLEMENTATION:
+
+- The native Windows HID reader now recognizes Sony DualShock 4 CUH-ZCT1
+  (`VID 0x054c`, PID `0x05c4`) and CUH-ZCT2 (`0x09cc`) in addition to
+  DualSense/Edge. Device selection prefers DualSense, then DS4, then the
+  existing XInput fallback.
+- DS4 USB/minimal-Bluetooth report `0x01` and full Bluetooth report `0x11`
+  decode all face, D-pad,
+  shoulder, Share/Create, Options, thumb-click, PS, and touchpad-click buttons,
+  four stick axes, and both analog triggers into the existing
+  `ControllerState`/guest-pad route.
+- DS4 is deliberately input-only. It is never published to the DualSense
+  rumble writer, so Raeen cannot send a DS5 output report to the wrong device.
+  DS4 rumble/lightbar framing remains a named follow-up.
+
+VERIFICATION:
+
+- TDD red step: focused DS4 tests first failed because
+  `parse_dualshock4_report` did not exist. The final `raeen-input` suite passes
+  all 31 tests, including both Bluetooth report forms and all four Sony product
+  ids.
+- `cargo test -p raeen-gui`: 216 tests passed. Strict all-target Clippy for
+  `raeen-input` + `raeen-gui`, formatting, and `git diff --check` are green.
+- Release Minecraft canary (`../Raeen-target-dev/minecraft-ds4-canary-180s.log`):
+  198.3 s captured, 13,868 frames at the last periodic sample, 452 worker
+  windows (p50/p95/p99 375/517/1,184 ms), 6,483 ms maximum, zero >10 s stalls,
+  and zero fatal/panic/device-loss records. Peak sampled working set was about
+  1.81 GB. This is regression evidence only; no physical DS4 was connected, so
+  live USB/Bluetooth hardware acceptance remains pending.
+- Isolated release: `../Raeen-target-dev/release/raeen.exe`, SHA-256
+  `FAC5684AF78AE9203BB16930BCA1684BF8115C05770ECF820ED6BDB16D5CAC9B`.
+
+## 2026-07-31 - ASTRO.BOT BVH translation and texture-budget correction
+
+This compatibility slice is measured from **`8131051+dirty`**. It removes the
+current shader refusal chain and corrects a large texture-accounting error, but
+it does **not** establish a complete boot, correct graphics, or correct audio.
+
+IMPLEMENTATION:
+
+- Added bounded guest-global scalar-load lowering for the measured Gen5
+  pointer chain. Runtime guest bases remain bind-time data and are excluded
+  from SPIR-V module identity.
+- Added the measured `IMAGE_BVH_INTERSECT_RAY` form using a bounded software
+  traversal for FP16/FP32 box nodes and triangle nodes, with slab tests,
+  Moller-Trumbore intersections, descriptor return modes, and deterministic
+  out-of-range misses. Unsupported A16/64-bit forms remain named refusals.
+- Added lane-safe SDWA output-modifier lowering, the measured DPP16 quad
+  permutations, 32 Gen5 image-table entries, a non-null invalid-format storage
+  placeholder, and unified texture format 130 as `R8G8B8A8_SRGB`.
+- Compute UAV snapshot budgeting now charges cache misses rather than repeated
+  logical aliases of the same immutable snapshot.
+- Fixed sampled-texture budget accounting for BC formats: the format size is
+  bytes per 4x4 block, not bytes per pixel. ASTRO's 256x256x192 BC6 resource is
+  now charged 12,582,912 bytes rather than 201,326,592 bytes. Cap diagnostics
+  rank and name the largest contributing descriptors.
+
+MEASURED RETAIL RESULT:
+
+- Stable final capture: `artifacts/compat/astro-bc-budget-final-20260731.json`,
+  run `run-1785530417221`, isolated release, 49.287 s wall, 52.640 s CPU,
+  5,701,496,832-byte peak process-tree RAM, clean process exit, 18 flips,
+  and **zero shader, GPU, Vulkan validation, device-loss, and audio API
+  errors**.
+- Four previously refused BVH compute shaders translated. The earlier bounded
+  80.469 s run (`astro-bc-budget-fix-20260731.json`) reached 36 flips with zero
+  shader/GPU/audio errors. The first cap report fell from a false 290,491,392
+  bytes to a correct 101,747,712 bytes.
+- AudioOut2 reaches guest PCM submission, but the stable run's first PCM peak
+  was 0.0. One earlier run reported peak 1.0; no audible/correct-audio claim is
+  made without a repeatable decoded signal.
+
+NEGATIVE RESULTS / NEXT BLOCKER:
+
+- A sampled-image alias-sharing experiment passed unit/Vulkan tests but caused
+  Windows heap corruption (`0xC0000374`) in two retail runs, at 18.490 s and
+  10.035 s. It was fully reverted. Raising the cap to 112 MiB was rejected as
+  a fix; the production cap remains 96 MiB.
+- The remaining termination begins with the known SAL worker fault at
+  `module+0xe03f1a` reading `0x10` through an uninitialized/poisoned voice-list
+  link. A later registry fault at `module+0xe47a43` and main-thread fault at
+  `module+0x33f335` form a lifecycle cascade. The single-thread guest A/B still
+  reproduced it, refuting native guest concurrency as the sole cause.
+- A faulted thread currently force-releases every owned guest mutex. The next
+  synchronization slice is to separate clean exit from owner-death and test a
+  poisoned-owner/EOWNERDEAD path; that can contain the cascade but is not
+  represented as a fix for the original SAL object-initialization defect.
+- Graphics still have quarantined scene/downsample/volume compute passes,
+  sampled-render-target mismatch at base `0x53b9f0000`, and placeholder sampled
+  descriptors. Presentation is not the measured bottleneck.
+
+VERIFICATION:
+
+- `cargo test -p kyty-graphics`: 728 tests passed earlier in this slice.
+- `cargo test -p raeen-gpu`: 386 unit tests passed, 3 measurement probes
+  ignored, and all executed Vulkan integration suites passed after reverting
+  the unsafe alias experiment.
+- Strict Clippy for `kyty-graphics` + `raeen-gpu` passed with `-D warnings`.
+- Current isolated release rebuilt at `../Raeen-target-dev/release/raeen.exe`,
+  SHA-256
+  `B5C16C074CA18ABF4C9EDB14A3EDFF5416F6865514A5E48382C877E925A81D9A`.

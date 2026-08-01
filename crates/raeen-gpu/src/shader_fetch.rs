@@ -1287,6 +1287,16 @@ impl ShaderTranslateCache {
                     0,
                     &mut cs_info.bind,
                 );
+                // Capture live user-pointer scalar loads in compute too. This
+                // materializes Astro's outer `s0 -> s8:s9` BVH pointer-table
+                // read per bind; later shader-produced pointer loads remain
+                // live through the bounded global-memory window below.
+                kyty_graphics::shader::shader_capture_runtime_scalar_loads(
+                    &code,
+                    mem,
+                    &cs.cs_user_sgpr,
+                    &mut cs_info.bind,
+                );
                 kyty_graphics::shader::shader_measure_constant_buffer_accesses(
                     &code,
                     &mut cs_info.bind,
@@ -1297,7 +1307,15 @@ impl ShaderTranslateCache {
                 // existed but was never called by the production CS path,
                 // leaving GTA's otherwise supported flat_load_ubyte to fail
                 // with "global_mem window not declared".
-                kyty_graphics::shader::shader_detect_flat_global_window(&code, &mut cs_info.bind);
+                kyty_graphics::shader::shader_detect_flat_global_window(
+                    &code,
+                    &mut cs_info.bind,
+                    Some(&cs.cs_user_sgpr),
+                );
+                kyty_graphics::shader::shader_rebase_global_window_for_bvh(
+                    &code,
+                    &mut cs_info.bind,
+                );
                 Ok(PreparedShader::Cs {
                     code,
                     info: Arc::new(cs_info),
@@ -1742,11 +1760,31 @@ impl WindowMem {
         while self.data.len() < want {
             let at = self.base + (self.data.len() as u64) * 4;
             let step = CHUNK_DWORDS.min(want - self.data.len()) as u32;
-            let Some(chunk) = crate::guest_mem::read_dwords_checked(at, step) else {
-                break;
+            let chunk = if let Some(chunk) = crate::guest_mem::read_dwords_checked(at, step) {
+                chunk
+            } else {
+                // The normal 4 KiB speculative fetch can cross the end of a
+                // perfectly valid, tightly-sized shader allocation. GTA V's
+                // 284-byte compute program is one measured case: the initial
+                // 16-byte header read succeeded, the 4 KiB continuation did
+                // not, and the parser was incorrectly handed only 16 bytes.
+                // Read the process-authorized, dword-aligned prefix instead.
+                let requested_bytes = u64::from(step) * 4;
+                let partial_bytes = crate::guest_mem::readable_prefix(at, requested_bytes) & !3u64;
+                let Ok(partial_step) = u32::try_from(partial_bytes / 4) else {
+                    break;
+                };
+                let Some(chunk) = crate::guest_mem::read_dwords_checked(at, partial_step) else {
+                    break;
+                };
+                chunk
             };
+            let complete_step = chunk.len() == step as usize;
             self.data.extend(chunk);
             grew = true;
+            if !complete_step {
+                break;
+            }
         }
         grew
     }
@@ -2317,6 +2355,33 @@ mod tests {
         assert_eq!(
             translated.cs_info.bind.storage_buffers.buffers[0].num_records(),
             4096
+        );
+    }
+
+    /// A shader allocation need not occupy the whole speculative 4 KiB fetch
+    /// window. Preserve every authorized dword up to its exact allocation end
+    /// so the parser sees the complete program instead of only its 16-byte
+    /// probe header.
+    #[test]
+    fn window_mem_grows_to_a_partial_readable_shader_tail() {
+        const GTA_SHADER_DWORDS: usize = 284 / 4;
+        let mut shader = vec![0u32; GTA_SHADER_DWORDS];
+        for (index, word) in shader.iter_mut().enumerate() {
+            *word = index as u32;
+        }
+        shader[GTA_SHADER_DWORDS - 1] = S_ENDPGM;
+        let addr = shader.as_ptr() as u64;
+        let mut mem = WindowMem {
+            base: addr,
+            data: shader[..4].to_vec(),
+        };
+
+        crate::guest_mem::with_test_ranges(
+            &[(addr, std::mem::size_of_val(shader.as_slice()))],
+            || {
+                assert!(mem.grow_to(CHUNK_DWORDS));
+                assert_eq!(mem.data, shader);
+            },
         );
     }
 

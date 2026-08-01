@@ -2138,7 +2138,10 @@ const fn sharp_dword3_is_buffer(dw3: u32) -> bool {
 /// varying — is what proves the descriptor is resolved at *runtime*, not a
 /// fixed wrong capture offset.
 fn texture_descriptor_is_unresolvable(t: &super::resources::ShaderTextureResource) -> bool {
-    t.format() >= 0x100
+    // AMD image DATA_FORMAT zero is INVALID. Keep Raeen's deliberate base-zero
+    // format-zero null image bindable, but treat a non-null format-zero capture
+    // as another unresolved runtime/SRT descriptor shape.
+    t.format() >= 0x100 || (t.format() == 0 && t.base40() != 0)
 }
 
 /// The stand-in fields of a placeholder T#: a valid 1x1 `Texture2D` (type 9)
@@ -2257,9 +2260,14 @@ fn check_read_only_texture_type(
 /// 15, or a poison descriptor) still errors by name so the coverage gap stays
 /// visible.
 fn check_read_write_texture_type(
-    t: &super::resources::ShaderTextureResource,
+    t: &mut super::resources::ShaderTextureResource,
     source: &str,
 ) -> Result<(), ShaderAnalysisError> {
+    if texture_descriptor_is_unresolvable(t) {
+        UNRESOLVABLE_TEXTURE_PLACEHOLDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        t.fields = placeholder_storage_fields(None);
+        return Ok(());
+    }
     if (t.type_() == 8 && t.height5() == 0) || matches!(t.type_(), 9 | 10 | 11 | 13) {
         return Ok(());
     }
@@ -2949,7 +2957,7 @@ pub fn shader_parse_usage(
                     info.textures2d_readwrite += 1;
                     let last = (bind.textures2d.textures_num - 1) as usize;
                     check_read_write_texture_type(
-                        &bind.textures2d.desc[last].texture,
+                        &mut bind.textures2d.desc[last].texture,
                         "usage 0x04",
                     )?;
                 }
@@ -3244,7 +3252,7 @@ pub fn shader_capture_eud_image_descriptors(
                         let last = (bind.textures2d.textures_num - 1) as usize;
                         if want_storage {
                             check_read_write_texture_type(
-                                &bind.textures2d.desc[last].texture,
+                                &mut bind.textures2d.desc[last].texture,
                                 "raw-EUD",
                             )?;
                         } else {
@@ -3947,7 +3955,7 @@ pub fn shader_parse_usage2(
         // (9), and 3D volumes (10). The compute path uploads and writes back
         // their complete linear texels.
         let last = (bind.textures2d.textures_num - 1) as usize;
-        let t = &bind.textures2d.desc[last].texture;
+        let t = &mut bind.textures2d.desc[last].texture;
         check_read_write_texture_type(t, "table 1")?;
     }
 
@@ -7663,7 +7671,7 @@ mod tests {
 
         let mut malformed = bind.textures2d.desc[0].texture;
         malformed.fields[2] |= 1 << 14; // height5=1 => two rows, invalid 1D
-        let err = check_read_write_texture_type(&malformed, "test")
+        let err = check_read_write_texture_type(&mut malformed, "test")
             .expect_err("type-8 UAVs wider than one row stay refused");
         assert!(format!("{err}").contains("height-1 1D"), "{err}");
     }
@@ -7685,13 +7693,30 @@ mod tests {
             t
         };
         for ty in [8u32, 9, 10, 11, 13] {
-            check_read_write_texture_type(&with_type(ty), "table 1")
+            check_read_write_texture_type(&mut with_type(ty), "table 1")
                 .unwrap_or_else(|e| panic!("read-write type {ty} must be accepted: {e}"));
         }
         for ty in [12u32, 14, 15] {
-            check_read_write_texture_type(&with_type(ty), "table 1")
+            check_read_write_texture_type(&mut with_type(ty), "table 1")
                 .expect_err("unsupported read-write type stays a visible refusal");
         }
+    }
+
+    #[test]
+    fn invalid_format_storage_descriptor_becomes_safe_placeholder() {
+        // ASTRO.BOT table-1 capture after the Gen5 32-image limit was restored:
+        // type 12, non-zero base, impossible dimensions, and DATA_FORMAT=0.
+        // AMD's image descriptor encoding reserves zero as INVALID, so this is
+        // an unresolved runtime descriptor rather than a real 1D-array UAV.
+        let mut t = super::super::resources::ShaderTextureResource::default();
+        t.fields[0] = 1; // non-zero base (base40() == 0x100)
+        t.fields[3] = 12 << 28;
+
+        check_read_write_texture_type(&mut t, "table 1")
+            .expect("an invalid-format runtime descriptor must degrade to a null UAV");
+        assert_eq!(t.fields, placeholder_storage_fields(None));
+        assert_eq!(t.base40(), 0);
+        assert_eq!(t.type_(), 9);
     }
 
     #[test]
@@ -7774,6 +7799,44 @@ mod tests {
         assert_eq!(info.desc[0].texture.fields, placeholder_texture_fields());
         // And the placeholder passes the type gate.
         check_read_only_texture_type(&mut info.desc[0].texture).expect("placeholder accepted");
+    }
+
+    #[test]
+    fn texture_resource_table_accepts_the_gen5_thirty_two_image_limit() {
+        // Current KytyPS5 resource tracking admits 32 distinct images per
+        // stage. ASTRO.BOT has compute usage tables with more than the legacy
+        // Kyty limit of 16, so rejecting entry 17 drops the whole shader even
+        // though Raeen's Vulkan descriptor arrays are sized dynamically.
+        let user_sgpr = UserSgprInfo::default();
+        let mut info = ShaderTextureResources::default();
+        let mut direct = [false; UserSgprInfo::SGPRS_MAX];
+
+        for slot in 0..32 {
+            shader_get_texture_buffer(
+                &mut info,
+                &mut direct,
+                slot,
+                slot,
+                ShaderTextureUsage::ReadOnly,
+                &user_sgpr,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("Gen5 image slot {slot} must fit: {error}"));
+        }
+        assert_eq!(info.textures_num, 32);
+        assert_eq!(info.textures2d_sampled_num, 32);
+
+        let error = shader_get_texture_buffer(
+            &mut info,
+            &mut direct,
+            32,
+            32,
+            ShaderTextureUsage::ReadOnly,
+            &user_sgpr,
+            None,
+        )
+        .expect_err("slot 33 remains a named refusal");
+        assert!(error.to_string().contains("too many textures"));
     }
 
     #[test]

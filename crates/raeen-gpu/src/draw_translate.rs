@@ -1776,6 +1776,12 @@ fn texture_vk_format(
         // 56 -> (10,0) = 8_8_8_8 UNORM (measured: Minecraft's 1920x1080 UI
         // texture, tile mode 27).
         56 => Ok((vk::Format::R8G8B8A8_UNORM, 4)),
+        // 130 -> (10,9) = 8_8_8_8 SRGB. ASTRO.BOT binds this exact
+        // 1920x1080 tile-27 image immediately after its BVH compute shaders.
+        // The RDNA2 unified table is sparse: this is the sRGB spelling of
+        // data-format 10, not a packed-float format. SharpEmu independently
+        // maps the pair to R8G8B8A8Srgb and reports 32 bits per texel.
+        130 => Ok((vk::Format::R8G8B8A8_SRGB, 4)),
         // 22 -> (4,7) = 32 FLOAT (measured: ASTRO.BOT's 1920x1080 R32F buffer
         // — a linear-depth/scalar target sampled back as a texture). SharpEmu
         // Gfx10UnifiedFormat.cs:48 maps unified 22 -> (dataFormat 4,
@@ -3369,6 +3375,32 @@ fn matching_live_target(
         .map(|(_, width, height, _)| (*width, *height))
 }
 
+/// Whether the persistent-target machinery has evidence that `base` belongs
+/// to a colour attachment.
+///
+/// A plain, single-level 2D T# is merely eligible to alias a render target;
+/// that shape alone is not evidence that it does. GTA V's intro video samples
+/// guest-backed 3840x2160 R8 planes with exactly that shape.
+fn render_target_base_known(
+    live: &[(u64, u32, u32, i32)],
+    framebuffers: &HashMap<u64, Arc<RenderedImage>>,
+    base: u64,
+) -> bool {
+    live.iter()
+        .any(|(target_base, _, _, _)| *target_base == base)
+        || framebuffers.contains_key(&base)
+}
+
+fn sampled_render_target_base_known(base: u64) -> bool {
+    sampling_scope(|scope| {
+        // SAFETY: `scope.map` points at the sink's framebuffer map, alive and
+        // unmutated for the published span (see `SAMPLING_SCOPE`).
+        let framebuffers = unsafe { &*scope.map };
+        Some(render_target_base_known(&scope.live, framebuffers, base))
+    })
+    .unwrap_or(false)
+}
+
 /// Whether a sampled T# may be served by a live persistent colour target's
 /// GPU image (stage B) instead of a guest-memory decode.
 ///
@@ -3548,16 +3580,26 @@ pub fn storage_addressing_skips() -> u64 {
 fn expected_sampled_bytes(t: &kyty_graphics::shader::ShaderTextureResource) -> u64 {
     let width = u64::from(u32::from(t.width5()) + 1);
     let height = u64::from(u32::from(t.height5()) + 1);
-    let bpp = texture_vk_format(t).map_or(4, |(_, b)| u64::from(b));
+    let (format, element_bytes) = texture_vk_format(t)
+        .map(|(format, bytes)| (format, u64::from(bytes)))
+        .unwrap_or((vk::Format::R8G8B8A8_UNORM, 4));
+    // `texture_vk_format` reports bytes per addressable ELEMENT. For BC1-BC7
+    // one element is a 4x4 texel block, exactly as `decode_texture` computes
+    // `elements_wide/elements_high`; treating it as bytes per texel inflated
+    // ASTRO.BOT's 192-layer BC6 cube array by 16x and falsely tripped the
+    // allocation guard.
+    let block_extent = u64::from(crate::vulkan::offscreen::format_block_extent(format));
+    let elements_wide = width.div_ceil(block_extent);
+    let elements_high = height.div_ceil(block_extent);
     // 3D volume (type 10) is `depth` slices; cube (11) / 2DArray (13) is
     // `depth + 1` layers; everything else is a single 2D image.
     let extent = match t.type_() {
         10 | 11 | 13 => u64::from(u32::from(t.depth()) + 1),
         _ => 1,
     };
-    width
-        .saturating_mul(height)
-        .saturating_mul(bpp)
+    elements_wide
+        .saturating_mul(elements_high)
+        .saturating_mul(element_bytes)
         .saturating_mul(extent)
 }
 
@@ -3593,6 +3635,68 @@ fn expected_storage_image_bytes(t: &kyty_graphics::shader::ShaderTextureResource
         .saturating_mul(depth)
         .saturating_mul(layers)
         .saturating_mul(texel)
+}
+
+#[derive(Clone, Copy)]
+struct StageTextureBudgetEntry {
+    kind: &'static str,
+    index: usize,
+    texture: kyty_graphics::shader::ShaderTextureResource,
+    bytes: u64,
+}
+
+impl StageTextureBudgetEntry {
+    fn extent(self) -> (u32, u32, u32) {
+        let depth = match self.texture.type_() {
+            10 | 11 | 13 => u32::from(self.texture.depth()) + 1,
+            _ => 1,
+        };
+        (
+            u32::from(self.texture.width5()) + 1,
+            u32::from(self.texture.height5()) + 1,
+            depth,
+        )
+    }
+}
+
+fn refuse_stage_texture_cap(
+    bytes: u64,
+    cap: u64,
+    stage: vk::ShaderStageFlags,
+    contributors: &[StageTextureBudgetEntry],
+) -> DrawError {
+    use std::fmt::Write as _;
+
+    STAGE_TEXTURE_CAP_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut ranked = contributors.to_vec();
+    ranked.sort_by_key(|entry| (std::cmp::Reverse(entry.bytes), entry.index));
+    let mut detail = String::new();
+    for (rank, entry) in ranked.into_iter().take(8).enumerate() {
+        if rank != 0 {
+            detail.push_str("; ");
+        }
+        let (width, height, depth) = entry.extent();
+        let _ = write!(
+            detail,
+            "{} T#{} base={:#x} extent={}x{}x{} format={} type={} tile={} bytes={}",
+            entry.kind,
+            entry.index,
+            entry.texture.base40(),
+            width,
+            height,
+            depth,
+            entry.texture.format(),
+            entry.texture.type_(),
+            entry.texture.tile_mode(),
+            entry.bytes
+        );
+    }
+    err(format!(
+        "translated {stage:?} stage decodes {bytes} B of sampled/storage textures, over the \
+         {cap} B per-stage cap (RAEEN_MAX_STAGE_TEXTURE_MIB) — refusing the draw/dispatch so \
+         the composite's simultaneous full-res uploads cannot exhaust host memory; top \
+         contributors: [{detail}]"
+    ))
 }
 
 /// Desired raw EUD-window snapshot size in bytes (SharpEmu port): at least
@@ -3801,8 +3905,12 @@ fn direct_sgpr_pair(bind: &ShaderBindResources, low_register: i32) -> Option<u64
 /// SGPR pairs as a bounded fallback for more complex address dataflow.
 fn select_global_mem_base(bind: &ShaderBindResources) -> u64 {
     let mut candidates = Vec::new();
+    if bind.global_mem.guest_base != 0 {
+        candidates.push(bind.global_mem.guest_base);
+    }
     if bind.global_mem.base_sgpr >= 0
         && let Some(base) = direct_sgpr_pair(bind, bind.global_mem.base_sgpr)
+        && !candidates.contains(&base)
     {
         candidates.push(base);
     }
@@ -4262,29 +4370,38 @@ fn prepare_stage_binding_inner(
     // persistent-target binds (`render_target`, empty pixels) cost nothing.
     let texture_byte_cap = stage_texture_byte_cap();
     let mut stage_decoded_bytes: u64 = 0;
-    let refuse_over_cap = |bytes: u64, stage: vk::ShaderStageFlags| -> DrawError {
-        STAGE_TEXTURE_CAP_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        err(format!(
-            "translated {stage:?} stage decodes {bytes} B of sampled/storage textures, over the \
-             {texture_byte_cap} B per-stage cap (RAEEN_MAX_STAGE_TEXTURE_MIB) — refusing the \
-             draw/dispatch so the composite's simultaneous full-res uploads cannot exhaust host \
-             memory"
-        ))
-    };
+    let mut budget_entries = Vec::with_capacity(texture_num);
     for (index, desc) in bind.textures2d.desc[..texture_num].iter().enumerate() {
         let mut rewritten = desc.texture;
         if desc.usage == ShaderTextureUsage::ReadWrite {
-            stage_decoded_bytes =
-                stage_decoded_bytes.saturating_add(expected_storage_image_bytes(&desc.texture));
-            if stage_decoded_bytes > texture_byte_cap {
-                return Err(refuse_over_cap(stage_decoded_bytes, stage));
-            }
             let upload = if let Some(cached) = compute_image_snapshots
                 .as_deref()
                 .and_then(|snapshots| snapshots.get(&desc.texture.fields))
             {
                 cached.clone()
             } else {
+                // `ComputeImageSnapshots` stores the pixel payload in an Arc.
+                // Repeated logical T# aliases clone only that Arc, so charging
+                // every descriptor here overstates the physical host allocation
+                // (measured: ASTRO.BOT crossed the 96 MiB cap on aliases of an
+                // already-captured UAV). Charge only a cache miss, immediately
+                // before the one allocation `read_storage_image` can make.
+                let bytes = expected_storage_image_bytes(&desc.texture);
+                stage_decoded_bytes = stage_decoded_bytes.saturating_add(bytes);
+                budget_entries.push(StageTextureBudgetEntry {
+                    kind: "storage",
+                    index,
+                    texture: desc.texture,
+                    bytes,
+                });
+                if stage_decoded_bytes > texture_byte_cap {
+                    return Err(refuse_stage_texture_cap(
+                        stage_decoded_bytes,
+                        texture_byte_cap,
+                        stage,
+                        &budget_entries,
+                    ));
+                }
                 let upload = read_storage_image(&desc.texture)?;
                 if let Some(snapshots) = compute_image_snapshots.as_deref_mut() {
                     snapshots.insert(desc.texture.fields, upload.clone());
@@ -4324,36 +4441,25 @@ fn prepare_stage_binding_inner(
             let mut decoded = match sampled_render_target(&desc.texture) {
                 Some(upload) => upload,
                 None => {
-                    // The other half of the flat-terrain pair. A T# shaped like
-                    // a live colour attachment (plain 2D, single level) that
-                    // matched no live target falls through to a guest-memory
-                    // decode standing in for pixels that only ever existed on
-                    // the device — stale or black, and today announced nowhere.
-                    if texture_aliases_live_target(&desc.texture) {
-                        static TARGET_UNMATCHED: BlockerCell = BlockerCell::new();
-                        bump_blocker(
-                            &TARGET_UNMATCHED,
-                            raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
-                            "sampled-render-target-unmatched",
-                            || {
-                                format!(
-                                    "a render-target-shaped T# matched no live target and fell \
-                                     back to guest memory (first: base={:#x} {}x{})",
-                                    desc.texture.base40(),
-                                    u32::from(desc.texture.width5()) + 1,
-                                    u32::from(desc.texture.height5()) + 1
-                                )
-                            },
-                        );
-                    }
                     // Guest-memory decode: count it against the per-stage budget
                     // and refuse before allocating if the composite's samples
                     // would exceed the cap (a direct persistent-target bind
                     // above costs nothing and never reaches here).
-                    stage_decoded_bytes =
-                        stage_decoded_bytes.saturating_add(expected_sampled_bytes(&desc.texture));
+                    let bytes = expected_sampled_bytes(&desc.texture);
+                    stage_decoded_bytes = stage_decoded_bytes.saturating_add(bytes);
+                    budget_entries.push(StageTextureBudgetEntry {
+                        kind: "sampled",
+                        index,
+                        texture: desc.texture,
+                        bytes,
+                    });
                     if stage_decoded_bytes > texture_byte_cap {
-                        return Err(refuse_over_cap(stage_decoded_bytes, stage));
+                        return Err(refuse_stage_texture_cap(
+                            stage_decoded_bytes,
+                            texture_byte_cap,
+                            stage,
+                            &budget_entries,
+                        ));
                     }
                     decode_texture(&desc.texture)?
                 }
@@ -4364,7 +4470,7 @@ fn prepare_stage_binding_inner(
             // Gated by the same aliasing predicate as the direct bind: a T#
             // whose authority is guest memory (mip-chained CPU-composed atlas)
             // must never have its decode overwritten by the target snapshot.
-            if texture_aliases_live_target(&desc.texture)
+            let replaced_with_target_pixels = if texture_aliases_live_target(&desc.texture)
                 && can_replace_with_render_target_pixels(&decoded)
                 && let Some((width, height, px)) =
                     render_target_pixels(desc.texture.base40(), decoded.width, decoded.height)
@@ -4372,6 +4478,34 @@ fn prepare_stage_binding_inner(
                 decoded.width = width;
                 decoded.height = height;
                 decoded.pixels = px;
+                true
+            } else {
+                false
+            };
+            // A mismatch is actionable only when a same-base render target
+            // really exists and neither its live GPU image nor its CPU
+            // snapshot could satisfy this T#. Plain 2D/single-level shape is
+            // also used by ordinary guest-backed textures such as video planes.
+            if texture_aliases_live_target(&desc.texture)
+                && decoded.render_target.is_none()
+                && !replaced_with_target_pixels
+                && sampled_render_target_base_known(desc.texture.base40())
+            {
+                static TARGET_UNMATCHED: BlockerCell = BlockerCell::new();
+                bump_blocker(
+                    &TARGET_UNMATCHED,
+                    raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
+                    "sampled-render-target-unmatched",
+                    || {
+                        format!(
+                            "a same-base render-target T# could not bind the live image or CPU \
+                             snapshot and fell back to guest memory (first: base={:#x} {}x{})",
+                            desc.texture.base40(),
+                            u32::from(desc.texture.width5()) + 1,
+                            u32::from(desc.texture.height5()) + 1
+                        )
+                    },
+                );
             }
             if crate::diagnostics::gpu_env().trace_draws {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -7700,6 +7834,21 @@ mod tests {
         // A larger extent scales linearly: 1024x1024 RGBA8 = 4 MiB.
         let big = rgba8_linear_tsharp(0x1000, 1024, 1024);
         assert_eq!(expected_sampled_bytes(&big), 1024 * 1024 * 4);
+
+        // ASTRO.BOT's measured T#9 is a 256x256, 192-layer BC6 cube array.
+        // BC6 stores one 16-byte element per 4x4 texel block, so its decoded
+        // upload is 64x64x192x16 = 12 MiB, not 256x256x192x16 = 192 MiB.
+        let mut bc6_cube = rgba8_linear_tsharp(0x1000, 256, 256);
+        bc6_cube.fields[1] &= !(0x1ff << 20);
+        bc6_cube.fields[1] |= 179 << 20;
+        bc6_cube.fields[3] &= !(0xf << 28);
+        bc6_cube.fields[3] |= 11 << 28;
+        bc6_cube.fields[4] = (bc6_cube.fields[4] & !0x1fff) | 191;
+        assert_eq!(
+            expected_sampled_bytes(&bc6_cube),
+            64 * 64 * 192 * 16,
+            "BC upload accounting is in 4x4 blocks"
+        );
     }
 
     /// A composite whose single sampled T# alone exceeds the per-stage byte cap
@@ -7727,10 +7876,61 @@ mod tests {
         let e = prepare_stage_binding(&bind, vk::ShaderStageFlags::FRAGMENT)
             .expect_err("oversized composite is refused");
         assert!(e.0.contains("per-stage cap"), "names the cap: {e}");
+        assert!(
+            e.0.contains(
+                "sampled T#0 base=0x1000 extent=8192x8192x1 format=56 type=9 tile=0 \
+                 bytes=268435456"
+            ),
+            "names the exact descriptor responsible for the cap: {e}"
+        );
         assert_eq!(
             stage_texture_cap_skips(),
             before + 1,
             "the refusal is counted"
+        );
+    }
+
+    /// ASTRO.BOT binds the same large compute UAV through several logical T#
+    /// slots. The per-submission image snapshot shares one `Arc<Vec<u8>>`, so
+    /// the safety budget must charge that allocation once rather than once per
+    /// descriptor. Seven aliases of a 4096x4096 R8 image describe 112 MiB of
+    /// logical bindings but allocate only one 16 MiB snapshot.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn compute_texture_budget_charges_shared_uav_snapshot_once() {
+        const SIDE: u32 = 4096;
+        const ALIASES: usize = 7;
+        let mut arena = vec![0u8; SIDE as usize * SIDE as usize + 255];
+        let base = (arena.as_ptr() as u64 + 255) & !255;
+        let mut t = rgba8_linear_tsharp(base, SIDE, SIDE);
+        t.fields[1] &= !(0x1ff << 20);
+        t.fields[1] |= 5 << 20; // unified format 5 = R8_UINT
+
+        let mut bind = ShaderBindResources::default();
+        bind.push_constant_size = (ALIASES * 32) as u32;
+        bind.textures2d.textures_num = ALIASES as i32;
+        bind.textures2d.textures2d_storage_num = ALIASES as i32;
+        bind.textures2d.binding_storage_index = 0;
+        for desc in &mut bind.textures2d.desc[..ALIASES] {
+            desc.texture = t;
+            desc.usage = ShaderTextureUsage::ReadWrite;
+        }
+
+        let mut storage_snapshots = ComputeStorageSnapshots::new();
+        let mut image_snapshots = ComputeImageSnapshots::new();
+        let binding =
+            crate::guest_mem::with_test_ranges(&[(arena.as_mut_ptr() as u64, arena.len())], || {
+                prepare_compute_stage_binding(&bind, &mut storage_snapshots, &mut image_snapshots)
+            })
+            .expect("shared UAV aliases stay below the physical allocation cap");
+        let images = &binding.storage_images.expect("storage binding").images;
+        assert_eq!(images.len(), ALIASES);
+        assert_eq!(image_snapshots.len(), 1);
+        assert!(
+            images
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0].pixels, &pair[1].pixels)),
+            "every alias must share the one captured pixel allocation"
         );
     }
 
@@ -8250,6 +8450,21 @@ mod tests {
             &(0..256).map(|i| i as u8).collect::<Vec<_>>()[..],
             "the SSBO header is followed by the authorized guest snapshot"
         );
+
+        // ASTRO.BOT consumes s0:s1 as an unresolved image resource during
+        // analysis, so it cannot remain in `direct_sgprs`. The raw pair is
+        // retained as bind-time-only global-memory metadata instead.
+        bind.direct_sgprs = Default::default();
+        bind.push_constant_size = 0;
+        bind.global_mem.base_sgpr = 0;
+        bind.global_mem.guest_base = base;
+        let binding = crate::guest_mem::with_test_ranges(&ranges, || {
+            prepare_stage_binding(&bind, vk::ShaderStageFlags::COMPUTE)
+        })
+        .expect("resource-consumed scalar pointer binding");
+        let global = binding.global_mem.expect("captured global window bound");
+        assert_eq!(global.guest_base, base);
+        assert_eq!(&global.bytes[8..8 + 256], &arena[off..off + 256]);
     }
 
     /// A storage T# whose format is not 32-bpp must zero-fill its seed (warn
@@ -8942,6 +9157,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guest_backed_sampled_texture_is_not_an_unmatched_target() {
+        let live = [(0x31c0_0000, 1920, 1080, vk::Format::R8G8B8A8_UNORM.as_raw())];
+        let mut framebuffers = HashMap::new();
+        framebuffers.insert(
+            0x31c0_0000,
+            Arc::new(RenderedImage {
+                width: 1920,
+                height: 1080,
+                pixels: Vec::new(),
+                bytes_per_pixel: 4,
+            }),
+        );
+
+        assert!(
+            render_target_base_known(&live, &framebuffers, 0x31c0_0000),
+            "a live persistent target is evidence that a same-base T# is an alias"
+        );
+        assert!(
+            !render_target_base_known(&live, &framebuffers, 0x0015_57c0_0000),
+            "GTA's guest-backed 4K R8 video plane must not be mislabeled as an \
+             unmatched render target merely because it is a plain single-level T#"
+        );
+    }
+
     fn replacement_candidate(cube: bool, array: bool, layers: u32, depth: u32) -> TextureUpload {
         TextureUpload {
             width: 8,
@@ -9062,12 +9302,12 @@ mod tests {
         assert_eq!(tex.pixels, linear, "detiled FP16 pixels must match");
     }
 
-    /// Unified formats 14, 29 and 65 (all flagged unimplemented in ASTRO.BOT
+    /// Unified formats 14, 29, 65 and 130 (all flagged unimplemented in ASTRO.BOT
     /// runs) map through SharpEmu's Gfx10UnifiedFormat table: 14 -> (3,0) =
     /// R8G8_UNORM (2 B), 29 -> (5,7) = R16G16_SFLOAT (4 B), 65 -> (12,0) =
     /// R16G16B16A16_UNORM (8 B).
     #[test]
-    fn texture_vk_format_maps_unified_14_29_65_and_77() {
+    fn texture_vk_format_maps_measured_astro_formats() {
         let case = |unified: u32| {
             let mut t = kyty_graphics::shader::ShaderTextureResource::default();
             t.fields[1] |= unified << 20;
@@ -9086,6 +9326,10 @@ mod tests {
         assert_eq!(
             case(77).expect("format 77"),
             (vk::Format::R32G32B32A32_SFLOAT, 16)
+        );
+        assert_eq!(
+            case(130).expect("format 130"),
+            (vk::Format::R8G8B8A8_SRGB, 4)
         );
     }
 
