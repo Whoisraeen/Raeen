@@ -1230,24 +1230,40 @@ impl GuestMemory for TestMemory {
 /// A minimal in-memory [`GuestAllocator`] test double, for unit tests that
 /// need a complete [`HleContext`] but don't exercise allocation behavior
 /// (nothing calls `ctx.alloc` yet — see [`GuestAllocator`]'s doc comment).
-/// `alloc`/`mmap` are a bump allocator over a `Cell<u64>`; `free`/`munmap`
+/// `alloc`/`mmap`/`reserve` are a bump allocator over a `Cell<u64>`; `free`/`munmap`
 /// are no-ops; `realloc` always bumps a fresh block rather than reusing
 /// `addr`.
-pub(crate) struct TestAllocator(std::cell::Cell<u64>);
+pub(crate) struct TestAllocator {
+    next: std::cell::Cell<u64>,
+    mmap_calls: std::cell::Cell<u64>,
+    reserve_calls: std::cell::Cell<u64>,
+}
 
 #[cfg(test)]
 impl TestAllocator {
     pub(crate) fn new(base: u64) -> Self {
-        Self(std::cell::Cell::new(base))
+        Self {
+            next: std::cell::Cell::new(base),
+            mmap_calls: std::cell::Cell::new(0),
+            reserve_calls: std::cell::Cell::new(0),
+        }
     }
 
     fn bump(&self, size: u64, align: u64) -> Option<u64> {
         let align = align.max(1);
-        let cur = self.0.get();
+        let cur = self.next.get();
         let aligned = cur.checked_add(align - 1)? & !(align - 1);
         let next = aligned.checked_add(size)?;
-        self.0.set(next);
+        self.next.set(next);
         Some(aligned)
+    }
+
+    pub(crate) fn mmap_calls(&self) -> u64 {
+        self.mmap_calls.get()
+    }
+
+    pub(crate) fn reserve_calls(&self) -> u64 {
+        self.reserve_calls.get()
     }
 }
 
@@ -1264,6 +1280,12 @@ impl GuestAllocator for TestAllocator {
     }
 
     fn mmap(&self, length: u64, align: u64) -> Option<u64> {
+        self.mmap_calls.set(self.mmap_calls.get() + 1);
+        self.bump(length, align)
+    }
+
+    fn reserve(&self, length: u64, align: u64) -> Option<u64> {
+        self.reserve_calls.set(self.reserve_calls.get() + 1);
         self.bump(length, align)
     }
 

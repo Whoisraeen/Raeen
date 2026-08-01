@@ -17,7 +17,7 @@
 
 use crate::agc::{self, AgcDecodeError, AgcSubmission};
 use crate::backend::GpuBackend;
-use crate::draw_translate::OffscreenDrawSink;
+use crate::draw_translate::{GuestTextureHashAuditor, OffscreenDrawSink};
 use crate::vulkan::{RenderedImage, VulkanBackend};
 use kyty_graphics::pm4;
 use kyty_graphics::run::{CommandProcessor, CpError, RunOutcome, SuspendedWait};
@@ -357,6 +357,10 @@ pub struct AgcGpuSession {
     /// across DCBs so per-frame re-binds hit the cache instead of
     /// re-translating (and failures warn once per distinct shader, ever).
     shader_cache: Mutex<crate::shader_fetch::ShaderTranslateCache>,
+    /// Exactness backstop for persistent sampled textures. The per-submission
+    /// sink owns the fast memo; this session-owned state rotates across source
+    /// segments so CPU-written glyph atlases cannot remain stale forever.
+    texture_hash_auditor: Mutex<GuestTextureHashAuditor>,
     /// Draws skipped because a bound guest shader failed translation.
     shader_skip_count: Mutex<u64>,
     /// Draws/dispatches the SINK refused and the command processor skipped, per
@@ -752,6 +756,7 @@ impl AgcGpuSession {
             splash: Mutex::new(None),
             draw_count: Mutex::new(0),
             shader_cache: Mutex::new(crate::shader_fetch::ShaderTranslateCache::new()),
+            texture_hash_auditor: Mutex::new(GuestTextureHashAuditor::default()),
             shader_skip_count: Mutex::new(0),
             refused_draws: Mutex::new([0; 2]),
             last_refusal: Mutex::new(None),
@@ -2350,7 +2355,9 @@ impl AgcGpuSession {
 
         let mut cache = self.shader_cache.lock();
         let mut framebuffers = self.framebuffers.lock();
-        let mut sink = OffscreenDrawSink::new(device, &mut cache, &mut framebuffers);
+        let texture_hash_auditor = self.texture_hash_auditor.lock();
+        let mut sink =
+            OffscreenDrawSink::new(device, &mut cache, &mut framebuffers, &texture_hash_auditor);
         sink.queue_is_compute = is_compute;
         // Cross-queue compute-shader seeding: hand the sink the last compute
         // shader bound on either queue so a dispatch-only ACB buffer can fall

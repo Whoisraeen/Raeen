@@ -6273,3 +6273,118 @@ VERIFICATION:
 - Current isolated release rebuilt at `../Raeen-target-dev/release/raeen.exe`,
   SHA-256
   `B5C16C074CA18ABF4C9EDB14A3EDFF5416F6865514A5E48382C877E925A81D9A`.
+
+## 2026-07-31 - Minecraft dynamic-glyph atlas bounded invalidation
+
+This slice is measured from **`b83c205b30e8+dirty`**. The user supplied a
+1920x1080 capture of Minecraft's tutorial-card page where card art, colour,
+and layout rendered, but nearly every newly introduced label glyph was absent
+or reduced to a dot. Existing source comments identify the same failure shape:
+a CPU-rasterized 4 MiB font atlas can change wholly between the persistent
+texture cache's fixed sparse probe windows.
+
+IMPLEMENTATION:
+
+- Added a session-scoped `GuestTextureHashAuditor`. The existing sparse hash
+  remains the immediate fast path. For sampled resources through 16 MiB, the
+  auditor records one exact baseline and checks one contiguous 1/64 segment per
+  PM4 submission. Therefore every byte of an atlas-sized source is revisited
+  within 64 binds even if its fixed sparse hash never changes.
+- A rotating-segment mismatch refreshes the complete baseline once and changes
+  the persistent texture identity, forcing a decode/upload. Refreshing all
+  segments at that point prevents one wide update from causing 64 redundant
+  uploads. Resources above 16 MiB keep the sparse policy; page-dirty tracking
+  remains the longer-term zero-read cache-hit design.
+- Added a rate-limited INFO record for a real sparse-blind invalidation, naming
+  guest base, length, tile mode, and segment. The auditor is process-session
+  state and is bounded to 2,048 texture identities.
+
+VERIFICATION:
+
+- The regression uses a 4 MiB buffer, mutates segment 17 at a byte that the 64
+  sparse windows and tail probe demonstrably miss, and proves the rotating
+  audit changes the cache identity within the bounded scan. It also proves the
+  refreshed identity stays stable instead of repeatedly invalidating.
+- `cargo test -p raeen-gpu`: 384 unit tests plus every executed Vulkan
+  integration test passed (436 passed total, 4 diagnostic/measurement tests
+  ignored). `cargo clippy -p raeen-gpu --all-targets -- -D warnings`, formatting,
+  and `git diff --check` are green.
+- The moved installation was used, not the prior external-drive copy: the
+  retail log maps `/app0/` to
+  `C:\Users\whoisraeen\Documents\Games\Minecraft\PPSA17221-app`.
+- Controlled cache-on retail run
+  `scratch/mc-font-audit-20260801-01/stdout.log`: 330 seconds, 14,976
+  published flips, 468 measured 32-flip worker windows, frame-time
+  p50/p95/p99 20.7/25.5/68.2 ms, maximum individual sampled frame time
+  153.1 ms, and maximum 32-flip window 4.9 seconds. Zero shader refusal,
+  Vulkan validation, or device-loss records; the only GPU blocker was the
+  expected early startup black frame.
+
+HONEST LIMIT:
+
+- The automated controller route did not reach the exact tutorial-card page.
+  Captures reached fully legible Accessibility and Keyboard/Mouse settings;
+  controller focus skips the non-settings `How to Play` row that the user
+  opened with pointer input. Consequently the synthetic regression closes the
+  cache blind spot, but this entry does **not** claim visual acceptance of the
+  supplied page. A direct user click-through on the rebuilt executable is the
+  remaining acceptance step.
+- Isolated release: `../Raeen-target-dev/release/raeen.exe`, SHA-256
+  `8BA4FC9CB2BE388BE100301794C65AB258AD3C266E851410474207823C4DBF83`.
+
+## 2026-07-31 - Minecraft streaming commit-pressure diagnosis
+
+This diagnosis and fix are from **`b83c205b30e8+dirty`**. The user reached a
+world in the moved installation at
+`C:\Users\whoisraeen\Documents\Games\Minecraft\PPSA17221-app` and supplied a
+1920x1080 capture showing approximately 14 FPS, incomplete distant terrain,
+and severe loading variability.
+
+MEASURED FAILURE:
+
+- The world began opening at +34.3 s and the player connected at +52.6 s. An
+  established in-world interval issued approximately 470 draws and 23
+  dispatches per published frame. There were no shader refusals, skipped
+  draws, Vulkan validation errors, or device loss in the captured interval.
+- The visible timing HUD reported approximately 0.0 ms worker drain, 1.2 ms
+  fence wait, 1.7 ms readback, 0.0 ms sRGB conversion, and 0.7 ms UI upload.
+  The approximately 3.6 ms present path therefore cannot explain a 14 FPS
+  frame; no swapchain work was selected.
+- At +287 s, `sceKernelAllocateMainDirectMemory` returned `0x8002000b`.
+  Streaming Pool(2) and Streaming Pool(1) subsequently poison-aborted at
+  `module+0xb645fcc`; one exited while owning a guest mutex, which the runtime
+  recovered. Earlier streaming contention on mutex `0x1015a691098` was held by
+  code acquired at `libc.prx+0x5ec9`, with an owner stack beginning at
+  `module+0x8e25e04`; the observed convoy recovered in approximately 7.4 s.
+- The runner's working set was approximately 1.85-3.02 GiB, but its private
+  committed memory reached **32.84 GiB** on a 13.8 GiB host. System commit
+  reached 54.5/55.9 GiB (approximately 97.5%). Direct-memory allocation had
+  eagerly committed the physical identity range and the later virtual mapping
+  committed a second, non-aliased range. Paging and eventual allocation
+  refusal are the measured loading/stutter mechanism.
+
+IMPLEMENTATION:
+
+- `sceKernelAllocateDirectMemory` now reserves the physical identity address
+  range without eagerly committing it. The runtime's existing demand-commit
+  path backs only pages actually reached through that identity. Requested
+  direct mappings continue through the existing `map_at` path, preserving
+  address selection, remap zeroing, allocator-budget accounting, GPU-visible
+  mapping metadata, and the ASTRO.BOT-sensitive mapping behavior.
+- This is intentionally narrower than implementing host alias mappings for
+  both guest ranges. It removes the duplicate whole-pool commitment without
+  broadening a synchronization or Vulkan change.
+
+VERIFICATION SO FAR:
+
+- The new allocator regression proves direct physical allocation calls
+  `reserve` exactly once and never calls eager `mmap`. The full `raeen-hle`
+  suite passes all 647 tests. Strict Clippy for `raeen-hle` and
+  `raeen-runtime`, formatting, and `git diff --check` are green.
+- The first full `raeen-runtime` run passed 102 tests and transiently failed
+  `repeated_map_unmap_cycles_reuse_the_same_range`; its immediate focused
+  rerun passed. A second full build could not start its tests because the old
+  32.84 GiB runner still held the machine at the Windows commit limit; rustc
+  received OS error 1455 while mapping an LTO bitcode file. A clean full rerun
+  and release retail A/B after that process exits remain required before
+  claiming the fix accepted.

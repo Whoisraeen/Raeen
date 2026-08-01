@@ -2786,12 +2786,14 @@ fn trace_guest_vmm(message: std::fmt::Arguments<'_>) {
 ///
 /// Partial integration: real hardware separates *reserving* physical
 /// memory (this call) from *mapping* it into the process's virtual address
-/// space (`sceKernelMapDirectMemory`). This HLE doesn't yet model physical
-/// memory as distinct from virtual mappings, so as a documented shortcut
-/// this now allocates from the arena's mmap region (`ctx.alloc.mmap`) —
-/// treating the "physical" address handed back as already virtual-mapped —
-/// records the mapping's metadata in `ctx.kernel.memory` (so
-/// `is_mapped`/`region_containing` see it), and writes the address through
+/// space (`sceKernelMapDirectMemory`). Raeen still represents the physical
+/// offset with an identity guest address, but reserves that address space
+/// without committing every page. The later direct mapping is the storage the
+/// title normally touches; if a title accesses the physical identity address
+/// itself, the runtime demand-commits only the reached pages. This avoids
+/// charging the host commit limit for both a large physical pool and its
+/// non-aliased virtual mapping while preserving the existing guest-visible
+/// address and mapping-metadata contracts. The address is written through
 /// the `physAddrOut` out-parameter (`args[5]`) via `ctx.mem`. Returns
 /// `SCE_OK` on success; `SCE_KERNEL_ERROR_EAGAIN` if the budget or the arena
 /// cannot satisfy the request, and `SCE_KERNEL_ERROR_EFAULT` if `physAddrOut`
@@ -2866,12 +2868,12 @@ fn hle_allocate_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
             }
         }
     }
-    let Some(addr) = ctx.alloc.mmap(len, alignment) else {
+    let Some(addr) = ctx.alloc.reserve(len, alignment) else {
         // Same code as the budget refusal above, and for the same reason: the
         // real allocator answers "I could not give you this memory" with
         // `EAGAIN` (shadPS4 `sceKernelAllocateDirectMemory`). A title sizing its
         // pools by allocating until refusal must see a status it recognises.
-        warn!("sceKernelAllocateDirectMemory: arena mmap failed (len={len:#x}) — EAGAIN");
+        warn!("sceKernelAllocateDirectMemory: arena reservation failed (len={len:#x}) — EAGAIN");
         ctx.kernel
             .direct_memory_allocated
             .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
@@ -3064,11 +3066,10 @@ fn hle_map_direct_memory(ctx: &HleContext, args: &[u64]) -> u64 {
     // unmapped memory. Honor the request.
     //
     // With no requested address there is nothing to honor, and the answer is
-    // NOT a fresh region: `sceKernelAllocateDirectMemory` hands out an address
-    // `ctx.alloc.mmap` already committed, so the direct memory is live arena
-    // memory at `direct_memory_start`. Publishing that address keeps the
-    // mapping and the direct memory the same storage; a fresh region would
-    // detach the guest's writes from its own direct memory and leak when
+    // NOT a fresh region: `sceKernelAllocateDirectMemory` has already reserved
+    // the identity address. Publishing it keeps the mapping and direct memory
+    // as one demand-backed storage range; a fresh region would detach the
+    // guest's writes from its own direct memory and leak when
     // `sceKernelReleaseDirectMemory` freed the physical range.
     //
     // GAP: when an address IS requested, the mapping is backed by its own
@@ -9140,7 +9141,7 @@ mod tests {
     }
 
     #[test]
-    fn allocate_direct_memory_actually_maps_through_the_arena_and_writes_phys_addr_out() {
+    fn allocate_direct_memory_reserves_without_committing_and_writes_phys_addr_out() {
         let registry = HleRegistry::new();
         let kernel = raeen_kernel::OrbisKernel::new();
         let mem = crate::TestMemory::new(0x1000);
@@ -9163,6 +9164,16 @@ mod tests {
         let addr = u64::from_le_bytes(addr_bytes);
         assert_ne!(addr, 0);
         assert!(kernel.memory.is_mapped(addr));
+        assert_eq!(
+            alloc.reserve_calls(),
+            1,
+            "physical direct memory must reserve address space"
+        );
+        assert_eq!(
+            alloc.mmap_calls(),
+            0,
+            "physical direct memory must not eagerly commit the whole allocation"
+        );
     }
 
     #[test]

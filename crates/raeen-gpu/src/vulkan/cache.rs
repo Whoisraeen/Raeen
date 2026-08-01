@@ -380,11 +380,11 @@ fn texture_aliases_compute_image(key: &TextureKey, base: u64) -> bool {
 ///
 /// ## Invalidation contract (documented, deliberate)
 ///
-/// - Every bind re-hashes a sparse ~4 KiB sample of the guest source bytes;
-///   a mismatch is a miss (the entry is evicted and re-uploaded). CPU guest
-///   writes that leave every sampled chunk byte-identical are therefore NOT
-///   detected until any sampled byte changes — that is the staleness window,
-///   bounded by the sample coverage.
+/// - Every bind re-hashes a sparse sample of the guest source bytes; a mismatch
+///   is a miss (the entry is evicted and re-uploaded). Atlas-sized resources
+///   additionally rotate an exact contiguous audit across the whole source,
+///   bounding sparse-probe misses to 64 submissions. See
+///   `draw_translate::GuestTextureHashAuditor`.
 /// - A completed compute storage-image write invalidates cached sampled views
 ///   at the same guest base. This covers format-reinterpreted aliases (for
 ///   example an `R32_UINT` UAV later sampled as `R8_UNORM`) without a range

@@ -1861,6 +1861,20 @@ fn texture_vk_format(
     }
 }
 
+const TEXTURE_HASH_CHUNKS: u64 = 64;
+const TEXTURE_HASH_CHUNK_BYTES: u64 = 64;
+const TEXTURE_EXACT_AUDIT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const TEXTURE_HASH_AUDIT_MAX_ENTRIES: usize = 2048;
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv_mix(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// Sparse sample-hash of a guest byte range for the persistent-texture cache
 /// (stage D): FNV-1a over the range length, tile mode, 64 evenly-strided
 /// windows, and the final 64 bytes. Each window grows with the surface so the
@@ -1870,39 +1884,29 @@ fn texture_vk_format(
 /// readable — the caller then decodes uncached and produces its own named error
 /// if the range is truly bad.
 ///
-/// ## Staleness window (documented, deliberate)
+/// ## Staleness window (documented, bounded for atlases)
 ///
-/// A CPU guest write that leaves every sampled chunk byte-identical is NOT
-/// detected: the cached image keeps being bound until any sampled byte
-/// changes. The window is bounded by the sample coverage — the hash is
-/// recomputed from guest memory on EVERY bind, so any write that touches a
-/// sampled chunk is picked up at the next draw. Other controlled writeback
-/// paths use the same per-bind rehash, while completed compute storage images
-/// invalidate sampled views at the exact guest base because format aliases
-/// can change sparse texels without perturbing this probe.
+/// This sparse function alone cannot detect a CPU guest write that leaves every
+/// sampled chunk byte-identical. `GuestTextureHashAuditor` closes that blind
+/// spot for resources through 16 MiB by rotating an exact audit across all 64
+/// contiguous segments; larger resources retain the deliberately probabilistic
+/// policy. Other controlled writeback paths use the same per-bind rehash, while
+/// completed compute storage images invalidate sampled views at the exact guest
+/// base because format aliases can change sparse texels without perturbing this
+/// probe.
 /// `RAEEN_NO_TEX_CACHE=1` restores per-draw decode + upload wholesale.
 fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
-    const CHUNKS: u64 = 64;
-    const CHUNK_BYTES: u64 = 64;
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    fn mix(mut h: u64, bytes: &[u8]) -> u64 {
-        for &b in bytes {
-            h = (h ^ u64::from(b)).wrapping_mul(FNV_PRIME);
-        }
-        h
-    }
     if len == 0 {
         return None;
     }
-    let mut h = mix(FNV_OFFSET, &len.to_le_bytes());
+    let mut h = fnv_mix(FNV_OFFSET, &len.to_le_bytes());
     // Source bytes are not enough to identify decoded content: the same
     // allocation produces different pixels under linear, SW_64KB_S, and
     // SW_64KB_R_X addressing.
-    h = mix(h, &[tile_mode]);
-    if len <= CHUNKS * CHUNK_BYTES {
+    h = fnv_mix(h, &[tile_mode]);
+    if len <= TEXTURE_HASH_CHUNKS * TEXTURE_HASH_CHUNK_BYTES {
         let bytes = read_guest_bytes_unaligned(base, len, "texture sample-hash").ok()?;
-        h = mix(h, &bytes);
+        h = fnv_mix(h, &bytes);
     } else {
         // Scale the probe with the surface instead of always sampling a flat
         // 4 KiB. A fixed 64x64-byte probe covers 0.1% of a 4 MiB font atlas,
@@ -1921,15 +1925,15 @@ fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
         // validated, and locked the guest arena, dominating Minecraft's world
         // draws despite hashing the same total bytes. A 4 MiB atlas now probes
         // 64 KiB as 64 x 1 KiB windows; a capped surface uses 64 x 8 KiB.
-        // Coverage remains probabilistic — the exact fix is write-tracking the
-        // guest pages (Tier 5 page-dirty tracking) — but no longer scales host
-        // call count with texture size.
-        const MIN_SAMPLED: u64 = CHUNKS * CHUNK_BYTES; // 4 KiB floor
+        // This fast probe remains probabilistic, but the session-scoped rotating
+        // audit below bounds that blind spot for atlas-sized resources. True
+        // page-dirty tracking remains the longer-term zero-read cache-hit path.
+        const MIN_SAMPLED: u64 = TEXTURE_HASH_CHUNKS * TEXTURE_HASH_CHUNK_BYTES; // 4 KiB floor
         const MAX_SAMPLED: u64 = 512 * 1024;
         let sampled = (len / 64).clamp(MIN_SAMPLED, MAX_SAMPLED);
-        let window_bytes = (sampled / CHUNKS).max(CHUNK_BYTES);
-        let stride = (len / CHUNKS).max(window_bytes);
-        for i in 0..CHUNKS {
+        let window_bytes = (sampled / TEXTURE_HASH_CHUNKS).max(TEXTURE_HASH_CHUNK_BYTES);
+        let stride = (len / TEXTURE_HASH_CHUNKS).max(window_bytes);
+        for i in 0..TEXTURE_HASH_CHUNKS {
             let offset = i * stride;
             if offset >= len {
                 break;
@@ -1937,19 +1941,137 @@ fn guest_sample_hash(base: u64, len: u64, tile_mode: u8) -> Option<u64> {
             let size = window_bytes.min(len - offset);
             let bytes =
                 read_guest_bytes_unaligned(base + offset, size, "texture sample-hash").ok()?;
-            h = mix(h, &bytes);
+            h = fnv_mix(h, &bytes);
         }
         // The strided chunks can miss the very end of the range; the tail is
         // where partial updates (e.g. an atlas row append) often land.
         let tail = read_guest_bytes_unaligned(
-            base + (len - CHUNK_BYTES),
-            CHUNK_BYTES,
+            base + (len - TEXTURE_HASH_CHUNK_BYTES),
+            TEXTURE_HASH_CHUNK_BYTES,
             "texture sample-hash",
         )
         .ok()?;
-        h = mix(h, &tail);
+        h = fnv_mix(h, &tail);
     }
     Some(h.max(1))
+}
+
+#[derive(Clone)]
+struct GuestTextureHashAudit {
+    sparse_hash: u64,
+    segment_hashes: [u64; TEXTURE_HASH_CHUNKS as usize],
+    next_segment: usize,
+    content_hash: u64,
+}
+
+/// Session-scoped exactness backstop for the persistent texture cache.
+///
+/// The fast hash above intentionally reads only about 1/64th of a large
+/// texture, but a CPU-rasterized glyph can land entirely between those fixed
+/// windows. For atlas-sized resources this auditor records an exact baseline
+/// once, then checks one contiguous 1/64th segment per PM4 submission. Thus
+/// every source byte is revisited within 64 binds even when the sparse hash is
+/// unchanged. A changed segment triggers one exact refresh, preventing the
+/// stale-atlas entry from surviving forever without making every bind scan the
+/// whole texture. Resources above 16 MiB retain the sparse policy so a single
+/// giant texture cannot turn a cache hit into a large recurring host read.
+#[derive(Default)]
+pub(crate) struct GuestTextureHashAuditor {
+    values: std::cell::RefCell<HashMap<(u64, u64, u8), GuestTextureHashAudit>>,
+}
+
+impl GuestTextureHashAuditor {
+    fn segment_bounds(len: u64, segment: usize) -> (u64, u64) {
+        let segment = segment as u64;
+        let start = len * segment / TEXTURE_HASH_CHUNKS;
+        let end = len * (segment + 1) / TEXTURE_HASH_CHUNKS;
+        (start, end - start)
+    }
+
+    fn exact_baseline(
+        base: u64,
+        len: u64,
+        tile_mode: u8,
+        sparse_hash: u64,
+    ) -> Option<GuestTextureHashAudit> {
+        let bytes = read_guest_bytes_unaligned(base, len, "texture exact audit").ok()?;
+        let mut segment_hashes = [0; TEXTURE_HASH_CHUNKS as usize];
+        let mut content_hash = fnv_mix(FNV_OFFSET, &len.to_le_bytes());
+        content_hash = fnv_mix(content_hash, &[tile_mode]);
+        for (segment, segment_hash) in segment_hashes.iter_mut().enumerate() {
+            let (start, size) = Self::segment_bounds(len, segment);
+            let start = start as usize;
+            let end = start + size as usize;
+            *segment_hash = fnv_mix(FNV_OFFSET, &bytes[start..end]);
+            content_hash = fnv_mix(content_hash, &bytes[start..end]);
+        }
+        Some(GuestTextureHashAudit {
+            sparse_hash,
+            segment_hashes,
+            next_segment: 0,
+            content_hash: content_hash.max(1),
+        })
+    }
+
+    fn audit(&self, base: u64, len: u64, tile_mode: u8, sparse_hash: u64) -> Option<u64> {
+        if len <= TEXTURE_HASH_CHUNKS * TEXTURE_HASH_CHUNK_BYTES
+            || len > TEXTURE_EXACT_AUDIT_MAX_BYTES
+        {
+            return Some(sparse_hash);
+        }
+
+        let key = (base, len, tile_mode);
+        let existing = self.values.borrow_mut().remove(&key);
+        let Some(mut audit) = existing else {
+            let audit = Self::exact_baseline(base, len, tile_mode, sparse_hash)?;
+            let content_hash = audit.content_hash;
+            let mut values = self.values.borrow_mut();
+            if values.len() >= TEXTURE_HASH_AUDIT_MAX_ENTRIES
+                && let Some(oldest) = values.keys().next().copied()
+            {
+                values.remove(&oldest);
+            }
+            values.insert(key, audit);
+            return Some(content_hash);
+        };
+
+        if audit.sparse_hash != sparse_hash {
+            audit = Self::exact_baseline(base, len, tile_mode, sparse_hash)?;
+        } else {
+            let segment = audit.next_segment;
+            audit.next_segment = (audit.next_segment + 1) % TEXTURE_HASH_CHUNKS as usize;
+            let (offset, size) = Self::segment_bounds(len, segment);
+            let bytes =
+                read_guest_bytes_unaligned(base + offset, size, "texture rotating exact audit")
+                    .ok()?;
+            let segment_hash = fnv_mix(FNV_OFFSET, &bytes);
+            if audit.segment_hashes[segment] != segment_hash {
+                static ROTATING_AUDIT_INVALIDATIONS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let occurrence = ROTATING_AUDIT_INVALIDATIONS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if occurrence <= 8 || occurrence.is_power_of_two() {
+                    tracing::info!(
+                        occurrence,
+                        base = format_args!("{base:#x}"),
+                        len,
+                        tile_mode,
+                        segment,
+                        "texture cache exact audit detected a source update hidden between sparse probes"
+                    );
+                }
+                // Refresh every segment now. Otherwise one wide CPU update
+                // would be rediscovered piecemeal and force up to 64 redundant
+                // texture uploads.
+                audit = Self::exact_baseline(base, len, tile_mode, sparse_hash)?;
+            }
+        }
+
+        let content_hash = audit.content_hash;
+        self.values.borrow_mut().insert(key, audit);
+        Some(content_hash)
+    }
 }
 
 /// Guest texture probes already computed in the current PM4 submission.
@@ -1973,13 +2095,20 @@ struct GuestSampleHashMemo {
 }
 
 impl GuestSampleHashMemo {
-    fn get_or_compute(&self, base: u64, len: u64, tile_mode: u8) -> Option<u64> {
+    fn get_or_compute(
+        &self,
+        auditor: &GuestTextureHashAuditor,
+        base: u64,
+        len: u64,
+        tile_mode: u8,
+    ) -> Option<u64> {
         self.apply_pending_writes();
         let key = (base, len, tile_mode);
         if let Some(hash) = self.values.borrow().get(&key).copied() {
             return Some(hash);
         }
-        let hash = guest_sample_hash(base, len, tile_mode)?;
+        let sparse_hash = guest_sample_hash(base, len, tile_mode)?;
+        let hash = auditor.audit(base, len, tile_mode, sparse_hash)?;
         self.values.borrow_mut().insert(key, hash);
         self.dep_mask
             .set(self.dep_mask.get() | address_granule_mask(base, len));
@@ -2094,7 +2223,10 @@ fn texture_cache_probe(
         // exactly the synchronous lifetime of this scope. See
         // `sampling_scope` for the matching same-thread lifetime invariant.
         let memo = unsafe { &*scope.sample_hash_memo };
-        memo.get_or_compute(base, src_len, tile_mode)
+        // SAFETY: the same synchronous draw scope borrows both sink-owned
+        // objects; neither pointer escapes `with_sampling_scope`.
+        let auditor = unsafe { &*scope.texture_hash_auditor };
+        memo.get_or_compute(auditor, base, src_len, tile_mode)
     }) else {
         return (0, None);
     };
@@ -3305,6 +3437,9 @@ struct SamplingScope {
     cached_textures: Vec<(crate::vulkan::cache::TextureKey, u64)>,
     /// Submission-local sample-hash memo owned by the active draw sink.
     sample_hash_memo: *const GuestSampleHashMemo,
+    /// Session-owned rotating exact audit state. It shares the synchronous
+    /// lifetime of `sample_hash_memo` but persists across submissions.
+    texture_hash_auditor: *const GuestTextureHashAuditor,
 }
 
 thread_local! {
@@ -5042,6 +5177,7 @@ pub fn draw_state_from_regs<'a>(
 pub struct OffscreenDrawSink<'a> {
     dev: &'a VulkanDevice,
     cache: &'a mut ShaderTranslateCache,
+    texture_hash_auditor: &'a GuestTextureHashAuditor,
     /// Persistent per-render-target contents, keyed by `CB_COLOR0_BASE`.
     /// Each draw seeds its attachment with the target's prior pixels and
     /// stores the result back, so draws compose into a frame instead of each
@@ -5116,10 +5252,12 @@ impl<'a> OffscreenDrawSink<'a> {
         dev: &'a VulkanDevice,
         cache: &'a mut ShaderTranslateCache,
         framebuffers: &'a mut HashMap<u64, Arc<RenderedImage>>,
+        texture_hash_auditor: &'a GuestTextureHashAuditor,
     ) -> Self {
         Self {
             dev,
             cache,
+            texture_hash_auditor,
             framebuffers,
             last: None,
             last_target: None,
@@ -5459,6 +5597,7 @@ impl OffscreenDrawSink<'_> {
             index_head,
             cached_textures,
             sample_hash_memo: std::ptr::from_ref(&self.texture_sample_hashes),
+            texture_hash_auditor: std::ptr::from_ref(self.texture_hash_auditor),
         };
         let bind_timer = crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_BIND_NS,
@@ -8674,25 +8813,75 @@ mod tests {
     }
 
     #[test]
+    fn rotating_texture_audit_detects_an_atlas_write_between_sparse_windows() {
+        let mut bytes = vec![0x5au8; 4 * 1024 * 1024];
+        let base = bytes.as_ptr() as u64;
+        let len = bytes.len() as u64;
+        let auditor = GuestTextureHashAuditor::default();
+        let sparse = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            guest_sample_hash(base, len, 27).unwrap()
+        });
+        let first = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            auditor.audit(base, len, 27, sparse).unwrap()
+        });
+
+        // Segment 17's midpoint is outside the fixed sparse sampler's leading
+        // window and outside its tail probe. This is the exact shape of the
+        // Minecraft failure: CPU glyph pixels changed while the old cache hash
+        // remained identical forever.
+        let (start, size) = GuestTextureHashAuditor::segment_bounds(len, 17);
+        bytes[(start + size / 2) as usize] ^= 0xff;
+        let sparse_after = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            guest_sample_hash(base, len, 27).unwrap()
+        });
+        assert_eq!(
+            sparse, sparse_after,
+            "the fixture write must reproduce the sparse-probe blind spot"
+        );
+
+        for _ in 0..17 {
+            let unchanged = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+                auditor.audit(base, len, 27, sparse_after).unwrap()
+            });
+            assert_eq!(first, unchanged, "unreached segments stay cache hits");
+        }
+        let changed = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            auditor.audit(base, len, 27, sparse_after).unwrap()
+        });
+        assert_ne!(
+            first, changed,
+            "the rotating exact audit must bound a missed atlas update"
+        );
+        let stable = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
+            auditor.audit(base, len, 27, sparse_after).unwrap()
+        });
+        assert_eq!(
+            changed, stable,
+            "one atlas update must not cause repeated cache invalidations"
+        );
+    }
+
+    #[test]
     fn submission_texture_hash_memo_reuses_then_invalidates_a_probe() {
         let mut bytes: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let base = bytes.as_ptr() as u64;
         let memo = GuestSampleHashMemo::default();
+        let auditor = GuestTextureHashAuditor::default();
         let first = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
-            memo.get_or_compute(base, bytes.len() as u64, 27)
+            memo.get_or_compute(&auditor, base, bytes.len() as u64, 27)
                 .expect("first probe")
         });
 
         bytes[0] ^= 0xff;
         let reused = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
-            memo.get_or_compute(base, bytes.len() as u64, 27)
+            memo.get_or_compute(&auditor, base, bytes.len() as u64, 27)
                 .expect("memo hit")
         });
         assert_eq!(first, reused, "the submission-local probe must be reused");
 
         memo.clear();
         let refreshed = crate::guest_mem::with_test_ranges(&[(base, bytes.len())], || {
-            memo.get_or_compute(base, bytes.len() as u64, 27)
+            memo.get_or_compute(&auditor, base, bytes.len() as u64, 27)
                 .expect("probe after invalidation")
         });
         assert_ne!(
@@ -8708,11 +8897,14 @@ mod tests {
         let a_base = a.as_ptr() as u64;
         let b_base = b.as_ptr() as u64;
         let memo = GuestSampleHashMemo::default();
+        let auditor = GuestTextureHashAuditor::default();
         let ranges = [(a_base, a.len()), (b_base, b.len())];
         let (a_first, b_first) = crate::guest_mem::with_test_ranges(&ranges, || {
             (
-                memo.get_or_compute(a_base, a.len() as u64, 27).unwrap(),
-                memo.get_or_compute(b_base, b.len() as u64, 27).unwrap(),
+                memo.get_or_compute(&auditor, a_base, a.len() as u64, 27)
+                    .unwrap(),
+                memo.get_or_compute(&auditor, b_base, b.len() as u64, 27)
+                    .unwrap(),
             )
         });
 
@@ -8721,8 +8913,10 @@ mod tests {
         memo.invalidate_ranges(&[(a_base, a.len() as u64)]);
         let (a_after, b_after) = crate::guest_mem::with_test_ranges(&ranges, || {
             (
-                memo.get_or_compute(a_base, a.len() as u64, 27).unwrap(),
-                memo.get_or_compute(b_base, b.len() as u64, 27).unwrap(),
+                memo.get_or_compute(&auditor, a_base, a.len() as u64, 27)
+                    .unwrap(),
+                memo.get_or_compute(&auditor, b_base, b.len() as u64, 27)
+                    .unwrap(),
             )
         });
 
@@ -10309,9 +10503,11 @@ mod tests {
         let mut a: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let a_base = a.as_ptr() as u64;
         let memo = GuestSampleHashMemo::default();
+        let auditor = GuestTextureHashAuditor::default();
         let ranges = [(a_base, a.len())];
         let first = crate::guest_mem::with_test_ranges(&ranges, || {
-            memo.get_or_compute(a_base, a.len() as u64, 27).unwrap()
+            memo.get_or_compute(&auditor, a_base, a.len() as u64, 27)
+                .unwrap()
         });
 
         a[0] ^= 0xff;
@@ -10333,7 +10529,8 @@ mod tests {
             "no pass over the probes may have happened yet"
         );
         let after = crate::guest_mem::with_test_ranges(&ranges, || {
-            memo.get_or_compute(a_base, a.len() as u64, 27).unwrap()
+            memo.get_or_compute(&auditor, a_base, a.len() as u64, 27)
+                .unwrap()
         });
         assert_ne!(first, after, "the deferred write must still rehash");
         assert!(memo.pending_writes.borrow().is_empty());
