@@ -3011,6 +3011,21 @@ pub(crate) static DRAW_STAGE_DRAWCOMMON_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_DECODE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Texture-cache probe split inside `decode_texture`: source hashing (normally
+/// a submission-local memo hit) versus lookup in the published persistent
+/// cache snapshot. Counts are per texture probe rather than per draw.
+pub(crate) static DRAW_STAGE_TEX_HASH_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_TEX_LOOKUP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_TEX_PROBES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_TEX_MEMO_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_TEX_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_TEX_ENTRIES_EXAMINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_RESOLVE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_RESOLVE_HITS: std::sync::atomic::AtomicU64 =
@@ -3091,6 +3106,28 @@ pub(crate) static DRAW_STAGE_CENSUS_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_BIND_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// `prepare_stage_binding` internal split (GRAPHICS stages only — compute
+/// routes through `cs_prepare` and must not pollute the `bind`
+/// reconciliation). `vsharp` is the storage-buffer V# loop and `vsharp_read`
+/// its guest-memory fetch subset (with `vsharp_bytes` the volume fetched);
+/// `tsharp` is the T# texture loop, whose decode subset is already reported
+/// as `decode`; `tail` is the sampler/GDS/direct-SGPR push-constant
+/// assembly. `bind - (vsharp + tsharp + tail)` is the pre-loop validation
+/// plus vector setup and is reported as `other` — never "unaccounted for".
+pub(crate) static DRAW_STAGE_BIND_VSHARP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_VSHARP_READ_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_VSHARP_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_VSHARP_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_TSHARP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_TSHARP_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_BIND_TAIL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_BACKEND_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_DISPATCH_NS: std::sync::atomic::AtomicU64 =
@@ -3110,7 +3147,7 @@ pub(crate) static DRAW_STAGE_CS_BACKEND_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static DRAW_STAGE_PREDRAW_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn draw_stage_timing_enabled() -> bool {
+pub(crate) fn draw_stage_timing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::diagnostics::gpu_env().time_draw)
 }
@@ -3165,6 +3202,12 @@ fn draw_stage_tick() {
     let build = target + seed + depth + vbuf + stage + pipeline + cmd;
     let drawcommon = DRAW_STAGE_DRAWCOMMON_NS.swap(0, Relaxed);
     let decode = DRAW_STAGE_DECODE_NS.swap(0, Relaxed);
+    let tex_hash = DRAW_STAGE_TEX_HASH_NS.swap(0, Relaxed);
+    let tex_lookup = DRAW_STAGE_TEX_LOOKUP_NS.swap(0, Relaxed);
+    let tex_probes = DRAW_STAGE_TEX_PROBES.swap(0, Relaxed);
+    let tex_memo_hits = DRAW_STAGE_TEX_MEMO_HITS.swap(0, Relaxed);
+    let tex_cache_hits = DRAW_STAGE_TEX_CACHE_HITS.swap(0, Relaxed);
+    let tex_entries_examined = DRAW_STAGE_TEX_ENTRIES_EXAMINED.swap(0, Relaxed);
     let resolve = DRAW_STAGE_RESOLVE_NS.swap(0, Relaxed);
     let resolve_hits = DRAW_STAGE_RESOLVE_HITS.swap(0, Relaxed);
     let resolve_misses = DRAW_STAGE_RESOLVE_MISSES.swap(0, Relaxed);
@@ -3184,6 +3227,13 @@ fn draw_stage_tick() {
     let setup = DRAW_STAGE_SETUP_NS.swap(0, Relaxed);
     let census = DRAW_STAGE_CENSUS_NS.swap(0, Relaxed);
     let bind = DRAW_STAGE_BIND_NS.swap(0, Relaxed);
+    let bind_vsharp = DRAW_STAGE_BIND_VSHARP_NS.swap(0, Relaxed);
+    let bind_vsharp_read = DRAW_STAGE_BIND_VSHARP_READ_NS.swap(0, Relaxed);
+    let bind_vsharp_bytes = DRAW_STAGE_BIND_VSHARP_BYTES.swap(0, Relaxed);
+    let bind_vsharp_n = DRAW_STAGE_BIND_VSHARP_N.swap(0, Relaxed);
+    let bind_tsharp = DRAW_STAGE_BIND_TSHARP_NS.swap(0, Relaxed);
+    let bind_tsharp_n = DRAW_STAGE_BIND_TSHARP_N.swap(0, Relaxed);
+    let bind_tail = DRAW_STAGE_BIND_TAIL_NS.swap(0, Relaxed);
     let backend = DRAW_STAGE_BACKEND_NS.swap(0, Relaxed);
     let dispatch = DRAW_STAGE_DISPATCH_NS.swap(0, Relaxed);
     let dispatches = DRAW_STAGE_DISPATCH_N.swap(0, Relaxed);
@@ -3225,6 +3275,17 @@ fn draw_stage_tick() {
         "DRAW COST: per-draw draw_common vs its texture-decode + build subsets, and compute dispatch (per 512 draws; RAEEN_TIME_DRAW)"
     );
     tracing::warn!(
+        probes = tex_probes,
+        hash_us = (tex_hash / 1000).checked_div(tex_probes).unwrap_or(0),
+        lookup_us = (tex_lookup / 1000).checked_div(tex_probes).unwrap_or(0),
+        memo_hits = tex_memo_hits,
+        memo_misses = tex_probes.saturating_sub(tex_memo_hits),
+        cache_hits = tex_cache_hits,
+        cache_misses = tex_probes.saturating_sub(tex_cache_hits),
+        entries_examined = tex_entries_examined.checked_div(tex_probes).unwrap_or(0),
+        "TEXTURE PROBE STAGES: per sampled T# source-hash and persistent-cache snapshot lookup (RAEEN_TIME_DRAW)"
+    );
+    tracing::warn!(
         resolve_us = per_draw_us(resolve),
         resolve_hits,
         resolve_misses,
@@ -3249,6 +3310,32 @@ fn draw_stage_tick() {
         predraw_us = per_draw_us(predraw),
         "DRAW COMMON STAGES: shader resolve, state/vertex setup, cache census, resource binding, Vulkan backend (record = backend minus build), the untimed remainder, and the pre-draw_common index/compute work. `miss_*` names WHICH part of a too-wide key churned: `_beyond` is outside the analysis's live user-SGPR window and can be masked out of the key; `_inside` is a register the analysis latches, which needs the per-program ABI split instead"
     );
+    // Exhaustive split of `bind` (graphics `prepare_stage_binding` only):
+    // V# loop / T# loop / push-constant tail / pre-loop validation remainder.
+    {
+        let bind_other = bind.saturating_sub(
+            bind_vsharp
+                .saturating_add(bind_tsharp)
+                .saturating_add(bind_tail),
+        );
+        let bind_pct = |x: u64| x.saturating_mul(100).checked_div(bind).unwrap_or(0);
+        tracing::warn!(
+            vsharp_us = per_draw_us(bind_vsharp),
+            vsharp_of_bind_pct = bind_pct(bind_vsharp),
+            vsharp_read_us = per_draw_us(bind_vsharp_read),
+            vsharp_buffers_per_512 = bind_vsharp_n,
+            vsharp_kib_per_draw = bind_vsharp_bytes / 1024 / 512,
+            vsharp_read_us_per_buffer = (bind_vsharp_read / 1000)
+                .checked_div(bind_vsharp_n)
+                .unwrap_or(0),
+            tsharp_us = per_draw_us(bind_tsharp),
+            tsharp_of_bind_pct = bind_pct(bind_tsharp),
+            tsharp_textures_per_512 = bind_tsharp_n,
+            tail_us = per_draw_us(bind_tail),
+            other_us = per_draw_us(bind_other),
+            "BIND STAGES: storage-buffer V# loop (read = guest-memory fetch subset, with volume), texture T# loop (its decode subset is `decode_us` above), sampler/GDS/SGPR push-constant tail, and the pre-loop validation remainder. A dominant `vsharp_read` with high KiB/draw means the win is caching or windowing guest V# fetches, not descriptor plumbing"
+        );
+    }
     tracing::warn!(
         analyze_calls,
         total_us = per_analysis_us(analyze_total),

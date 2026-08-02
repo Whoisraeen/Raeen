@@ -81,9 +81,9 @@ fn hle_setspecific(ctx: &HleContext, args: &[u64]) -> u64 {
 /// or the key is unknown). The value is the return value, per the ABI.
 fn hle_getspecific(ctx: &HleContext, args: &[u64]) -> u64 {
     let key = args.first().copied().unwrap_or(0) as i32;
-    if !ctx.kernel.pthread_tls_keys.contains_key(&key) {
-        return 0;
-    }
+    // Deleting a key removes every `(thread, key)` value, so absence here
+    // already covers both an unknown key and an unset known key. Avoid a
+    // second DashMap lookup on this streaming-worker hot path.
     ctx.kernel
         .pthread_tls_values
         .get(&(ctx.guest_threads.current_thread(), key))

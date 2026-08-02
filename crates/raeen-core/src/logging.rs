@@ -151,9 +151,50 @@ impl<W: Write> Write for CappedWriter<W> {
 /// inside the init function, as this module previously did) silently loses
 /// buffered events — the log file ends up empty or truncated. Holding this in
 /// `main` is what makes the file actually complete.
+///
+/// The `WorkerGuard` itself lives in [`FILE_WRITER_GUARD`] rather than in this
+/// struct, so a crash handler ([`flush_for_crash`]) can drain the writer from
+/// any thread; dropping a `LogGuard` still tears the writer down exactly as
+/// before.
 #[must_use = "dropping this stops the background log writer and loses buffered log events"]
 pub struct LogGuard {
-    _file: Option<WorkerGuard>,
+    owns_file_writer: bool,
+}
+
+impl Drop for LogGuard {
+    fn drop(&mut self) {
+        if self.owns_file_writer {
+            let mut slot = FILE_WRITER_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(slot.take());
+        }
+    }
+}
+
+/// The async file writer's flush handle, stashed process-globally so the
+/// crash path can reach it. `None` before [`init_with_file`] and after the
+/// writer has been drained (by [`flush_for_crash`] or a `LogGuard` drop).
+static FILE_WRITER_GUARD: std::sync::Mutex<Option<WorkerGuard>> = std::sync::Mutex::new(None);
+
+/// Drain the async file sink **now**, so every event already handed to
+/// `tracing` reaches `raeen.log` before the process dies.
+///
+/// `tracing_appender`'s worker only flushes when its `WorkerGuard` drops, and
+/// `Drop` does not run on an abnormal death — which is exactly when the last
+/// buffered ERROR line matters most. This takes the stashed guard and drops
+/// it, which blocks until the worker has drained its queue.
+///
+/// After this call the **file** sink is gone for the rest of the process
+/// (stderr and the in-app console keep working), so it is only for paths that
+/// are about to abort: the last-resort exception filter and the HLE gateway's
+/// panic-then-abort. Idempotent, and `try_lock`-based so a crash inside the
+/// logging machinery itself can never deadlock the handler.
+pub fn flush_for_crash() {
+    let Ok(mut slot) = FILE_WRITER_GUARD.try_lock() else {
+        return;
+    };
+    drop(slot.take());
 }
 
 /// Build the level filter: `RAEEN_LOG` wins, else `level`.
@@ -369,7 +410,9 @@ pub fn init(level: &str) -> LogGuard {
         .try_init();
 
     tracing::info!("Raeen v{} — PS5 Emulator initialized", crate::VERSION);
-    LogGuard { _file: None }
+    LogGuard {
+        owns_file_writer: false,
+    }
 }
 
 /// Initialize the global tracing subscriber, writing to **both** stderr and
@@ -438,7 +481,12 @@ pub fn init_with_file(level: &str, log_dir: &Path) -> anyhow::Result<LogGuard> {
             format!("{} MiB", cap / (1024 * 1024))
         }
     );
-    Ok(LogGuard { _file: Some(guard) })
+    *FILE_WRITER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guard);
+    Ok(LogGuard {
+        owns_file_writer: true,
+    })
 }
 
 #[cfg(test)]

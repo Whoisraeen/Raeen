@@ -789,6 +789,32 @@ impl HleContext<'_> {
 /// [`HleContext::float_args`] — the SysV ABI passes them in XMM registers.
 pub type HleFunction = fn(&HleContext, &[u64]) -> u64;
 
+// Retail import names are short (the longest registered key is well below
+// this), so compose the dispatch lookup key in caller-owned stack storage.
+// The old unconditional `format!("{library}::{function}")` allocated on every
+// HLE call; Minecraft's streaming workers make these calls densely while
+// holding title locks, amplifying allocator contention into multi-second
+// convoys. Oversized external registrations retain a cold heap fallback.
+const HLE_STACK_KEY_BYTES: usize = 256;
+
+fn hle_key_in<'a>(
+    library: &str,
+    function: &str,
+    storage: &'a mut [u8; HLE_STACK_KEY_BYTES],
+) -> Option<&'a str> {
+    let key_len = library.len().checked_add(2)?.checked_add(function.len())?;
+    if key_len > storage.len() {
+        return None;
+    }
+    let separator = library.len();
+    let function_start = separator + 2;
+    storage[..separator].copy_from_slice(library.as_bytes());
+    storage[separator..function_start].copy_from_slice(b"::");
+    storage[function_start..key_len].copy_from_slice(function.as_bytes());
+    // Both inputs are valid UTF-8 and the inserted separator is ASCII.
+    std::str::from_utf8(&storage[..key_len]).ok()
+}
+
 fn canonical_provider_name(provider: &str) -> String {
     let lower = provider.to_ascii_lowercase();
     let lower = lower
@@ -1055,11 +1081,23 @@ impl HleRegistry {
         function: &str,
         args: &[u64],
     ) -> Option<u64> {
-        let key = format!("{}::{}", library, function);
-        if let Some(func) = self.functions.get(&key) {
+        let mut storage = [0u8; HLE_STACK_KEY_BYTES];
+        if let Some(key) = hle_key_in(library, function, &mut storage) {
+            self.call_key(ctx, key, args)
+        } else {
+            let key = format!("{library}::{function}");
+            self.call_key(ctx, &key, args)
+        }
+    }
+
+    fn call_key(&self, ctx: &HleContext, key: &str, args: &[u64]) -> Option<u64> {
+        if let Some(func) = self.functions.get(key).map(|func| *func) {
+            // Never hold a DashMap shard guard across a handler that may block
+            // or call another subsystem; the function pointer is Copy.
             debug!("HLE call: {}({:?})", key, args);
-            let thread = ctx.guest_threads.current_thread();
-            if ctx.kernel.diagnostics.is_enabled() {
+            let diagnostics_enabled = ctx.kernel.diagnostics.is_enabled();
+            let diagnostic_thread = diagnostics_enabled.then(|| ctx.guest_threads.current_thread());
+            if let Some(thread) = diagnostic_thread {
                 let detail = args
                     .iter()
                     .take(14)
@@ -1069,19 +1107,23 @@ impl HleRegistry {
                 ctx.kernel.diagnostics.record(
                     thread,
                     DiagnosticKind::HleEnter,
-                    &key,
+                    key,
                     ctx.caller_return_addr,
                     detail,
                 );
             }
             let result = func(ctx, args);
-            ctx.kernel.diagnostics.record(
-                thread,
-                DiagnosticKind::HleExit,
-                &key,
-                ctx.caller_return_addr,
-                format!("return={result:#x}"),
-            );
+            if let Some(thread) = diagnostic_thread {
+                // `record` itself is cheap when disabled, but constructing the
+                // detail String was not. Keep both events behind one snapshot.
+                ctx.kernel.diagnostics.record(
+                    thread,
+                    DiagnosticKind::HleExit,
+                    key,
+                    ctx.caller_return_addr,
+                    format!("return={result:#x}"),
+                );
+            }
             // Every HLE dispatch is a **safe point** for asynchronous Orbis
             // exception delivery: the guest is stopped at a known instruction
             // boundary on its own stack, with its register file captured, and
@@ -1107,9 +1149,12 @@ impl HleRegistry {
             // would put a lock and a hash on the hot path to report something
             // derivable at report time from `incomplete_registrations()`
             // intersected with the title's own import list, at no per-call cost.
-            blockers::record(BlockerCategory::UnimplementedStub, key, 0, || {
-                "no HLE registration — the call returned nothing to the guest".to_string()
-            });
+            blockers::record(
+                BlockerCategory::UnimplementedStub,
+                key.to_owned(),
+                0,
+                || "no HLE registration — the call returned nothing to the guest".to_string(),
+            );
             None
         }
     }
@@ -1497,6 +1542,21 @@ mod tests {
         assert!(ValidatedGuestRange::validate(&memory, outside, GuestAccess::Read).is_none());
         assert!(ExecutableGuestMapping::validate(&memory, outside).is_none());
         assert!(GpuVisibleGuestRange::validate(&memory, outside).is_none());
+    }
+
+    #[test]
+    fn hle_lookup_key_stays_on_stack_with_a_bounded_fallback() {
+        let mut storage = [0u8; HLE_STACK_KEY_BYTES];
+        assert_eq!(
+            hle_key_in("libkernel", "scePthreadGetthreadid", &mut storage),
+            Some("libkernel::scePthreadGetthreadid")
+        );
+
+        let oversized = "x".repeat(HLE_STACK_KEY_BYTES);
+        assert!(
+            hle_key_in("libkernel", &oversized, &mut storage).is_none(),
+            "external registrations longer than the stack buffer use the heap fallback"
+        );
     }
 
     #[test]

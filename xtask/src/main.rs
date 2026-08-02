@@ -1,4 +1,5 @@
 mod baseline;
+mod compat_diff;
 mod nids;
 mod schema;
 mod soak;
@@ -24,6 +25,9 @@ use std::{
 
 const DEFAULT_REGISTRY: &str = "artifacts/compat/registry.json";
 const DEFAULT_RESULTS: &str = "artifacts/compat/latest.json";
+/// Records the path of the most recent `compat run` report so the next sweep
+/// can diff against it automatically (overridable with `--baseline`).
+const LATEST_POINTER: &str = "artifacts/compat/latest-run-pointer.txt";
 
 #[derive(Deserialize)]
 struct LocalConfig {
@@ -50,6 +54,8 @@ fn main() -> Result<()> {
         compat_publish(rest)
     } else if area == "compat" && command == "compare" {
         compat_compare(rest)
+    } else if area == "compat" && command == "diff" {
+        compat_diff::diff(rest)
     } else if area == "refs" && command == "report" {
         refs_report(rest)
     } else if area == "baseline" && command == "run" {
@@ -77,6 +83,8 @@ fn print_help() {
   cargo xtask compat discover [--config config.toml] [--library PATH] [--output PATH]
   cargo xtask compat run [--registry PATH] [--output PATH] [--exe PATH]
                           [--timeout SECONDS] [--tier all|nightly] [--profile max-fps]
+                          [--baseline PATH] [--flip-tolerance PCT]
+  cargo xtask compat diff <old.json> <new.json> [--flip-tolerance PCT]
   cargo xtask compat compare --baseline PATH [--current PATH]
   cargo xtask compat publish [--input PATH] [--output compat/COMPATIBILITY.md]
   cargo xtask baseline run [--registry PATH] [--output PATH] [--exe PATH]
@@ -331,12 +339,24 @@ fn compat_run(args: &[String]) -> Result<()> {
         .context("--timeout must be an integer")?;
     let tier = option(args, "--tier").unwrap_or_else(|| "all".into());
     let profile = option(args, "--profile").unwrap_or_else(|| "max-fps".into());
+    let diff_options = compat_diff::parse_options(args)?;
     let selected = select_games(&registry.games, &tier)?;
+    let output = PathBuf::from(option(args, "--output").unwrap_or_else(|| DEFAULT_RESULTS.into()));
+    // Resolve and read the baseline before the sweep: the default output IS
+    // the previous latest.json, so it must be captured before being replaced,
+    // and an unreadable explicit --baseline should fail before a long run.
+    let baseline_report = match option(args, "--baseline") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            let report: RunReport = read_json(&path)?;
+            Some((path.display().to_string(), report))
+        }
+        None => previous_sweep(&output),
+    };
     let run_id = format!("run-{}", now_ms());
     let raw_dir = PathBuf::from("artifacts/compat/raw").join(&run_id);
     fs::create_dir_all(&raw_dir)?;
-    let build_revision =
-        git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|_| "unknown".into());
+    let build_revision = build_identity();
     let machine_id = machine_id();
     let mut results = Vec::new();
     for game in selected {
@@ -357,14 +377,91 @@ fn compat_run(args: &[String]) -> Result<()> {
         machine_id,
         results,
     };
-    let output = PathBuf::from(option(args, "--output").unwrap_or_else(|| DEFAULT_RESULTS.into()));
     write_json(&output, &report)?;
+    if let Err(error) = fs::write(LATEST_POINTER, format!("{}\n", output.display())) {
+        eprintln!("warning: cannot update {LATEST_POINTER}: {error}");
+    }
     println!(
         "wrote {} measured results to {}",
         report.results.len(),
         output.display()
     );
+    match baseline_report {
+        Some((label, baseline)) => {
+            let diff = compat_diff::compute_diff(&baseline, &report, diff_options);
+            println!();
+            print!(
+                "{}",
+                compat_diff::render_diff(
+                    &diff,
+                    &label,
+                    &output.display().to_string(),
+                    diff_options
+                )
+            );
+            let regressed = diff.count(compat_diff::Verdict::Regressed);
+            if regressed > 0 {
+                println!(
+                    "WARNING: {regressed} title(s) regressed vs the baseline; \
+                     gate with `cargo xtask compat diff {label} {}`",
+                    output.display()
+                );
+            }
+        }
+        None => println!("no previous sweep to diff against (first run, or pass --baseline)"),
+    }
     Ok(())
+}
+
+/// The report the previous sweep produced: the latest-run pointer if it names
+/// a readable file, otherwise the output file about to be replaced. Fails
+/// soft — a missing or stale baseline must never block a measurement run.
+fn previous_sweep(output: &Path) -> Option<(String, RunReport)> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(pointer) = fs::read_to_string(LATEST_POINTER) {
+        let pointed = pointer.trim();
+        if !pointed.is_empty() {
+            candidates.push(PathBuf::from(pointed));
+        }
+    }
+    candidates.push(output.to_path_buf());
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        match read_json::<RunReport>(&candidate) {
+            Ok(report) => return Some((candidate.display().to_string(), report)),
+            Err(error) => {
+                eprintln!(
+                    "warning: skipping unreadable baseline {}: {error:#}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+    None
+}
+
+/// The honest build label for a measured result: the short HEAD revision,
+/// suffixed `+dirty` when tracked files are modified so a report can never
+/// imply the HEAD commit alone contains the measured changes. Untracked files
+/// are not counted — they do not change tracked build inputs, and this tree
+/// permanently carries untracked logs/savedata.
+fn build_identity() -> String {
+    let head = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|_| "unknown".into());
+    let dirty = git_output(&["status", "--porcelain", "--untracked-files=no"])
+        .map(|status| !status.trim().is_empty())
+        .unwrap_or(false);
+    compose_build_revision(&head, dirty)
+}
+
+fn compose_build_revision(head: &str, dirty: bool) -> String {
+    let head = head.trim();
+    if dirty {
+        format!("{head}+dirty")
+    } else {
+        head.into()
+    }
 }
 
 fn select_games<'a>(games: &'a [GameRecord], tier: &str) -> Result<Vec<&'a GameRecord>> {
@@ -666,10 +763,30 @@ fn sanitize_line(line: &str, roots: &[String]) -> String {
     }
     output = output
         .split_whitespace()
-        .map(sanitize_token)
+        .map(|token| scrub_paths(&sanitize_token(token)))
         .collect::<Vec<_>>()
         .join(" ");
     output.chars().take(500).collect()
+}
+
+/// Replace an absolute drive-letter path (`C:\…` or `C:/…`) and everything
+/// after it in a token with `<PATH>`: a publishable line must never carry
+/// machine-local paths or usernames, even when no game-root replacement
+/// applied. URL schemes (`https://`) are left alone — a drive letter is a
+/// single letter not preceded by another alphanumeric character.
+fn scrub_paths(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    for (index, window) in chars.windows(3).enumerate() {
+        if window[0].is_ascii_alphabetic()
+            && window[1] == ':'
+            && (window[2] == '\\' || window[2] == '/')
+            && (index == 0 || !chars[index - 1].is_ascii_alphanumeric())
+        {
+            let prefix: String = chars[..index].iter().collect();
+            return format!("{prefix}<PATH>");
+        }
+    }
+    token.into()
 }
 
 fn strip_ansi(value: &str) -> String {
@@ -737,6 +854,23 @@ fn compat_publish(args: &[String]) -> Result<()> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
+    fs::write(&output, render_compat_markdown(&report))?;
+    println!(
+        "published {} measured rows to {}",
+        report.results.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Render a validated, measured `RunReport` as the sanitized public
+/// compatibility table. Rows carry the recorded build identity verbatim —
+/// including a `+dirty` suffix when the sweep measured a modified tree — and
+/// blocker lines are re-sanitized on publication as a defense in depth: older
+/// measured schema-v1 reports may predate a sanitizer improvement (absolute
+/// paths in particular are scrubbed here even when the recording-time
+/// sanitizer missed them).
+fn render_compat_markdown(report: &RunReport) -> String {
     let mut markdown = String::from(
         "# Measured compatibility\n\n\
          Generated only from Raeen's sanitized compatibility-result schema. \
@@ -757,8 +891,6 @@ fn compat_publish(args: &[String]) -> Result<()> {
             .filter(|line| is_blocker_line(line))
             .unwrap_or("none observed")
             .to_string();
-        // Re-sanitize on publication as a defense in depth: older measured
-        // schema-v1 reports may predate a sanitizer improvement.
         let blocker = sanitize_line(&blocker, &[]).replace('|', "\\|");
         let title = result.title.replace('|', "\\|");
         markdown.push_str(&format!(
@@ -773,13 +905,7 @@ fn compat_publish(args: &[String]) -> Result<()> {
             blocker
         ));
     }
-    fs::write(&output, markdown)?;
-    println!(
-        "published {} measured rows to {}",
-        report.results.len(),
-        output.display()
-    );
-    Ok(())
+    markdown
 }
 
 fn compat_compare(args: &[String]) -> Result<()> {
@@ -1219,6 +1345,99 @@ flips_submitted=9@25ms frames_published=9@26ms\n";
         );
         assert_eq!(observed_fps(&strip_ansi(log)), Some(62.5));
         assert_eq!(observed_fps("no completed-present telemetry"), None);
+    }
+
+    #[test]
+    fn sanitizer_scrubs_absolute_drive_paths_but_not_urls() {
+        let value = sanitize_line(
+            r"ERROR open failed path=C:\Users\someone\Games\eboot.bin see https://example.org/docs",
+            &[],
+        );
+        assert!(!value.contains(r"C:\"), "{value}");
+        assert!(!value.contains("someone"), "{value}");
+        assert!(value.contains("path=<PATH>"), "{value}");
+        assert!(value.contains("https://example.org/docs"), "{value}");
+        let forward = sanitize_line("mount d:/ps5/library failed", &[]);
+        assert!(forward.contains("mount <PATH> failed"), "{forward}");
+    }
+
+    #[test]
+    fn build_identity_labels_a_dirty_tree_and_a_clean_one_honestly() {
+        assert_eq!(compose_build_revision("01f7b613911a\n", false), "01f7b613911a");
+        assert_eq!(
+            compose_build_revision("01f7b613911a", true),
+            "01f7b613911a+dirty"
+        );
+    }
+
+    /// The exact Minecraft row from the measured report that produced the
+    /// checked-in `compat/COMPATIBILITY.md` (artifacts/compat/latest.json,
+    /// run-1785567964106). The renderer must round-trip it byte-identically,
+    /// or regenerating the public table from the same evidence would create a
+    /// phantom diff.
+    fn measured_minecraft_report() -> RunReport {
+        RunReport {
+            schema_version: SCHEMA_VERSION,
+            generated_unix_ms: 1785568144600,
+            machine_id: "machine-ddfbe4e61ec9".into(),
+            results: vec![CompatResult {
+                schema_version: SCHEMA_VERSION,
+                measured_unix_ms: 1785568144598,
+                run_id: "run-1785567964106".into(),
+                build_revision: "96da89e90acf".into(),
+                profile: "max-fps".into(),
+                game_id: "PPSA17221".into(),
+                title: "Minecraft".into(),
+                content_sha1: "05b59012cd4ebea8be5ab195b62bd842d158deeb".into(),
+                stage: schema::Stage::TimedOut,
+                metrics: Metrics {
+                    wall_ms: 180310,
+                    cpu_ms: Some(178046),
+                    peak_working_set_bytes: Some(1200795648),
+                    exit_code: Some(1),
+                    flip_events: 6304,
+                    shader_errors: 0,
+                    gpu_errors: 0,
+                    audio_errors: 0,
+                    input_events: 0,
+                    observed_fps: Some(83.3),
+                },
+                evidence: Evidence {
+                    log_sha1: "16a1ee6760288db6b91eaa904441bfa8cbda31a9".into(),
+                    blocker_signature: None,
+                    first_blocker: None,
+                    measured: true,
+                    unresolved_nids: Some(Vec::new()),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn published_markdown_round_trips_the_checked_in_table() {
+        let expected = "# Measured compatibility\n\n\
+            Generated only from Raeen's sanitized compatibility-result schema. \
+            A result is evidence for this build and machine class, not a universal compatibility claim.\n\n\
+            | Title | Build | Stage | Wall | Peak RAM | Flips | Shader errors | First blocker |\n\
+            |---|---:|---|---:|---:|---:|---:|---|\n\
+            | Minecraft | `96da89e90acf` | TimedOut | 180.3s | 1145 MiB | 6304 | 0 | none observed |\n";
+        assert_eq!(render_compat_markdown(&measured_minecraft_report()), expected);
+    }
+
+    #[test]
+    fn published_markdown_preserves_the_dirty_label_and_scrubs_paths() {
+        let mut report = measured_minecraft_report();
+        report.results[0].build_revision = "96da89e90acf+dirty".into();
+        report.results[0].evidence.first_blocker =
+            Some(r"ERROR guest fault while reading C:\Users\someone\save.bin".into());
+        let markdown = render_compat_markdown(&report);
+        assert!(
+            markdown.contains("`96da89e90acf+dirty`"),
+            "a dirty-tree measurement must stay labeled +dirty: {markdown}"
+        );
+        assert!(!markdown.contains(r"C:\"), "{markdown}");
+        assert!(!markdown.contains("someone"), "{markdown}");
+        assert!(markdown.contains("<PATH>"), "{markdown}");
     }
 
     #[test]

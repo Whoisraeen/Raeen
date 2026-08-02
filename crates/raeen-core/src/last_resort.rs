@@ -105,6 +105,38 @@ const BACKTRACE_LIMIT: usize = 8;
 /// Count of panics seen by the hook, for [`BACKTRACE_LIMIT`].
 static PANICS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Stable crash code for a panic at `location` (`file:line:column`):
+/// `RAEEN-PANIC-<8 hex>`, an FNV-1a hash of the location string.
+///
+/// The code names the *crash site*, not the run: the same panic location
+/// produces the same code across runs and machines, so recurring crashes in
+/// user reports and compat sweeps can be bucketed by a grep for one token
+/// instead of by fuzzy-matching message text.
+#[must_use]
+pub fn panic_crash_code(location: &str) -> String {
+    format!("RAEEN-PANIC-{:08X}", fnv1a64(location) as u32)
+}
+
+/// Stable crash code for an unhandled SEH exception: `RAEEN-SEH-<code hex>`,
+/// e.g. `RAEEN-SEH-C0000094` for `STATUS_INTEGER_DIVIDE_BY_ZERO`.
+#[must_use]
+pub fn seh_crash_code(exception_code: u32) -> String {
+    format!("RAEEN-SEH-{exception_code:08X}")
+}
+
+/// FNV-1a 64-bit: tiny, dependency-free, and stable across builds — all this
+/// hash has to be. (Rust's `DefaultHasher` is explicitly unstable across
+/// releases, which would silently re-key every crash bucket on a toolchain
+/// bump.)
+fn fnv1a64(s: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in s.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Install the panic hook and, on Windows, the unhandled-exception filter.
 ///
 /// Idempotent — only the first call takes effect, so the Shell and the runner

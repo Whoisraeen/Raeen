@@ -483,12 +483,12 @@ type PresentEncodeCache = Vec<(usize, Weak<RenderedImage>, Arc<RenderedImage>)>;
 const MAX_SCANOUT_SNAPSHOTS: usize = 8;
 
 fn should_report_black_frame(
-    gpu_work_submitted: bool,
+    graphics_attempted: bool,
     flip_address_hit: bool,
     guest_preferred: bool,
     fallback_hit: bool,
 ) -> bool {
-    gpu_work_submitted && !flip_address_hit && !guest_preferred && !fallback_hit
+    graphics_attempted && !flip_address_hit && !guest_preferred && !fallback_hit
 }
 
 /// Count pixels with visible colour, optionally sampling every `stride`th
@@ -1752,8 +1752,26 @@ impl AgcGpuSession {
                 },
             );
         }
+        // A state-only or compute-only DCB is not evidence of a failed frame.
+        // Minecraft submits both before its first graphics draw, so using the
+        // broad submission counter polluted every healthy run with a startup
+        // `gpu-error black-frame`. Preserve the Dead Cells diagnostic: a
+        // refused/skipped draw is a graphics attempt even when completed_draws
+        // remains zero.
+        let black_frame_counts =
+            (!flip_address_hit && !guest_preferred && !fallback_hit).then(|| {
+                (
+                    *self.draw_count.lock(),
+                    self.refused_draws(),
+                    *self.shader_skip_count.lock(),
+                )
+            });
+        let graphics_attempted =
+            black_frame_counts.is_some_and(|(completed_draws, refused_draws, shader_skips)| {
+                completed_draws != 0 || refused_draws != 0 || shader_skips != 0
+            });
         if should_report_black_frame(
-            self.submission_count.load(Ordering::Relaxed) != 0,
+            graphics_attempted,
             flip_address_hit,
             guest_preferred,
             fallback_hit,
@@ -1767,22 +1785,24 @@ impl AgcGpuSession {
                     .keys()
                     .map(|base| format!("{base:#x}"))
                     .collect::<Vec<_>>();
+                let (completed_draws, refused_draws, shader_skips) =
+                    black_frame_counts.expect("reported black frame has diagnostic counts");
                 warn!(
                     occurrence,
                     scanout = format_args!("{address:#x}"),
                     scanout_target_known = flip_target_known,
                     render_targets = ?render_targets,
-                    completed_draws = *self.draw_count.lock(),
+                    completed_draws,
                     // Without these two, `completed_draws=0` is ambiguous
                     // between "the command processor never reached a draw
                     // packet" and "it reached them and the sink refused every
                     // one" — the second is what held Dead Cells at 447 black
                     // frames, and it named nothing.
-                    refused_draws = self.refused_draws(),
+                    refused_draws,
                     refusal_reason = self
                         .last_refusal()
                         .unwrap_or_else(|| "(none — no draw was refused)".to_owned()),
-                    shader_skips = *self.shader_skip_count.lock(),
+                    shader_skips,
                     shader_cache = ?self.shader_stats(),
                     descriptor = ?*self.scanout_descriptor.lock(),
                     "BLACK FRAME: the flipped scanout, guest-memory scanout, and every \
@@ -4604,14 +4624,14 @@ mod tests {
     }
 
     #[test]
-    fn pre_submission_empty_present_is_startup_not_a_black_frame() {
+    fn an_empty_present_requires_a_graphics_attempt_to_be_a_black_frame() {
         assert!(
             !should_report_black_frame(false, false, false, false),
-            "a flip before the first DCB cannot diagnose a graphics failure"
+            "state/compute work before the first draw cannot diagnose a graphics failure"
         );
         assert!(
             should_report_black_frame(true, false, false, false),
-            "an empty present after submitted GPU work remains actionable"
+            "an empty present after a completed/refused/skipped draw remains actionable"
         );
         assert!(!should_report_black_frame(true, true, false, false));
         assert!(!should_report_black_frame(true, false, true, false));

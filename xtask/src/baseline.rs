@@ -77,8 +77,7 @@ pub fn run(args: &[String]) -> Result<()> {
     fs::create_dir_all(&parts_dir)?;
     let raw_dir = PathBuf::from("artifacts/compat/raw").join(&run_id);
     fs::create_dir_all(&raw_dir)?;
-    let build_revision =
-        git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|_| "unknown".into());
+    let build_revision = crate::build_identity();
     let machine = machine_id();
 
     let mut parts: Vec<RunReport> = Vec::new();
@@ -384,7 +383,7 @@ impl BaselineDiff {
 /// early exit; whether frames were presented is judged separately from
 /// `flip_events`, because a rendering run that lives to the timeout is still
 /// classified `TimedOut`.
-fn stage_rank(stage: Stage) -> u8 {
+pub(crate) fn stage_rank(stage: Stage) -> u8 {
     match stage {
         Stage::Refused | Stage::Detected => 0,
         Stage::Crashed | Stage::Launching => 1,

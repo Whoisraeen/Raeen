@@ -7575,9 +7575,14 @@ mod tests {
         }
     }
 
-    /// A DCB with one WRITE_DATA label (0x900 <- 0xAB) followed by one
-    /// standard IT_DMA_DATA copy (0xA00 -> 0xDEAD_0000, 8 bytes; the dst is
-    /// unmapped in TestMemory) at 0xB00, plus the submit descriptor at 0x280.
+    /// A DCB exercising both healthy and faulting side effects, at 0xB00 with
+    /// the submit descriptor at 0x280:
+    /// 1. WRITE_DATA label 0x900 <- 0xAB (mapped — must always apply eagerly);
+    /// 2. WRITE_DATA label 0xDEAD_1000 <- 0x77 (unmapped — a sync-write fault);
+    /// 3. standard IT_DMA_DATA copy 0xA00 -> 0xDEAD_0000, 8 bytes (unmapped
+    ///    dst — a DMA-copy fault);
+    /// 4. WRITE_DATA label 0x910 <- 0xCD (mapped, sequenced after both faults
+    ///    — proves fail-open kept going).
     fn write_side_effect_dcb(ctx: &HleContext) {
         let words = [
             HDR_WRITE_DATA_1DW,
@@ -7585,6 +7590,11 @@ mod tests {
             0x900,
             0,    // label address
             0xAB, // label value
+            HDR_WRITE_DATA_1DW,
+            1,
+            0xDEAD_1000,
+            0,    // label address (unmapped)
+            0x77, // label value
             HDR_DMA_DATA,
             0, // control: src Memory(0), dst Memory(0)
             0xA00,
@@ -7592,6 +7602,11 @@ mod tests {
             0xDEAD_0000,
             0, // dst (unmapped)
             8, // num_bytes
+            HDR_WRITE_DATA_1DW,
+            1,
+            0x910,
+            0,    // label address
+            0xCD, // label value
         ];
         let mut bytes = Vec::with_capacity(words.len() * 4);
         for w in words {
@@ -7599,16 +7614,68 @@ mod tests {
         }
         assert!(ctx.mem.write(0xB00, &bytes));
         assert!(ctx.mem.write(0x280, &0xB00u64.to_le_bytes()));
-        assert!(ctx.mem.write(0x288, &12u32.to_le_bytes()));
+        assert!(ctx.mem.write(0x288, &(words.len() as u32).to_le_bytes()));
         assert!(ctx.mem.write(0x900, &0u64.to_le_bytes()));
+        assert!(ctx.mem.write(0x910, &0u64.to_le_bytes()));
     }
 
-    /// Default policy (gate OFF): the eager path is preserved — the label IS
-    /// written at submit, and a faulting DMA copy fails the submission.
+    /// Default policy (gate OFF): the eager path is preserved — labels ARE
+    /// written at submit — and a faulting side effect FAILS OPEN (SharpEmu's
+    /// `SubmitOrderedGpuSideEffect` model): it is skipped with a rate-limited
+    /// diagnostic, the remaining side effects still apply, and the buffer
+    /// still reaches the GPU instead of erroring the submission.
     #[test]
     fn submit_applies_side_effects_eagerly_by_default() {
         let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        unsafe { std::env::remove_var("RAEEN_STRICT_SIDE_EFFECT_FAULTS") };
+        let (kernel, mem, alloc) = ctx_env();
+        let gpu = NoopGpu {
+            submissions: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ctx = crate::test_ctx_with_gpu(&kernel, &mem, &alloc, &gpu);
+        write_side_effect_dcb(&ctx);
+
+        assert_eq!(
+            hle_driver_submit_dcb(&ctx, &[0x280]),
+            0,
+            "fail-open default: side-effect faults must not fail the submit"
+        );
+        assert_eq!(
+            read_u64(&ctx, 0x900),
+            0xAB,
+            "the label write is eager by default"
+        );
+        assert_eq!(
+            read_u64(&ctx, 0x910),
+            0xCD,
+            "the label after the faulting effects must still be written \
+             (fail-open skips the fault, not the rest of the buffer)"
+        );
+        assert_eq!(
+            gpu.submissions.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the buffer must still reach the GPU pipeline despite the faults"
+        );
+    }
+
+    /// `RAEEN_STRICT_SIDE_EFFECT_FAULTS=1` restores the historical
+    /// fail-closed policy byte-for-byte: the first faulting side effect fails
+    /// the submission with INVALID_ARGUMENT, later side effects never apply,
+    /// and nothing reaches the GPU.
+    #[test]
+    fn strict_gate_restores_fail_closed_side_effect_faults() {
+        let _guard = SIDEFX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("RAEEN_STRICT_SIDE_EFFECT_FAULTS") };
+            }
+        }
+        unsafe { std::env::remove_var("RAEEN_DEFER_GPU_SIDE_EFFECTS") };
+        unsafe { std::env::set_var("RAEEN_STRICT_SIDE_EFFECT_FAULTS", "1") };
+        let _reset = EnvReset;
+
         let (kernel, mem, alloc) = ctx_env();
         let gpu = NoopGpu {
             submissions: std::sync::atomic::AtomicUsize::new(0),
@@ -7619,12 +7686,22 @@ mod tests {
         assert_eq!(
             hle_driver_submit_dcb(&ctx, &[0x280]),
             SCE_ERROR_INVALID_ARGUMENT,
-            "fail-closed default: the unmapped DMA dst must fail the submit"
+            "strict mode: the unmapped sync-write target must fail the submit"
         );
         assert_eq!(
             read_u64(&ctx, 0x900),
             0xAB,
-            "the label write is eager by default (it ran before the DMA fault)"
+            "the label before the fault was already written when it hit"
+        );
+        assert_eq!(
+            read_u64(&ctx, 0x910),
+            0,
+            "strict mode stops at the first fault — later labels never apply"
+        );
+        assert_eq!(
+            gpu.submissions.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "strict mode fails the submit before the GPU handoff"
         );
     }
 
@@ -7641,6 +7718,7 @@ mod tests {
             }
         }
         unsafe { std::env::set_var("RAEEN_DEFER_GPU_SIDE_EFFECTS", "1") };
+        unsafe { std::env::remove_var("RAEEN_STRICT_SIDE_EFFECT_FAULTS") };
         let _reset = EnvReset;
 
         let (kernel, mem, alloc) = ctx_env();
@@ -7659,6 +7737,12 @@ mod tests {
             read_u64(&ctx, 0x900),
             0,
             "under the gate the label write is deferred to the GPU worker"
+        );
+        assert_eq!(
+            read_u64(&ctx, 0x910),
+            0,
+            "under the gate every eager label write is deferred, including \
+             the one sequenced after the faulting effects"
         );
         assert_eq!(
             gpu.submissions.load(std::sync::atomic::Ordering::Relaxed),

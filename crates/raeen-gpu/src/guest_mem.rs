@@ -397,6 +397,33 @@ pub(crate) fn read_bytes_validated(addr: u64, len: u64) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Process-authorized resource read into caller-owned initialized storage.
+///
+/// Texture freshness probes read 64 small, potentially unaligned windows from
+/// one guest allocation. Routing each window through `read_bytes_validated`
+/// allocated a temporary `Vec` and then copied its aligned sub-slice again.
+/// This seam preserves the same process authority, submission byte budget,
+/// GPU-image-shadow preference, and resource-size ceiling while letting that
+/// hot path reuse one bounded scratch buffer.
+pub(crate) fn read_bytes_into_validated(addr: u64, out: &mut [u8]) -> bool {
+    let len = out.len() as u64;
+    if addr == 0
+        || len == 0
+        || len > u64::from(MAX_RESOURCE_READ_DWORDS).saturating_mul(4)
+        || !charge_guest_bytes(len)
+    {
+        return false;
+    }
+    if let Some(bytes) = read_gpu_image_shadow(addr, len) {
+        out.copy_from_slice(&bytes);
+        return true;
+    }
+    with_active_memory(|memory| {
+        memory.validate_gpu_range(addr, len, false) && memory.read_gpu(addr, out)
+    })
+    .unwrap_or(false)
+}
+
 /// Scene→scanout fill trace (SharpEmu port task #5). The title composites its
 /// HDR scene into a set of render targets, then flips to a *different* display
 /// buffer (e.g. ASTRO.BOT renders to 0x53a.../0x539... but flips to
@@ -669,6 +696,18 @@ mod tests {
             read_bytes_validated(addr, expected.len() as u64)
         });
         assert_eq!(got, Some(expected));
+    }
+
+    #[test]
+    fn reads_unaligned_resource_bytes_into_reusable_storage() {
+        let mut data: Vec<u32> = vec![0xAABB_CCDD, 0x0102_0304, 0x1122_3344];
+        let addr = data.as_ptr() as u64;
+        let all: Vec<u8> = data.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let memory = memory_for(&mut data);
+        let mut out = [0u8; 7];
+        let accepted = with_guest_memory(&memory, || read_bytes_into_validated(addr + 1, &mut out));
+        assert!(accepted);
+        assert_eq!(out.as_slice(), &all[1..8]);
     }
 
     #[test]

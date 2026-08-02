@@ -6510,3 +6510,83 @@ VERIFICATION:
 - Final isolated release:
   `../Raeen-target-memfix/release/raeen.exe`, 39,491,584 bytes, SHA-256
   `DF8C8FA39685CE60164CC0270B39A8A8EFFB5FA0B03154152B1C055AAB511860`.
+
+## 2026-08-01 - Minecraft texture-binding profile and retained hash-path reductions
+
+BUILD/EVIDENCE IDENTITY: release **`5f50f786e220+dirty`**. The build was made
+from the shared dirty working tree; the raw reports, game files, firmware,
+keys, and shader cache remain machine-local and outside git. Phase 2 remains
+red: none of these short runs satisfies the required 30-minute soak or the
+60 FPS in-world gate.
+
+MEASURED DECOMPOSITION:
+
+- `scratch/mc-texture-probe-profile-ab/soak-1785586958838` established the
+  allocated/FNV baseline: 193.6 s, 9,824 flips, 51.3 flips/s overall, 10.7 s
+  worst no-flip window, and 2,719 MiB peak RAM. After world entry, texture
+  hashing cost 12/84/88 us p50/p95/p99 per probe while persistent-cache lookup
+  was below the timer at p95 despite scanning roughly 60-71 entries. The
+  sampled-hash memo hit 65.6% of probes. Draw-common measured 104/162/321 us.
+- `scratch/mc-binding-substage-profile/soak-1785628867889` split graphics
+  binding by resource family: 193.7 s, 10,144 flips, 53.1 flips/s overall,
+  9.2 s worst no-flip window, and 2,642 MiB peak RAM. In-world binding was
+  15/38/44 us p50/p95/p99; T# work consumed 12/35/41 us, while V# work was
+  0/2 us and sampler/GDS/direct-SGPR tail and residual work remained near the
+  timer floor. Texture freshness hashing, not linear cache lookup or V# ABI
+  binding, is the measured Minecraft binding wall. Structural shader-ABI work
+  may still help other paths, but it is not the next dominant slice here.
+
+RETAINED OPTIMIZATIONS:
+
+- Replaced byte-serial FNV texture freshness hashing with Rust's session-local
+  `DefaultHasher`. The sampled byte coverage, rotating full-source audit, and
+  exact 64-bit freshness comparison are unchanged, and the value is not a
+  persisted cache format. In
+  `scratch/mc-texture-hash-profile-ab/soak-1785587608640`, texture-hash
+  p50/p95/p99 fell from 12/84/88 to 5/38/49 us, binding from 19/59/68 to
+  13/38/45 us, draw-common from 104/162/321 to 64/125/189 us, and worker p99
+  from 96.7 to 70.9 ms.
+- Added a process-authorized guest read into caller-owned initialized storage
+  and reused one bounded 8 KiB scratch buffer across a texture probe's sample
+  windows. This removes up to 65 temporary allocations without changing the
+  bytes hashed, active-process authority, GPU-shadow preference, read budget,
+  or maximum resource size. Against the immediately preceding profile,
+  `scratch/mc-texture-scratch-profile-ab/soak-1785629447975` reduced texture
+  hash p95/p99 from 36/47 to 30/40 us, T# p95 from 35 to 29 us, binding p95
+  from 38 to 31 us, draw-common p95/p99 from 162/334 to 129/180 us, and worker
+  p95/p99 from 49.6/86.1 to 29.1/68.9 ms. It produced 10,720 flips in 193.8 s,
+  although a guest mutex convoy caused an 11.7 s no-flip window.
+- Empty-frame diagnosis now requires an actual completed, refused, or
+  shader-skipped graphics draw. State-only and compute-only submissions no
+  longer create a false startup `black-frame`; a startup report that remains
+  after this change names real completed/refused/skipped draw counts.
+
+STRICT RETAIL RESULT AND OPEN STABILITY WALL:
+
+- `scratch/mc-texture-scratch-clean-ab/soak-1785629802509`: release without
+  `RAEEN_TIME_DRAW`, 193.8 s, 9,856 flips, 51.3 flips/s overall,
+  4.0/80.9/116.3 ten-second-window min/avg/max, 8.1 s worst no-flip window,
+  zero probable-deadlock warnings, 354.1% average CPU, 810.7% peak CPU, and
+  2,787 MiB peak process-tree RAM. It passed the short strict rule of no
+  observed frozen window over 10 seconds.
+- The same title-side Streaming Pool mutex convoy remains. The profiled run
+  captured stable owners at mutexes `0x100d6691098` and `0x100d6136718`, both
+  acquired through `libc.prx+0x5ec9`, with owner guest stacks beginning at
+  `module+0x8e25e04` and `module+0x8d19ca8`; waiters recovered after roughly
+  7.6 and 7.3 seconds. The strict run again recorded one 3.002-second sample.
+  No owner change occurred during the first convoy. The samples point to
+  title streaming work, including host file activity, inside the guest
+  critical section; they do not justify a blind Vulkan or scheduler change.
+- No probable deadlock, shader refusal, Vulkan validation error, device loss,
+  panic, or EFAULT was observed. Presentation remains outside the dominant
+  path. The next Phase 2 stability step is to correlate the owner acquire
+  stack/file operation and shorten or unblock that specific path, then run the
+  mandatory 30-minute soak.
+
+VERIFICATION:
+
+- The full `raeen-gpu` test suite and every executed Vulkan integration suite
+  pass. `cargo clippy -p raeen-gpu --all-targets -- -D warnings`, scoped
+  formatting, and `git diff --check` for the four GPU files are green.
+- Workspace formatting remains blocked only by unrelated dirty xtask files in
+  the shared worktree; those files were preserved and not reformatted here.
