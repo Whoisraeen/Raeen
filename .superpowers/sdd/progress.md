@@ -7110,3 +7110,34 @@ raw-report directories; none are committed.
   is original Rust based on Raeen's existing public production types. No Sony
   material, firmware, keys, decrypted modules, game data, or third-party source
   was incorporated.
+
+### Integrated-main re-verification
+
+While the Phase 1 sweep was running, `origin/main` advanced independently with
+present-plugin commit `dc6b7cab5cb4`. Local Phase 1 commit `347ddd4` and that
+commit diverged from the same base. The histories were merged without conflict
+as clean `main` commit **`0f29f0838a6a`**, then the release build, fresh corpus,
+and complete eight-title gate were repeated rather than assuming the unrelated
+Vulkan change was harmless.
+
+- Authoritative report:
+  `artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`, run
+  `run-1785738108516`, clean release build `0f29f0838a6a`. Compared with the
+  accepted pre-merge Phase 1 report, the result was **1 improved, 7 unchanged,
+  0 regressed**: Avatar 416 -> 502 flips (+20.7%), GTA V 12,512 -> 12,422
+  (-0.7%), Minecraft 16,711 -> 16,000 (-4.3%), and Subnautica 4,808 -> 4,862
+  (+1.1%). GTA V and Minecraft again had zero shader and zero GPU errors.
+  The direct Phase 0 -> integrated diff was also green: 8 unchanged and 0
+  regressed (Avatar -2.0%, GTA V +2.7%, Minecraft +7.7%, Subnautica +1.2%).
+- The fresh integrated corpus contains **122 shader objects, 3,166 exact replay
+  cases, and 43 ranked clusters**. The cross-title MUBUF opcode `0x12` class is
+  still rank 1 (three shaders across Avatar and Subnautica). The next largest
+  shader fan-out classes are `SLoadDwordx8` (23 shaders / 1,388 cases), MIMG
+  opcode `0x08` (23 shaders), and MIMG opcode `0x00` (nine shaders).
+  `BufferLoadFormatXyz` remains a precise MTBUF cluster (one shader / 342 exact
+  cases), never a generic wrapper-stage label.
+- Offline replay processed all 3,166 cases in **1.991 s**. The immediate second
+  `--strict` replay took **1.984 s** and reported zero regressions. This fresh
+  integrated corpus and clean compatibility report supersede the pre-merge
+  dirty-tree artifacts as the Phase 2 starting point; the older artifacts stay
+  retained as honest history.
