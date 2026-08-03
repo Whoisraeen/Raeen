@@ -50,6 +50,14 @@ const NP_ERROR_SIGNED_OUT: u64 = 0x8055_0006;
 const REMOTEPLAY_DISCONNECT: u32 = 0;
 
 /// Register every grouped library.
+///
+/// The plain `hle_ok` registrations below are Initialize/Terminate/teardown
+/// brackets for subsystems Raeen models as absent (no remote-play client, no
+/// share-play peer, no live stream, no recorder session): their whole contract
+/// is the return code, the substantive queries beside them give real honest
+/// answers (disconnected / not-found / not-recording), and there is
+/// legitimately nothing to set up or release — so OK is the complete behavior,
+/// not a silent skip.
 pub fn register(registry: &HleRegistry) {
     // --- libSceRemoteplay ---------------------------------------------------
     registry.register("libSceRemoteplay", "sceRemoteplayInitialize", hle_ok);

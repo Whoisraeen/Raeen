@@ -48,6 +48,9 @@ pub fn register(registry: &HleRegistry) {
         "libSceSaveData_native",
         "libSceSaveData.native",
     ] {
+        // Initialize*/Terminate: return-code-only lifecycle brackets; the
+        // mount/search/commit machinery behind them is real (host-mapped
+        // /savedata), so acknowledging them is the complete behavior.
         registry.register(library, "sceSaveDataInitialize", hle_ok);
         registry.register(library, "sceSaveDataInitialize2", hle_ok);
         registry.register(library, "sceSaveDataInitialize3", hle_ok);

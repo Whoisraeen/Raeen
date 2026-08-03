@@ -32,6 +32,8 @@ static MSG_STATUS: AtomicI32 = AtomicI32::new(STATUS_NONE);
 
 /// Register libSceCommonDialog + libSceMsgDialog HLE functions.
 pub fn register(registry: &HleRegistry) {
+    // Base-library init whose whole contract is the return code; the dialog
+    // machinery behind it (MsgDialog status/result) is modeled for real.
     registry.register("libSceCommonDialog", "sceCommonDialogInitialize", hle_ok);
     registry.register("libSceCommonDialog", "sceCommonDialogIsUsed", hle_is_used);
 

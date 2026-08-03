@@ -29,6 +29,8 @@ const MAX_ENTRIES: u64 = 1 << 16;
 /// Register libScePlayGo HLE functions.
 pub fn register(registry: &HleRegistry) {
     registry.register("libScePlayGo", "scePlayGoInitialize", hle_initialize);
+    // Terminate/Close: the handle is a fixed constant with no backing state,
+    // so there is legitimately nothing to release — OK is complete.
     registry.register("libScePlayGo", "scePlayGoTerminate", hle_ok);
     registry.register("libScePlayGo", "scePlayGoOpen", hle_open);
     registry.register("libScePlayGo", "scePlayGoClose", hle_ok);
@@ -78,6 +80,9 @@ pub fn register(registry: &HleRegistry) {
         "reports success without writing the caller's ScePlayGoInstallSpeed out-parameter",
     );
     registry.register("libScePlayGo", "scePlayGoSetInstallSpeed", hle_ok);
+    // SetTodoList/Prefetch hand download hints to an installer; with the whole
+    // title already on local disk there is nothing to schedule or prefetch, so
+    // accepting them is the complete fully-installed behavior.
     registry.register("libScePlayGo", "scePlayGoSetTodoList", hle_ok);
     registry.register("libScePlayGo", "scePlayGoPrefetch", hle_ok);
 

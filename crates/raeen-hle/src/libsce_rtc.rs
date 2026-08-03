@@ -52,6 +52,8 @@ const MAX_TZ_OFFSET_MINUTES: i32 = 14 * 60;
 
 /// Register the libSceRtc HLE functions.
 pub fn register(registry: &HleRegistry) {
+    // Return-code-only lifecycle around a clock that is always available (the
+    // host's); there is nothing to set up or release, so OK is complete.
     registry.register("libSceRtc", "sceRtcInit", hle_ok);
     registry.register("libSceRtc", "sceRtcEnd", hle_ok);
     registry.register(

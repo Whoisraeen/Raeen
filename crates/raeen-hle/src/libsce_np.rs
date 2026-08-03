@@ -39,6 +39,8 @@ pub fn register(registry: &HleRegistry) {
         "sceNpRegisterStateCallbackA",
         hle_register_callback_a,
     );
+    // Unregister is complete: the registered callback never fires offline
+    // (state never transitions), so removing vs. ignoring it is unobservable.
     registry.register("libSceNpManager", "sceNpUnregisterStateCallback", hle_ok);
     // `sceNpRegisterNpReachabilityStateCallback(callback, userdata)`: accept the
     // reachability callback and never invoke it. Reachability transitions only
@@ -51,6 +53,8 @@ pub fn register(registry: &HleRegistry) {
         "sceNpRegisterNpReachabilityStateCallback",
         hle_ok,
     );
+    // Hand-a-value call (title id + secret for PSN requests); offline, no
+    // request ever consumes it, so accepting and dropping is complete.
     registry.register("libSceNpManager", "sceNpSetNpTitleId", hle_ok);
     registry.register("libSceNpManager", "sceNpGetOnlineId", hle_get_online_id);
     registry.register(
@@ -68,6 +72,7 @@ pub fn register(registry: &HleRegistry) {
         "sceNpGetAccountIdA",
         hle_get_account_id_a,
     );
+    // Return-code-only init; no game-intent event can arrive offline.
     registry.register("libSceNpManager", "sceNpGameIntentInitialize", hle_ok);
 
     // Sync/async NP request lifecycle (Tier B, 2026-07-27). Model re-derived
@@ -193,6 +198,8 @@ pub fn register(registry: &HleRegistry) {
         "sceNpAuthAuthorizedAppDialogGetResult",
         hle_auth_dialog_get_result,
     );
+    // Close/Terminate after an immediately-FINISHED dialog have nothing left
+    // to dismiss; the return code is the whole contract.
     for f in [
         "sceNpAuthAuthorizedAppDialogClose",
         "sceNpAuthAuthorizedAppDialogTerminate",

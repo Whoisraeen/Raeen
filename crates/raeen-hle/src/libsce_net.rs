@@ -28,6 +28,8 @@ static NEXT_NET_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Register libSceNet + libSceNetCtl HLE functions.
 pub fn register(registry: &HleRegistry) {
+    // Init/Term: return-code-only lifecycle; the socket/resolver machinery
+    // behind them is real (offline model), so acknowledging is complete.
     registry.register("libSceNet", "sceNetInit", hle_ok);
     registry.register("libSceNet", "sceNetTerm", hle_ok);
     // libSceRudp (reliable-UDP P2P transport) lives beside the socket layer.
@@ -44,6 +46,8 @@ pub fn register(registry: &HleRegistry) {
     // Accepting the internal I/O thread request without starting one is honest:
     // there is no peer transport for it to service.
     registry.register("libSceRudp", "sceRudpEnableInternalIOThread", hle_ok);
+    // Pool/resolver ids are bare counters with no backing allocation, so the
+    // destroy side legitimately has nothing to release.
     registry.register("libSceNet", "sceNetPoolCreate", hle_new_id);
     registry.register("libSceNet", "sceNetPoolDestroy", hle_ok);
     registry.register("libSceNet", "sceNetResolverCreate", hle_new_id);
@@ -86,10 +90,14 @@ pub fn register(registry: &HleRegistry) {
         hle_net_resolver_start_ntoa,
     );
 
+    // Ctl Init/Term are return-code-only; GetState reports the honest
+    // DISCONNECTED answer for real.
     registry.register("libSceNetCtl", "sceNetCtlInit", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlTerm", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlGetState", hle_ctl_get_state);
     registry.register("libSceNetCtl", "sceNetCtlGetStateV6", hle_ctl_get_state);
+    // CheckCallback's contract is "invoke pending callbacks"; disconnected
+    // means no state transition can ever be pending, so the no-op is complete.
     registry.register("libSceNetCtl", "sceNetCtlCheckCallback", hle_ok);
     // `sceNetCtlRegisterCallback(func, arg, int *cid)`: the third argument is an
     // output — the callback id the title keeps so it can unregister later.
@@ -108,6 +116,8 @@ pub fn register(registry: &HleRegistry) {
         hle_ok,
         "reports success without writing the caller's callback-id out-parameter",
     );
+    // No callback registry is kept (nothing ever fires), so unregistering has
+    // legitimately nothing to remove.
     registry.register("libSceNetCtl", "sceNetCtlUnregisterCallback", hle_ok);
     registry.register("libSceNetCtl", "sceNetCtlGetResult", hle_ctl_get_result);
     registry.register("libSceNet", "sceNetEpollCreate", hle_epoll_create);

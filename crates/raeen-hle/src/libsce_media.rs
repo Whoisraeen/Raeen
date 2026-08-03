@@ -37,8 +37,18 @@ pub fn register(registry: &HleRegistry) {
     // the PS5-only names (`BatchInitialize`, the `BatchJob*` builders) are
     // unknown-ABI unblock stubs that log their arguments once.
     registry.register("libSceAjm", "sceAjmInitialize", hle_ajm_initialize);
+    // Finalize/Unregister/InstanceDestroy: contexts and instances are bare
+    // counter handles with no backing state, so there is legitimately nothing
+    // to release — the return code is the whole contract here.
     registry.register("libSceAjm", "sceAjmFinalize", hle_ok);
-    registry.register("libSceAjm", "sceAjmModuleRegister", hle_ok);
+    // ModuleRegister is where the silent-audio fiction starts: the OK tells
+    // the title its codec (AT9/MP3/M4AAC) is now available, and nothing is.
+    registry.register_incomplete(
+        "libSceAjm",
+        "sceAjmModuleRegister",
+        hle_ok,
+        "codec module registration accepted but no codec is loaded; decode yields silence",
+    );
     registry.register("libSceAjm", "sceAjmModuleUnregister", hle_ok);
     registry.register("libSceAjm", "sceAjmInstanceCreate", hle_ajm_instance_create);
     registry.register("libSceAjm", "sceAjmInstanceDestroy", hle_ok);
@@ -79,7 +89,12 @@ pub fn register(registry: &HleRegistry) {
         hle_ok,
         "no asynchronous AJM work exists to cancel",
     );
-    registry.register("libSceAjm", "sceAjmBatchErrorDump", hle_ok);
+    registry.register_incomplete(
+        "libSceAjm",
+        "sceAjmBatchErrorDump",
+        hle_ok,
+        "reports success without writing any batch error diagnostics for the caller",
+    );
     // The remaining PS5-only batch-*builder* names have no public ABI; keep the
     // unblock stub that logs its arguments once so a real run records the shape
     // to reverse (these are not on the per-frame decode hot path).
@@ -106,6 +121,8 @@ pub fn register(registry: &HleRegistry) {
         "sceNgs2SystemCreateWithAllocator",
         hle_ngs2_create_out2,
     );
+    // System/Rack destroy: the handles are bare counters with no backing
+    // synthesis objects, so there is legitimately nothing to tear down.
     registry.register("libSceNgs2", "sceNgs2SystemDestroy", hle_ok);
     registry.register(
         "libSceNgs2",
@@ -118,8 +135,21 @@ pub fn register(registry: &HleRegistry) {
         "sceNgs2RackGetVoiceHandle",
         hle_ngs2_create_out2,
     );
-    registry.register("libSceNgs2", "sceNgs2VoiceControl", hle_ok);
-    registry.register("libSceNgs2", "sceNgs2VoiceRunCommands", hle_ok);
+    // VoiceControl/RunCommands carry the actual audio work — play/stop,
+    // waveform pointers, gains. Accepting and dropping them is exactly why an
+    // Ngs2 title's audio is missing with no error, so both are named.
+    registry.register_incomplete(
+        "libSceNgs2",
+        "sceNgs2VoiceControl",
+        hle_ok,
+        "voice control params accepted and dropped; no synthesis backend, so voices never sound",
+    );
+    registry.register_incomplete(
+        "libSceNgs2",
+        "sceNgs2VoiceRunCommands",
+        hle_ok,
+        "voice command lists accepted and dropped; no synthesis backend, so voices never sound",
+    );
     // Both report success and write nothing, so "reports idle" is aspirational:
     // the caller reads back whatever was already in its own buffer. Classified
     // so a crash report names them instead of presenting them as working.
@@ -150,11 +180,39 @@ pub fn register(registry: &HleRegistry) {
     // Signatures cross-checked against shadPS4's GPL-2.0 `avplayer.cpp`
     // (`sceAvPlayerInitEx(const AvPlayerInitDataEx*, AvPlayerHandle*)`);
     // error codes from its `avplayer_error.h`.
-    registry.register("libSceAvPlayer", "sceAvPlayerInit", hle_ok); // null handle → title skips FMV
-    registry.register("libSceAvPlayer", "sceAvPlayerPostInit", hle_ok);
-    registry.register("libSceAvPlayer", "sceAvPlayerIsActive", hle_ok); // 0 = inactive
-    registry.register("libSceAvPlayer", "sceAvPlayerGetVideoDataEx", hle_ok); // no frame
-    registry.register("libSceAvPlayer", "sceAvPlayerGetAudioData", hle_ok); // no frame
+    // The legacy-path stubs below keep their measured behavior (null handle,
+    // inactive, no frame) but are all named for the coverage report: they are
+    // exactly where "FMV never appears, no error" comes from.
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerInit",
+        hle_ok,
+        "returns a null player handle, so the title treats FMV as unavailable and skips it",
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerPostInit",
+        hle_ok,
+        "reports success but no player exists to allocate decoder resources for",
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerIsActive",
+        hle_ok,
+        "always reports inactive; playback never starts on either init path",
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerGetVideoDataEx",
+        hle_ok,
+        "always reports no frame; no video is ever decoded",
+    );
+    registry.register_incomplete(
+        "libSceAvPlayer",
+        "sceAvPlayerGetAudioData",
+        hle_ok,
+        "always reports no frame; no movie audio is ever decoded",
+    );
     registry.register("libSceAvPlayer", "sceAvPlayerClose", hle_avplayer_close);
     registry.register_incomplete(
         "libSceAvPlayer",
@@ -203,7 +261,9 @@ pub fn register(registry: &HleRegistry) {
         hle_avplayer_no_stream,
     );
 
-    // libSceUlt — user-level threads library init.
+    // libSceUlt — user-level threads library init. The contract is the return
+    // code alone; any actual Ult runtime/thread call a title makes next is
+    // unregistered and names itself loudly.
     registry.register("libSceUlt", "sceUltInitialize", hle_ok);
 }
 

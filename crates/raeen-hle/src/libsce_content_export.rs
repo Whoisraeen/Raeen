@@ -94,18 +94,42 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceContentExport", "sceContentExportInit", hle_init);
     registry.register("libSceContentExport", "sceContentExportInit2", hle_init2);
     registry.register("libSceContentExport", "sceContentExportTerm", hle_term);
-    registry.register("libSceContentExport", "sceContentExportStart", hle_ok);
-    registry.register("libSceContentExport", "sceContentExportFinish", hle_ok);
-    registry.register("libSceContentExport", "sceContentExportFromData", hle_ok);
+    // The export surface reports success while producing nothing: no session,
+    // no file, no media-gallery entry. The title only observes the return
+    // code, but the user observes the missing export — so every one of these
+    // is named for the coverage report instead of passing as working.
+    registry.register_incomplete(
+        "libSceContentExport",
+        "sceContentExportStart",
+        hle_ok,
+        "reports success but no export session is created",
+    );
+    registry.register_incomplete(
+        "libSceContentExport",
+        "sceContentExportFinish",
+        hle_ok,
+        "reports success for an export session that was never created",
+    );
+    registry.register_incomplete(
+        "libSceContentExport",
+        "sceContentExportFromData",
+        hle_ok,
+        "reports success but nothing is exported to any host media store",
+    );
     // File-sourced exports (measured GTA V imports): same accept-and-drop
     // model as FromData above — the "export to the console media gallery"
-    // side effect has no host equivalent, and the title only observes the
-    // return code.
-    registry.register("libSceContentExport", "sceContentExportFromFile", hle_ok);
-    registry.register(
+    // side effect has no host equivalent.
+    registry.register_incomplete(
+        "libSceContentExport",
+        "sceContentExportFromFile",
+        hle_ok,
+        "reports success but the source file is not exported anywhere",
+    );
+    registry.register_incomplete(
         "libSceContentExport",
         "sceContentExportFromFileWithThumbnail",
         hle_ok,
+        "reports success but neither file nor thumbnail is exported anywhere",
     );
 }
 

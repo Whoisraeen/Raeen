@@ -42,14 +42,17 @@ pub fn register(registry: &HleRegistry) {
         "sceSystemServiceGetDisplaySafeAreaInfo",
         hle_get_safe_area,
     );
-    // `sceSystemServiceGetHdrToneMapLuminance()` takes no arguments and simply
-    // reports success: Raeen presents an SDR display, so there is no HDR
-    // tone-map curve to report. shadPS4 stubs it identically
-    // (`systemservice.cpp:1747`). Measured: Until Dawn stops its boot here.
-    registry.register(
+    // `sceSystemServiceGetHdrToneMapLuminance`: Raeen presents an SDR display,
+    // so there is no HDR tone-map curve to report; shadPS4 stubs it the same
+    // way (`systemservice.cpp:1747`). Measured: Until Dawn stops its boot
+    // here. The ABI is undocumented and the name says "Get" — if it hands
+    // luminance values back through a pointer, this shim leaves them unwritten,
+    // so it is classified rather than presented as working.
+    registry.register_incomplete(
         "libSceSystemService",
         "sceSystemServiceGetHdrToneMapLuminance",
         hle_ok,
+        "reports success without writing any tone-map luminance data (undocumented ABI; SDR modeled)",
     );
     // Notice-screen skip flag. Reporting 0 (do not skip) is the neutral answer
     // and matches shadPS4, which stubs all three of these
@@ -69,6 +72,8 @@ pub fn register(registry: &HleRegistry) {
         "sceSystemServiceHideSplashScreen",
         hle_hide_splash_screen,
     );
+    // Fire-and-forget telemetry report; nothing is handed back to the caller,
+    // so acknowledging it is the complete behavior.
     registry.register(
         "libSceSystemService",
         "sceSystemServiceReportAbnormalTermination",

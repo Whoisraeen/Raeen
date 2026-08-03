@@ -48,6 +48,10 @@ const PORT_INFO_FRAME_SIZE_OFFSET: usize = 20;
 pub fn register(registry: &HleRegistry) {
     registry.register("libSceVoice", "sceVoiceInit", hle_init);
     registry.register("libSceVoice", "sceVoiceEnd", hle_end);
+    // Start/Stop: return-code-only service toggles. In the documented no-mic /
+    // no-session model the running service still carries only silence, so
+    // starting it changes nothing a caller can read — reads report zero bytes
+    // either way, which is the honest offline state, not a skipped output.
     registry.register("libSceVoice", "sceVoiceStart", hle_ok);
     registry.register("libSceVoice", "sceVoiceStop", hle_ok);
     registry.register("libSceVoice", "sceVoiceCreatePort", hle_create_port);
@@ -67,6 +71,8 @@ pub fn register(registry: &HleRegistry) {
     registry.register("libSceVoice", "sceVoiceGetPortInfo", hle_get_port_info);
     registry.register("libSceVoice", "sceVoiceGetBitRate", hle_get_bit_rate);
     registry.register("libSceVoice", "sceVoiceGetPortAttr", hle_get_port_attr);
+    // Volume of silence is silence, and there are no worker threads to
+    // configure — both setters are complete in the no-mic model.
     registry.register("libSceVoice", "sceVoiceSetVolume", hle_ok);
     registry.register("libSceVoice", "sceVoiceSetThreadsParams", hle_ok);
 }

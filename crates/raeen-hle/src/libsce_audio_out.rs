@@ -87,15 +87,29 @@ fn port_formats() -> &'static Mutex<HashMap<u32, PortFormat>> {
 
 /// Register libSceAudioOut HLE functions.
 pub fn register(registry: &HleRegistry) {
+    // Init's whole contract is the return code; the port lifecycle behind it
+    // (Open/Output/Close) is real, so acknowledging init is complete behavior.
     registry.register("libSceAudioOut", "sceAudioOutInit", hle_ok);
     registry.register("libSceAudioOut", "sceAudioOutOpen", hle_open);
     registry.register("libSceAudioOut", "sceAudioOutOutput", hle_output);
     registry.register("libSceAudioOut", "sceAudioOutClose", hle_close);
-    registry.register("libSceAudioOut", "sceAudioOutSetVolume", hle_ok);
+    // `Output` really does feed the host mix, so a dropped per-port volume is
+    // audible: every port plays at its initial level.
+    registry.register_incomplete(
+        "libSceAudioOut",
+        "sceAudioOutSetVolume",
+        hle_ok,
+        "volume accepted and dropped; ports keep playing into the host mix at a fixed level",
+    );
     // Pad-speaker mix level (measured GTA V import): Raeen routes no audio to
-    // a DualSense speaker, so the level is accepted and dropped — same
-    // accept-and-ignore contract as SetVolume above.
-    registry.register("libSceAudioOut", "sceAudioOutSetMixLevelPadSpk", hle_ok);
+    // a DualSense speaker, so the level is accepted and dropped — but on
+    // hardware that speaker plays, so the caller-visible gap is named.
+    registry.register_incomplete(
+        "libSceAudioOut",
+        "sceAudioOutSetMixLevelPadSpk",
+        hle_ok,
+        "reports success but no audio is ever routed to a controller speaker",
+    );
 }
 
 fn hle_ok(_ctx: &HleContext, _args: &[u64]) -> u64 {

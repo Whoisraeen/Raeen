@@ -24,6 +24,8 @@ const ERROR_INVALID_ARGUMENT: u64 = 0x8096_0005;
 
 /// Register libSceUserService HLE functions.
 pub fn register(registry: &HleRegistry) {
+    // Return-code-only lifecycle: the user queries behind them (initial user,
+    // login list, names, events) are real, so acknowledging is complete.
     registry.register("libSceUserService", "sceUserServiceInitialize", hle_ok);
     registry.register("libSceUserService", "sceUserServiceTerminate", hle_ok);
     registry.register(

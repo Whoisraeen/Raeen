@@ -2465,6 +2465,8 @@ pub fn register(registry: &HleRegistry) {
         "_sceKernelRtldSetApplicationHeapAPI",
         hle_rtld_set_application_heap_api,
     );
+    // The sanitizer trio returns 0 as the TRUE answer, not a placeholder:
+    // no sanitizer is enabled and no malloc/new replacement table exists.
     registry.register(
         "libkernel",
         "sceKernelIsAddressSanitizerEnabled",
@@ -2481,8 +2483,22 @@ pub fn register(registry: &HleRegistry) {
         hle_zero_stub,
     );
     registry.register("libkernel", "__error", hle_error_addr);
-    registry.register("libkernel", "__pthread_cxa_finalize", hle_ok_stub);
-    registry.register("libkernel", "__elf_phdr_match_addr", hle_zero_stub);
+    // `__pthread_cxa_finalize` exists to RUN the destructors `__cxa_atexit`
+    // registered for a module/thread; an ok-stub skips every one of them.
+    registry.register_incomplete(
+        "libkernel",
+        "__pthread_cxa_finalize",
+        hle_ok_stub,
+        "reports success without running any __cxa_atexit-registered finalizers",
+    );
+    // Returning 0 means "no module contains this address" even for addresses
+    // inside loaded modules, so unwind/rtld lookups through it see nothing.
+    registry.register_incomplete(
+        "libkernel",
+        "__elf_phdr_match_addr",
+        hle_zero_stub,
+        "always reports no matching module phdr, even for mapped module addresses",
+    );
     registry.register("libkernel", "sceKernelMprotect", hle_kernel_mprotect);
     registry.register(
         "libkernel",
