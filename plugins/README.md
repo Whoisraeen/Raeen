@@ -312,7 +312,9 @@ and reject unknown fields.
 
 Directories without a manifest retain developer-friendly recursive discovery:
 at most four nested directories and 256 candidate libraries per scan, with
-directory symlinks skipped.
+directory symlinks skipped. Build/runtime trees named `build`, `dist`,
+`runtime`, `vendor`, `package-stage`, or ending in `-source` are skipped so an
+adapter's intermediate DLL and its packaged entrypoint cannot initialize twice.
 
 Raeen does **not** execute a ZIP directly. A future `.raeen-plugin` archive may
 wrap this directory layout, but an installer must validate and extract it

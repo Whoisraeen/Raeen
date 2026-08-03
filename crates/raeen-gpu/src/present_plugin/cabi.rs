@@ -1353,7 +1353,16 @@ pub unsafe fn scan_dir(dir: &Path) -> Vec<Result<DynamicPlugin, LoadError>> {
                 continue;
             }
             if kind.is_dir() {
-                if depth < MAX_PLUGIN_SCAN_DEPTH {
+                let directory_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let non_package_tree =
+                    matches!(
+                        directory_name.to_ascii_lowercase().as_str(),
+                        "build" | "dist" | "runtime" | "vendor" | "package-stage"
+                    ) || directory_name.to_ascii_lowercase().ends_with("-source");
+                if depth < MAX_PLUGIN_SCAN_DEPTH && !non_package_tree {
                     pending.push((path, depth + 1));
                 }
                 continue;
@@ -2125,7 +2134,7 @@ mod tests {
     fn scanning_finds_a_nested_plugin_candidate() {
         let dir = std::env::temp_dir().join("raeen-plugin-nested-scan-test");
         let _ = std::fs::remove_dir_all(&dir);
-        let nested = dir.join("vendor").join("plugin");
+        let nested = dir.join("community").join("plugin");
         std::fs::create_dir_all(&nested).unwrap();
         let bogus = nested.join(format!("nested.{}", plugin_extension()));
         std::fs::write(&bogus, b"not a shared library").unwrap();
