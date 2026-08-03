@@ -2458,7 +2458,6 @@ dependencies = [
 name = "kyty-graphics"
 version = "0.2.0"
 dependencies = [
- "kyty-core",
  "naga",
  "serde",
  "spirv-tools",
@@ -2571,9 +2570,6 @@ name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "lzma-rs"
@@ -3819,7 +3815,6 @@ dependencies = [
  "raeen-gpu",
  "raeen-hle",
  "raeen-input",
- "raeen-io",
  "raeen-kernel",
  "raeen-loader",
  "raeen-runtime",
@@ -3868,17 +3863,6 @@ dependencies = [
  "raeen-core",
  "tracing",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "raeen-io"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "lz4_flex",
- "raeen-core",
- "tracing",
- "zstd",
 ]
 
 [[package]]
@@ -5040,12 +5024,6 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
-
-[[package]]
-name = "twox-hash"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "type-map"

@@ -12,7 +12,6 @@ repository.workspace = true
 # Phase 5 for conventions.
 
 [dependencies]
-kyty-core = { path = "../kyty-core" }
 tracing.workspace = true
 serde.workspace = true
 

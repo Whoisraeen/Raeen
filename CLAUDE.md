@@ -55,7 +55,7 @@ Shell (raeen-gui)
   → raeen-runtime::execute_linked | execute_process
       (GuestArena identity map, VEH HLE trampolines, guest stack, FSGSBASE TLS)
   → raeen-hle (libc/libkernel/… NIDs)
-  → raeen-gpu / audio / input / io   (scaffolds → Kyty-backed)
+  → raeen-gpu / audio / input   (scaffolds → Kyty-backed)
 ```
 
 | Crate | Role | Maturity |
@@ -68,8 +68,8 @@ Shell (raeen-gui)
 | `raeen-kernel` | VMM/VFS/equeue — **on the launch hot path** via raeen-hle; `syscalls/` dispatch still unwired | Partial |
 | `raeen-gui` | egui PS5-style Shell + launcher | MVP |
 | `raeen-gpu` | AGC/PM4/shader/Vulkan placeholders | Scaffold |
-| `raeen-audio` / `io` / `input` | Tempest / SSD / DualSense | Scaffold |
-| `kyty-core` | Kyty `lib/Core` (+ Sys as `sys_*.rs`) Rust port | Phase 1 |
+| `raeen-audio` / `input` | Tempest / DualSense | Scaffold |
+| `kyty-core` | Kyty `lib/Core` (+ Sys as `sys_*.rs`) Rust port — **orphan**: zero consumers today (the kyty-graphics dep edge was false and was removed 2026-08-03); wire it or its build cost is waste | Phase 1 |
 
 **Hot path rule:** do not abandon `raeen-firmware` / `raeen-runtime` / Shell.
 Port into `kyty-*`, then **wire into** `raeen-*`. Orphan ports that never link

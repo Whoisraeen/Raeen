@@ -7,7 +7,6 @@ members = [
     "crates/raeen-kernel",
     "crates/raeen-gpu",
     "crates/raeen-audio",
-    "crates/raeen-io",
     "crates/raeen-input",
     "crates/raeen-hle",
     "crates/raeen-gui",
@@ -173,7 +172,6 @@ raeen-loader = { path = "crates/raeen-loader" }
 raeen-kernel = { path = "crates/raeen-kernel" }
 raeen-gpu = { path = "crates/raeen-gpu" }
 raeen-audio = { path = "crates/raeen-audio" }
-raeen-io = { path = "crates/raeen-io" }
 raeen-input = { path = "crates/raeen-input" }
 raeen-hle = { path = "crates/raeen-hle" }
 raeen-gui = { path = "crates/raeen-gui" }

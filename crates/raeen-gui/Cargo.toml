@@ -15,7 +15,6 @@ raeen-loader = { workspace = true }
 raeen-kernel = { workspace = true }
 raeen-gpu = { workspace = true }
 raeen-audio = { workspace = true }
-raeen-io = { workspace = true }
 raeen-input = { workspace = true }
 raeen-hle = { workspace = true }
 raeen-firmware = { workspace = true }
