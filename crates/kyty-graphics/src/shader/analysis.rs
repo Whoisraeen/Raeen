@@ -2182,6 +2182,15 @@ static UNRESOLVABLE_TEXTURE_PLACEHOLDERS: std::sync::atomic::AtomicU64 =
 static UNHANDLED_TYPE_TEXTURE_PLACEHOLDERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Sampled T#s whose 1DArray/2DMsaa/2DMsaaArray type (12/14/15) was rewritten
+/// in place to plain 2D (type 9) by [`check_read_only_texture_type`]. The
+/// approximation keeps the draw alive but samples WRONG pixels for a real
+/// MSAA/array resource — and until this counter existed it was the one
+/// substitution in the gate that left no diagnostic trail at all (2026-08-03
+/// audit). Folded into the blocker table alongside the placeholder installs.
+static MSAA_ARRAY_APPROXIMATED_TEXTURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Total sampled T#s replaced by a 1x1 transparent-black placeholder in
 /// [`check_read_only_texture_type`], both causes.
 #[must_use]
@@ -2198,6 +2207,15 @@ pub fn placeholder_texture_installs() -> u64 {
 #[must_use]
 pub fn unresolvable_texture_placeholders() -> u64 {
     UNRESOLVABLE_TEXTURE_PLACEHOLDERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sampled T#s approximated from 1DArray/2DMsaa/2DMsaaArray (12/14/15) to
+/// plain 2D — the draw proceeds but samples a non-MSAA/non-array view of the
+/// resource. Counted separately from the placeholder installs because the
+/// image still binds real memory; only its TYPE semantics are degraded.
+#[must_use]
+pub fn msaa_array_texture_approximations() -> u64 {
+    MSAA_ARRAY_APPROXIMATED_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Gate for a read-only sampled T#'s type. Non-fatal by construction: a valid
@@ -2234,7 +2252,19 @@ fn check_read_only_texture_type(
         return Ok(());
     }
     if matches!(ty, 12 | 14 | 15) {
-        // Approximate as 2D: rewrite the type nibble to 9 in place.
+        // Approximate as 2D: rewrite the type nibble to 9 in place. Counted
+        // and rate-limit logged — an MSAA texture sampled as plain 2D renders
+        // wrong pixels, and this must never again be a silent substitution
+        // (2026-08-03 audit: the one degrade path with no diagnostic trail).
+        let n = MSAA_ARRAY_APPROXIMATED_TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n.is_power_of_two() || n == 0 {
+            tracing::warn!(
+                image_type = ty,
+                occurrence = n + 1,
+                "sampled T# type {ty} (12=1DArray 14=2DMsaa 15=2DMsaaArray) approximated \
+                 as plain 2D — draw proceeds, MSAA/array semantics are lost"
+            );
+        }
         t.fields[3] = (t.fields[3] & 0x0FFF_FFFF) | (9 << 28);
         return Ok(());
     }
@@ -7746,6 +7776,9 @@ mod tests {
         // 12=1DArray, 14=2DMsaa, 15=2DMsaaArray with a plausible descriptor are
         // approximated as 2D (type rewritten to 9) rather than aborting the
         // shader — downstream `from_texture_type` already collapses them to 2D.
+        // The approximation must be COUNTED (2026-08-03 audit: this was the
+        // gate's one silent substitution) so sweeps can surface the degrade.
+        let before = msaa_array_texture_approximations();
         for ty in [12u32, 14, 15] {
             let mut t = super::super::resources::ShaderTextureResource::default();
             t.fields[0] = 0x1000; // non-zero base (plausible)
@@ -7754,6 +7787,11 @@ mod tests {
             check_read_only_texture_type(&mut t).expect("array/MSAA approximated, not aborted");
             assert_eq!(t.type_(), 9, "type {ty} rewritten to 2D");
         }
+        assert_eq!(
+            msaa_array_texture_approximations() - before,
+            3,
+            "every MSAA/array->2D approximation increments the counter"
+        );
     }
 
     #[test]

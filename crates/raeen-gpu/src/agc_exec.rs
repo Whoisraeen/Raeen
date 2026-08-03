@@ -2668,6 +2668,36 @@ impl AgcGpuSession {
         }
     }
 
+    /// Same fold as [`Self::fold_placeholder_textures`], for the sampled T#s
+    /// whose 1DArray/2DMsaa/2DMsaaArray type was approximated as plain 2D —
+    /// the image binds real memory but its type semantics are degraded, so a
+    /// sweep/crash report must name the degrade instead of presenting the
+    /// title as fully textured.
+    fn fold_msaa_approximated_textures(&self) {
+        static FOLDED: AtomicU64 = AtomicU64::new(0);
+        let total = kyty_graphics::shader::analysis::msaa_array_texture_approximations();
+        let seen = FOLDED.swap(total, Ordering::Relaxed);
+        let Some(delta) = total.checked_sub(seen).filter(|d| *d > 0) else {
+            return;
+        };
+        static SLOT: OnceLock<Option<raeen_core::blockers::Slot>> = OnceLock::new();
+        let slot = SLOT.get_or_init(|| {
+            raeen_core::blockers::intern(
+                raeen_core::blockers::BlockerCategory::DescriptorUnresolved,
+                "shader-msaa-array-approximated-2d",
+                0,
+                || {
+                    "sampled T# with 1DArray/2DMsaa/2DMsaaArray type approximated as plain \
+                     2D; the draw is issued but MSAA/array sampling semantics are lost"
+                        .to_string()
+                },
+            )
+        });
+        if let Some(slot) = slot {
+            raeen_core::blockers::bump_n(*slot, delta);
+        }
+    }
+
     /// Accumulate this submission's shader skips and warn with a process-wide
     /// rate limit (first occurrence, then powers of two).
     fn record_shader_skips(
@@ -2680,6 +2710,7 @@ impl AgcGpuSession {
         shader_state: &kyty_graphics::hw_regs::Shader,
     ) {
         self.fold_placeholder_textures();
+        self.fold_msaa_approximated_textures();
         if shader_skips == 0 {
             return;
         }
