@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use raeen_gpu::{ShaderReplayInput, replay_corpus_shader};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +13,8 @@ use std::time::Instant;
 pub const DEFAULT_CORPUS_DIR: &str = "artifacts/shader-corpus";
 const CORPUS_SCHEMA_VERSION: u32 = 2;
 const REPLAY_SCHEMA_VERSION: u32 = 1;
+const REPLAY_INDEX_SCHEMA_VERSION: u32 = 1;
+const REPLAY_INDEX_FILE: &str = "replay-index.json";
 
 pub fn run(command: &str, args: &[String]) -> Result<()> {
     match command {
@@ -108,6 +111,16 @@ fn report(args: &[String]) -> Result<()> {
             .unwrap_or_else(|| corpus.join("report.md").display().to_string()),
     );
     write_file(&output, markdown.as_bytes())?;
+    let event_count = records.len();
+    let replay_cases = build_replay_cases(records);
+    write_json(
+        &corpus.join(REPLAY_INDEX_FILE),
+        &ReplayIndex {
+            schema_version: REPLAY_INDEX_SCHEMA_VERSION,
+            event_count,
+            cases: replay_cases,
+        },
+    )?;
     print!("{markdown}");
     println!("wrote ranked shader failure report to {}", output.display());
     Ok(())
@@ -284,6 +297,7 @@ struct ReplayReport {
     results: Vec<ReplayResult>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ReplayCase {
     case_id: String,
     shader_sha1: String,
@@ -293,26 +307,25 @@ struct ReplayCase {
     titles: BTreeSet<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ReplayIndex {
+    schema_version: u32,
+    event_count: usize,
+    cases: Vec<ReplayCase>,
+}
+
 fn replay(args: &[String]) -> Result<()> {
     let started = Instant::now();
     let corpus = corpus_path(args);
-    let records = read_records(&corpus)?;
-    let mut cases: BTreeMap<String, ReplayCase> = BTreeMap::new();
-    for record in records {
-        let case_id = replay_case_id(&record);
-        cases
-            .entry(case_id.clone())
-            .and_modify(|case| {
-                case.titles.insert(record.title.clone());
-            })
-            .or_insert_with(|| ReplayCase {
-                case_id,
-                shader_sha1: record.shader_sha1,
-                stage: record.stage,
-                binary: record.binary,
-                replay_input: record.replay_input,
-                titles: BTreeSet::from([record.title]),
-            });
+    let cases = load_or_build_replay_index(&corpus)?;
+    let mut binaries = BTreeMap::new();
+    for case in &cases {
+        if !binaries.contains_key(&case.shader_sha1) {
+            binaries.insert(
+                case.shader_sha1.clone(),
+                read_case_binary(&corpus, &case.binary, &case.shader_sha1)?,
+            );
+        }
     }
 
     let output = PathBuf::from(
@@ -324,19 +337,23 @@ fn replay(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let mut results = Vec::with_capacity(cases.len());
-    for case in cases.into_values() {
-        let bytes = read_case_binary(&corpus, &case.binary, &case.shader_sha1)?;
-        let replayed = replay_corpus_shader(&case.stage, &bytes, case.replay_input.as_ref());
-        results.push(ReplayResult {
-            case_id: case.case_id,
-            shader_sha1: case.shader_sha1,
-            stage: case.stage,
-            titles: case.titles.into_iter().collect(),
-            passed: replayed.is_ok(),
-            outcome: replayed.unwrap_or_else(|error| error),
-        });
-    }
+    let mut results: Vec<_> = cases
+        .into_par_iter()
+        .map(|case| {
+            let bytes = binaries
+                .get(&case.shader_sha1)
+                .expect("replay object cache was populated for every case");
+            let replayed = replay_corpus_shader(&case.stage, bytes, case.replay_input.as_ref());
+            ReplayResult {
+                case_id: case.case_id,
+                shader_sha1: case.shader_sha1,
+                stage: case.stage,
+                titles: case.titles.into_iter().collect(),
+                passed: replayed.is_ok(),
+                outcome: replayed.unwrap_or_else(|error| error),
+            }
+        })
+        .collect();
     results.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     let report = ReplayReport {
         schema_version: REPLAY_SCHEMA_VERSION,
@@ -401,6 +418,65 @@ fn replay(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn build_replay_cases(records: Vec<FailureRecord>) -> Vec<ReplayCase> {
+    let mut cases: BTreeMap<String, ReplayCase> = BTreeMap::new();
+    for record in records {
+        let case_id = replay_case_id(&record);
+        cases
+            .entry(case_id.clone())
+            .and_modify(|case| {
+                case.titles.insert(record.title.clone());
+            })
+            .or_insert_with(|| ReplayCase {
+                case_id,
+                shader_sha1: record.shader_sha1,
+                stage: record.stage,
+                binary: record.binary,
+                replay_input: record.replay_input,
+                titles: BTreeSet::from([record.title]),
+            });
+    }
+    cases.into_values().collect()
+}
+
+fn replay_event_count(corpus: &Path) -> Result<usize> {
+    let events = corpus.join("events");
+    Ok(fs::read_dir(&events)
+        .with_context(|| format!("read shader corpus events at {}", events.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count())
+}
+
+fn load_or_build_replay_index(corpus: &Path) -> Result<Vec<ReplayCase>> {
+    let path = corpus.join(REPLAY_INDEX_FILE);
+    let event_count = replay_event_count(corpus)?;
+    if path.exists() {
+        let index: ReplayIndex = read_json(&path)?;
+        if index.schema_version == REPLAY_INDEX_SCHEMA_VERSION && index.event_count == event_count {
+            return Ok(index.cases);
+        }
+    }
+
+    let cases = build_replay_cases(read_records(corpus)?);
+    write_json(
+        &path,
+        &ReplayIndex {
+            schema_version: REPLAY_INDEX_SCHEMA_VERSION,
+            event_count,
+            cases: cases.clone(),
+        },
+    )?;
+    println!(
+        "rebuilt compact replay index from {event_count} corpus event(s): {} exact case(s)",
+        cases.len()
+    );
+    Ok(cases)
+}
+
 fn replay_case_id(record: &FailureRecord) -> String {
     let mut hasher = Sha1::new();
     hasher.update(record.shader_sha1.as_bytes());
@@ -433,17 +509,45 @@ fn read_records(corpus: &Path) -> Result<Vec<FailureRecord>> {
     if paths.is_empty() {
         bail!("shader corpus has no events at {}", events.display());
     }
-    let mut records = Vec::with_capacity(paths.len());
-    for path in paths {
-        let record: FailureRecord = read_json(&path)?;
-        validate_record(corpus, &record)
-            .with_context(|| format!("validate corpus event {}", path.display()))?;
-        records.push(record);
+    let records: Vec<FailureRecord> = paths
+        .par_iter()
+        .map(|path| {
+            let record: FailureRecord = read_json(path)?;
+            validate_record_metadata(&record)
+                .with_context(|| format!("validate corpus event {}", path.display()))?;
+            Ok(record)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut objects: BTreeMap<&str, (&str, usize)> = BTreeMap::new();
+    for record in &records {
+        if let Some((binary, fetched_bytes)) = objects.get(record.shader_sha1.as_str()) {
+            if *binary != record.binary || *fetched_bytes != record.fetched_bytes {
+                bail!(
+                    "shader object {} has conflicting corpus declarations",
+                    record.shader_sha1
+                );
+            }
+        } else {
+            objects.insert(
+                record.shader_sha1.as_str(),
+                (record.binary.as_str(), record.fetched_bytes),
+            );
+        }
+    }
+    for (shader_sha1, (binary, fetched_bytes)) in objects {
+        let bytes = read_case_binary(corpus, binary, shader_sha1)?;
+        if bytes.len() != fetched_bytes {
+            bail!(
+                "recorded fetched length {fetched_bytes} does not match object length {}",
+                bytes.len()
+            );
+        }
     }
     Ok(records)
 }
 
-fn validate_record(corpus: &Path, record: &FailureRecord) -> Result<()> {
+fn validate_record_metadata(record: &FailureRecord) -> Result<()> {
     if record.schema_version != CORPUS_SCHEMA_VERSION {
         bail!("unsupported corpus schema {}", record.schema_version);
     }
@@ -490,14 +594,6 @@ fn validate_record(corpus: &Path, record: &FailureRecord) -> Result<()> {
         || record.reason.is_empty()
     {
         bail!("corpus event has empty provenance or reason");
-    }
-    let bytes = read_case_binary(corpus, &record.binary, &record.shader_sha1)?;
-    if bytes.len() != record.fetched_bytes {
-        bail!(
-            "recorded fetched length {} does not match object length {}",
-            record.fetched_bytes,
-            bytes.len()
-        );
     }
     Ok(())
 }
@@ -652,5 +748,36 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         let outcome = replay_corpus_shader("cs", &bytes, None).expect("known compute program");
         assert!(outcome.contains("validated SPIR-V"), "{outcome}");
+    }
+
+    #[test]
+    fn replay_index_deduplicates_provenance_but_preserves_structural_bindings() {
+        let record = |title: &str, binding_identity: &[u32]| FailureRecord {
+            schema_version: CORPUS_SCHEMA_VERSION,
+            shader_sha1: "0123456789abcdef0123456789abcdef01234567".into(),
+            stage: "cs".into(),
+            failure_kind: "translation".into(),
+            reason: "missing lowering".into(),
+            binary: "objects/0123456789abcdef0123456789abcdef01234567.bin".into(),
+            fetched_bytes: 12,
+            binding_identity: Some(binding_identity.to_vec()),
+            replay_input: Some(ShaderReplayInput::Cs(Default::default())),
+            title: title.into(),
+            game_id: format!("{title}-id"),
+            run_id: format!("{title}-run"),
+            build_revision: "test-build".into(),
+        };
+
+        let cases = build_replay_cases(vec![
+            record("Avatar", &[1, 2, 3]),
+            record("Subnautica", &[1, 2, 3]),
+            record("Avatar", &[1, 2, 4]),
+        ]);
+        assert_eq!(cases.len(), 2, "different titles are provenance, not cases");
+        assert!(
+            cases.iter().any(|case| {
+                case.titles == BTreeSet::from(["Avatar".into(), "Subnautica".into()])
+            })
+        );
     }
 }

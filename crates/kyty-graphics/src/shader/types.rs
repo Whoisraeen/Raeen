@@ -57,6 +57,10 @@ pub enum ShaderInstructionType {
     /// as [`BufferStoreDwordX4`]; the shared `buffer_store_dwordxn` helper
     /// writes `n` consecutive dwords.
     BufferStoreDwordX2,
+    /// MUBUF 0x1f: three-dword raw store. Kyty leaves it `KYTY_NI`; the same
+    /// captured compute shader reaches it in Avatar and Subnautica (raw
+    /// 0xe07c2000, idxen).
+    BufferStoreDwordX3,
     /// MUBUF 0x1e: four-dword raw store. Kyty leaves it `KYTY_NI`; measured
     /// in ASTRO.BOT scene compute (raw 0xe0780000).
     BufferStoreDwordX4,

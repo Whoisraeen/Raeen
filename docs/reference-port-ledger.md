@@ -91,6 +91,20 @@ Claude `/goal` (≤200 chars):
 - **Mesa delta — NO AMD CHANGE.** `3e2d851..780727e` contains no files under
   `src/amd`; AddrLib/register/PM4 source used by Raeen is unchanged.
 
+### KytyPS5/shadPS4 V_ADD_LSHL shader slice 2026-08-03
+
+- **REJECTED / NOT PORTED.** AMD's public RDNA2 ISA, KytyPS5's typed shader IR,
+  and shadPS4's translator agree that VOP3 opcode `0x347` computes
+  `(src0 + src1) << (src2 & 31)`. Raeen's original-Rust TDD implementation
+  passed 732 `kyty-graphics` tests, SPIR-V assembly/validation, strict Clippy,
+  and a 37,559-case replay with zero regressions. It was removed because two
+  identical-binary eight-title sweeps regressed Avatar frame delivery by 31.7%
+  and 41.0%. The production decoder therefore retains its precise named
+  refusal. Two subsequent source-restored rollback sweeps also remained red,
+  exposing an unresolved baseline-stability problem; see
+  `.superpowers/sdd/progress.md`. Do not retry this port until that gate is
+  trustworthy and Avatar dispatch/frame timing explains the effect.
+
 ### SharpEmu v0.0.3-hotfix-2 release audit 2026-07-31 (`d5108e8`)
 
 - **Reference state:** `reference/sharpemu` is checked out at the signed

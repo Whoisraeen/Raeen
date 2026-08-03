@@ -13,6 +13,7 @@ raeen-hle.workspace = true
 # Soak-harness input scripts are validated with the exact parser the runner
 # uses at launch (`RAEEN_INPUT_SCRIPT`), so a typo fails before a 30-min run.
 raeen-input.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

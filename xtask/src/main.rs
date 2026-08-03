@@ -349,8 +349,7 @@ fn compat_run(args: &[String]) -> Result<()> {
     let selected = select_games(&registry.games, &tier)?;
     let output = PathBuf::from(option(args, "--output").unwrap_or_else(|| DEFAULT_RESULTS.into()));
     let shader_corpus_dir = PathBuf::from(
-        option(args, "--shader-corpus")
-            .unwrap_or_else(|| shader_corpus::DEFAULT_CORPUS_DIR.into()),
+        option(args, "--shader-corpus").unwrap_or_else(|| shader_corpus::DEFAULT_CORPUS_DIR.into()),
     );
     // Resolve and read the baseline before the sweep: the default output IS
     // the previous latest.json, so it must be captured before being replaced,
@@ -459,7 +458,8 @@ fn previous_sweep(output: &Path) -> Option<(String, RunReport)> {
 /// are not counted — they do not change tracked build inputs, and this tree
 /// permanently carries untracked logs/savedata.
 fn build_identity() -> String {
-    let head = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|_| "unknown".into());
+    let head =
+        git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|_| "unknown".into());
     let dirty = git_output(&["status", "--porcelain", "--untracked-files=no"])
         .map(|status| !status.trim().is_empty())
         .unwrap_or(false);
@@ -1379,7 +1379,10 @@ flips_submitted=9@25ms frames_published=9@26ms\n";
 
     #[test]
     fn build_identity_labels_a_dirty_tree_and_a_clean_one_honestly() {
-        assert_eq!(compose_build_revision("01f7b613911a\n", false), "01f7b613911a");
+        assert_eq!(
+            compose_build_revision("01f7b613911a\n", false),
+            "01f7b613911a"
+        );
         assert_eq!(
             compose_build_revision("01f7b613911a", true),
             "01f7b613911a+dirty"
@@ -1437,7 +1440,10 @@ flips_submitted=9@25ms frames_published=9@26ms\n";
             | Title | Build | Stage | Wall | Peak RAM | Flips | Shader errors | First blocker |\n\
             |---|---:|---|---:|---:|---:|---:|---|\n\
             | Minecraft | `96da89e90acf` | TimedOut | 180.3s | 1145 MiB | 6304 | 0 | none observed |\n";
-        assert_eq!(render_compat_markdown(&measured_minecraft_report()), expected);
+        assert_eq!(
+            render_compat_markdown(&measured_minecraft_report()),
+            expected
+        );
     }
 
     #[test]

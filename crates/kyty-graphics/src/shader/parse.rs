@@ -3349,7 +3349,10 @@ fn shader_parse_mubuf(
     let b0 = buffer[0];
     let b1 = dw(buffer, 1, pc)?;
 
-    let opcode = (b0 >> 18) & 0x1f;
+    // AMD RDNA2 defines a seven-bit MUBUF OP field in bits [24:18]. The old
+    // five-bit mask silently changed retail opcode 0x32 (buffer_atomic_add)
+    // into 0x12, making the refusal itself incorrect.
+    let opcode = (b0 >> 18) & 0x7f;
     let lds = (b0 >> 16) & 0x1;
     let glc = (b0 >> 14) & 0x1;
     let idxen = (b0 >> 13) & 0x1;
@@ -3379,7 +3382,7 @@ fn shader_parse_mubuf(
     // addends, and every recompile body already routes src[2] into
     // `temp_int_2` (the instruction-offset slot). 116 measured ASTRO.BOT CS
     // failures ("offset != 0").
-    if glc == 1 {
+    if glc == 1 && opcode != 0x32 {
         return Err(feature(S, "glc == 1", pc));
     }
     if slc == 1 {
@@ -3618,12 +3621,37 @@ fn shader_parse_mubuf(
             inst.src[1].size = 4;
             inst.dst.size = 4;
         }
-        0x1f => return Err(ni(dst, S, "buffer_store_dwordx3", opcode, pc, b0)),
-        // Kyty's table continues past the 5-bit opcode range (0x30-0x87
-        // atomics/d16, incl. next_gen-gated 0x34/0x71 — ShaderParse.cpp
-        // L2653-2711). Those arms are unreachable with the
-        // (buffer[0] >> 18) & 0x1f decode Kyty itself uses, so the port
-        // folds them into UnknownOpcode.
+        // Beyond Kyty (KYTY_NI upstream): three-dword raw store. The same
+        // hash-deduplicated compute shader reaches raw 0xe07c2000 in Avatar
+        // and Subnautica, making this a measured two-title corpus cluster.
+        0x1f => {
+            inst.type_ = T::BufferStoreDwordX3;
+            inst.format = match (idxen, offen) {
+                (1, 1) => F::Vdata3Vaddr2SvSoffsOffenIdxen,
+                (1, 0) => F::Vdata3VaddrSvSoffsIdxen,
+                (0, 1) => F::Vdata3VaddrSvSoffsOffen,
+                _ => F::Vdata3SvSoffs,
+            };
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
+            inst.dst.size = 3;
+        }
+        // AMD RDNA2 MUBUF 0x32 BUFFER_ATOMIC_ADD. A production lowering was
+        // rejected after the eight-title retail gate: making Subnautica's
+        // histogram shader executable reduced its flip count beyond the 20%
+        // tolerance. Keep the corrected seven-bit decode and name the exact
+        // missing operation instead of regressing to the old, false 0x12
+        // `UnknownOpcode` classification or silently skipping it.
+        0x32 => {
+            if glc == 1 {
+                return Err(feature(S, "buffer_atomic_add return-data (glc == 1)", pc));
+            }
+            return Err(ni(dst, S, "buffer_atomic_add", opcode, pc, b0));
+        }
+        // The original Kyty decoder masked this field to five bits even
+        // though its own table continues with atomics and D16 operations.
+        // The seven-bit RDNA2 width above makes those opcodes reachable and
+        // ensures any one not yet implemented is refused under its real id.
         _ => return Err(unknown_op(dst, S, opcode, pc, b0)),
     }
 
@@ -6159,6 +6187,29 @@ mod tests {
         );
         assert_eq!(inst.src[2].type_, O::IntegerInlineConstant);
         assert_eq!(inst.src[2].constant.i(), 0);
+    }
+
+    #[test]
+    fn retail_buffer_atomic_add_uses_full_opcode_in_precise_refusal() {
+        // Exact first-failure words captured from both Avatar and Subnautica.
+        // MUBUF uses a seven-bit opcode: bits [24:18] are 0x32 here. The old
+        // five-bit mask truncated that to 0x12 and emitted a false unknown-op
+        // report, which made corpus clustering point at the wrong operation.
+        let (_, result) = parse(
+            &[0xE0C8_2000, 0x8002_0005, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        assert_eq!(
+            result,
+            Err(ShaderParseError::NotImplemented {
+                family: "mubuf",
+                instruction: "buffer_atomic_add",
+                opcode: 0x32,
+                pc: 0,
+                raw: 0xE0C8_2000,
+            })
+        );
     }
 
     #[test]

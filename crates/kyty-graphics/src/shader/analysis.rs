@@ -994,6 +994,7 @@ fn buffer_resource_operand(inst: &ShaderInstruction) -> Option<(i32, bool)> {
         | T::TBufferLoadFormatXyzw => (inst.src[1], false),
         T::BufferStoreDword
         | T::BufferStoreDwordX2
+        | T::BufferStoreDwordX3
         | T::BufferStoreDwordX4
         | T::BufferStoreFormatX
         | T::BufferStoreFormatXy
@@ -3357,6 +3358,7 @@ pub fn shader_capture_eud_storage_buffers(
             | T::TBufferLoadFormatXyzw => (inst.src[1], false),
             T::BufferStoreDword
             | T::BufferStoreDwordX2
+            | T::BufferStoreDwordX3
             | T::BufferStoreDwordX4
             | T::BufferStoreFormatX
             | T::BufferStoreFormatXy
@@ -5494,6 +5496,7 @@ pub fn shader_refine_compute_storage_usage(code: &ShaderCode, bind: &mut ShaderB
             inst.type_,
             T::BufferStoreDword
                 | T::BufferStoreDwordX2
+                | T::BufferStoreDwordX3
                 | T::BufferStoreDwordX4
                 | T::BufferStoreFormatX
                 | T::BufferStoreFormatXy

@@ -7141,3 +7141,450 @@ Vulkan change was harmless.
   integrated corpus and clean compatibility report supersede the pre-merge
   dirty-tree artifacts as the Phase 2 starting point; the older artifacts stay
   retained as honest history.
+
+## 2026-08-03 - Shader Phase 2 WIP: corrected MUBUF decode; atomic lowering rejected
+
+BUILD/EVIDENCE IDENTITY: release **`23c0b203e091+dirty`**, accepted diagnostic
+report `artifacts/compat/phase2-wip-mubuf-decode-only-23c0b20-dirty.json`, run
+`run-1785744685002`. The comparison baseline remains
+`artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`
+(`0f29f0838a6a`). This is not a Phase 2 exit baseline and changes no scorecard
+grade.
+
+- The apparent cross-title MUBUF `0x12` cluster was a decoder bug, not an AMD
+  opcode. RDNA2 MUBUF OP is seven bits (`[24:18]`); raw `0xe0c82000` is opcode
+  `0x32`, `BUFFER_ATOMIC_ADD`. The production parser now uses the full field and
+  the exact Avatar/Subnautica words produce a typed, named
+  `buffer_atomic_add, opcode = 0x32, raw = 0xe0c82000` refusal. The accepted
+  Avatar/Subnautica logs contain 378/51 such records and zero instances of the
+  false `unknown mubuf opcode: 0x12` text.
+- A real GLC=0 lowering using device-scope relaxed `OpAtomicIAdd` was built and
+  validated first. It passed SPIR-V validation, all 729 `kyty-graphics` tests,
+  the complete `raeen-gpu` suite, and strict all-target `kyty-graphics` Clippy,
+  but failed the commercial regression gate. The first complete sweep left
+  Minecraft and GTA V clean while Subnautica fell from 4,862 to 3,323 flips
+  (-31.7%); an isolated repeat reached 3,514 (-27.7%). The lowering was
+  rejected and removed rather than averaging away the regression.
+- Disassembling the captured 328-byte Subnautica program showed why enabling it
+  is expensive: it is a luminance-histogram compute shader using a 64-bin LDS
+  reduction followed by global atomics. A measured dispatch is 120x68
+  workgroups at 16x16 lanes with a 1,814-word SPIR-V module. Raeen's conservative
+  TDR budget split it four ways; one profiled synchronous dispatch cost 10.877
+  ms (6.933 ms resource build/upload and 3.895 ms submit/fence) while sampling
+  15.8 MiB. This is a real compute-pipeline performance wall, not permission to
+  skip the guest operation.
+- The existing `RAEEN_RELAX_SIMPLE_COMPUTE_TDR=1` A/B removed the four-way split
+  without exposing ASTRO.BOT's 8,700-word dangerous shader. An isolated
+  Subnautica run reached 3,933 flips (-19.1%, inside tolerance), but the required
+  eight-title run reached only 3,810 (-21.6%). That promotion was also rejected;
+  the default TDR policy is unchanged.
+- The final decode/refusal-only candidate passed the full gate: **8 unchanged,
+  0 improved, 0 regressed**. Avatar produced 472 flips (-6.0%), GTA V 12,581
+  (+1.3%), Minecraft 16,352 (+2.2%), and Subnautica 5,634 (+15.9%). Minecraft
+  and GTA V each retained exactly zero shader errors and zero GPU errors.
+- Verification after rollback: all **729 `kyty-graphics` tests** passed and
+  strict all-target Clippy passed. The expanded local corpus replay processed
+  9,208 binding-aware cases in 14.813 s with zero pass/fail deltas. The report
+  currently retains both historical false-`0x12` events and the corrected
+  `0x32` events; current replay plus the accepted raw logs are authoritative
+  for burn-down state. The next implementable Phase 2 classes are the measured
+  three-component formatted buffer load/store forms and dynamic SMEM offsets.
+- Clean-room: semantics and field width were derived from AMD's public RDNA2 ISA
+  documentation. The attempted lowering and retained parser/test changes are
+  original Rust; no Sony material, firmware, keys, decrypted modules, game
+  data, or third-party source was incorporated.
+
+## 2026-08-03 - Shader Phase 2 WIP: XYZ load and raw X3 store pass retail gate
+
+BUILD/EVIDENCE IDENTITY: release **`23c0b203e091+dirty`**, report
+`artifacts/compat/phase2-wip-xyz-x3-23c0b20-dirty.json`, run
+`run-1785747016557`, compared directly with the still-authoritative Phase 1
+baseline `artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`.
+This is an accepted Phase 2 work-in-progress slice, not the Phase 2 exit
+baseline, and changes no scorecard grade.
+
+- Implemented RDNA2 MUBUF `buffer_load_format_xyz` for descriptors whose first
+  three channels are complete 32-bit UINT/FLOAT dwords. The measured Avatar VS
+  uses both unified format 74 (`32_32_32_FLOAT`, 12-byte stride) and unified
+  format 77 (`32_32_32_32_FLOAT`, 16-byte stride); both now return exactly the
+  first three channels while retaining the descriptor's true stride. Packed or
+  normalized formats remain a named refusal rather than being misread as raw
+  dwords.
+- Implemented raw MUBUF opcode `0x1f`, `buffer_store_dwordx3`, in all four
+  legal idxen/offen address forms. The hash-identical captured compute shader
+  reaches raw `0xe07c2000` in both Avatar and Subnautica. Its lowering reuses
+  the width-parametric raw store body, writes exactly three consecutive dwords,
+  and remains EXEC-guarded.
+- TDD evidence: both synthesized instructions first failed with
+  `UnknownTypeFormat`, then passed parser shape checks, exact three-call source
+  assertions, SPIR-V assembly, and Naga validation. The complete
+  `kyty-graphics` suite passed **731 tests** and strict all-target Clippy passed.
+- Offline replay processed **12,349** binding-aware cases in **105.771 s**:
+  **1,041 improved, 0 regressed**. The newly exposed Avatar failure is
+  `BufferLoadFormatXy`; the store-X3 case advances past opcode `0x1f`. Replay
+  time is now outside the intended fast inner-loop envelope because thousands
+  of occurrence-identical events each advance through full translation; the
+  corpus tool needs unique `(shader, binding identity)` replay scheduling
+  before claiming the seconds-scale property again.
+- The mandatory eight-title retail gate passed **8 unchanged, 0 improved,
+  0 regressed**. Avatar reached 455 flips (-9.4%), GTA V 12,352 (-0.6%),
+  Minecraft 16,736 (+4.6%), and Subnautica 4,605 (-5.3%). Minecraft and GTA V
+  retained exactly **0 shader errors / 0 GPU errors**. Peak RAM was 3,374 MiB,
+  3,307 MiB, 1,808 MiB, and 2,370 MiB respectively.
+- The raw failure counters moved materially without being averaged into a
+  grade: Avatar shader/GPU errors fell from **19,105/16,825** to
+  **16,105/13,976**; Subnautica fell from **557/557** to **24/24**. Phase 2 is
+  still red because its exit requires Avatar below 100 unique-clustered
+  failures and Subnautica at zero. Subnautica's remaining exact shader blocker
+  is the correctly decoded `buffer_atomic_add`; its prior correct lowering
+  remains rejected until the measured compute upload/submit cost is removed.
+- Clean-room: opcode/operand semantics were checked against AMD's public RDNA2
+  ISA tables and GPL-compatible shadPS4/Kyty-family references. The retained
+  implementation and tests are original Rust; no Sony SDK material, firmware,
+  keys, decrypted modules, or game data entered git.
+
+## 2026-08-03 - Shader Phase 2 WIP: fast replay restored; XY lowering rejected
+
+BUILD/EVIDENCE IDENTITY: release **`23c0b203e091+dirty`**, accepted report
+`artifacts/compat/phase2-wip-corpus-speed-repeat2-23c0b20-dirty.json`, run
+`run-1785752011414`, executable SHA-256
+`ca906acce5b865a89ba576539df1a43c908c87b9a0422168f06074dd93c6c1de`.
+The comparison baseline remains
+`artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`. This is not a
+Phase 2 exit baseline and changes no shader scorecard grade.
+
+- Restored the Phase 1 seconds-scale inner loop after corpus growth exposed two
+  avoidable costs: replay reread and rehashed the same 146 content-addressed
+  binaries for every binding case, and translation ran serially. `shader-corpus
+  report` now writes a schema/version/event-count-checked compact replay index;
+  replay validates each binary once, preserves every exact `(shader, stage,
+  structural binding identity)` case, merges only title/run provenance, and
+  translates the cases in parallel. Event metadata parsing is parallel and
+  binary integrity is still checked once per unique SHA-1. TDD proves that two
+  titles with the same binding state merge while a one-dword structural binding
+  change remains a distinct case.
+- The first cold migration implementation was rejected after exceeding 124 s:
+  it still verified the same object once per event. After fixing that redundant
+  integrity work, report/index generation completed and two strict replays of
+  15,220 cases took **6.893 s** and **6.789 s**, with zero regressions on the
+  second run. After the later retail captures enlarged the local history to
+  24,736 events / 23,571 exact cases, strict replay still completed in
+  **7.835 s** with **1,394 passed, 22,177 failed, 0 improved, 0 regressed**.
+- A TDD implementation of MUBUF `buffer_load_format_xy` for unified 64
+  (`32_32_FLOAT`) / its UINT twin passed the package suite and initially moved
+  two exact replay cases to green. It was nevertheless **rejected and removed**:
+  `artifacts/compat/phase2-wip-xy-23c0b20-dirty.json` regressed Avatar from the
+  Phase 1 baseline's 502 flips to 384 (**-23.5%**, beyond tolerance). Minecraft
+  and GTA V stayed clean, but the standing all-title rule rejects the slice.
+  The dispatch row, helper guard, and test are gone; replay again produces the
+  precise `no lowering table entry: BufferLoadFormatXy
+  [Vdata2VaddrSvSoffsIdxen]` refusal rather than silent output. The next attempt
+  must profile why advancing that shader lowers Avatar throughput before it can
+  return.
+- The first full rollback sweep is preserved as
+  `artifacts/compat/phase2-wip-xy-rollback-23c0b20-dirty.json` and was also red:
+  Subnautica hit the known guest synchronization instability, logged
+  `scePthreadMutexLock waiting >30s with one owner`, and collapsed to 123 flips.
+  A complete repeat on the exact same executable/hash recovered to 4,891 flips,
+  demonstrating nondeterministic mutex convoy behavior without erasing the red
+  run. This stability defect remains separately actionable; it was not averaged
+  away into the accepted report.
+- The accepted identical-binary repeat passed the mandatory Phase 1 comparison:
+  **8 unchanged, 0 improved, 0 regressed**. Avatar reached 465 flips (-7.4%),
+  GTA V 12,416 (-0.0%), Minecraft 17,056 (+6.6%), and Subnautica 4,891 (+0.6%).
+  GTA V and Minecraft each retained exactly **0 shader errors / 0 GPU errors**.
+  Avatar reported 17,809/15,549 shader/GPU errors; Subnautica reported 23/23,
+  still the correctly decoded `buffer_atomic_add` class. Peak RAM was 3,426.0,
+  3,353.5, 1,887.4, and 2,333.1 MiB respectively.
+- Verification after the rollback passed all **731 `kyty-graphics` tests**, all
+  **86 `xtask` tests**, and strict all-target Clippy for both packages. The
+  release executable was rebuilt in the isolated `../Raeen-target-dev` target
+  and its modification time/hash were recorded before both retail runs.
+- Scorecard: Phase 1 corpus/clustering remains **A+** and its speed claim is
+  restored with larger-corpus evidence. Phase 2 and the overall shader grade do
+  **not** improve: XY failed retail despite correct local semantics, Avatar is
+  nowhere near the under-100 exit threshold, and Subnautica is not yet zero.
+- Clean-room: the replay/index work is original Rust over Raeen's existing
+  captured ABI types. The rejected XY semantics were checked only against AMD's
+  public RDNA2 ISA documentation and GPL-compatible references. No Sony SDK
+  material, firmware, keys, decrypted modules, game data, or proprietary
+  binaries entered git.
+
+## 2026-08-03 - Shader Phase 2 WIP: dynamic SMEM lowering rejected
+
+REJECTED EVIDENCE: release **`23c0b203e091+dirty`**, report
+`artifacts/compat/phase2-wip-dynamic-smem-23c0b20-dirty.json`, run
+`run-1785754111057`, compared with
+`artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`. This report is
+negative evidence only and is not an accepted baseline; no scorecard grade
+changes.
+
+- A TDD implementation kept non-EUD scalar-load register offsets live in
+  SPIR-V and routed `base + aligned soffset + immediate` through the bounded
+  `%global_mem` window. It covered Avatar's captured VCC_LO form and a
+  synthesized SGPR-plus-64-byte combined form. Both assembled and passed
+  `spirv-val`; all 733 `kyty-graphics` tests and strict all-target Clippy passed.
+- Strict offline replay processed 23,571 exact cases in 10.493 s with zero
+  whole-shader regressions. The known Avatar hashes advanced from dynamic
+  scalar-load refusals to later blockers (`ImageStore` and
+  `BufferLoadFormatXy`), so replay's binary pass/fail counter remained 0
+  improved / 0 regressed rather than crediting a moved first blocker.
+- The mandatory eight-title retail sweep **rejected** the slice: Avatar exited
+  successfully after only 108.0 s and 215 flips versus the baseline's full
+  timeout and 502 flips (-57.2%). Although its stage advanced from `TimedOut`
+  to `Rendering`, the shorter wall-time class and flip collapse are a strict
+  regression. It also produced 5,521 shader errors and 5,495 GPU errors. The
+  first refusal was `SLoadDword [SdstSbaseSoffset] vcc_lo, s[2:3], 8`, showing
+  that resolving some dynamic loads exposed another destination/source shape
+  rather than closing the class.
+- Minecraft remained clean at 17,056 flips and exactly 0 shader/GPU errors;
+  GTA V remained clean at 12,384 flips and exactly 0/0. Subnautica reached
+  5,626 flips with 25/25 errors. Seven titles were unchanged, but the one
+  Avatar regression rejects the change under the standing rule.
+- The dynamic-offset lowering and its two tests were removed. The precise,
+  deduplicated `unresolved register soffset` refusal remains, so rollback does
+  not create silent output. The next attempt must explain Avatar's early clean
+  exit and model all live scalar offset/destination cases together before it is
+  eligible for another retail gate.
+- Post-rollback verification passed all **731 `kyty-graphics` tests**, strict
+  all-target Clippy, and a strict 25,145-case replay with zero pass/fail
+  regressions. The first rollback retail run
+  (`phase2-wip-dynamic-smem-rollback-23c0b20-dirty.json`) was preserved red:
+  Subnautica hit the independent `scePthreadMutexLock waiting >30s with one
+  owner` guest-synchronization convoy and fell to 117 flips despite reporting
+  zero shader/GPU errors.
+- A complete repeat on the exact same rebuilt executable (SHA-256
+  `0c3c6946731e8853d57b976fd02715188d56b5a9c78a1a75c6f558fe77a41617`)
+  recovered and is the accepted rollback evidence:
+  `artifacts/compat/phase2-wip-dynamic-smem-rollback-repeat2-23c0b20-dirty.json`,
+  **8 unchanged / 0 regressed**. Avatar survived 180.3 s with 480 flips;
+  GTA V reached 11,936 flips with exactly 0/0 shader/GPU errors; Minecraft
+  reached 17,152 with exactly 0/0; Subnautica recovered to 5,380 flips with
+  28/28. The explicit `cargo xtask compat diff` against the authoritative
+  Phase 1 baseline reproduced the green verdict. Both the red convoy run and
+  green identical-binary repeat remain recorded; neither is averaged away.
+- Clean-room: the rejected semantics were derived from AMD's public RDNA2 ISA
+  documentation and GPL-compatible shadPS4/Kyty-family references; the code was
+  original Rust. No Sony material, firmware, keys, modules, or game data entered
+  git.
+
+## 2026-08-03 - Shader Phase 2 WIP: DS addtid lowering rejected
+
+REJECTED EVIDENCE: release **`23c0b203e091+dirty`**, report
+`artifacts/compat/phase2-wip-ds-addtid-23c0b20-dirty.json`, run
+`run-1785758340626`, executable SHA-256
+`4a0cd536a458baa12ea623c79aaf8256d4e4f1d979f19e1ec1867e5d7bedb389`,
+compared with
+`artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`. This report is
+negative evidence only; no scorecard grade or Phase 2 status changes.
+
+- The corpus-ranked DS opcode `0xb0`/`0xb1` pair was identified as RDNA2
+  `ds_write_addtid_b32` / `ds_read_addtid_b32`. A TDD implementation modeled
+  its lane-relative LDS address as
+  `(M0.low16 + offset + 4 * (LocalInvocationIndex & 63)) >> 2`, retained EXEC
+  masking, and kept guest lane identity independent of the Vulkan subgroup
+  width. The parser test first failed with the exact unknown DS opcode 176; the
+  lowering test first failed with `UnknownTypeFormat`, then both passed SPIR-V
+  assembly and Naga validation. All **733 `kyty-graphics` tests**, formatting,
+  and strict all-target Clippy passed.
+- Strict offline replay processed **31,093 exact cases in 12.225 s** with
+  **1,394 passed, 29,699 failed, 0 improved, 0 regressed**. The four addtid
+  shader hashes still encountered earlier dynamic-SMEM refusals, so replay did
+  not claim a whole-shader improvement merely because the later DS operation
+  had gained a lowering.
+- The mandatory retail sweep **rejected** the slice. Avatar fell from the
+  Phase 1 baseline's 502 flips to **364 (-27.5%)**, beyond the -20% tolerance,
+  while still emitting **12,895 shader errors / 11,176 GPU errors**. Minecraft
+  reached 16,704 flips and GTA V 12,352, both with exactly **0 shader errors / 0
+  GPU errors**; preserving the two canaries was necessary but not sufficient.
+  Subnautica reached 5,164 flips with 24/24 shader/GPU errors and changed to a
+  guest `read 0x2b` fault. Seven unchanged titles cannot average away Avatar's
+  regression.
+- The two decoder arms, instruction types, dispatch rows, SPIR-V built-in
+  plumbing, lowerings, and tests were removed. Post-rollback verification
+  passed all **731 `kyty-graphics` tests**, formatting, strict all-target
+  Clippy, and a strict **37,559-case** corpus replay in **67.270 s** with
+  **1,394 passed, 36,165 failed, 0 improved, 0 regressed**. The unsupported DS
+  form is again a precise, clustered refusal; it is not silently skipped.
+- The first rollback retail sweep is preserved as
+  `artifacts/compat/phase2-wip-ds-addtid-rollback-23c0b20-dirty.json`, run
+  `run-1785759661354`, and was red because Avatar delivered only 266 flips
+  (-47.0%). It used the rolled-back executable SHA-256
+  `73e6527fa869429958f87ee94850a1a88f6d283f5b4461d688b136550ea1a8e0`.
+  Minecraft and GTA V nevertheless remained exactly 0/0 shader/GPU-clean.
+- A complete repeat on that **exact same executable** recovered and is the
+  accepted rollback evidence:
+  `artifacts/compat/phase2-wip-ds-addtid-rollback-repeat2-23c0b20-dirty.json`,
+  run `run-1785760624503`. Both the harness comparison and an explicit
+  `cargo xtask compat diff` reported **8 unchanged / 0 regressed**. Avatar
+  reached 416 flips (-17.1%); GTA V reached 10,035 (-19.2%) and Minecraft
+  14,592 (-8.8%), each with exactly **0 shader errors / 0 GPU errors**;
+  Subnautica reached 4,768 (-1.9%) with 31/31. The red and green runs remain
+  separate and are not averaged.
+- Scorecard: Phase 1 corpus/clustering remains **A+**. Phase 2 and the overall
+  shader grade do **not** improve: DS addtid failed its retail gate, Avatar is
+  still far above the under-100 exit requirement, and Subnautica is not zero.
+  Before this cluster can return, its effect on Avatar's dispatch/frame
+  delivery must be measured and its wave/LDS execution semantics proven more
+  completely.
+- Clean-room: opcode identity and semantics were checked only against AMD's
+  public RDNA2 ISA documentation and GPL-compatible Kyty/KytyPS5 and shadPS4
+  references. The rejected implementation and tests were original Rust. No
+  Sony SDK material, firmware, keys, decrypted modules, game data, or
+  third-party source entered git.
+
+## 2026-08-03 - Shader Phase 2 WIP: V_ADD_LSHL rejected; rollback gate unstable
+
+REJECTED EVIDENCE: release **`23c0b203e091+dirty`**, candidate reports
+`artifacts/compat/phase2-wip-v-add-lshl-23c0b20-dirty.json` (run
+`run-1785762291868`) and
+`artifacts/compat/phase2-wip-v-add-lshl-repeat2-23c0b20-dirty.json` (run
+`run-1785763256140`), executable SHA-256
+`1c4a0cfc56e148e353d5f4291a8d0eb301160cef2bebbb733a554dacbd608fc3`.
+Both compared with
+`artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`. No grade or
+phase-status change is claimed.
+
+- The refreshed corpus ranked RDNA2 VOP3 `v_add_lshl_u32` (`0x347`) across
+  three Avatar compute shaders. AMD's public semantics and the independent
+  GPL-compatible shadPS4/KytyPS5 paths agree on
+  `(src0 + src1) << (src2 & 31)`. A synthesized TDD case first failed on the
+  exact named `v_add_lshl_u32` refusal, then passed after an instruction type,
+  decoder arm, and one EXEC-preserving integer-VOP3 row were added. The test
+  asserted add-before-shift ordering, five-bit shift masking, SPIR-V assembly,
+  and Naga validation. All **732 `kyty-graphics` tests**, formatting, and
+  strict all-target Clippy passed.
+- Strict replay covered **37,559 exact cases in 12.637 s** with **1,394 passed,
+  36,165 failed, 0 improved, 0 regressed**. The affected shaders still hit
+  earlier dynamic-SMEM/typed-XY blockers, so the later opcode did not produce
+  a whole-shader pass and replay correctly awarded no improvement.
+- Retail rejected the candidate twice on the exact same executable. Run 1:
+  Avatar **343 flips (-31.7%)**, 11,357 shader / 9,783 GPU errors. Run 2:
+  Avatar **296 flips (-41.0%)**. GTA V reached 10,050 then 10,362 flips and
+  Minecraft 13,888 then 13,952; both canaries retained exactly **0 shader
+  errors / 0 GPU errors** in both runs. Subnautica reached 5,148 then 5,572
+  flips, but first-blocker changes remained guest-runtime faults rather than a
+  closed shader class. A canary-clean result does not average away Avatar's
+  repeated regression.
+- The decoder arm, instruction type, dispatch row, and test were removed. The
+  precise opcode refusal is restored. Post-removal verification passed all
+  **731 `kyty-graphics` tests**, formatting, strict all-target Clippy, and an
+  enlarged strict **41,491-case** replay in **83.643 s** with **1,394 passed,
+  40,097 failed, 0 improved, 0 regressed**.
+- The current rollback retail gate is **not green** despite source restoration.
+  `phase2-wip-v-add-lshl-rollback-23c0b20-dirty.json` (run
+  `run-1785764534856`) used rolled-back executable SHA-256
+  `f4cb28830b1212a54b520610bfbc5f2ae27e9cbff5d36e76cbdbece5d1cc72d2`
+  and regressed Avatar to 224 flips (-55.4%), exiting after 145.2 s with stage
+  `Rendering`. An identical-binary repeat,
+  `phase2-wip-v-add-lshl-rollback-repeat2-23c0b20-dirty.json` (run
+  `run-1785765463190`), remained red: Avatar 352 (-29.9%) and Subnautica 3,857
+  (-20.7%). Minecraft (13,408 / 13,376) and GTA V (10,080 / 10,138) stayed
+  exactly 0/0 shader/GPU-clean. Both red rollback reports are preserved.
+- The same source state had previously produced a green eight-title rollback
+  (`phase2-wip-ds-addtid-rollback-repeat2-23c0b20-dirty.json`: 8 unchanged,
+  0 regressed), so the current red restoration runs expose unresolved retail
+  variability/stability rather than retained V_ADD_LSHL code. Nevertheless,
+  the standing gate is absolute: the rollback is not newly accepted and no
+  further shader cluster may be attempted until a trustworthy full-sweep
+  baseline is re-established.
+- Comparing the last green Avatar log with both red source-restored logs makes
+  the variance actionable. The shader first blocker is unchanged, but guest
+  worker faults differ by run. Green run `run-1785760624503` had two faults:
+  `0x100001cdc2ca` reading `0x68` and `0x10000bc50434` writing
+  `0x2025600000`. Red rollback `run-1785764534856` had three different fault
+  instances: `0x1000012492b1` writing `0x2041700000`, `0x10000126c42a`
+  writing `0x203cfffff0`, and `0x1000012255a9` reading `0x20c1099df8`; it then
+  exited early. Red repeat `run-1785765463190` reproduced the fixed PCs
+  `0x1000012255a9`, `0x100001cdc2ca`, and `0x10000bc50434`, but with a
+  different loader write address (`0x2023b00000`). GPU worker timing windows
+  are overwhelmingly busy in submit/flush while these faults remove Long Task
+  and Loader workers. The next gate-restoration task is therefore to root-cause
+  this nondeterministic guest worker memory corruption/fault ordering before
+  testing another shader lowering; rerunning until one sample passes is not an
+  acceptable substitute.
+- Scorecard remains unchanged. Phase 1 corpus/clustering is **A+**; Phase 2 is
+  still red, Avatar remains far above the under-100 exit threshold, Subnautica
+  is not zero, and V_ADD_LSHL remains unimplemented with one precise refusal.
+- Clean-room: only AMD's public RDNA2 ISA documentation and GPL-compatible
+  shadPS4/KytyPS5 behavior were consulted. The rejected Rust implementation
+  and synthesized test were original; no Sony material, firmware, keys,
+  decrypted modules, game data, or third-party source entered git.
+
+## 2026-08-03 - Parallel pipeline audits: ASTRO.BOT and Until Dawn are pre-shader
+
+- **ASTRO.BOT:** Windows WER recorded repeatable `0xC0000005` execute/DEP
+  faults at `0x0000400010001060`, inside Raeen's intentionally `PAGE_NOACCESS`
+  slow-HLE trap range (`0x400010000000`). The slot calculation is 524, and the
+  matching 746-entry linked-image metadata maps slot 524 to registered
+  `libSceFiber::sceFiberFinalize`. The HLE implementation body was never
+  reached. Four Application Error events across candidate/control/current
+  builds share this exact RIP; zero VideoOut/DCB/draw/dispatch/flip activity
+  and zero shader/GPU errors make this categorically a runtime trap-routing
+  failure, not shader evidence. The missing diagnostic is an allocation-free
+  VEH breadcrumb for slow-range AVs (TID, RIP, RSP, `ACTIVE_CONTEXT` presence,
+  armed state) plus a minidump route for `cargo xtask compat`; the current
+  runner attaches minidumper only when `RAEEN_CRASH_SOCKET` exists.
+- **Until Dawn:** the latest 180 s run never called `sceVideoOutOpen` and used
+  roughly one CPU core continuously. Its startup tail matches an earlier
+  instrumented run whose steady state was approximately 8.8 million cycles
+  each of `scePthreadMutexLock`, `scePthreadMutexUnlock`, and
+  `scePthreadSelf`. This is a pre-VideoOut UE/RHI initialization livelock, not
+  shader translation. The exact predicate/guest PC is not yet captured. The
+  next bounded diagnostic is a 40–60 s run with both `RAEEN_CALL_STATS=1` and
+  `RAEEN_SAMPLE_GUEST_RIPS=1`, which should name the dominant HLE contract,
+  thread, and guest module offset for Ghidra. AGC default-table version 13
+  falling back to version 8 and stack-resident AIO initialization remain
+  hypotheses only, not claimed causes.
+- Both audits were read-only; no file, title state, scorecard grade, or phase
+  status changed. Each blocker remains on the separate pipeline track and may
+  not be counted as shader-translator progress.
+
+## 2026-08-03 - Baseline repair attempts rejected: fixed mapping ownership is not the gate
+
+REJECTED EVIDENCE: release **`23c0b203e091+dirty`**, compared with
+`artifacts/compat/phase1-shader-corpus-integrated-0f29f08.json`. Both
+candidates were removed after their full retail diffs failed. No grade or
+phase-status change is claimed.
+
+- The first candidate routed direct `sceKernelBatchMap` operations through the
+  direct-memory mapper and preserved their physical-offset metadata. Its
+  synthesized HLE/runtime tests, formatting, scoped tests, and strict Clippy
+  passed. The release executable SHA-256 was
+  `21b7acc06f17b2a58c056cb158473b5d16a5c032494b9c70545de96e3cfa67f3`;
+  the sweep is
+  `artifacts/compat/phase2-baseline-repair-batch-map-23c0b20-dirty.json`, run
+  `run-1785767666867`. Retail rejected it decisively: Avatar fell from 502
+  flips to **0**, and GTA V changed from a 180 s / 12,422-flip timeout to a
+  **2.0 s guest-fault exit with 0 flips**. Minecraft remained 0/0
+  shader/GPU-clean at 15,798 flips. The broad routing and all of its code/tests
+  were removed.
+- The second candidate left BatchMap semantics unchanged and addressed only a
+  narrower host-memory lifecycle: after a partial `munmap`, a `Free` guest VMA
+  slice inside a still-owned Windows parent reservation could be reclaimed by
+  the existing generic fixed mapper. A retail-free test reproduced the failure
+  first, then passed; all **107 runtime unit tests**, **64 integration tests**,
+  the interactive test, formatting, and strict scoped Clippy passed. The
+  release executable SHA-256 was
+  `b78727d0b08e96fff79f6534184a17a22c96ac39bf2c6cdad82dc625532e61d9`;
+  the complete eight-result artifact is
+  `artifacts/compat/phase2-baseline-repair-map-at-owned-slice-23c0b20-dirty.json`,
+  run `run-1785768924137`.
+- Explicit `cargo xtask compat diff` rejected that narrow candidate with **0
+  improved / 6 unchanged / 2 regressed**. Avatar reached only **224 flips
+  (-55.4%)** with 8,051 shader / 6,957 GPU errors. Subnautica collapsed from
+  4,862 to **101 flips (-97.9%)** and gained a `scePthreadMutexLock` >30 s
+  probable-deadlock first blocker. GTA V reached 12,160 (-2.1%) and Minecraft
+  15,680 (-2.0%); both retained exactly **0 shader errors / 0 GPU errors**.
+  The host-mapping change and its test were removed.
+- The outer shell timed out after 1,004 s while the harness was lingering after
+  report generation, but the JSON had already closed cleanly with all eight
+  measured results. The explicit diff above read that complete artifact; no
+  partial result was accepted.
+- Conclusion: the low-VA mapping symptom is not a safely isolated baseline
+  repair. Both plausible ownership fixes changed unrelated scheduling/frame
+  delivery, and neither satisfies the absolute regression gate. The tree is
+  restored to the last accepted shader source state. Phase 1 remains **A+**;
+  Phase 2 remains red, and no further shader lowering is accepted until the
+  retail variability has a repeatable diagnostic rather than a timing-sensitive
+  memory-map workaround.

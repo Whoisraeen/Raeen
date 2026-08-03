@@ -594,6 +594,69 @@ fn recompile_buffer_store_dwordx2(
     )
 }
 
+/// Beyond-Kyty: RDNA2 MUBUF 0x1f `buffer_store_dwordx3`. AMD's public opcode
+/// table and the GPL-compatible shadPS4 decoder both define this as the
+/// three-register member of the raw dword-store family. One hash-identical
+/// compute shader reaches raw 0xe07c2000 in both Avatar and Subnautica.
+fn recompile_buffer_store_dwordx3(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    buffer_store_dwordxn(
+        index,
+        code,
+        dst_source,
+        spirv,
+        3,
+        "Recompile_BufferStoreDwordX3_Vdata3VaddrSvSoffsIdxen",
+    )
+}
+
+/// RDNA2 `buffer_load_format_xyz` for 32-bit-per-channel descriptors.
+///
+/// Avatar's retail capture uses unified 74 (`32_32_32_FLOAT`) and unified 77
+/// (`32_32_32_32_FLOAT`) at two sites in the same vertex shader. In either
+/// case the opcode returns the first three channels. Each is a complete dword,
+/// so three raw bit-preserving component loads are exact while the descriptor
+/// still supplies the real element stride (12 or 16 bytes). Integer twins are
+/// exact for the same reason. Any normalized/packed descriptor remains a
+/// classified refusal instead of being decoded as three dwords.
+fn recompile_buffer_load_format_xyz(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferLoadFormatXyz_Vdata3VaddrSvSoffsIdxen";
+    let inst = inst_at(code, index, FUNC)?;
+    let Some(bind_info) = spirv.get_bind_info() else {
+        return Ok(false);
+    };
+    if bind_info.storage_buffers.buffers_num == 0 {
+        return Err(not_supported(
+            FUNC,
+            format!(
+                "no storage buffer bound for the V#: {:?} [{:?}] V#=s[{base}:{base_end}], \
+                 pc={:#x} — the descriptor format and stride are unknown",
+                inst.type_,
+                inst.format,
+                inst.pc,
+                base = inst.src[1].register_id,
+                base_end = inst.src[1].register_id + 3,
+            ),
+        ));
+    }
+    let _ =
+        mubuf_descriptor_packed_format(&inst, bind_info, spirv, FUNC, &[&TBUF_LOAD_FORMAT_XYZ])?;
+    buffer_load_dwordxn(index, code, dst_source, spirv, 3, FUNC)
+}
+
 /// RDNA2 `buffer_store_format_xyz`: three consecutive 32-bit channels with
 /// descriptor-driven format conversion.
 ///
@@ -660,6 +723,7 @@ fn buffer_store_dwordxn(
             | Format::Vdata2VaddrSvSoffsIdxen
             | Format::Vdata2Vaddr2SvSoffsOffenIdxen
             | Format::Vdata3VaddrSvSoffsIdxen
+            | Format::Vdata3Vaddr2SvSoffsOffenIdxen
     );
     let offen = matches!(
         inst.format,
@@ -667,6 +731,8 @@ fn buffer_store_dwordxn(
             | Format::Vdata4VaddrSvSoffsOffen
             | Format::Vdata2Vaddr2SvSoffsOffenIdxen
             | Format::Vdata2VaddrSvSoffsOffen
+            | Format::Vdata3Vaddr2SvSoffsOffenIdxen
+            | Format::Vdata3VaddrSvSoffsOffen
     );
     let src0_index = idxen.then(|| operand_variable_to_str(inst.src[0]));
     let src0_off = offen.then(|| operand_variable_to_str_shift(inst.src[0], i32::from(idxen)));
@@ -816,6 +882,23 @@ const TBUF_STORE_FORMAT_XY: TypedBufferHelper = TypedBufferHelper {
     channels: 2,
     is_store: true,
     takes_format_arg: true,
+};
+
+/// `buffer_load_format_xyz`: three returned channels from either a three- or
+/// four-channel 32-bit descriptor. The 32-bit UINT/FLOAT encodings are
+/// bit-preserving through the shared raw component loader; no packed or
+/// normalized format is admitted by this table.
+const TBUF_LOAD_FORMAT_XYZ: TypedBufferHelper = TypedBufferHelper {
+    name: "buffer_load_format_xyz",
+    accepted: &[
+        (108, "32_32_32_UINT"),
+        (111, "32_32_32_FLOAT"),
+        (116, "32_32_32_32_UINT"),
+        (119, "32_32_32_32_FLOAT"),
+    ],
+    channels: 3,
+    is_store: false,
+    takes_format_arg: false,
 };
 
 /// `buffer_store_format_xyz`: 32-bit three-channel UINT/FLOAT layouts. The
@@ -13480,6 +13563,9 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3SvSoffs, p1("")),
     f(recompile_buffer_load_dwordx3,         T::BufferLoadDwordX3, F::Vdata3VaddrSvSoffsOffen, p1("")),
     f(recompile_buffer_load_format_x_vdata1, T::BufferLoadFormatX, F::Vdata1VaddrSvSoffsIdxen, p1("")),
+    // Corpus-ranked Avatar cluster: first three 32-bit channels from either a
+    // three- or four-channel descriptor, with descriptor-provided stride.
+    f(recompile_buffer_load_format_xyz, T::BufferLoadFormatXyz, F::Vdata3VaddrSvSoffsIdxen, p1("")),
     // Beyond Kyty: four-channel MUBUF typed fetch with index-enable addressing.
     // Measured first blocker of Avatar: Frontiers of Pandora.
     f(recompile_buffer_load_format_xyzw_vdata4, T::BufferLoadFormatXyzw, F::Vdata4VaddrSvSoffsIdxen, p1("")),
@@ -13527,6 +13613,12 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2Vaddr2SvSoffsOffenIdxen, p1("")),
     f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2SvSoffs,                 p1("")),
     f(recompile_buffer_store_dwordx2, T::BufferStoreDwordX2, F::Vdata2VaddrSvSoffsOffen,       p1("")),
+    // Cross-title Avatar/Subnautica cluster: raw three-dword store (0x1f),
+    // using the same four legal MUBUF addressing forms as X2/X4.
+    f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3VaddrSvSoffsIdxen,       p1("")),
+    f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3SvSoffs,                 p1("")),
+    f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3VaddrSvSoffsOffen,       p1("")),
 
     f(recompile_fetch, T::FetchX,    F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_fetch, T::FetchXy,   F::Vdata2VaddrSvSoffsIdxen, p1("")),
@@ -14589,7 +14681,7 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            458,
+            463,
             "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
@@ -14611,7 +14703,8 @@ mod tests {
              and the four cubemap helpers VCubeId/Sc/Tc/MaF32, plus SNotB64, SBrevB32 and \
              VCmpxEqF32, the four BufferLoadDwordX2 rows, ImageStore dmask3, \
              VCmpxGeF32/VCmpxNleF32, the LDS family DsWriteB32/DsReadB32/\
-             DsRead2B32/DsWriteB96/SBarrier, the round-4 batch: the four \
+             DsRead2B32/DsWriteB96/SBarrier, \
+             the round-4 batch: the four \
              BufferStoreDwordX4 rows, DsWriteB128, and ImageGather4Lz dmask1, \
              and the convergence batch: the four BufferLoadDwordX3 rows, \
              DsReadB64, and ImageSampleLz dmask3, and the round-7 batch: \
@@ -14634,7 +14727,7 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 458,
+            implemented, 463,
             "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
@@ -18743,6 +18836,103 @@ mod tests {
         );
         let words = spirv_run(&source).expect("assemble buffer_store_format_xyz");
         naga_parse_and_validate(&words, "buffer_store_format_xyz");
+    }
+
+    /// Avatar's captured vertex shader issues `buffer_load_format_xyz` through
+    /// both unified 74 (`32_32_32_FLOAT`) and unified 77
+    /// (`32_32_32_32_FLOAT`) V# descriptors. The opcode returns the first
+    /// three channels in either case; the resource stride still comes from the
+    /// descriptor, so this must not be approximated as an unconditional
+    /// tightly-packed 12-byte element.
+    #[test]
+    fn avatar_buffer_load_format_xyz_reads_exactly_three_32bit_channels() {
+        for unified_format in [74u32, 77] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[0xE008_2000, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .expect("parse buffer_load_format_xyz");
+            let inst = &code.get_instructions()[0];
+            assert_eq!(inst.type_, T::BufferLoadFormatXyz);
+            assert_eq!(inst.format, F::Vdata3VaddrSvSoffsIdxen);
+            assert_eq!(inst.dst.size, 3);
+
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            input_info.bind.push_constant_size = 64;
+            input_info.bind.storage_buffers.buffers_num = 1;
+            input_info.bind.storage_buffers.start_register[0] = 4;
+            input_info.bind.storage_buffers.buffers[0].fields =
+                [0, 16 << 16, 256, unified_format << 12];
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .expect("recompile buffer_load_format_xyz");
+            assert_eq!(
+                source
+                    .lines()
+                    .filter(|line| {
+                        line.contains("%t110_0_")
+                            && line.contains("OpFunctionCall %void %buffer_load_float1")
+                    })
+                    .count(),
+                3,
+                "XYZ must issue three component loads for unified {unified_format}:\n{source}"
+            );
+            assert!(
+                !source.lines().any(|line| {
+                    line.contains("%t110_0_") && line.contains("%tbuffer_load_format_xyzw")
+                }),
+                "the XYZ instruction must not call the four-result helper for unified \
+                 {unified_format}:\n{source}"
+            );
+            let words = spirv_run(&source).expect("assemble buffer_load_format_xyz");
+            naga_parse_and_validate(&words, "buffer_load_format_xyz");
+        }
+    }
+
+    /// The corpus-identical Avatar/Subnautica compute shader uses RDNA2 MUBUF
+    /// opcode 0x1f to write v[4:6]. It must produce exactly three ordered raw
+    /// dword stores under the normal EXEC guard.
+    #[test]
+    fn avatar_subnautica_buffer_store_dwordx3_writes_exactly_three_dwords() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        shader_parse(
+            0,
+            &[0xE07C_2000, 0x8001_0400, 0xBF80_0000, S_ENDPGM],
+            &mut code,
+            true,
+        )
+        .expect("parse buffer_store_dwordx3");
+        let inst = &code.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferStoreDwordX3);
+        assert_eq!(inst.format, F::Vdata3VaddrSvSoffsIdxen);
+        assert_eq!(inst.dst.size, 3);
+
+        let mut input_info = ShaderComputeInputInfo::default();
+        input_info.threads_num = [1, 1, 1];
+        input_info.bind.push_constant_size = 64;
+        input_info.bind.storage_buffers.buffers_num = 1;
+        input_info.bind.storage_buffers.start_register[0] = 4;
+        let source = spirv_generate_source(&code, None, None, Some(&input_info))
+            .expect("recompile buffer_store_dwordx3");
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.contains("OpFunctionCall %void %buffer_store_float1"))
+                .count(),
+            3,
+            "X3 must issue exactly three stores:\n{source}"
+        );
+        assert!(
+            source.contains("%sdxn_e1_0 = OpINotEqual %bool"),
+            "store must remain EXEC-guarded:\n{source}"
+        );
+        let words = spirv_run(&source).expect("assemble buffer_store_dwordx3");
+        naga_parse_and_validate(&words, "buffer_store_dwordx3");
     }
 
     #[test]

@@ -6215,6 +6215,7 @@ dependencies = [
  "raeen-gpu",
  "raeen-hle",
  "raeen-input",
+ "rayon",
  "serde",
  "serde_json",
  "sha1",

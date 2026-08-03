@@ -6202,6 +6202,7 @@ impl<'a> Spirv<'a> {
         let needs_buffer_store_float1 = self.code.has_any_of(&[
             T::BufferStoreDword,
             T::BufferStoreDwordX2,
+            T::BufferStoreDwordX3,
             T::BufferStoreDwordX4,
             T::BufferStoreFormatX,
             T::BufferStoreFormatXy,
