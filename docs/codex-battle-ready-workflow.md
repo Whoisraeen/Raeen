@@ -261,6 +261,16 @@ Cold-launch load time for ASTRO cut by >50%. Minecraft A/B clean.
 
 **Goal:** Minecraft holds 60 FPS in-world; ASTRO produces non-zero flips.
 
+**Measured status (2026-08-03): green.** ASTRO.BOT previously produced 96
+flips and bounded async flip passed its 3×180 s no-wedge gate. Minecraft's
+strict scripted run
+`scratch/mc-phase2-strict-30m/soak-1785724463876` lasted 30m00.6s, produced
+133,280 flips (74.1 overall; 74.7 average telemetry-window FPS), had a 2.0 s
+worst no-flip window and zero deadlock warnings. Across 3,853 steady
+post-transition 32-frame windows, p50/p95/p99 frame time was
+13.1/14.7/16.4 ms and the derived 1% low was 61.0 FPS. This closes Phase 2;
+it does not establish compatibility or performance for unmeasured titles.
+
 Read `docs/reference-recon-roadmap.md` §"The one thing to internalize" before
 starting. The measured diagnosis:
 

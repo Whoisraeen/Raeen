@@ -6974,3 +6974,29 @@ test were fully removed after GTA V rejected the candidate.
   environment gate or cache lifetime change remains. Raw reports and user game
   files remain gitignored. Phase 2 remains red; neither short A/B is the
   mandatory 30-minute strict Minecraft soak.
+
+## 2026-08-03 - Phase 2 strict Minecraft gate passed
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, executable SHA-256
+`10E3981E451F7CC80CA034B384DB5E70D5BF7CCE74F88F6222F21DB9E802B42B`.
+The raw report and logs remain gitignored under
+`scratch/mc-phase2-strict-30m/soak-1785724463876`; game files, savedata,
+firmware, keys, and shader caches remain outside git.
+
+- The strict scripted Minecraft soak ran for 30m00.6s of 30m00.0s planned,
+  produced 133,280 flips, reached first present at 2.6s, and passed with a
+  2.0s worst no-flip window, zero deadlock warnings, 144.1% average / 452.3%
+  peak process-tree CPU, and 1,758 MiB peak process-tree RAM. Overall rate was
+  74.1 flips/s; all-window min/average/max telemetry rate was
+  13.4/74.7/97.1 FPS, where the minimum includes scripted loading transitions.
+- To isolate the sustained post-transition workload, 3,853 32-frame windows
+  after flip 10,000 were analyzed. Their frame-time p50/p95/p99 was
+  13.1/14.7/16.4 ms, derived 1% low was 61.0 FPS, and the slowest such window
+  was 22.0 ms (45.5 FPS). The long-tail stability criterion is the harness's
+  complete no-flip tracking: no frozen window exceeded the strict 10s limit.
+- Phase 2 is green. Its other exit evidence was already present: bounded async
+  flip passed three consecutive 180s no-wedge runs, ASTRO.BOT produced 96
+  flips in the Phase 1 re-verification, and timing showed fence wait was no
+  longer dominant. This closes the FPS/stability phase only; it is not a claim
+  that Minecraft rendering is perfect or that unmeasured games are playable.
+  Ordered work may now advance to Phase 3 commercial-title rendering breadth.
