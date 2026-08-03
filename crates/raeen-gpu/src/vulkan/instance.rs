@@ -939,6 +939,20 @@ impl VulkanDevice {
             extension_names.push(c"VK_EXT_external_memory_host".as_ptr());
         }
         for name in &plugin_device_extension_names {
+            // Some SDKs report both the promoted KHR buffer-device-address
+            // extension and its incompatible legacy EXT predecessor. Vulkan
+            // explicitly forbids enabling both. On Raeen's Vulkan 1.3 device,
+            // prefer KHR and keep the requested core feature bit enabled.
+            if name.as_c_str() == c"VK_EXT_buffer_device_address"
+                && plugin_device_extension_names
+                    .iter()
+                    .any(|candidate| candidate.as_c_str() == c"VK_KHR_buffer_device_address")
+            {
+                tracing::info!(
+                    "active plugin requested both KHR and EXT buffer device address; using KHR"
+                );
+                continue;
+            }
             if ![
                 c"VK_EXT_depth_range_unrestricted",
                 c"VK_EXT_robustness2",
