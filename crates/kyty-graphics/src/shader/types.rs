@@ -64,6 +64,12 @@ pub enum ShaderInstructionType {
     /// MUBUF 0x1e: four-dword raw store. Kyty leaves it `KYTY_NI`; measured
     /// in ASTRO.BOT scene compute (raw 0xe0780000).
     BufferStoreDwordX4,
+    /// RDNA2 MUBUF 0x32 `buffer_atomic_add` with GLC clear. The source vdata
+    /// is added atomically to the addressed uint dword and is not overwritten.
+    BufferAtomicAdd,
+    /// The GLC-set form of `buffer_atomic_add`: identical memory side effect,
+    /// then the pre-add value is returned in vdata.
+    BufferAtomicAddReturn,
     BufferStoreFormatX,
     BufferStoreFormatXy,
     /// MUBUF 0x06: formatted 3-channel store. Kyty leaves it `KYTY_NI`

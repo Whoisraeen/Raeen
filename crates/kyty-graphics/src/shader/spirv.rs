@@ -4403,6 +4403,9 @@ impl<'a> Spirv<'a> {
             }
             if bind.storage_buffers.buffers_num > 0 {
                 vars.push("%buf".to_string());
+                if self.uses_buffer_atomic() {
+                    vars.push("%buf_atomic".to_string());
+                }
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
                 // One interface variable per present sampled (Dim, class)
@@ -4638,6 +4641,13 @@ impl<'a> Spirv<'a> {
        OpDecorate %buf DescriptorSet <DescriptorSet>
        OpDecorate %buf Binding <BindingIndex>
 "#;
+        const STORAGE_BUFFER_ATOMIC_ANNOTATIONS: &str = r#"
+       OpDecorate %buffers_runtimearr_uint ArrayStride 4
+       OpMemberDecorate %BufferObjectUint 0 Offset 0
+       OpDecorate %BufferObjectUint Block
+       OpDecorate %buf_atomic DescriptorSet <DescriptorSet>
+       OpDecorate %buf_atomic Binding <BindingIndex>
+"#;
         const TEXTURES_ANNOTATIONS_S: &str = r#"
        OpDecorate %textures2D_S<S> DescriptorSet <DescriptorSet>
        OpDecorate %textures2D_S<S> Binding <BindingIndex>
@@ -4696,6 +4706,14 @@ impl<'a> Spirv<'a> {
                         "<BindingIndex>",
                         &format!("{}", bind.storage_buffers.binding_index),
                     );
+                if self.uses_buffer_atomic() {
+                    self.source += &STORAGE_BUFFER_ATOMIC_ANNOTATIONS
+                        .replace("<DescriptorSet>", &format!("{}", bind.descriptor_set_slot))
+                        .replace(
+                            "<BindingIndex>",
+                            &format!("{}", bind.storage_buffers.binding_index),
+                        );
+                }
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
                 // One SAMPLED_IMAGE descriptor array per present (Dim, class)
@@ -4883,6 +4901,12 @@ impl<'a> Spirv<'a> {
                    %_arr_BufferObject_uint_<buffers_num> = OpTypeArray %BufferObject %buffers_num_uint_<buffers_num>
 %_ptr_StorageBuffer__arr_BufferObject_uint_<buffers_num> = OpTypePointer StorageBuffer %_arr_BufferObject_uint_<buffers_num>
 "#;
+        const STORAGE_BUFFER_ATOMIC_TYPES: &str = r#"
+                                %buffers_runtimearr_uint = OpTypeRuntimeArray %uint
+                                       %BufferObjectUint = OpTypeStruct %buffers_runtimearr_uint
+                      %_arr_BufferObjectUint_uint_<buffers_num> = OpTypeArray %BufferObjectUint %buffers_num_uint_<buffers_num>
+%_ptr_StorageBuffer__arr_BufferObjectUint_uint_<buffers_num> = OpTypePointer StorageBuffer %_arr_BufferObjectUint_uint_<buffers_num>
+"#;
 
         const TEXTURES_SAMPLED_TYPES: &str = r#"
                                              %ImageS<S> = OpTypeImage <stype> <dim> 0 <arrayed> 0 1 Unknown
@@ -4950,6 +4974,12 @@ impl<'a> Spirv<'a> {
                     "<buffers_num>",
                     &format!("{}", bind.storage_buffers.buffers_num),
                 );
+                if self.uses_buffer_atomic() {
+                    self.source += &STORAGE_BUFFER_ATOMIC_TYPES.replace(
+                        "<buffers_num>",
+                        &format!("{}", bind.storage_buffers.buffers_num),
+                    );
+                }
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
                 // The OpTypeImage Dim comes from the measured T# types: 9 =
@@ -5058,6 +5088,13 @@ impl<'a> Spirv<'a> {
         ])
     }
 
+    fn uses_buffer_atomic(&self) -> bool {
+        self.code.has_any_of(&[
+            ShaderInstructionType::BufferAtomicAdd,
+            ShaderInstructionType::BufferAtomicAddReturn,
+        ])
+    }
+
     /// LDS allocation in dwords. `COMPUTE_PGM_RSRC2.LDS_SIZE` counts 128-dword
     /// granules (GFX10); a shader that uses DS ops with a zero (or missing)
     /// register still needs backing, so fall back to the full 64 KiB LDS.
@@ -5129,6 +5166,12 @@ impl<'a> Spirv<'a> {
                     "%buf = OpVariable %_ptr_StorageBuffer__arr_BufferObject_uint_{} StorageBuffer",
                     bind.storage_buffers.buffers_num
                 ));
+                if self.uses_buffer_atomic() {
+                    vars.push(format!(
+                        "%buf_atomic = OpVariable %_ptr_StorageBuffer__arr_BufferObjectUint_uint_{} StorageBuffer",
+                        bind.storage_buffers.buffers_num
+                    ));
+                }
             }
             if bind.textures2d.textures2d_sampled_num > 0 {
                 // One array variable per present (Dim, class) key, each

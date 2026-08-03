@@ -8,7 +8,7 @@
 
 use super::cache::{
     ComputeBufferKey, ComputeImageKey, ComputeImageWriteback, DrawCaches, PendingDrawResources,
-    PersistentComputeImage,
+    PersistentComputeImage, TargetKey, TargetLayout, TextureKey,
 };
 use super::instance::VulkanDevice;
 use super::offscreen::{ShaderStageBinding, StorageImageUpload, TextureUpload};
@@ -303,7 +303,7 @@ pub fn dispatch_compute(
                 .sum()
         });
     let image_count = resources.images.len();
-    let sampled_count = resources.sampled.len();
+    let sampled_count = resources.sampled_views.len();
     let dirty_storage_bytes: usize = outputs
         .buffers
         .iter()
@@ -500,7 +500,15 @@ struct ComputeResources<'a> {
     caches: &'a mut DrawCaches,
     storage: Vec<BufferAllocation>,
     images: Vec<ImageAllocation>,
+    /// Per-descriptor sampled views in guest T# order. Entries may be owned
+    /// by `sampled`, borrowed from a persistent render target, or borrowed
+    /// from the persistent texture cache.
+    sampled_views: Vec<vk::ImageView>,
     sampled: Vec<SampledAllocation>,
+    /// Persistent colour targets borrowed as sampled images. They are never
+    /// destroyed here; the cache owns them. One transition before and after
+    /// the dispatch preserves the cache's between-consumer layout invariant.
+    sampled_targets: Vec<(TargetKey, vk::Image, TargetLayout)>,
     samplers: Vec<vk::Sampler>,
     /// The persistent GDS arena (cache-owned, NOT destroyed here); null when
     /// the dispatch binds no GDS.
@@ -533,7 +541,9 @@ impl<'a> ComputeResources<'a> {
             caches,
             storage: Vec::new(),
             images: Vec::new(),
+            sampled_views: Vec::new(),
             sampled: Vec::new(),
+            sampled_targets: Vec::new(),
             samplers: Vec::new(),
             gds: vk::Buffer::null(),
             eud_raw: None,
@@ -697,7 +707,7 @@ impl<'a> ComputeResources<'a> {
                 }
                 if !textures.textures.is_empty() {
                     for upload in &textures.textures {
-                        self.create_sampled_image(upload)?;
+                        self.bind_sampled_image(upload)?;
                     }
                     if textures.sampled_groups.is_empty() {
                         // Homogeneous: one array of every sampled view.
@@ -705,7 +715,7 @@ impl<'a> ComputeResources<'a> {
                             vk::DescriptorSetLayoutBinding::default()
                                 .binding(textures.sampled_binding)
                                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                                .descriptor_count(self.sampled.len() as u32)
+                                .descriptor_count(self.sampled_views.len() as u32)
                                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
                         );
                     } else {
@@ -836,7 +846,10 @@ impl<'a> ComputeResources<'a> {
                         + u32::from(self.push_uniform.is_some()),
                 ),
                 (vk::DescriptorType::STORAGE_IMAGE, self.images.len() as u32),
-                (vk::DescriptorType::SAMPLED_IMAGE, self.sampled.len() as u32),
+                (
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    self.sampled_views.len() as u32,
+                ),
                 (vk::DescriptorType::SAMPLER, self.samplers.len() as u32),
             ]
             .into_iter()
@@ -928,11 +941,11 @@ impl<'a> ComputeResources<'a> {
                 }
             }
             let sampled_infos: Vec<_> = self
-                .sampled
+                .sampled_views
                 .iter()
-                .map(|allocation| {
+                .map(|&view| {
                     vk::DescriptorImageInfo::default()
-                        .image_view(allocation.view)
+                        .image_view(view)
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 })
                 .collect();
@@ -1388,6 +1401,86 @@ impl<'a> ComputeResources<'a> {
         Ok(true)
     }
 
+    /// Resolve one sampled descriptor without changing guest order. A live
+    /// colour target or a verified persistent-texture hit borrows its existing
+    /// view; only an ordinary guest-memory upload allocates a transient image.
+    fn bind_sampled_image(&mut self, upload: &TextureUpload) -> Result<(), GpuError> {
+        if let Some(base) = upload.render_target {
+            let key = TargetKey {
+                base,
+                width: upload.width,
+                height: upload.height,
+                format: upload.format.as_raw(),
+            };
+            let (image, view, layout) = self.caches.target_image(&key).ok_or_else(|| {
+                GpuError::PipelineCreationFailed(format!(
+                    "compute sampled render target {base:#x} ({}x{}) is no longer a live \
+                     persistent target",
+                    upload.width, upload.height
+                ))
+            })?;
+            if layout == TargetLayout::Undefined
+                && !crate::diagnostics::gpu_env().init_undefined_sampled_target
+            {
+                return Err(GpuError::PipelineCreationFailed(format!(
+                    "compute sampled persistent target {base:#x} has an undefined layout; \
+                     set RAEEN_INIT_UNDEFINED_SAMPLED_TARGET=1 to initialize it to \
+                     transparent black"
+                )));
+            }
+            if !self
+                .sampled_targets
+                .iter()
+                .any(|(_, candidate, _)| *candidate == image)
+            {
+                self.sampled_targets.push((key, image, layout));
+            }
+            self.caches.stats.sampled_target_binds += 1;
+            self.sampled_views.push(view);
+            return Ok(());
+        }
+
+        if upload.cached {
+            let key = TextureKey {
+                base: upload.guest_base,
+                width: upload.width,
+                height: upload.height,
+                layers: upload.layers,
+                depth: upload.depth.max(1),
+                cube: upload.cube,
+                array: upload.array,
+                volume: upload.volume,
+                format: upload.format.as_raw(),
+            };
+            let (view, hash) = self.caches.texture_entry(&key).ok_or_else(|| {
+                GpuError::PipelineCreationFailed(format!(
+                    "compute cached texture {:#x} ({}x{}) predicted by the decode snapshot \
+                     is no longer in the texture cache",
+                    upload.guest_base, upload.width, upload.height
+                ))
+            })?;
+            if hash != upload.sample_hash {
+                return Err(GpuError::PipelineCreationFailed(format!(
+                    "compute cached texture {:#x} content hash changed between decode and bind \
+                     ({hash:#x} != {:#x})",
+                    upload.guest_base, upload.sample_hash
+                )));
+            }
+            self.caches.stats.texture_cache_hits += 1;
+            self.sampled_views.push(view);
+            return Ok(());
+        }
+
+        self.create_sampled_image(upload)?;
+        self.sampled_views.push(
+            self.sampled
+                .last()
+                .expect("create_sampled_image pushed an allocation")
+                .view,
+        );
+        Ok(())
+    }
+
     /// One sampled texture: staging buffer + device-local image + view, in
     /// the upload's own decoded format. `depth > 1` builds a
     /// `VK_IMAGE_TYPE_3D` volume with a `3D` view (measured: ASTRO.BOT's
@@ -1509,7 +1602,7 @@ impl<'a> ComputeResources<'a> {
         Ok(())
     }
 
-    fn record_and_submit(&self, state: &ComputeState<'_>) -> Result<(), GpuError> {
+    fn record_and_submit(&mut self, state: &ComputeState<'_>) -> Result<(), GpuError> {
         let full_color = |allocation: &ImageAllocation| vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -1698,6 +1791,96 @@ impl<'a> ComputeResources<'a> {
                 );
             }
 
+            // A read-only compute T# may directly borrow a persistent colour
+            // target. Publish prior graphics writes and move the image to the
+            // layout promised by the sampled-image descriptor. Undefined
+            // content is never silently substituted: the explicit diagnostic
+            // opt-in mirrors the graphics path and emits a warning when it
+            // defines the resource as transparent black.
+            for &(key, image, layout) in &self.sampled_targets {
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let (old_layout, src_access, src_stage) = match layout {
+                    TargetLayout::Undefined => {
+                        let to_transfer = vk::ImageMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::empty())
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(image)
+                            .subresource_range(range);
+                        self.device().cmd_pipeline_barrier(
+                            self.command_buffer,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[to_transfer],
+                        );
+                        let clear = vk::ClearColorValue { float32: [0.0; 4] };
+                        self.device().cmd_clear_color_image(
+                            self.command_buffer,
+                            image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &clear,
+                            &[range],
+                        );
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
+                        let occurrence = INITIALIZATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if occurrence == 1 || occurrence.is_power_of_two() {
+                            tracing::warn!(
+                                occurrence,
+                                base = format_args!("{:#x}", key.base),
+                                "compute initialized an explicitly opted-in undefined sampled \
+                                 target to transparent black"
+                            );
+                        }
+                        (
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::PipelineStageFlags::TRANSFER,
+                        )
+                    }
+                    TargetLayout::TransferSrc => (
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    ),
+                    TargetLayout::ColorAttachment => (
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    ),
+                };
+                let to_shader_read = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(src_access)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(old_layout)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    src_stage,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_shader_read],
+                );
+            }
+
             self.device().cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1879,6 +2062,37 @@ impl<'a> ComputeResources<'a> {
                 );
             }
 
+            // Restore borrowed colour targets to the cache's between-consumer
+            // invariant. This transition also orders it after every compute
+            // shader read without inventing a write that did not occur.
+            for &(_, image, _) in &self.sampled_targets {
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let to_transfer_src = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range);
+                self.device().cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer_src],
+                );
+            }
+
             // Copy every UAV back out for the guest-memory writeback.
             for allocation in self
                 .images
@@ -1957,10 +2171,21 @@ impl<'a> ComputeResources<'a> {
                 GpuError::VulkanInitFailed(format!("vkQueueSubmit: {e}"))
             })?;
             // SAFETY: waiting on this submission's live fence.
-            unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }.map_err(|e| {
-                self.dev.note_vk_error(e);
-                GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}"))
-            })
+            unsafe { self.device().wait_for_fences(&[self.fence], true, u64::MAX) }.map_err(
+                |e| {
+                    self.dev.note_vk_error(e);
+                    GpuError::VulkanInitFailed(format!("vkWaitForFences: {e}"))
+                },
+            )?;
+            self.commit_sampled_target_layouts();
+            Ok(())
+        }
+    }
+
+    fn commit_sampled_target_layouts(&mut self) {
+        for (key, _, _) in &self.sampled_targets {
+            self.caches
+                .mark_target_layout(key, TargetLayout::TransferSrc);
         }
     }
 
@@ -2004,6 +2229,7 @@ impl<'a> ComputeResources<'a> {
             std::mem::take(&mut self.deferred_write_keys),
             std::mem::take(&mut self.deferred_image_writes),
         );
+        self.commit_sampled_target_layouts();
         Ok(())
     }
 

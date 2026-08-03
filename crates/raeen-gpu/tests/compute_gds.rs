@@ -16,9 +16,20 @@ use ash::vk;
 use raeen_gpu::backend::GpuBackend;
 use raeen_gpu::vulkan::compute::{ComputeState, dispatch_compute};
 use raeen_gpu::vulkan::offscreen::{
-    ShaderStageBinding, StorageBufferBinding, TextureBinding, TextureUpload,
+    DrawState, ShaderStageBinding, StorageBufferBinding, TextureBinding, TextureUpload,
+    render_draw_deferred,
 };
-use raeen_gpu::vulkan::{VulkanBackend, validation_error_count};
+use raeen_gpu::vulkan::{
+    VulkanBackend,
+    shaders::{triangle_fragment_spirv, triangle_vertex_spirv},
+    validation_error_count,
+};
+
+const TRIANGLE_VERTICES: [[f32; 4]; 3] = [
+    [0.0, -0.7, 0.0, 1.0],
+    [0.7, 0.7, 0.0, 1.0],
+    [-0.7, 0.7, 0.0, 1.0],
+];
 
 /// `LocalSize 1 1 1`: `out[0] = atomicAdd(gds[0], 1)` — the same `%gds`
 /// declaration shape the recompiler emits (StorageBuffer block over a runtime
@@ -108,6 +119,59 @@ const FETCH_NO_SAMPLER_CS: &str = "\
     %texel = OpImageFetch %v4float %image %coord Lod %int_0\n\
     %r = OpCompositeExtract %float %texel 0\n\
     %scaled = OpFMul %float %r %f255\n\
+    %rounded = OpFAdd %float %scaled %f05\n\
+    %value = OpConvertFToU %uint %rounded\n\
+    %po = OpAccessChain %ptr_uint %out %uint_0 %uint_0\n\
+    OpStore %po %value\n\
+    OpReturn\n\
+    OpFunctionEnd\n";
+
+/// Fetch the green channel from the center of a 64x64 persistent render
+/// target. The source texture intentionally carries no CPU pixels: the
+/// compute backend must bind the live target's existing `VkImage` directly.
+const FETCH_LIVE_TARGET_CENTER_CS: &str = "\
+    OpCapability Shader\n\
+    OpMemoryModel Logical GLSL450\n\
+    OpEntryPoint GLCompute %main \"main\" %tex %out\n\
+    OpExecutionMode %main LocalSize 1 1 1\n\
+    OpDecorate %tex DescriptorSet 0\n\
+    OpDecorate %tex Binding 1\n\
+    OpDecorate %out_arr ArrayStride 4\n\
+    OpMemberDecorate %Out 0 Offset 0\n\
+    OpDecorate %Out Block\n\
+    OpDecorate %out DescriptorSet 0\n\
+    OpDecorate %out Binding 0\n\
+    %void = OpTypeVoid\n\
+    %fnty = OpTypeFunction %void\n\
+    %uint = OpTypeInt 32 0\n\
+    %int = OpTypeInt 32 1\n\
+    %float = OpTypeFloat 32\n\
+    %v2int = OpTypeVector %int 2\n\
+    %v4float = OpTypeVector %float 4\n\
+    %img = OpTypeImage %float 2D 0 0 0 1 Unknown\n\
+    %uint_0 = OpConstant %uint 0\n\
+    %uint_1 = OpConstant %uint 1\n\
+    %int_0 = OpConstant %int 0\n\
+    %int_32 = OpConstant %int 32\n\
+    %f255 = OpConstant %float 255.000000\n\
+    %f05 = OpConstant %float 0.500000\n\
+    %arr = OpTypeArray %img %uint_1\n\
+    %ptr_arr = OpTypePointer UniformConstant %arr\n\
+    %ptr_img = OpTypePointer UniformConstant %img\n\
+    %tex = OpVariable %ptr_arr UniformConstant\n\
+    %out_arr = OpTypeRuntimeArray %uint\n\
+    %Out = OpTypeStruct %out_arr\n\
+    %ptr_out = OpTypePointer StorageBuffer %Out\n\
+    %out = OpVariable %ptr_out StorageBuffer\n\
+    %ptr_uint = OpTypePointer StorageBuffer %uint\n\
+    %main = OpFunction %void None %fnty\n\
+    %entry = OpLabel\n\
+    %pimg = OpAccessChain %ptr_img %tex %uint_0\n\
+    %image = OpLoad %img %pimg\n\
+    %coord = OpCompositeConstruct %v2int %int_32 %int_32\n\
+    %texel = OpImageFetch %v4float %image %coord Lod %int_0\n\
+    %green = OpCompositeExtract %float %texel 1\n\
+    %scaled = OpFMul %float %green %f255\n\
     %rounded = OpFAdd %float %scaled %f05\n\
     %value = OpConvertFToU %uint %rounded\n\
     %po = OpAccessChain %ptr_uint %out %uint_0 %uint_0\n\
@@ -342,6 +406,96 @@ fn sampled_texture_without_sampler_dispatches() {
         outputs.buffers[0].materialize(&[0u8; 4]),
         0x40u32.to_le_bytes().to_vec(),
         "the fetched red texel must round-trip through the sampled-image array"
+    );
+    assert_eq!(validation_error_count(), 0, "validation must stay clean");
+}
+
+#[test]
+fn compute_samples_a_live_render_target_without_cpu_round_trip() {
+    let Some(backend) = backend_or_skip() else {
+        return;
+    };
+    let dev = backend.device().expect("backend is initialized");
+    const TARGET_BASE: u64 = 0xCAFE_0000;
+    const EXTENT: u32 = 64;
+
+    let vs = triangle_vertex_spirv();
+    let fs = triangle_fragment_spirv();
+    let scene = DrawState {
+        vertices: Some(&TRIANGLE_VERTICES),
+        vertex_count: TRIANGLE_VERTICES.len() as u32,
+        target_base: Some(TARGET_BASE),
+        ..DrawState::new(EXTENT, EXTENT, &vs, &fs)
+    };
+    assert!(
+        render_draw_deferred(dev, &scene)
+            .expect("scene draw records")
+            .is_none(),
+        "a named target must stay GPU-resident until its consumer"
+    );
+
+    let spirv = kyty_graphics::spirv_asm::assemble(FETCH_LIVE_TARGET_CENTER_CS)
+        .expect("live-target compute shader assembles");
+    let binding = ShaderStageBinding {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        descriptor_set_slot: 0,
+        push_constant_offset: 0,
+        push_constants: Vec::new(),
+        push_uniform_binding: None,
+        storage_buffers: Some(StorageBufferBinding {
+            binding: 0,
+            buffers: vec![std::sync::Arc::new(vec![0u8; 4])],
+            guest_bases: vec![0],
+            guest_sizes: vec![4],
+            writable: vec![true],
+        }),
+        textures: Some(TextureBinding {
+            sampled_binding: 1,
+            sampler_binding: 2,
+            textures: vec![TextureUpload {
+                width: EXTENT,
+                height: EXTENT,
+                format: vk::Format::R8G8B8A8_UNORM,
+                pixels: Vec::new(),
+                layers: 1,
+                cube: false,
+                array: false,
+                volume: false,
+                depth: 1,
+                render_target: Some(TARGET_BASE),
+                guest_base: 0,
+                sample_hash: 0,
+                cached: false,
+            }],
+            samplers: Vec::new(),
+            sampled_groups: Vec::new(),
+        }),
+        storage_images: None,
+        gds_binding: None,
+        eud_raw: None,
+        global_mem: None,
+    };
+    let before = dev.draw_cache_stats();
+    let outputs = dispatch_compute(
+        dev,
+        &ComputeState {
+            groups: [1, 1, 1],
+            spirv: &spirv,
+            binding: Some(&binding),
+        },
+    )
+    .expect("compute samples the live target directly");
+    let after = dev.draw_cache_stats();
+
+    assert_eq!(
+        outputs.buffers[0].materialize(&[0u8; 4]),
+        255u32.to_le_bytes().to_vec(),
+        "the center of the reference triangle is fully green"
+    );
+    assert_eq!(
+        after.sampled_target_binds,
+        before.sampled_target_binds + 1,
+        "the compute T# must bind the persistent image, not upload pixels"
     );
     assert_eq!(validation_error_count(), 0, "validation must stay clean");
 }

@@ -7588,3 +7588,159 @@ phase-status change is claimed.
   Phase 2 remains red, and no further shader lowering is accepted until the
   retail variability has a repeatable diagnostic rather than a timing-sensitive
   memory-map workaround.
+
+### Baseline re-established against the correct accepted successor
+
+- An environment-gated Avatar diagnostic run enabled
+  `RAEEN_TRACE_DIRECT_MEMORY=1` on restored-source executable SHA-256
+  `18bfb3950afaefa9034fa90d1ffc27facffc50e04a43dc44dd380c1469843730`.
+  Report
+  `artifacts/compat/phase2-diagnostic-avatar-batch-map-trace-23c0b20-dirty.json`,
+  run `run-1785770448553`, reached 352 flips. Pairing every fixed-map refusal
+  with its immediately preceding entry produced **175/175** failures with the
+  same shape: direct-map operation 0, length `0x10000`, protection `0xf2`.
+  Each reused a virtual address previously seen with a **different physical
+  offset**; 172 distinct physical-offset shapes appeared.
+- GPL-compatible KytyPS5 and shadPS4 behavior confirms ordinary BatchMap passes
+  fixed flag `0x10` without no-overwrite `0x80`; a fixed direct mapping may
+  therefore replace an existing virtual mapping. Correct implementation needs
+  multiple virtual views of one shared direct-memory backing object. Raeen's
+  current anonymous/demand-backed mapping cannot represent that aliasing. The
+  rejected candidates either refused the legal overwrite or claimed success
+  while retaining unrelated bytes. This remains a separately classified
+  runtime/direct-memory blocker, not shader progress.
+- Restored-source full run
+  `phase2-restored-baseline-repeat3-23c0b20-dirty.json` was retained red against
+  the old Phase 1 report: Minecraft 9,984 and Subnautica 853. Exact-binary
+  focused repeats showed the variance: Minecraft recovered a 94.8 FPS final
+  window but totaled 12,224 after a longer transition; Subnautica recovered to
+  4,353 flips. Neither focused result was substituted for a full gate.
+- The complete identical-binary repeat is
+  `artifacts/compat/phase2-restored-baseline-repeat4-23c0b20-dirty.json`, run
+  `run-1785772337257`. Comparing it to the **actual latest accepted successor**,
+  `phase2-wip-ds-addtid-rollback-repeat2-23c0b20-dirty.json`, passed **8
+  unchanged / 0 improved / 0 regressed**. Avatar was 416 -> 388 (-6.7%), GTA V
+  10,035 -> 11,624 (+15.8%), Minecraft 14,592 -> 14,016 (-3.9%), and
+  Subnautica 4,768 -> 4,015 (-15.8%). GTA V and Minecraft stored exactly **0
+  shader errors / 0 GPU errors**, with final observed windows of 78.4 and 95.7
+  FPS respectively.
+- The same repeat is red only when compared to the stale Phase 1 starting
+  report. The standing rule says every accepted baseline becomes the next
+  comparison point; continuing to compare all later identical-source samples
+  to Phase 1 discarded that chain and manufactured a false blocker. The red
+  samples remain preserved and are not averaged away. The repeat-4 report is
+  now the working baseline for the next Phase 2 candidate. No shader grade
+  changes: this restores measurement trust only.
+
+## 2026-08-03 - Phase 1 corpus gate restored at 57,702-event scale
+
+EVIDENCE: production shader source remained unchanged while the local
+gitignored corpus grew to **57,702 events / 160 unique shaders / 54,124 exact
+binding-aware replay cases**. This is a tooling-scale correction for the
+already-green Phase 1 gate, not a Phase 2 grade change.
+
+- Replaced the replay index's pretty-printed, whole-buffer write with compact
+  JSON streamed through `BufWriter` to a sibling temporary file and atomically
+  promoted. The real index fell from **3,465,578,554 bytes** to
+  **686,076,604 bytes** (80.2% smaller). A synthesized large-stage-ABI test
+  first demonstrated the size problem, then proved exact round-trip identity
+  and compact encoding.
+- Added an exact-schema/event-count report cache. The unavoidable cold pass
+  over roughly 3.0 GB of legacy event JSON took about 117 s once; the warm
+  57,702-event report now completes in **11.8 s**. Every historical cluster
+  keeps one concrete example refusal, so a ranked row is actionable rather
+  than only statistical.
+- Replay schema 2 / index schema 3 retain stable game IDs independently of
+  mutable display titles. The new current-outcome burn-down excludes cases
+  that now pass and ranks unresolved forms by distinct game ID, shader hash,
+  and exact case count. This fixes the old report's misleading mixture of
+  historical failures and current blockers.
+- The strict warm replay completed all **54,124** cases in **12.612 s**:
+  **1,394 passed / 52,730 failed / 0 improved / 0 regressed**. The current top
+  rows are an EUD-unreadable analysis class (Phase 3), dynamic
+  `SLoadDwordx4` (2 games / 6 shaders / 25 cases), and
+  `buffer_atomic_add` (2 games / 3 shaders / 5 cases). Phase ordering keeps the
+  EUD class queued for Phase 3; the highest Phase 2 row is selected next.
+- Verification passed all **90 xtask tests**, formatting, and strict
+  all-target xtask Clippy with dependency linting disabled. The
+  dependency-inclusive Clippy command reached an unrelated existing
+  `raeen-hle/src/libsce_agc.rs` `manual_is_multiple_of` warning and therefore
+  is not reported as a clean workspace result.
+- While verification ran, `main` advanced externally from `23c0b203e091` to
+  `ba5931b33585`; the new commits include runtime, GPU-diagnostic, HLE, and
+  workspace changes. They are preserved. Consequently the repeat-4 executable
+  remains valid evidence for the old accepted shader state but cannot serve as
+  the build-identity baseline for accepting a new lowering on current HEAD. A
+  fresh eight-title baseline is required before the next retail claim.
+
+### Current-main successor baseline accepted
+
+- Built release `ba5931b33585+dirty` in the isolated
+  `../Raeen-target-dev` target. Executable SHA-256:
+  `0a787ce2d35567446a4218606e311d768c971fc559963d02f54b59f0c120c8b7`.
+  The only dirty tracked files were this evidence ledger and the Phase 1 xtask
+  corpus-tool implementation; neither enters `raeen.exe`.
+- Complete eight-title report:
+  `artifacts/compat/phase2-current-head-baseline-ba5931b-dirty.json`, run
+  `run-1785776258421`. The explicit diff against
+  `phase2-restored-baseline-repeat4-23c0b20-dirty.json` passed **1 improved / 7
+  unchanged / 0 regressed**.
+- Subnautica improved from 4,015 to **5,397 flips (+34.4%)**. Avatar reached
+  393 (+1.3%), GTA V 12,096 (+4.1%), and Minecraft 15,648 (+11.6%); all other
+  titles retained their accepted stage/wall classes.
+- The stricter standing gate also passed: GTA V and Minecraft each recorded
+  exactly **0 shader errors / 0 GPU errors**, with final observed windows of
+  79.7 and 98.0 FPS. This report is the accepted current-main successor
+  baseline for the next Phase 2 shader candidate. It does not by itself improve
+  a shader scorecard grade.
+
+## 2026-08-03 - Shader Phase 2 WIP: scoped dynamic scalar-memory lowering accepted
+
+BUILD/EVIDENCE IDENTITY: release **`ba5931b33585+dirty`**, accepted report
+`artifacts/compat/phase2-wip-dynamic-smem-scoped-ba5931b-dirty.json`, run
+`run-1785778340025`. Release executable SHA-256:
+`7f4aa94c50a0af4a286ba81862912b7d1f697bb2bf082da9b9dae9907c4aad8f`.
+The comparison baseline is
+`artifacts/compat/phase2-current-head-baseline-ba5931b-dirty.json`.
+
+- TDD first reproduced two unsafe cases: a register-offset S_LOAD was refused
+  even when the capture supplied a matching global-memory window, while the
+  proposed broad fallback would have allowed a different SGPR base to alias
+  that window. The accepted lowering uses the runtime scalar offset only when
+  the load's base SGPR exactly matches `global_mem.base_sgpr`; a mismatch now
+  refuses precisely and names both bases. It covers S_LOAD dword widths
+  1/2/4/8/16 without routing unrelated descriptors through an arbitrary
+  memory window.
+- Register offsets are treated as unsigned byte offsets with their low two
+  bits ignored. One-dword dispatch-time captures may now materialize legal
+  scalar destinations including VCC, EXEC, and M0. This advanced the matching
+  Avatar `SLoadDwordx4` programs to their next real `ImageStore` blocker while
+  leaving mismatched `SLoadDwordx8` programs as loud, classified refusals.
+- The red tests became green, the complete **734-test** `kyty-graphics` unit
+  suite and its integration tests passed, strict all-target Clippy passed, and
+  formatting plus `git diff --check` passed. Clean-room semantics were checked
+  against AMD's public RDNA2 ISA documentation; no Sony material or
+  incompatible source entered the implementation.
+- Pre-retail strict replay processed 56,489 exact cases in 15.117 s with
+  **1,394 pass / 55,095 fail / 0 improved / 0 regressed**. After the sweep
+  refreshed the corpus, strict replay processed **59,637** exact cases in
+  13.665 s with **1,394 pass / 58,243 fail / 0 improved / 0 regressed**. The
+  whole-shader pass count does not increase because the affected programs now
+  reach later missing operations; the matching dynamic-x4 root cluster is no
+  longer the current failure.
+- The mandatory retail diff passed **0 improved / 8 unchanged / 0 regressed**.
+  Avatar reached 428 flips (+8.9%), GTA V 12,160 (+0.5%), Minecraft 16,320
+  (+4.3%), and Subnautica 5,091 (-5.7%). GTA V and Minecraft retained exactly
+  **0 shader errors / 0 GPU errors**, with final observed windows of 79.7 and
+  103.1 FPS. All eight titles retained their accepted stage/wall classes.
+- Raw error events are reported honestly rather than averaged away: Avatar
+  rose from 13,689/11,760 shader/GPU errors to 15,371/14,380 as newly executable
+  shaders reached repeated later `ImageStore` failures; Subnautica moved from
+  24/24 to 25/25. This slice fixes one root form and passes compatibility, but
+  **does not improve a scorecard grade**. Phase 2 remains red: Avatar is far
+  above the under-100 unique-clustered gate and Subnautica is not zero.
+- The accepted report above becomes the next comparison baseline. Current
+  Phase 2 ranking, without skipping the Phase-3-only EUD dataflow class, selects
+  the cross-title `buffer_atomic_add` cluster next. Its previous semantically
+  correct lowering remains rejected until the measured Subnautica compute
+  upload/submit regression is eliminated.

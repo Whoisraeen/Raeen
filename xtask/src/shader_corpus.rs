@@ -6,15 +6,18 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 pub const DEFAULT_CORPUS_DIR: &str = "artifacts/shader-corpus";
 const CORPUS_SCHEMA_VERSION: u32 = 2;
-const REPLAY_SCHEMA_VERSION: u32 = 1;
-const REPLAY_INDEX_SCHEMA_VERSION: u32 = 1;
+const REPLAY_SCHEMA_VERSION: u32 = 2;
+const REPLAY_INDEX_SCHEMA_VERSION: u32 = 3;
 const REPLAY_INDEX_FILE: &str = "replay-index.json";
+const REPORT_CACHE_SCHEMA_VERSION: u32 = 2;
+const REPORT_CACHE_META_FILE: &str = "report-cache.json";
 
 pub fn run(command: &str, args: &[String]) -> Result<()> {
     match command {
@@ -72,6 +75,24 @@ struct Cluster {
 
 fn report(args: &[String]) -> Result<()> {
     let corpus = corpus_path(args);
+    let output = PathBuf::from(
+        super::option(args, "--output")
+            .unwrap_or_else(|| corpus.join("report.md").display().to_string()),
+    );
+    let event_count = replay_event_count(&corpus)?;
+    if let Some(markdown) = load_cached_report(&corpus, event_count)? {
+        let canonical = corpus.join("report.md");
+        if output != canonical {
+            write_file(&output, markdown.as_bytes())?;
+        }
+        print!("{markdown}");
+        println!(
+            "used cached ranked shader failure report for {event_count} event(s): {}",
+            output.display()
+        );
+        return Ok(());
+    }
+
     let records = read_records(&corpus)?;
     let mut clusters: BTreeMap<(String, FailureClass), Cluster> = BTreeMap::new();
     for record in &records {
@@ -79,7 +100,7 @@ fn report(args: &[String]) -> Result<()> {
         let cluster = clusters.entry(key).or_default();
         cluster.occurrences += 1;
         cluster.shaders.insert(record.shader_sha1.clone());
-        cluster.titles.insert(record.title.clone());
+        cluster.titles.insert(record.game_id.clone());
         if cluster.example_reason.is_empty() {
             cluster.example_reason.clone_from(&record.reason);
         }
@@ -102,23 +123,30 @@ fn report(args: &[String]) -> Result<()> {
         .len();
     let titles = records
         .iter()
-        .map(|record| &record.title)
+        .map(|record| &record.game_id)
         .collect::<BTreeSet<_>>()
         .len();
     let markdown = render_report(&ranked, records.len(), unique_shaders, titles);
-    let output = PathBuf::from(
-        super::option(args, "--output")
-            .unwrap_or_else(|| corpus.join("report.md").display().to_string()),
-    );
-    write_file(&output, markdown.as_bytes())?;
-    let event_count = records.len();
+    let canonical = corpus.join("report.md");
+    write_file(&canonical, markdown.as_bytes())?;
+    if output != canonical {
+        write_file(&output, markdown.as_bytes())?;
+    }
+    debug_assert_eq!(event_count, records.len());
     let replay_cases = build_replay_cases(records);
-    write_json(
+    write_replay_index(
         &corpus.join(REPLAY_INDEX_FILE),
         &ReplayIndex {
             schema_version: REPLAY_INDEX_SCHEMA_VERSION,
             event_count,
             cases: replay_cases,
+        },
+    )?;
+    write_json(
+        &corpus.join(REPORT_CACHE_META_FILE),
+        &ReportCacheMeta {
+            schema_version: REPORT_CACHE_SCHEMA_VERSION,
+            event_count,
         },
     )?;
     print!("{markdown}");
@@ -134,8 +162,8 @@ fn render_report(
 ) -> String {
     let mut out = format!(
         "# Shader failure corpus\n\n{} occurrence(s), {} unique shader(s), {} title(s), {} cluster(s).\n\n\
-         | Rank | Stage | Family | Opcode | Operand/encoding form | Titles | Shaders | Occurrences |\n\
-         |---:|---|---|---|---|---:|---:|---:|\n",
+         | Rank | Stage | Family | Opcode | Operand/encoding form | Titles | Shaders | Occurrences | Example refusal |\n\
+         |---:|---|---|---|---|---:|---:|---:|---|\n",
         occurrences,
         unique_shaders,
         titles,
@@ -143,7 +171,7 @@ fn render_report(
     );
     for (index, ((stage, class), cluster)) in ranked.iter().enumerate() {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             index + 1,
             markdown_cell(stage),
             markdown_cell(&class.family),
@@ -152,6 +180,7 @@ fn render_report(
             cluster.titles.len(),
             cluster.shaders.len(),
             cluster.occurrences,
+            markdown_cell(&cluster.example_reason),
         ));
     }
     out
@@ -286,6 +315,8 @@ struct ReplayResult {
     shader_sha1: String,
     stage: String,
     titles: Vec<String>,
+    #[serde(default)]
+    game_ids: Vec<String>,
     passed: bool,
     outcome: String,
 }
@@ -305,6 +336,8 @@ struct ReplayCase {
     binary: String,
     replay_input: Option<ShaderReplayInput>,
     titles: BTreeSet<String>,
+    #[serde(default)]
+    game_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -312,6 +345,33 @@ struct ReplayIndex {
     schema_version: u32,
     event_count: usize,
     cases: Vec<ReplayCase>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReportCacheMeta {
+    schema_version: u32,
+    event_count: usize,
+}
+
+fn report_cache_is_current(meta: &ReportCacheMeta, event_count: usize) -> bool {
+    meta.schema_version == REPORT_CACHE_SCHEMA_VERSION && meta.event_count == event_count
+}
+
+fn load_cached_report(corpus: &Path, event_count: usize) -> Result<Option<String>> {
+    let meta_path = corpus.join(REPORT_CACHE_META_FILE);
+    let report_path = corpus.join("report.md");
+    if !meta_path.exists() || !report_path.exists() {
+        return Ok(None);
+    }
+    let Ok(meta) = read_json::<ReportCacheMeta>(&meta_path) else {
+        return Ok(None);
+    };
+    if !report_cache_is_current(&meta, event_count) {
+        return Ok(None);
+    }
+    fs::read_to_string(&report_path)
+        .with_context(|| format!("read {}", report_path.display()))
+        .map(Some)
 }
 
 fn replay(args: &[String]) -> Result<()> {
@@ -349,6 +409,7 @@ fn replay(args: &[String]) -> Result<()> {
                 shader_sha1: case.shader_sha1,
                 stage: case.stage,
                 titles: case.titles.into_iter().collect(),
+                game_ids: case.game_ids.into_iter().collect(),
                 passed: replayed.is_ok(),
                 outcome: replayed.unwrap_or_else(|error| error),
             }
@@ -397,6 +458,21 @@ fn replay(args: &[String]) -> Result<()> {
         improved,
         regressed
     );
+    let ranked_failures = rank_current_failures(&report.results);
+    println!("current failing clusters (ranked by stable game-ID fan-out):");
+    for (rank, ((stage, class), cluster)) in ranked_failures.iter().take(20).enumerate() {
+        println!(
+            "  {:>2}. {} {} {} {} — games={} shaders={} cases={}",
+            rank + 1,
+            stage,
+            class.family,
+            class.opcode,
+            class.form,
+            cluster.titles.len(),
+            cluster.shaders.len(),
+            cluster.occurrences
+        );
+    }
     for result in report
         .results
         .iter()
@@ -426,6 +502,7 @@ fn build_replay_cases(records: Vec<FailureRecord>) -> Vec<ReplayCase> {
             .entry(case_id.clone())
             .and_modify(|case| {
                 case.titles.insert(record.title.clone());
+                case.game_ids.insert(record.game_id.clone());
             })
             .or_insert_with(|| ReplayCase {
                 case_id,
@@ -434,9 +511,39 @@ fn build_replay_cases(records: Vec<FailureRecord>) -> Vec<ReplayCase> {
                 binary: record.binary,
                 replay_input: record.replay_input,
                 titles: BTreeSet::from([record.title]),
+                game_ids: BTreeSet::from([record.game_id]),
             });
     }
     cases.into_values().collect()
+}
+
+fn rank_current_failures(results: &[ReplayResult]) -> Vec<((String, FailureClass), Cluster)> {
+    let mut clusters: BTreeMap<(String, FailureClass), Cluster> = BTreeMap::new();
+    for result in results.iter().filter(|result| !result.passed) {
+        let key = (result.stage.clone(), classify_reason(&result.outcome));
+        let cluster = clusters.entry(key).or_default();
+        cluster.occurrences += 1;
+        cluster.shaders.insert(result.shader_sha1.clone());
+        if result.game_ids.is_empty() {
+            cluster.titles.extend(result.titles.iter().cloned());
+        } else {
+            cluster.titles.extend(result.game_ids.iter().cloned());
+        }
+        if cluster.example_reason.is_empty() {
+            cluster.example_reason.clone_from(&result.outcome);
+        }
+    }
+    let mut ranked: Vec<_> = clusters.into_iter().collect();
+    ranked.sort_by(|(left_key, left), (right_key, right)| {
+        right
+            .titles
+            .len()
+            .cmp(&left.titles.len())
+            .then_with(|| right.shaders.len().cmp(&left.shaders.len()))
+            .then_with(|| right.occurrences.cmp(&left.occurrences))
+            .then_with(|| left_key.cmp(right_key))
+    });
+    ranked
 }
 
 fn replay_event_count(corpus: &Path) -> Result<usize> {
@@ -462,7 +569,7 @@ fn load_or_build_replay_index(corpus: &Path) -> Result<Vec<ReplayCase>> {
     }
 
     let cases = build_replay_cases(read_records(corpus)?);
-    write_json(
+    write_replay_index(
         &path,
         &ReplayIndex {
             schema_version: REPLAY_INDEX_SCHEMA_VERSION,
@@ -648,6 +755,38 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_file(path, &bytes)
 }
 
+#[cfg(test)]
+fn encode_replay_index(index: &ReplayIndex) -> Result<Vec<u8>> {
+    serde_json::to_vec(index).context("encode compact replay index")
+}
+
+/// Replay indexes contain tens of thousands of large, mostly sparse stage-ABI
+/// records. Pretty JSON multiplied the local corpus into a multi-gigabyte
+/// cache and made `shader-corpus report` spend minutes formatting whitespace.
+/// Stream compact JSON through a temporary sibling so regeneration neither
+/// allocates the whole index a second time nor destroys the last usable cache
+/// if serialization fails.
+fn write_replay_index(path: &Path, index: &ReplayIndex) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let file =
+        File::create(&temporary).with_context(|| format!("create {}", temporary.display()))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, index)
+        .with_context(|| format!("encode compact replay index {}", temporary.display()))?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    drop(writer);
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("replace {}", path.display()))?;
+    }
+    fs::rename(&temporary, path)
+        .with_context(|| format!("promote {} to {}", temporary.display(), path.display()))
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -743,6 +882,20 @@ mod tests {
     }
 
     #[test]
+    fn report_keeps_one_actionable_example_for_each_cluster() {
+        let class = classify_reason("opaque failure");
+        let cluster = Cluster {
+            occurrences: 3,
+            shaders: BTreeSet::from(["shader".into()]),
+            titles: BTreeSet::from(["Avatar".into()]),
+            example_reason: "shader_recompile_cs: precise missing lowering".into(),
+        };
+        let markdown = render_report(&[(('c'.to_string() + "s", class), cluster)], 3, 1, 1);
+        assert!(markdown.contains("Example refusal"));
+        assert!(markdown.contains("shader_recompile_cs: precise missing lowering"));
+    }
+
+    #[test]
     fn replay_translates_a_known_compute_program_to_valid_spirv() {
         let words = [0x7E00_0280u32, 0x7E02_0280, 0xBF81_0000];
         let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
@@ -778,6 +931,80 @@ mod tests {
             cases.iter().any(|case| {
                 case.titles == BTreeSet::from(["Avatar".into(), "Subnautica".into()])
             })
+        );
+    }
+
+    #[test]
+    fn replay_index_encoding_is_compact_and_round_trips_large_stage_abis() {
+        let index = ReplayIndex {
+            schema_version: REPLAY_INDEX_SCHEMA_VERSION,
+            event_count: 1,
+            cases: vec![ReplayCase {
+                case_id: "case".into(),
+                shader_sha1: "0123456789abcdef0123456789abcdef01234567".into(),
+                stage: "cs".into(),
+                binary: "objects/0123456789abcdef0123456789abcdef01234567.bin".into(),
+                replay_input: Some(ShaderReplayInput::Cs(Default::default())),
+                titles: BTreeSet::from(["Avatar".into()]),
+                game_ids: BTreeSet::from(["PPSA01576".into()]),
+            }],
+        };
+        let pretty = serde_json::to_vec_pretty(&index).expect("pretty control encoding");
+        let compact = encode_replay_index(&index).expect("compact replay-index encoding");
+        assert!(
+            compact.len() * 3 < pretty.len(),
+            "the replay index must not replicate pretty-print whitespace: compact={} pretty={}",
+            compact.len(),
+            pretty.len()
+        );
+        let decoded: ReplayIndex = serde_json::from_slice(&compact).expect("round trip");
+        assert_eq!(decoded.event_count, 1);
+        assert_eq!(decoded.cases.len(), 1);
+        assert_eq!(decoded.cases[0].replay_input, index.cases[0].replay_input);
+    }
+
+    #[test]
+    fn warm_report_cache_requires_exact_schema_and_event_count() {
+        let current = ReportCacheMeta {
+            schema_version: REPORT_CACHE_SCHEMA_VERSION,
+            event_count: 57_702,
+        };
+        assert!(report_cache_is_current(&current, 57_702));
+        assert!(!report_cache_is_current(&current, 57_703));
+        assert!(!report_cache_is_current(
+            &ReportCacheMeta {
+                schema_version: REPORT_CACHE_SCHEMA_VERSION + 1,
+                event_count: 57_702,
+            },
+            57_702
+        ));
+    }
+
+    #[test]
+    fn current_burn_down_excludes_passes_and_counts_stable_game_ids() {
+        let result = |passed: bool, title: &str, game_id: &str| ReplayResult {
+            case_id: format!("{title}-{game_id}-{passed}"),
+            shader_sha1: format!("shader-{title}"),
+            stage: "cs".into(),
+            titles: vec![title.into()],
+            game_ids: vec![game_id.into()],
+            passed,
+            outcome: "no lowering table entry: BufferLoadFormatXy \
+                      [Vdata2VaddrSvSoffsIdxen]"
+                .into(),
+        };
+        let ranked = rank_current_failures(&[
+            result(false, "Subnautica", "PPSA02456"),
+            result(false, "PPSA02456-app", "PPSA02456"),
+            result(false, "Avatar", "PPSA01576"),
+            result(true, "Passing alias", "PPSA99999"),
+        ]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].1.occurrences, 3);
+        assert_eq!(
+            ranked[0].1.titles.len(),
+            2,
+            "two display names for one game ID must not inflate fan-out"
         );
     }
 }

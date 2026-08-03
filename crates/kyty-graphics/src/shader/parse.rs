@@ -3636,17 +3636,20 @@ fn shader_parse_mubuf(
             inst.src[1].size = 4;
             inst.dst.size = 3;
         }
-        // AMD RDNA2 MUBUF 0x32 BUFFER_ATOMIC_ADD. A production lowering was
-        // rejected after the eight-title retail gate: making Subnautica's
-        // histogram shader executable reduced its flip count beyond the 20%
-        // tolerance. Keep the corrected seven-bit decode and name the exact
-        // missing operation instead of regressing to the old, false 0x12
-        // `UnknownOpcode` classification or silently skipping it.
+        // AMD RDNA2 MUBUF 0x32 BUFFER_ATOMIC_ADD. GLC selects whether the old
+        // dword is returned in vdata; both forms keep vdata as the input addend.
+        // The first production attempt was rejected on retail performance, not
+        // semantics. The lowering is enabled again only with a general compute
+        // resource-path fix and must pass the same eight-title gate.
         0x32 => {
-            if glc == 1 {
-                return Err(feature(S, "buffer_atomic_add return-data (glc == 1)", pc));
-            }
-            return Err(ni(dst, S, "buffer_atomic_add", opcode, pc, b0));
+            inst.type_ = if glc == 1 {
+                T::BufferAtomicAddReturn
+            } else {
+                T::BufferAtomicAdd
+            };
+            inst.format = format1;
+            inst.src[0].size = src0_size;
+            inst.src[1].size = 4;
         }
         // The original Kyty decoder masked this field to five bits even
         // though its own table continues with atomics and D16 operations.
@@ -6190,25 +6193,33 @@ mod tests {
     }
 
     #[test]
-    fn retail_buffer_atomic_add_uses_full_opcode_in_precise_refusal() {
+    fn retail_buffer_atomic_add_decodes_glc_and_addressing_exactly() {
         // Exact first-failure words captured from both Avatar and Subnautica.
         // MUBUF uses a seven-bit opcode: bits [24:18] are 0x32 here. The old
         // five-bit mask truncated that to 0x12 and emitted a false unknown-op
         // report, which made corpus clustering point at the wrong operation.
-        let (_, result) = parse(
+        let (plain, result) = parse(
             &[0xE0C8_2000, 0x8002_0005, S_ENDPGM],
             ShaderType::Compute,
             true,
         );
+        result.expect("decode buffer_atomic_add without return data");
+        let inst = &plain.get_instructions()[0];
+        assert_eq!(inst.type_, T::BufferAtomicAdd);
+        assert_eq!(inst.format, F::Vdata1VaddrSvSoffsIdxen);
+        assert_eq!((inst.dst.type_, inst.dst.register_id), (O::Vgpr, 0));
+        assert_eq!((inst.src[0].type_, inst.src[0].register_id), (O::Vgpr, 5));
+        assert_eq!((inst.src[1].type_, inst.src[1].register_id), (O::Sgpr, 8));
+
+        let (returned, result) = parse(
+            &[0xE0C8_6000, 0x8002_0005, S_ENDPGM],
+            ShaderType::Compute,
+            true,
+        );
+        result.expect("decode buffer_atomic_add with GLC return data");
         assert_eq!(
-            result,
-            Err(ShaderParseError::NotImplemented {
-                family: "mubuf",
-                instruction: "buffer_atomic_add",
-                opcode: 0x32,
-                pc: 0,
-                raw: 0xE0C8_2000,
-            })
+            returned.get_instructions()[0].type_,
+            T::BufferAtomicAddReturn
         );
     }
 

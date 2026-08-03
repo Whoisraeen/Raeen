@@ -824,6 +824,133 @@ fn buffer_store_dwordxn(
     Ok(true)
 }
 
+/// RDNA2 MUBUF `buffer_atomic_add` (opcode 0x32).
+///
+/// Storage buffers are otherwise declared as float dwords for the Kyty helper
+/// ABI. The atomic path uses an explicitly aliased uint view of the same Vulkan
+/// descriptor binding so `OpAtomicIAdd` is integer-exact without converting
+/// payload bits. GLC is represented by the instruction type: the return form
+/// writes the pre-add uint bits back to vdata; the plain form discards them.
+fn recompile_buffer_atomic_add(
+    index: u32,
+    code: &ShaderCode,
+    dst_source: &mut String,
+    spirv: &Spirv<'_>,
+    _param: &Params,
+    _scc_check: SccCheck,
+) -> Result<bool, ShaderRecompileError> {
+    const FUNC: &str = "Recompile_BufferAtomicAdd_Vdata1VaddrSvSoffs";
+    let inst = inst_at(code, index, FUNC)?;
+    let returns_old = inst.type_ == ShaderInstructionType::BufferAtomicAddReturn;
+    let Some(bind_info) = spirv.get_bind_info() else {
+        return Ok(false);
+    };
+    if bind_info.storage_buffers.buffers_num == 0 {
+        if returns_old {
+            let vdata = operand_variable_to_str(inst.dst);
+            if vdata.type_ != SpirvType::Float {
+                return Err(not_supported(FUNC, "unexpected vdata type"));
+            }
+            *dst_source += &format!("               OpStore %{} %float_0_000000\n", vdata.value);
+        }
+        return Ok(true);
+    }
+    if !operand_is_constant(inst.src[2]) {
+        return Err(not_supported(FUNC, "src2 is not a constant"));
+    }
+
+    let vdata = operand_variable_to_str(inst.dst);
+    let srsrc0 = operand_variable_to_str_shift(inst.src[1], 0);
+    let srsrc1 = operand_variable_to_str_shift(inst.src[1], 1);
+    if vdata.type_ != SpirvType::Float
+        || srsrc0.type_ != SpirvType::Uint
+        || srsrc1.type_ != SpirvType::Uint
+    {
+        return Err(not_supported(FUNC, "unexpected operand types"));
+    }
+
+    let idxen = matches!(
+        inst.format,
+        Format::Vdata1VaddrSvSoffsIdxen | Format::Vdata1Vaddr2SvSoffsOffenIdxen
+    );
+    let offen = matches!(
+        inst.format,
+        Format::Vdata1VaddrSvSoffsOffen | Format::Vdata1Vaddr2SvSoffsOffenIdxen
+    );
+    let vindex = idxen.then(|| operand_variable_to_str(inst.src[0]));
+    let voffset = offen.then(|| operand_variable_to_str_shift(inst.src[0], i32::from(idxen)));
+    if vindex
+        .as_ref()
+        .is_some_and(|value| value.type_ != SpirvType::Float)
+        || voffset
+            .as_ref()
+            .is_some_and(|value| value.type_ != SpirvType::Float)
+    {
+        return Err(not_supported(FUNC, "unexpected address-register type"));
+    }
+
+    let i = index;
+    let offset = spirv.get_constant(inst.src[2]);
+    let mut text = format!(
+        "        %bat_exec_{i} = OpLoad %uint %exec_lo\n\
+                %bat_active_{i} = OpINotEqual %bool %bat_exec_{i} %uint_0\n\
+                OpSelectionMerge %bat_end_{i} None\n\
+                OpBranchConditional %bat_active_{i} %bat_body_{i} %bat_end_{i}\n\
+         %bat_body_{i} = OpLabel\n\
+                %bat_sr0_{i} = OpLoad %uint %{srsrc0}\n\
+                %bat_bi_{i} = OpBitcast %int %bat_sr0_{i}\n\
+                %bat_sr1_{i} = OpLoad %uint %{srsrc1}\n\
+                %bat_sh_{i} = OpShiftRightLogical %uint %bat_sr1_{i} %int_16\n\
+                %bat_sm_{i} = OpBitwiseAnd %uint %bat_sh_{i} %uint_0x00003fff\n\
+                %bat_stride_{i} = OpBitcast %int %bat_sm_{i}\n",
+        srsrc0 = srsrc0.value,
+        srsrc1 = srsrc1.value,
+    );
+    let index_id = if let Some(value) = vindex {
+        text += &format!(
+            "        %bat_vi_f_{i} = OpLoad %float %{value}\n\
+                    %bat_vi_{i} = OpBitcast %int %bat_vi_f_{i}\n",
+            value = value.value,
+        );
+        format!("%bat_vi_{i}")
+    } else {
+        "%int_0".to_owned()
+    };
+    text += &format!(
+        "        %bat_mul_{i} = OpIMul %int {index_id} %bat_stride_{i}\n\
+                %bat_baseoff_{i} = OpIAdd %int %{offset} %bat_mul_{i}\n",
+    );
+    let byte_address = if let Some(value) = voffset {
+        text += &format!(
+            "        %bat_vo_f_{i} = OpLoad %float %{value}\n\
+                    %bat_vo_{i} = OpBitcast %int %bat_vo_f_{i}\n\
+                    %bat_addr_{i} = OpIAdd %int %bat_baseoff_{i} %bat_vo_{i}\n",
+            value = value.value,
+        );
+        format!("%bat_addr_{i}")
+    } else {
+        format!("%bat_baseoff_{i}")
+    };
+    text += &format!(
+        "        %bat_dw_{i} = OpSDiv %int {byte_address} %int_4\n\
+                %bat_data_f_{i} = OpLoad %float %{vdata}\n\
+                %bat_data_{i} = OpBitcast %uint %bat_data_f_{i}\n\
+                %bat_ptr_{i} = OpAccessChain %_ptr_StorageBuffer_uint %buf_atomic %bat_bi_{i} %int_0 %bat_dw_{i}\n\
+                %bat_old_{i} = OpAtomicIAdd %uint %bat_ptr_{i} %uint_1 %uint_0 %bat_data_{i}\n",
+        vdata = vdata.value,
+    );
+    if returns_old {
+        text += &format!(
+            "        %bat_old_f_{i} = OpBitcast %float %bat_old_{i}\n\
+                    OpStore %{vdata} %bat_old_f_{i}\n",
+            vdata = vdata.value,
+        );
+    }
+    text += &format!("               OpBranch %bat_end_{i}\n        %bat_end_{i} = OpLabel\n");
+    *dst_source += &text;
+    Ok(true)
+}
+
 /// One typed-buffer SPIR-V helper, described by the set of element formats it
 /// actually implements.
 ///
@@ -2431,12 +2558,43 @@ fn sload_dword_global(
     if src_lo.type_ != SpirvType::Uint || src_hi.type_ != SpirvType::Uint {
         return Err(not_supported(func, "unexpected global s_load base type"));
     }
-    let byte_offset = inst.src[1].constant.u;
-    if byte_offset % 4 != 0 {
-        return Err(not_supported(func, "unaligned global s_load offset"));
-    }
-
     let tag = format!("{index}");
+    let immediate = crate::shader::types::smem_immediate_offset_bytes(inst)
+        .ok_or_else(|| not_supported(func, "invalid global s_load immediate offset"))?;
+    let mut offset_source = String::new();
+    let offset_id = if let Some(soffset) = crate::shader::types::smem_register_soffset(inst) {
+        let soffset_id = format!("sload_soffset_{tag}");
+        if !operand_load_uint(spirv, soffset, &soffset_id, &tag, &mut offset_source, -1)? {
+            return Err(not_supported(
+                func,
+                format!(
+                    "runtime soffset {:?} has no uint load form at pc={:#x}",
+                    soffset.type_, inst.pc
+                ),
+            ));
+        }
+        *dst_source += &format!("        {offset_source}\n");
+        let unaligned = if immediate == 0 {
+            soffset_id
+        } else {
+            let immediate_id = spirv.get_constant_uint(immediate);
+            *dst_source += &format!(
+                "        %sload_offset_sum_{tag} = OpIAdd %uint %sload_soffset_{tag} %{immediate_id}\n"
+            );
+            format!("sload_offset_sum_{tag}")
+        };
+        *dst_source += &format!(
+            "        %sload_offset_dw_{tag} = OpShiftRightLogical %uint %{unaligned} %uint_2\n\
+             %sload_offset_{tag} = OpShiftLeftLogical %uint %sload_offset_dw_{tag} %uint_2\n"
+        );
+        format!("sload_offset_{tag}")
+    } else {
+        if immediate & 3 != 0 {
+            return Err(not_supported(func, "unaligned global s_load offset"));
+        }
+        spirv.get_constant_uint(immediate)
+    };
+
     *dst_source += &format!(
         "        %sload_bp_lo_{tag} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_0
         %sload_bp_hi_{tag} = OpAccessChain %_ptr_StorageBuffer_uint %global_mem %int_0 %uint_1
@@ -2451,15 +2609,24 @@ fn sload_dword_global(
         src_hi = src_hi.value,
     );
 
+    let mut previous_component_offset = offset_id;
     for i in 0..n {
         let dst = operand_variable_to_str_shift(inst.dst, i);
         if dst.type_ != SpirvType::Uint {
             return Err(not_supported(func, "unexpected global s_load dst type"));
         }
-        let offset = byte_offset.wrapping_add(u32::try_from(i).unwrap_or(0).wrapping_mul(4));
-        let offset_id = spirv.get_constant_uint(offset);
+        let component_offset_id = if i == 0 {
+            previous_component_offset.clone()
+        } else {
+            let component_id = format!("sload_component_offset_{tag}_{i}");
+            *dst_source += &format!(
+                "        %{component_id} = OpIAdd %uint %{previous_component_offset} %uint_4\n"
+            );
+            previous_component_offset.clone_from(&component_id);
+            component_id
+        };
         *dst_source += &format!(
-            "        %sload_addr_lo_{tag}_{i} = OpIAdd %uint %sload_addr_src_lo_{tag} %{offset_id}
+            "        %sload_addr_lo_{tag}_{i} = OpIAdd %uint %sload_addr_src_lo_{tag} %{component_offset_id}
         %sload_carry_b_{tag}_{i} = OpULessThan %bool %sload_addr_lo_{tag}_{i} %sload_addr_src_lo_{tag}
         %sload_carry_{tag}_{i} = OpSelect %uint %sload_carry_b_{tag}_{i} %uint_1 %uint_0
         %sload_addr_hi_{tag}_{i} = OpIAdd %uint %sload_addr_src_hi_{tag} %sload_carry_{tag}_{i}
@@ -2520,7 +2687,7 @@ fn sload_dword_extended(
         return Ok(true);
     }
 
-    // Beyond Kyty: an unresolved **register soffset**. RDNA2 adds
+    // Beyond Kyty: a runtime **register soffset**. RDNA2 adds
     // `SGPR[soffset]` to the address, so neither the EUD dword index below nor
     // the raw-window index is knowable at translate time. Analysis
     // (`resolve_scalar_soffset_bytes`) folds the shapes it can prove into the
@@ -2529,6 +2696,26 @@ fn sload_dword_extended(
     // form still missing (measured ASTRO.BOT `rendering`, three compute
     // shaders).
     if let Some(soffset) = crate::shader::types::smem_register_soffset(inst) {
+        if bind_info.global_mem.used && bind_info.global_mem.base_sgpr == inst.src[0].register_id {
+            return sload_dword_global(index, inst, dst_source, spirv, n, func);
+        }
+        if bind_info.global_mem.used {
+            return Err(not_supported(
+                func,
+                format!(
+                    "runtime register soffset cannot alias an unrelated global window: \
+                     global window base=s{}, load base=s{}, soffset={}, imm={:#x}, pc={:#x}",
+                    bind_info.global_mem.base_sgpr,
+                    inst.src[0].register_id,
+                    match soffset.type_ {
+                        ShaderOperandType::Sgpr => format!("s{}", soffset.register_id),
+                        other => format!("{other:?}"),
+                    },
+                    crate::shader::types::smem_offset_operand(inst).constant.u,
+                    inst.pc,
+                ),
+            ));
+        }
         return Err(not_supported(
             func,
             format!(
@@ -13619,6 +13806,16 @@ static G_RECOMP_FUNC: &[RecompilerFunc] = &[
     f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3Vaddr2SvSoffsOffenIdxen, p1("")),
     f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3SvSoffs,                 p1("")),
     f(recompile_buffer_store_dwordx3, T::BufferStoreDwordX3, F::Vdata3VaddrSvSoffsOffen,       p1("")),
+    // RDNA2 MUBUF 0x32: integer atomic add through the V# descriptor. GLC is
+    // represented by the instruction type so return-data cannot be forgotten.
+    f(recompile_buffer_atomic_add, T::BufferAtomicAdd,       F::Vdata1VaddrSvSoffsIdxen,       p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAdd,       F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAdd,       F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAdd,       F::Vdata1VaddrSvSoffsOffen,       p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAddReturn, F::Vdata1VaddrSvSoffsIdxen,       p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAddReturn, F::Vdata1Vaddr2SvSoffsOffenIdxen, p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAddReturn, F::Vdata1SvSoffs,                 p1("")),
+    f(recompile_buffer_atomic_add, T::BufferAtomicAddReturn, F::Vdata1VaddrSvSoffsOffen,       p1("")),
 
     f(recompile_fetch, T::FetchX,    F::Vdata1VaddrSvSoffsIdxen, p1("")),
     f(recompile_fetch, T::FetchXy,   F::Vdata2VaddrSvSoffsIdxen, p1("")),
@@ -14681,8 +14878,9 @@ mod tests {
             .count();
         assert_eq!(
             table.len(),
-            463,
-            "the three beyond-Kyty s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
+            471,
+            "the eight BufferAtomicAdd address/GLC rows, and the three beyond-Kyty \
+             s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30; \
              0x30 is ASTRO.BOT's measured `unknown sop2 opcode`), \
              the eight beyond-Kyty VOP3P rows (SharpEmu PRs #466/#460/#420: \
              VPkFma/Add/Mul/Min/MaxF16 + VFmaMixF32/loF16/hiF16), \
@@ -14727,8 +14925,9 @@ mod tests {
         );
         assert_eq!(implemented + ni, table.len());
         assert_eq!(
-            implemented, 463,
-            "the three s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
+            implemented, 471,
+            "the eight BufferAtomicAdd address/GLC rows, and the three \
+             s_lshl1/2/3_add_u32 rows (SOP2 0x2e/0x2f/0x30), \
              the eight VOP3P rows (SharpEmu PRs #466/#460/#420), \
              the seven FLAT-class rows (SharpEmu PR #587), and the \
              C1 implemented subset plus title-driven ports (incl. DsWrxchgRtnB32, \
@@ -22910,6 +23109,48 @@ mod tests {
     }
 
     #[test]
+    fn retail_buffer_atomic_add_is_exec_guarded_and_return_data_is_exact() {
+        for (word0, expected, returns_old) in [
+            (0xE0C8_2000, T::BufferAtomicAdd, false),
+            (0xE0C8_6000, T::BufferAtomicAddReturn, true),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            shader_parse(
+                0,
+                &[word0, 0x8002_0005, 0xBF80_0000, S_ENDPGM],
+                &mut code,
+                true,
+            )
+            .expect("parse buffer_atomic_add");
+            assert_eq!(code.get_instructions()[0].type_, expected);
+
+            let mut input_info = ShaderComputeInputInfo::default();
+            input_info.threads_num = [1, 1, 1];
+            input_info.bind.push_constant_size = 64;
+            input_info.bind.storage_buffers.buffers_num = 1;
+            input_info.bind.storage_buffers.start_register[0] = 8;
+            let source = spirv_generate_source(&code, None, None, Some(&input_info))
+                .expect("recompile buffer_atomic_add");
+            assert!(
+                source.contains("OpAtomicIAdd %uint"),
+                "integer atomic add must be emitted:\n{source}"
+            );
+            assert!(
+                source.contains("OpLoad %uint %exec_lo"),
+                "inactive EXEC lanes must not mutate memory:\n{source}"
+            );
+            assert_eq!(
+                source.contains("OpStore %v0 %bat_old_f_0"),
+                returns_old,
+                "GLC alone controls whether the old value replaces vdata:\n{source}"
+            );
+            let words = spirv_run(&source).expect("assemble buffer_atomic_add");
+            spirv_val_ok(&words, "buffer_atomic_add");
+        }
+    }
+
+    #[test]
     fn astro_image_gather4_lz_gathers_four_texels() {
         // image_gather4_lz v[2:5], v[6:8], s[0:7], s[8:11] dmask:1 (raw
         // 0xf11c0108, measured on ASTRO.BOT scene compute). Four texels of
@@ -24621,6 +24862,222 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A runtime SMEM soffset is supportable only when the bounded global
+    /// memory window is rooted at the instruction's exact SBASE pair. Exercise
+    /// every decoded width with VCC_LO kept live in the generated module. This
+    /// is the corpus-ranked Avatar form; a compile-time snapshot cannot fold
+    /// it because VCC is produced by the shader.
+    #[test]
+    fn runtime_soffset_uses_the_matching_global_window_for_every_sload_width() {
+        for (type_, format, width) in [
+            (T::SLoadDword, F::SdstSbaseSoffset, 1),
+            (T::SLoadDwordx2, F::Sdst2Ssrc02Ssrc1, 2),
+            (T::SLoadDwordx4, F::Sdst4SbaseSoffset, 4),
+            (T::SLoadDwordx8, F::Sdst8SbaseSoffset, 8),
+            (T::SLoadDwordx16, F::Sdst16SbaseSoffset, 16),
+        ] {
+            let mut code = ShaderCode::new();
+            code.set_type(ShaderType::Compute);
+            for pc in [0x20, 0x28] {
+                code.get_instructions_mut().push(ShaderInstruction {
+                    pc,
+                    type_,
+                    format,
+                    src_num: 2,
+                    dst: ShaderOperand {
+                        type_: ShaderOperandType::Sgpr,
+                        register_id: 32,
+                        size: width,
+                        ..Default::default()
+                    },
+                    src: [
+                        ShaderOperand {
+                            type_: ShaderOperandType::Sgpr,
+                            register_id: 4,
+                            size: 2,
+                            ..Default::default()
+                        },
+                        ShaderOperand {
+                            type_: ShaderOperandType::VccLo,
+                            size: 1,
+                            ..Default::default()
+                        },
+                        ShaderOperand::default(),
+                        ShaderOperand::default(),
+                    ],
+                    ..Default::default()
+                });
+            }
+            code.get_instructions_mut().push(ShaderInstruction {
+                type_: T::SEndpgm,
+                format: F::Empty,
+                ..Default::default()
+            });
+
+            let mut input = ShaderComputeInputInfo::default();
+            input.threads_num = [1, 1, 1];
+            input.bind.global_mem.used = true;
+            input.bind.global_mem.binding_index = 0;
+            input.bind.global_mem.base_sgpr = 4;
+
+            let source = spirv_generate_source(&code, None, None, Some(&input))
+                .unwrap_or_else(|error| panic!("x{width} runtime soffset must lower: {error}"));
+            assert!(
+                source.contains("OpLoad %uint %vcc_lo"),
+                "x{width} must consume the live soffset:\n{source}"
+            );
+            assert!(
+                source.contains("OpShiftRightLogical %uint")
+                    && source.contains("OpShiftLeftLogical %uint")
+                    && source.contains("%global_mem"),
+                "x{width} must align and bounds-check through the matching window:\n{source}"
+            );
+            let words = spirv_run(&source).unwrap_or_else(|error| {
+                panic!("assemble runtime-soffset x{width}: {error}\n{source}")
+            });
+            spirv_val_ok(&words, &format!("runtime_soffset_sload_x{width}"));
+        }
+    }
+
+    /// A global window rooted at some other live-in pointer cannot service an
+    /// unrelated scalar base merely because both happen to exist in one
+    /// shader. The old rejected retail candidate made exactly that aliasing
+    /// mistake and could turn a real read into a silent zero.
+    #[test]
+    fn runtime_soffset_refuses_a_mismatched_global_window_base() {
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        code.get_instructions_mut().push(ShaderInstruction {
+            pc: 0x20,
+            type_: T::SLoadDwordx4,
+            format: F::Sdst4SbaseSoffset,
+            src_num: 2,
+            dst: ShaderOperand {
+                type_: ShaderOperandType::Sgpr,
+                register_id: 32,
+                size: 4,
+                ..Default::default()
+            },
+            src: [
+                ShaderOperand {
+                    type_: ShaderOperandType::Sgpr,
+                    register_id: 4,
+                    size: 2,
+                    ..Default::default()
+                },
+                ShaderOperand {
+                    type_: ShaderOperandType::VccLo,
+                    size: 1,
+                    ..Default::default()
+                },
+                ShaderOperand::default(),
+                ShaderOperand::default(),
+            ],
+            ..Default::default()
+        });
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut input = ShaderComputeInputInfo::default();
+        input.threads_num = [1, 1, 1];
+        input.bind.global_mem.used = true;
+        input.bind.global_mem.binding_index = 0;
+        input.bind.global_mem.base_sgpr = 8;
+
+        let error = spirv_generate_source(&code, None, None, Some(&input))
+            .expect_err("an unrelated global-memory window must not satisfy s4:s5");
+        let text = error.to_string();
+        assert!(
+            text.contains("global window base=s8") && text.contains("load base=s4"),
+            "the refusal must identify both non-aliasing bases: {text}"
+        );
+    }
+
+    /// SDATA is a scalar destination encoding, not an SGPR-only encoding. A
+    /// one-dword scalar load may legally write VCC_LO; when its live-in pointer
+    /// and memory are captured at dispatch time the exact dword should be
+    /// materialized instead of being skipped by the analysis pass.
+    #[test]
+    fn captured_single_dword_sload_materializes_a_vcc_destination() {
+        use std::borrow::Cow;
+
+        struct Mem(u64, u32);
+        impl crate::shader::analysis::ShaderMemory for Mem {
+            fn dwords_at(&self, address: u64) -> Option<Cow<'_, [u32]>> {
+                (address == self.0).then(|| Cow::Owned(vec![self.1]))
+            }
+        }
+
+        let mut code = ShaderCode::new();
+        code.set_type(ShaderType::Compute);
+        for pc in [0x20, 0x28] {
+            code.get_instructions_mut().push(ShaderInstruction {
+                pc,
+                type_: T::SLoadDword,
+                format: F::SdstSbaseSoffset,
+                src_num: 2,
+                dst: ShaderOperand {
+                    type_: ShaderOperandType::VccLo,
+                    size: 1,
+                    ..Default::default()
+                },
+                src: [
+                    ShaderOperand {
+                        type_: ShaderOperandType::Sgpr,
+                        register_id: 2,
+                        size: 2,
+                        ..Default::default()
+                    },
+                    ShaderOperand {
+                        type_: ShaderOperandType::IntegerInlineConstant,
+                        constant: crate::shader::types::ShaderConstant::from_u(8),
+                        ..Default::default()
+                    },
+                    ShaderOperand::default(),
+                    ShaderOperand::default(),
+                ],
+                ..Default::default()
+            });
+        }
+        code.get_instructions_mut().push(ShaderInstruction {
+            type_: T::SEndpgm,
+            format: F::Empty,
+            ..Default::default()
+        });
+
+        let mut user = crate::shader::hw_regs::UserSgprInfo::default();
+        user.set(
+            2,
+            0x0080_0000,
+            crate::shader::hw_regs::UserSgprType::Unknown,
+        );
+        user.set(3, 0, crate::shader::hw_regs::UserSgprType::Unknown);
+        let value = 0xa5a5_5a5a;
+        let memory = Mem(0x0080_0008, value);
+        let mut input = ShaderComputeInputInfo::default();
+        input.threads_num = [1, 1, 1];
+        crate::shader::analysis::shader_capture_runtime_scalar_loads(
+            &code,
+            &memory,
+            &user,
+            &mut input.bind,
+        );
+        assert!(
+            input.bind.embedded_constant_loads.find(0x20).is_some(),
+            "analysis must capture a legal VCC scalar destination"
+        );
+
+        let source = spirv_generate_source(&code, None, None, Some(&input))
+            .expect("captured VCC destination must recompile");
+        assert!(source.contains("OpStore %vcc_lo"), "{source}");
+        assert!(source.contains("%uint_0xa5a55a5a"), "{source}");
+        let words = spirv_run(&source).expect("assemble captured VCC scalar load");
+        spirv_val_ok(&words, "captured_sload_vcc_destination");
     }
 
     /// `s_load_dword` (x1) used to be an embedded-fetch-only gate: every other

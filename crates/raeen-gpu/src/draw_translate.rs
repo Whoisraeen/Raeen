@@ -2240,6 +2240,9 @@ fn texture_cache_probe(
     if crate::diagnostics::gpu_env().no_tex_cache {
         return (0, None);
     }
+    if sampling_scope(|scope| Some(scope.writable_bases.contains(&base))).unwrap_or(false) {
+        return (0, None);
+    }
     let timing = crate::vulkan::offscreen::draw_stage_timing_enabled();
     let hash_timer = crate::vulkan::offscreen::StageTimer::start(
         &crate::vulkan::offscreen::DRAW_STAGE_TEX_HASH_NS,
@@ -3530,6 +3533,12 @@ struct SamplingScope {
     map: *const HashMap<u64, Arc<RenderedImage>>,
     live: Vec<(u64, u32, u32, i32)>,
     self_base: u64,
+    /// Guest image bases written by this same dispatch. A read/write alias
+    /// cannot borrow a persistent colour target or cached sampled image: the
+    /// compute backend currently represents its UAV as a separate image, so
+    /// direct reuse would silently split one guest resource into two Vulkan
+    /// authorities. Such T#s take the explicit guest-memory snapshot path.
+    writable_bases: Vec<u64>,
     resolution_scale: f32,
     vs_addr: u64,
     ps_addr: u64,
@@ -3679,7 +3688,7 @@ fn sampled_render_target(
     let base = t.base40();
     let format = texture_vk_format(t).ok()?.0;
     sampling_scope(|scope| {
-        if base == scope.self_base {
+        if base == scope.self_base || scope.writable_bases.contains(&base) {
             // Feedback loop: the CPU-pixels fallback handles it.
             return None;
         }
@@ -5789,6 +5798,7 @@ impl OffscreenDrawSink<'_> {
             map: std::ptr::from_ref(self.framebuffers),
             live,
             self_base: rt_base,
+            writable_bases: Vec::new(),
             resolution_scale: crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale,
             vs_addr,
             ps_addr,
@@ -6557,15 +6567,63 @@ impl DrawSink for OffscreenDrawSink<'_> {
             || bind.direct_sgprs.sgprs_num != 0
             || bind.extended.used
             || bind.global_mem.used;
-        let prepared = has_binding
-            .then(|| {
+        let prepared = if has_binding {
+            // Compute shaders sample the same persistent colour targets and
+            // cached textures as graphics shaders. Publish the identical
+            // decode census so a read-only T# can keep its pixels on the GPU
+            // instead of reading/detiling/uploading them through the CPU.
+            // Unlike a graphics draw, compute has no colour attachment of its
+            // own; only same-dispatch UAV aliases are excluded.
+            let (live, cached_textures) = {
+                let caches = self.dev.draw_caches();
+                (
+                    caches
+                        .live_target_keys()
+                        .into_iter()
+                        .map(|k| (k.base, k.width, k.height, k.format))
+                        .collect(),
+                    caches.cached_texture_hashes(),
+                )
+            };
+            let texture_num = usize::try_from(bind.textures2d.textures_num)
+                .unwrap_or(0)
+                .min(bind.textures2d.desc.len());
+            let writable_bases = bind.textures2d.desc[..texture_num]
+                .iter()
+                .filter(|desc| desc.usage == ShaderTextureUsage::ReadWrite)
+                .map(|desc| desc.texture.base40())
+                .filter(|&base| base != 0)
+                .collect();
+            let scope = SamplingScope {
+                map: std::ptr::from_ref(self.framebuffers),
+                live,
+                self_base: u64::MAX,
+                writable_bases,
+                resolution_scale: crate::agc_exec::AgcGpuSession::runtime_config().resolution_scale,
+                vs_addr: 0,
+                ps_addr: 0,
+                primitive: 0,
+                vertex_count: 0,
+                indexed: false,
+                first_attribute: None,
+                first_stride: None,
+                index_type: None,
+                vertex_head: Vec::new(),
+                index_head: Vec::new(),
+                cached_textures,
+                sample_hash_memo: std::ptr::from_ref(&self.texture_sample_hashes),
+                texture_hash_auditor: std::ptr::from_ref(self.texture_hash_auditor),
+            };
+            Some(with_sampling_scope(&scope, || {
                 prepare_compute_stage_binding(
                     bind,
                     &mut self.compute_storage_snapshots,
                     &mut self.compute_image_snapshots,
                 )
-            })
-            .transpose()?;
+            })?)
+        } else {
+            None
+        };
         let trace_general_binding =
             crate::diagnostics::gpu_env().trace_draws && bind.textures2d.textures_num != 0;
         if trace_general_binding || trace_compute {

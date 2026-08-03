@@ -799,9 +799,19 @@ pub fn shader_capture_runtime_scalar_loads_shifted(
         let Some(immediate_bytes) = crate::shader::types::smem_immediate_offset_bytes(load) else {
             continue;
         };
+        let supported_destination = load.dst.type_ == ShaderOperandType::Sgpr
+            || (dwords == 1
+                && matches!(
+                    load.dst.type_,
+                    ShaderOperandType::VccLo
+                        | ShaderOperandType::VccHi
+                        | ShaderOperandType::ExecLo
+                        | ShaderOperandType::ExecHi
+                        | ShaderOperandType::M0
+                ));
         if load.src[0].type_ != ShaderOperandType::Sgpr
             || load.src[0].size != 2
-            || load.dst.type_ != ShaderOperandType::Sgpr
+            || !supported_destination
         {
             continue;
         }
@@ -996,6 +1006,8 @@ fn buffer_resource_operand(inst: &ShaderInstruction) -> Option<(i32, bool)> {
         | T::BufferStoreDwordX2
         | T::BufferStoreDwordX3
         | T::BufferStoreDwordX4
+        | T::BufferAtomicAdd
+        | T::BufferAtomicAddReturn
         | T::BufferStoreFormatX
         | T::BufferStoreFormatXy
         | T::BufferStoreFormatXyz
@@ -3390,6 +3402,8 @@ pub fn shader_capture_eud_storage_buffers(
             | T::BufferStoreDwordX2
             | T::BufferStoreDwordX3
             | T::BufferStoreDwordX4
+            | T::BufferAtomicAdd
+            | T::BufferAtomicAddReturn
             | T::BufferStoreFormatX
             | T::BufferStoreFormatXy
             | T::BufferStoreFormatXyz
@@ -5528,6 +5542,8 @@ pub fn shader_refine_compute_storage_usage(code: &ShaderCode, bind: &mut ShaderB
                 | T::BufferStoreDwordX2
                 | T::BufferStoreDwordX3
                 | T::BufferStoreDwordX4
+                | T::BufferAtomicAdd
+                | T::BufferAtomicAddReturn
                 | T::BufferStoreFormatX
                 | T::BufferStoreFormatXy
                 | T::BufferStoreFormatXyz
