@@ -1747,6 +1747,28 @@ fn defer_gpu_side_effects() -> bool {
     raeen_gpu::ordered_side_effects::defer_gpu_side_effects()
 }
 
+/// `RAEEN_STRICT_SIDE_EFFECT_FAULTS` (default OFF): restore the historical
+/// fail-closed policy for eager side-effect faults — the first faulting
+/// WRITE_DATA/RELEASE_MEM/DMA target fails the whole submission with
+/// INVALID_ARGUMENT and nothing reaches the GPU. Default is SharpEmu's
+/// fail-open model: a faulting side effect is skipped with a rate-limited
+/// diagnostic, the remaining effects still apply, and the buffer still
+/// reaches the GPU — one bad label address must not kill a frame. Read per
+/// call (like the `RAEEN_TRACE_*` gates) so tests can flip it per case.
+fn strict_side_effect_faults() -> bool {
+    std::env::var_os("RAEEN_STRICT_SIDE_EFFECT_FAULTS").is_some()
+}
+
+/// Rate limiter for the fail-open side-effect diagnostics: log the first 16
+/// faults, then every 4096th, so a per-frame bad label can't flood the log.
+/// Returns `true` when this fault should be logged.
+fn side_effect_fault_should_log() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let n = FAULTS.fetch_add(1, Ordering::Relaxed);
+    n < 16 || n % 4096 == 0
+}
+
 /// Signal every registered equeue event keyed by `event_id` — the eager and
 /// the ordered (worker-drain) delivery paths share this one implementation,
 /// so flipping `RAEEN_DEFER_GPU_SIDE_EFFECTS` changes WHEN an event fires,
@@ -1895,16 +1917,21 @@ fn submit_command_buffer(
     // copy keeps guest-CPU label polling alive (regression rules 1-2) — and
     // `RAEEN_DEFER_GPU_SIDE_EFFECTS` selects the worker-only behavior.
     let defer = defer_gpu_side_effects();
+    let strict = strict_side_effect_faults();
     if !defer {
         for write in &decoded.memory_writes {
             if !ctx.mem.write(write.address, &write.data) {
-                tracing::warn!(
-                    address = write.address,
-                    bytes = write.data.len(),
-                    packet_offset = write.packet_offset,
-                    "AGC synchronization write targeted unreadable guest memory"
-                );
-                return SCE_ERROR_INVALID_ARGUMENT;
+                if side_effect_fault_should_log() {
+                    tracing::warn!(
+                        address = write.address,
+                        bytes = write.data.len(),
+                        packet_offset = write.packet_offset,
+                        "AGC synchronization write targeted unreadable guest memory"
+                    );
+                }
+                if strict {
+                    return SCE_ERROR_INVALID_ARGUMENT;
+                }
             }
         }
         // RELEASE_MEM `data_selection` 3 fences: hardware writes the GPU core
@@ -1914,12 +1941,16 @@ fn submit_command_buffer(
         for ts in &decoded.timestamp_writes {
             let value = next_gpu_timestamp(ctx);
             if !ctx.mem.write(ts.address, &value.to_le_bytes()) {
-                tracing::warn!(
-                    address = ts.address,
-                    packet_offset = ts.packet_offset,
-                    "AGC timestamp fence targeted unreadable guest memory"
-                );
-                return SCE_ERROR_INVALID_ARGUMENT;
+                if side_effect_fault_should_log() {
+                    tracing::warn!(
+                        address = ts.address,
+                        packet_offset = ts.packet_offset,
+                        "AGC timestamp fence targeted unreadable guest memory"
+                    );
+                }
+                if strict {
+                    return SCE_ERROR_INVALID_ARGUMENT;
+                }
             }
         }
     }
@@ -1934,24 +1965,33 @@ fn submit_command_buffer(
         for copy in &decoded.memory_copies {
             let mut bytes = vec![0u8; copy.num_bytes as usize];
             if !ctx.mem.read(copy.src, &mut bytes) {
-                tracing::warn!(
-                    src = copy.src,
-                    dst = copy.dst,
-                    bytes = copy.num_bytes,
-                    packet_offset = copy.packet_offset,
-                    "AGC DMA copy read from unreadable guest memory"
-                );
-                return SCE_ERROR_INVALID_ARGUMENT;
+                if side_effect_fault_should_log() {
+                    tracing::warn!(
+                        src = copy.src,
+                        dst = copy.dst,
+                        bytes = copy.num_bytes,
+                        packet_offset = copy.packet_offset,
+                        "AGC DMA copy read from unreadable guest memory"
+                    );
+                }
+                if strict {
+                    return SCE_ERROR_INVALID_ARGUMENT;
+                }
+                continue;
             }
             if !ctx.mem.write(copy.dst, &bytes) {
-                tracing::warn!(
-                    src = copy.src,
-                    dst = copy.dst,
-                    bytes = copy.num_bytes,
-                    packet_offset = copy.packet_offset,
-                    "AGC DMA copy targeted unreadable guest memory"
-                );
-                return SCE_ERROR_INVALID_ARGUMENT;
+                if side_effect_fault_should_log() {
+                    tracing::warn!(
+                        src = copy.src,
+                        dst = copy.dst,
+                        bytes = copy.num_bytes,
+                        packet_offset = copy.packet_offset,
+                        "AGC DMA copy targeted unreadable guest memory"
+                    );
+                }
+                if strict {
+                    return SCE_ERROR_INVALID_ARGUMENT;
+                }
             }
         }
         for fill in &decoded.memory_fills {
@@ -1961,13 +2001,17 @@ fn submit_command_buffer(
                 bytes.extend_from_slice(&fill.value.to_le_bytes());
             }
             if !ctx.mem.write(fill.address, &bytes) {
-                tracing::warn!(
-                    address = fill.address,
-                    bytes = fill.num_bytes,
-                    packet_offset = fill.packet_offset,
-                    "AGC DMA fill targeted unreadable guest memory"
-                );
-                return SCE_ERROR_INVALID_ARGUMENT;
+                if side_effect_fault_should_log() {
+                    tracing::warn!(
+                        address = fill.address,
+                        bytes = fill.num_bytes,
+                        packet_offset = fill.packet_offset,
+                        "AGC DMA fill targeted unreadable guest memory"
+                    );
+                }
+                if strict {
+                    return SCE_ERROR_INVALID_ARGUMENT;
+                }
             }
         }
     }
