@@ -6440,8 +6440,7 @@ fn validate_graphics_interface(state: &DrawState) -> Result<(), GpuError> {
     ///   BuiltIn`, written through an `OpAccessChain`) — what the Kyty Gen5
     ///   recompiler emits; and
     /// * a **direct variable** (`OpDecorate %var BuiltIn`, written by a plain
-    ///   `OpStore`) — what `super::shaders` and `crate::shader::spirv_emitter`
-    ///   emit.
+    ///   `OpStore`) — what the synthetic `super::shaders` module emits.
     ///
     /// Handling only the block form made the shipped triangle vertex shader —
     /// which demonstrably writes `gl_Position` — read as if it did not.
@@ -6923,10 +6922,10 @@ mod tests {
     }
 
     /// `gl_PointSize` may also be a DIRECT variable decorated `BuiltIn
-    /// PointSize` rather than a `gl_PerVertex` member — the form
-    /// `crate::shader::spirv_emitter` and `super::shaders` emit. Recognizing
-    /// only the block form made this gate refuse a point-list draw whose
-    /// translated shader does write the point size.
+    /// PointSize` rather than a `gl_PerVertex` member — the form the synthetic
+    /// `super::shaders` module emits. Recognizing only the block form made this
+    /// gate refuse a point-list draw whose translated shader writes the point
+    /// size.
     #[test]
     fn point_list_gate_accepts_a_directly_decorated_point_size_store() {
         let mut vs = location_module(3, 0);

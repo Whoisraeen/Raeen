@@ -7000,3 +7000,43 @@ firmware, keys, and shader caches remain outside git.
   longer dominant. This closes the FPS/stability phase only; it is not a claim
   that Minecraft rendering is perfect or that unmeasured games are playable.
   Ordered work may now advance to Phase 3 commercial-title rendering breadth.
+
+## 2026-08-03 - Shader Phase 0: one production translator
+
+BUILD/EVIDENCE IDENTITY: release **`44460ffc9e10+dirty`**, accepted report
+`artifacts/compat/phase0-single-translator-rerun-44460ff-dirty.json`, run
+`run-1785730810491`. The
+comparison baseline was
+`artifacts/compat/phase3-baseline-4089-dirty.json` (`6e4864cca39b+dirty`).
+
+- Retired the unused `raeen-gpu/src/shader` RDNA2 -> IR -> SPIR-V prototype.
+  It had no commercial caller and could lower unknown instructions to an IR
+  no-op. The sole commercial path is now `raeen-gpu::shader_fetch` ->
+  `kyty-graphics`. Misleading synthetic-triangle documentation was corrected.
+- TDD: `production_shader_architecture` failed while the prototype existed,
+  then passed after retirement. Full `raeen-gpu` tests passed (356 unit tests,
+  3 measurement tests ignored, plus all integration tests), all 728
+  `kyty-graphics` unit tests passed, strict `raeen-gpu` all-target Clippy passed,
+  package formatting passed, and `git diff --check` passed.
+- The workspace-wide test run exposed one reproducible pre-existing failure in
+  untouched HLE code:
+  `libsce_agc::tests::submit_applies_side_effects_eagerly_by_default` returned
+  `0x80020016` instead of fail-open zero. Workspace-wide formatting also remains
+  red on pre-existing unformatted `xtask/src/main.rs` lines. Neither failure is
+  attributed to or hidden by this shader-only change.
+- The first full candidate sweep was rejected: Minecraft and GTA V remained
+  0/0 for shader/GPU errors, but Subnautica reached only 648 flips after the
+  known `module+0x12e4110` URI-parser guest fault led into a mutex deadlock. The
+  old baseline contains the identical fault site twice but continued its render
+  loop, proving runtime nondeterminism rather than a dead-translator call.
+- A second complete sweep of the same release executable passed the declared
+  gate: 8 unchanged, 0 improved, 0 regressed. GTA V produced 12,096 flips
+  (+9.0%) and Minecraft 14,857 (-5.2%, inside tolerance), both with zero shader
+  and zero GPU errors. Subnautica produced 4,805 (+2.4%); Avatar remained 512.
+  No instruction-coverage grade changed.
+- Scorecard: translator ownership is now A+. The overall shader grade remains
+  **C+ (6.3/10)** because the accepted sweep still recorded 17,053 Avatar and
+  546 Subnautica shader errors. Phase 1 corpus capture/report/replay is next.
+- Clean-room: this phase deleted original dead code and changed original Rust
+  tests/documentation only. No reference code, Sony material, firmware, keys,
+  decrypted modules, or game data was incorporated.

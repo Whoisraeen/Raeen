@@ -1,30 +1,18 @@
 //! Hand-built SPIR-V for the offscreen triangle.
 //!
-//! # Why this is hand-built, and what replaces it
+//! # Why this is hand-built
 //!
-//! Raeen's real shader path is `shader::gcn_decoder` → `shader::ir` →
-//! [`shader::spirv_emitter`](crate::shader::spirv_emitter), which translates a
-//! title's RDNA2 ISA into SPIR-V.
+//! These two minimal, purpose-built shaders prove the **Vulkan half** of the
+//! synthetic offscreen-triangle pipeline: device, pipeline, draw, and readback
+//! with a known-good input. They are not used for commercial guest shaders.
 //!
-//! That path's **I/O model is now real**: `ExportPosition` emits a `vec4`
-//! decorated `BuiltIn Position`, `ExportColor` a `vec4` at a Location, and both
-//! compose their components (padding a short export to `w = 1`). So the shape a
-//! driver requires is there — see `spirv_emitter`'s
-//! `position_export_is_a_vec4_builtin_position_not_a_location`.
+//! The one production guest-shader path is [`crate::shader_fetch`], which
+//! fetches title RDNA2/GCN bytes and routes them through the `kyty-graphics`
+//! parser, analysis, and SPIR-V recompiler. Keeping that ownership explicit is
+//! intentional: an earlier unused prototype translator under `crate::shader`
+//! silently lowered unknown operations to no-ops and was retired.
 //!
-//! What is still missing before this module can be deleted is the **body**, not
-//! the interface: `gcn_decoder` must lower enough real RDNA2 ISA that a title's
-//! actual vertex/fragment pair round-trips. Until a decoded shader is proven to
-//! draw, swapping these hand-built modules out would trade a known-good input
-//! for an unknown one and make any failure ambiguous.
-//!
-//! Rather than fake that, this module emits two minimal, purpose-built shaders
-//! directly. They exist to prove the **Vulkan half** of the pipeline — device,
-//! pipeline, draw, readback — with a known-good input, so that when the
-//! GCN→SPIR-V translation lands it plugs into a backend already verified to
-//! draw. Hooking `spirv_emitter` up here is the next step, not a done one.
-//!
-//! The modules are built with a tiny instruction writer instead of being pasted
+//! These modules are built with a tiny instruction writer instead of being pasted
 //! in as an opaque `[u32]` blob, so every opcode and id is reviewable.
 
 // ─── SPIR-V binary layout ──────────────────────────────────

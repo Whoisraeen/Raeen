@@ -38,7 +38,6 @@ mod guest_mem;
 pub mod metal;
 pub mod ordered_side_effects;
 pub mod present_plugin;
-pub mod shader;
 pub mod shader_bridge;
 pub(crate) mod shader_fetch;
 pub mod spirv_gate;
