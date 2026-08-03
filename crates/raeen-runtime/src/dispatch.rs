@@ -709,7 +709,11 @@ struct ActiveContext {
     /// Guest callbacks return here so the VEH can finish the original HLE
     /// call and resume its caller.
     callback_return_addr: u64,
-    tls_rearm_trampoline: u64,
+    /// Red-zone-safe rearm stub (`ret 0x80` twin of the plain WRFSBASE stub):
+    /// staging lands at `[rsp-144, rsp-128)`, below the SysV red zone, so
+    /// resuming an ARBITRARY interrupted instruction cannot overwrite a leaf
+    /// function's live red-zone locals.
+    tls_rearm_trampoline_redzone: u64,
     /// Top-level guest calls return through the same guarded address when no
     /// nested HLE callback frame is active.
     returned: Cell<bool>,
@@ -847,6 +851,68 @@ struct ActiveContext {
 }
 
 const DIRECT_HOST_STACK_SIZE: usize = 256 * 1024;
+
+/// The direct HLE gateway's per-run host stack: a dedicated VirtualAlloc'd
+/// region with a `PAGE_NOACCESS` guard page at its LOW end. The bridge
+/// re-bases RSP to `top` on every direct-dispatched import, and the deepest
+/// frame chains (GPU submit, the mutex-contention stack walk) grow downward —
+/// with the old heap `Box<[u8]>` an overflow wrote silently into whatever
+/// allocation the allocator had placed below it. Overrunning this region
+/// faults AT THE STORE on the guard page, which the VEH catches and
+/// classifies like any other host fault.
+struct DirectHostStack {
+    /// Allocation base == the guard page. Usable stack is `[base+4096, top)`.
+    base: u64,
+    top: u64,
+}
+
+impl DirectHostStack {
+    const GUARD: usize = 4096;
+
+    fn new() -> Result<Self, RuntimeError> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let total = DIRECT_HOST_STACK_SIZE + Self::GUARD;
+        // SAFETY: fresh anonymous reserve+commit, released exactly once in
+        // `Drop`. No address is published until the call succeeds.
+        let raw = unsafe {
+            VirtualAlloc(
+                core::ptr::null(),
+                total,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if raw.is_null() {
+            return Err(RuntimeError::MapFailed);
+        }
+        let mut old = 0u32;
+        // SAFETY: the first page of the region committed just above.
+        let armed = unsafe { VirtualProtect(raw, Self::GUARD, PAGE_NOACCESS, &mut old) } != 0;
+        if !armed {
+            // SAFETY: `raw` is the live allocation base from the call above.
+            unsafe { VirtualFree(raw, 0, MEM_RELEASE) };
+            return Err(RuntimeError::MapFailed);
+        }
+        let base = raw as u64;
+        Ok(Self {
+            base,
+            top: base + total as u64,
+        })
+    }
+}
+
+impl Drop for DirectHostStack {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: `base` is the exact allocation base `new` obtained, and the
+        // bridge only uses the stack inside guarded guest calls that end
+        // before this run frame unwinds.
+        unsafe { VirtualFree(self.base as *mut core::ffi::c_void, 0, MEM_RELEASE) };
+    }
+}
 
 #[repr(C)]
 struct DirectThreadState {
@@ -1139,7 +1205,15 @@ fn resume_guest_with_tls(
         return;
     }
 
-    let Some(staged_rsp) = target_rsp.checked_sub(16) else {
+    // Stage BELOW the SysV red zone (`[rsp-128, rsp)`), not at `[rsp-16, rsp)`:
+    // several callers resume an ARBITRARY interrupted instruction (preempted
+    // `fs:` access, watchpoint step, CPUID/syscall traps), where a leaf
+    // function's live locals may occupy the red zone — including the
+    // `fs:0x28` stack canary a function is about to re-check. The red-zone
+    // stub's `ret 0x80` discards the 128-byte gap so RSP still lands exactly
+    // on `target_rsp`. Call-boundary resumes tolerate the lower staging
+    // trivially (everything below RSP is dead there).
+    let Some(staged_rsp) = target_rsp.checked_sub(144) else {
         return;
     };
     if mem.write(staged_rsp, &context.R11.to_le_bytes())
@@ -1147,7 +1221,7 @@ fn resume_guest_with_tls(
     {
         context.Rsp = staged_rsp;
         context.R11 = ctx.guest_fsbase.get();
-        context.Rip = ctx.tls_rearm_trampoline;
+        context.Rip = ctx.tls_rearm_trampoline_redzone;
         FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1612,8 +1686,8 @@ pub(crate) unsafe fn run(
         )
     };
 
-    let direct_host_stack = vec![0u8; DIRECT_HOST_STACK_SIZE].into_boxed_slice();
-    let direct_host_stack_top = direct_host_stack.as_ptr() as u64 + direct_host_stack.len() as u64;
+    let direct_host_stack = DirectHostStack::new()?;
+    let direct_host_stack_top = direct_host_stack.top;
     let mut direct_state = Box::new(DirectThreadState {
         context: ptr::null_mut(),
         host_stack_top: direct_host_stack_top,
@@ -1635,7 +1709,7 @@ pub(crate) unsafe fn run(
         region_base: guard.base(),
         region_len: guard.len(),
         callback_return_addr: guard.return_trampoline(),
-        tls_rearm_trampoline: guard.tls_rearm_trampoline(),
+        tls_rearm_trampoline_redzone: guard.tls_rearm_trampoline_redzone(),
         returned: Cell::new(false),
         retval: Cell::new(0),
         pending_guest_call: Cell::new(None),
@@ -3223,8 +3297,11 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 // through NtContinue and may restore FS=0 again before the
                 // faulting instruction executes. Stage a tiny guest-side
                 // trampoline instead, so WRFSBASE is the first instruction
-                // after the OS has completed exception return.
-                let Some(staged_rsp) = context.Rsp.checked_sub(16) else {
+                // after the OS has completed exception return. The staging
+                // sits BELOW the red zone (`[rsp-144, rsp-128)`, red-zone
+                // stub) — the interrupted instruction is mid-function, so a
+                // leaf frame's live red-zone locals must survive the rearm.
+                let Some(staged_rsp) = context.Rsp.checked_sub(144) else {
                     return EXCEPTION_CONTINUE_SEARCH;
                 };
                 if mem.write(staged_rsp, &context.R11.to_le_bytes())
@@ -3232,7 +3309,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
                 {
                     context.Rsp = staged_rsp;
                     context.R11 = want;
-                    context.Rip = ctx.tls_rearm_trampoline;
+                    context.Rip = ctx.tls_rearm_trampoline_redzone;
                     FSBASE_REARMS.fetch_add(1, Ordering::Relaxed);
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }

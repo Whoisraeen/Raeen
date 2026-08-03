@@ -30,6 +30,22 @@ pub(crate) const HLE_SLOW_TRAMPOLINE_BASE: u64 = HLE_TRAMPOLINE_BASE + 0x1000_00
 // wrfsbase r11; pop r11; ret
 const TLS_REARM_CODE: [u8; 8] = [0xF3, 0x49, 0x0F, 0xAE, 0xD3, 0x41, 0x5B, 0xC3];
 
+/// Red-zone-safe twin of [`TLS_REARM_CODE`]: `wrfsbase r11; pop r11; ret 0x80`.
+///
+/// The VEH may resume guest code at an ARBITRARY interrupted instruction (a
+/// preempted `fs:` access, a watchpoint single-step, a CPUID/syscall trap),
+/// where a leaf function may keep live locals in the SysV red zone
+/// `[rsp-128, rsp)`. The plain stub's staging at `[rsp-16, rsp)` would
+/// overwrite them. This twin expects the saved R11 and the return RIP staged
+/// at `[rsp-144, rsp-128)` — BELOW the red zone — and `ret 0x80` discards the
+/// 128 bytes above the return slot, so RSP lands exactly back on the
+/// interrupted frame's RSP: staged_rsp + 8 (pop) + 8 (ret) + 0x80 = rsp.
+const TLS_REARM_REDZONE_CODE: [u8; 10] =
+    [0xF3, 0x49, 0x0F, 0xAE, 0xD3, 0x41, 0x5B, 0xC2, 0x80, 0x00];
+
+/// Byte offset of [`TLS_REARM_REDZONE_CODE`] inside the rearm page.
+const TLS_REARM_REDZONE_OFFSET: u64 = 16;
+
 pub(crate) struct TrampolineGuard {
     code_base: u64,
     slow_base: u64,
@@ -165,6 +181,28 @@ impl TrampolineGuard {
                 rearm.cast::<u8>(),
                 TLS_REARM_CODE.len(),
             );
+            core::ptr::copy_nonoverlapping(
+                TLS_REARM_REDZONE_CODE.as_ptr(),
+                rearm.cast::<u8>().add(TLS_REARM_REDZONE_OFFSET as usize),
+                TLS_REARM_REDZONE_CODE.len(),
+            );
+        }
+        // The stubs are final: drop write access (W^X hygiene, matching the
+        // main trampoline region above) and flush so the fresh bytes are
+        // visible to instruction fetch.
+        let mut rearm_old = 0;
+        if unsafe { VirtualProtect(rearm, PAGE_SIZE as usize, PAGE_EXECUTE_READ, &mut rearm_old) }
+            == 0
+        {
+            unsafe {
+                VirtualFree(code, 0, MEM_RELEASE);
+                VirtualFree(slow, 0, MEM_RELEASE);
+                VirtualFree(rearm, 0, MEM_RELEASE);
+            }
+            return Err(RuntimeError::MapFailed);
+        }
+        unsafe {
+            FlushInstructionCache(GetCurrentProcess(), rearm, PAGE_SIZE as usize);
         }
 
         Ok(Self {
@@ -188,8 +226,10 @@ impl TrampolineGuard {
         self.return_trampoline
     }
 
-    pub(crate) fn tls_rearm_trampoline(&self) -> u64 {
-        self.tls_rearm_trampoline
+    /// The red-zone-safe rearm stub (`ret 0x80` twin) — see
+    /// [`TLS_REARM_REDZONE_CODE`] for the staging contract.
+    pub(crate) fn tls_rearm_trampoline_redzone(&self) -> u64 {
+        self.tls_rearm_trampoline + TLS_REARM_REDZONE_OFFSET
     }
 }
 

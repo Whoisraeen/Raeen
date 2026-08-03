@@ -758,6 +758,23 @@ struct AllocState {
     sparse_heap_announced: bool,
     /// Avoid repeating the demand-commit notice for every committed page.
     demand_commit_announced: bool,
+    /// Page-aligned committed ranges whose HOST protection forbids CPU reads
+    /// (`PAGE_NOACCESS`): the inter-region guard pages, plus any page an
+    /// enforced guest `mprotect(PROT_NONE)` re-protected. The VMA map cannot
+    /// answer this — a guard page lives inside the image/heap VMAs and W^X /
+    /// enforcement flip host protection without rewriting VMA records — and
+    /// `GuestMemory::read`/`write` MUST refuse these instead of touching them:
+    /// an AV inside a host copy fires with the state lock's read guard live,
+    /// and the VEH's longjmp recovery abandons that guard without running its
+    /// destructor, wedging the lock for the life of the process.
+    host_noaccess: Vec<(u64, u64)>,
+    /// Superset of [`Self::host_noaccess`]: page-aligned committed ranges whose
+    /// host protection forbids CPU WRITES (guard pages, W^X'd image code
+    /// spans, enforced read-only `mprotect`s). `GuestMemory` write paths must
+    /// refuse these — see `host_noaccess` for why an AV here is fatal, not
+    /// recoverable. `patch_code` bypasses deliberately (it lifts the host
+    /// protection around its store).
+    host_nonwritable: Vec<(u64, u64)>,
 }
 
 impl AllocState {
@@ -825,8 +842,95 @@ impl AllocState {
             window_commits: Vec::new(),
             sparse_heap_announced: false,
             demand_commit_announced: false,
+            host_noaccess: Vec::new(),
+            host_nonwritable: Vec::new(),
         }
     }
+
+    /// Record `[start, end)` (page-aligned) as host-NOACCESS. Implies
+    /// non-writable, so the range enters both interval sets.
+    fn add_host_noaccess(&mut self, start: u64, end: u64) {
+        interval_add(&mut self.host_noaccess, start, end);
+        interval_add(&mut self.host_nonwritable, start, end);
+    }
+
+    /// Record `[start, end)` (page-aligned) as host-readable but not
+    /// host-writable (`PAGE_READONLY` / `PAGE_EXECUTE_READ`).
+    fn add_host_readonly(&mut self, start: u64, end: u64) {
+        interval_remove(&mut self.host_noaccess, start, end);
+        interval_add(&mut self.host_nonwritable, start, end);
+    }
+
+    /// Record `[start, end)` (page-aligned) as fully host-writable again.
+    fn clear_host_restriction(&mut self, start: u64, end: u64) {
+        interval_remove(&mut self.host_noaccess, start, end);
+        interval_remove(&mut self.host_nonwritable, start, end);
+    }
+
+    /// Whether any byte of `[start, end)` lies in a host-NOACCESS page. A
+    /// host-side READ of such a byte would AV with the state lock held.
+    fn intersects_host_noaccess(&self, start: u64, end: u64) -> bool {
+        interval_intersects(&self.host_noaccess, start, end)
+    }
+
+    /// Whether any byte of `[start, end)` lies in a host-non-writable page. A
+    /// host-side WRITE of such a byte would AV with the state lock held.
+    fn intersects_host_nonwritable(&self, start: u64, end: u64) -> bool {
+        interval_intersects(&self.host_nonwritable, start, end)
+    }
+}
+
+/// Insert `[start, end)` into a sorted, disjoint interval list, coalescing
+/// with abutting or overlapping neighbours. The lists stay tiny (two guard
+/// pages, a handful of W^X code spans, enforced `mprotect` ranges), so linear
+/// rebuilds are cheaper than a tree and trivially correct.
+fn interval_add(set: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    let mut merged_start = start;
+    let mut merged_end = end;
+    set.retain(|&(s, e)| {
+        if s <= merged_end && merged_start <= e {
+            merged_start = merged_start.min(s);
+            merged_end = merged_end.max(e);
+            false
+        } else {
+            true
+        }
+    });
+    set.push((merged_start, merged_end));
+    set.sort_unstable_by_key(|&(s, _)| s);
+}
+
+/// Remove `[start, end)` from a sorted, disjoint interval list, splitting any
+/// interval it punches a hole in.
+fn interval_remove(set: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    let mut out = Vec::with_capacity(set.len() + 1);
+    for &(s, e) in set.iter() {
+        if e <= start || end <= s {
+            out.push((s, e));
+            continue;
+        }
+        if s < start {
+            out.push((s, start));
+        }
+        if end < e {
+            out.push((end, e));
+        }
+    }
+    *set = out;
+}
+
+/// Whether `[start, end)` intersects any interval in a sorted, disjoint list.
+fn interval_intersects(set: &[(u64, u64)], start: u64, end: u64) -> bool {
+    if end <= start {
+        return false;
+    }
+    set.iter().any(|&(s, e)| s < end && start < e)
 }
 
 /// Whether every VMA covering `[start, end)` satisfies `pred`, i.e. whether the
@@ -1022,16 +1126,24 @@ impl GuestArena {
             } else {
                 tracing::warn!("failed to arm {what} guard page at {page:#x}");
             }
+            ok
         };
+        let mut state = AllocState::new(base);
         if image_len <= IMAGE_SIZE - PAGE_SIZE {
-            install_guard(base + IMAGE_SIZE - PAGE_SIZE, "image|heap");
+            let guard = base + IMAGE_SIZE - PAGE_SIZE;
+            if install_guard(guard, "image|heap") {
+                state.add_host_noaccess(guard, guard + PAGE_SIZE);
+            }
         }
-        install_guard(base + STACK_OFFSET - PAGE_SIZE, "heap|stack");
+        let stack_guard = base + STACK_OFFSET - PAGE_SIZE;
+        if install_guard(stack_guard, "heap|stack") {
+            state.add_host_noaccess(stack_guard, stack_guard + PAGE_SIZE);
+        }
 
         Ok(Self {
             base,
             image_len,
-            state: RwLock::new(AllocState::new(base)),
+            state: RwLock::new(state),
             wx_image: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1760,6 +1872,7 @@ impl GuestArena {
         // Minecraft stores to a .data global immediately). RX-ing just the code
         // spans keeps data writable while still trapping a stray store into code.
         let mut any = false;
+        let mut state = self.lock_state();
         for &(offset, len) in exec_ranges {
             // Clamp to the committed image region, never touching the
             // image|heap guard page at the very top.
@@ -1784,6 +1897,10 @@ impl GuestArena {
             } != 0;
             if ok {
                 any = true;
+                // Record host reality so `GuestMemory::write` refuses these
+                // pages (recoverable guest fault) instead of AVing inside the
+                // host copy with the state lock's read guard held.
+                state.add_host_readonly(page_start, page_start + span as u64);
                 tracing::debug!(
                     "W^X: {page_start:#x}..{:#x} -> execute+read",
                     page_start + span as u64
@@ -1792,6 +1909,7 @@ impl GuestArena {
                 tracing::warn!("W^X: failed to protect code range {page_start:#x} (+{span:#x})");
             }
         }
+        drop(state);
         if any {
             self.wx_image.store(true, Ordering::SeqCst);
             tracing::info!(
@@ -1810,17 +1928,24 @@ impl GuestArena {
     /// self-modifying store keeps faulting.
     fn patch_code_wx(&self, guest_addr: u64, data: &[u8]) -> bool {
         use std::sync::atomic::Ordering;
-        if !self.wx_image.load(Ordering::SeqCst) {
-            return self.write(guest_addr, data);
-        }
         if data.is_empty() {
             return true;
         }
-        let first_page = guest_addr & !(PAGE_SIZE - 1);
-        let Some(last_byte) = guest_addr.checked_add(data.len() as u64 - 1) else {
+        let Some(end) = guest_addr.checked_add(data.len() as u64) else {
             return false;
         };
-        let last_page = last_byte & !(PAGE_SIZE - 1);
+        // A protection lift is needed when W^X armed the image, or when an
+        // enforced guest mprotect left any target page host-non-writable — a
+        // patch is the runtime's own instrumentation and must land either way.
+        let needs_lift = self.wx_image.load(Ordering::SeqCst) || {
+            let state = self.read_state();
+            state.intersects_host_nonwritable(guest_addr, end)
+        };
+        if !needs_lift {
+            return self.write_host_checked(guest_addr, data, true);
+        }
+        let first_page = guest_addr & !(PAGE_SIZE - 1);
+        let last_page = (end - 1) & !(PAGE_SIZE - 1);
         let span = (last_page - first_page + PAGE_SIZE) as usize;
         let mut old = 0u32;
         // SAFETY: the patched pages lie in the committed image region.
@@ -1835,18 +1960,102 @@ impl GuestArena {
         if !unlocked {
             return false;
         }
-        let wrote = self.write(guest_addr, data);
+        // Restrictions bypassed: the pages were just made writable above.
+        let wrote = self.write_host_checked(guest_addr, data, false);
         let mut discard = 0u32;
-        // SAFETY: same pages, restoring the W^X protection.
+        // SAFETY: same pages, restoring the prior protection. `old` is the
+        // pre-lift protection of the FIRST page; W^X spans are uniformly
+        // EXECUTE_READ and single-page enforced-mprotect patches restore
+        // exactly, which covers every current caller.
         unsafe {
-            VirtualProtect(
-                first_page as *const c_void,
-                span,
-                PAGE_EXECUTE_READ,
-                &mut discard,
-            );
+            VirtualProtect(first_page as *const c_void, span, old, &mut discard);
         }
         wrote
+    }
+
+    /// Restore default `PAGE_READWRITE` on any host-restricted pages inside a
+    /// range the guest just released, and drop their restriction records — a
+    /// recycled range must behave like fresh memory, not inherit a stale
+    /// enforced-mprotect refusal. The two inter-region guard pages are never
+    /// reopened (they are not guest-releasable in the first place; this is
+    /// defense in depth).
+    fn restore_rw_on_release_locked(&self, state: &mut AllocState, start: u64, end: u64) {
+        if !state.intersects_host_nonwritable(start, end) {
+            return;
+        }
+        let image_guard = self.base + IMAGE_SIZE - PAGE_SIZE;
+        let stack_guard = self.base + STACK_OFFSET - PAGE_SIZE;
+        let overlaps: Vec<(u64, u64)> = state
+            .host_nonwritable
+            .iter()
+            .filter_map(|&(s, e)| {
+                let s = s.max(start);
+                let e = e.min(end);
+                (s < e).then_some((s, e))
+            })
+            .collect();
+        for (s, e) in overlaps {
+            let mut cursor = s;
+            while cursor < e {
+                let page_end = cursor + PAGE_SIZE;
+                if cursor != image_guard && cursor != stack_guard {
+                    let mut old = 0u32;
+                    // SAFETY: `[cursor, page_end)` is a committed page this
+                    // arena itself re-protected earlier (that is the only way
+                    // into the restriction records for a releasable range).
+                    unsafe {
+                        VirtualProtect(
+                            cursor as *const c_void,
+                            PAGE_SIZE as usize,
+                            PAGE_READWRITE,
+                            &mut old,
+                        );
+                    }
+                    state.clear_host_restriction(cursor, page_end);
+                }
+                cursor = page_end;
+            }
+        }
+    }
+
+    /// The one real implementation behind [`GuestMemory::write`].
+    /// `honor_restrictions` is `false` only for [`Self::patch_code_wx`], which
+    /// transiently lifts the host protection around its store and so may
+    /// legally write pages the restriction records list as non-writable.
+    fn write_host_checked(&self, guest_addr: u64, data: &[u8], honor_restrictions: bool) -> bool {
+        let len = data.len() as u64;
+        let Some(end) = guest_addr.checked_add(len) else {
+            return false;
+        };
+        // Same bounds argument as `read`, except a write demand-commits
+        // reservation pages exactly as a native guest store would.
+        if !self.ensure_range_backed_for_write(guest_addr, end) {
+            return false;
+        }
+        // Demand-commit above may take the state lock repeatedly. Reacquire it
+        // once and revalidate before dereferencing; a mapping may have been
+        // removed between the final commit/check and this point.
+        let state = self.read_state();
+        if !Self::range_is_committed_locked(&state, guest_addr, end) {
+            return false;
+        }
+        if honor_restrictions && state.intersects_host_nonwritable(guest_addr, end) {
+            // Committed but host-non-writable (guard page, W^X'd code, an
+            // enforced read-only mprotect): the store would AV with the read
+            // guard live and longjmp recovery would leak the lock. Refuse, so
+            // a corrupt guest out-pointer becomes a recoverable guest fault.
+            return false;
+        }
+        // SAFETY: same bounds argument as `read` above. Every sub-region is
+        // committed writable, or the restriction records were just consulted
+        // (see `AllocState::host_nonwritable`) / deliberately bypassed by the
+        // caller that lifted the protection. As with `read`, native guest
+        // concurrency is deliberately inherited: unsynchronized conflicting
+        // access may tear and is the guest program's responsibility.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), guest_addr as *mut u8, data.len());
+        }
+        true
     }
 
     /// `range_is_committed`, with the same lazy-commit semantics a native
@@ -1930,13 +2139,13 @@ impl GuestMemory for GuestArena {
         // Re-protect page by page so a partially-committed range (some pages
         // still reserved) protects what it can without failing the whole call,
         // and so a guard page in the range is left NOACCESS rather than reopened.
+        // The write lock is held across the loop so the host-restriction
+        // records can never disagree with the protections actually applied.
+        let mut state = self.lock_state();
         let mut page = start;
         let mut any = false;
         while page < end {
-            let committed = {
-                let state = self.read_state();
-                Self::range_is_committed_locked(&state, page, page + PAGE_SIZE)
-            };
+            let committed = Self::range_is_committed_locked(&state, page, page + PAGE_SIZE);
             let is_guard = page == self.base + IMAGE_SIZE - PAGE_SIZE
                 || page == self.base + STACK_OFFSET - PAGE_SIZE;
             if committed && !is_guard {
@@ -1946,9 +2155,23 @@ impl GuestMemory for GuestArena {
                     VirtualProtect(page as *const c_void, PAGE_SIZE as usize, win, &mut old)
                 } != 0;
                 any |= ok;
+                if ok {
+                    // Mirror the applied host protection into the restriction
+                    // records read/write validation consults, so a later HLE
+                    // access refuses instead of AVing under the state lock.
+                    let page_end = page + PAGE_SIZE;
+                    if win == PAGE_NOACCESS {
+                        state.add_host_noaccess(page, page_end);
+                    } else if prot & prot::CPU_WRITE == 0 {
+                        state.add_host_readonly(page, page_end);
+                    } else {
+                        state.clear_host_restriction(page, page_end);
+                    }
+                }
             }
             page += PAGE_SIZE;
         }
+        drop(state);
         // Even a fully-uncommitted range is a legal mprotect of a reservation;
         // report success so the guest is not told its own call failed.
         let _ = any;
@@ -1967,6 +2190,12 @@ impl GuestMemory for GuestArena {
         // `range_is_committed` is the real gate.
         let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end) {
+            return false;
+        }
+        if state.intersects_host_noaccess(guest_addr, end) {
+            // A guard page (or an enforced PROT_NONE page) is committed but
+            // host-unreadable: touching it would AV with the read guard live,
+            // and longjmp recovery would leak the lock. Refuse instead.
             return false;
         }
         // SAFETY: every byte of `[guest_addr, guest_addr + out.len())` is backed
@@ -1989,31 +2218,7 @@ impl GuestMemory for GuestArena {
     }
 
     fn write(&self, guest_addr: u64, data: &[u8]) -> bool {
-        let len = data.len() as u64;
-        let Some(end) = guest_addr.checked_add(len) else {
-            return false;
-        };
-        // Same bounds argument as `read`, except a write demand-commits
-        // reservation pages exactly as a native guest store would.
-        if !self.ensure_range_backed_for_write(guest_addr, end) {
-            return false;
-        }
-        // Demand-commit above may take the state lock repeatedly. Reacquire it
-        // once and revalidate before dereferencing; a mapping may have been
-        // removed between the final commit/check and this point.
-        let state = self.read_state();
-        if !Self::range_is_committed_locked(&state, guest_addr, end) {
-            return false;
-        }
-        // SAFETY: same bounds argument as `read` above. Every sub-region is
-        // committed `PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE` (see
-        // `new`), so it is writable. As with `read`, native guest concurrency
-        // is deliberately inherited: unsynchronized conflicting access may
-        // tear and is the guest program's responsibility.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), guest_addr as *mut u8, data.len());
-        }
-        true
+        self.write_host_checked(guest_addr, data, true)
     }
 
     fn fill_write(
@@ -2034,6 +2239,11 @@ impl GuestMemory for GuestArena {
         if !Self::range_is_committed_locked(&state, guest_addr, end) {
             return None;
         }
+        if state.intersects_host_nonwritable(guest_addr, end) {
+            // See `write_host_checked`: a host-non-writable page would AV
+            // under the read guard; refuse so the fault stays recoverable.
+            return None;
+        }
         // SAFETY: the arena owns every committed byte in the validated range
         // and identity maps guest address A to host address A. The address-space
         // lock remains held across the callback, so unmap cannot release it.
@@ -2049,7 +2259,9 @@ impl GuestMemory for GuestArena {
         let Some(end) = range.end() else {
             return false;
         };
-        self.ensure_range_backed_for_write(range.start().raw(), end)
+        let start = range.start().raw();
+        self.ensure_range_backed_for_write(start, end)
+            && !self.read_state().intersects_host_nonwritable(start, end)
     }
 
     fn validate_range(&self, range: GuestRange, _access: GuestAccess) -> bool {
@@ -2089,13 +2301,14 @@ impl GuestMemory for GuestArena {
         let end = guest_addr.checked_add(4)?;
         let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end)
+            || state.intersects_host_noaccess(guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return None;
         }
         // SAFETY: the checked address is 4-byte aligned and lies in committed
-        // guest memory for the lifetime of this arena. Guest synchronization
-        // words are accessed atomically through this API by HLE.
+        // host-readable guest memory for the lifetime of this arena. Guest
+        // synchronization words are accessed atomically through this API by HLE.
         Some(unsafe {
             (&*(guest_addr as *const std::sync::atomic::AtomicU32))
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -2106,11 +2319,13 @@ impl GuestMemory for GuestArena {
         let end = guest_addr.checked_add(4)?;
         let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end)
+            || state.intersects_host_nonwritable(guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return None;
         }
-        // SAFETY: same address/alignment/lifetime proof as atomic_load_u32.
+        // SAFETY: same address/alignment/lifetime proof as atomic_load_u32,
+        // plus host writability (a compare-exchange stores on success).
         let atomic = unsafe { &*(guest_addr as *const std::sync::atomic::AtomicU32) };
         Some(
             atomic
@@ -2131,11 +2346,13 @@ impl GuestMemory for GuestArena {
         };
         let state = self.read_state();
         if !Self::range_is_committed_locked(&state, guest_addr, end)
+            || state.intersects_host_nonwritable(guest_addr, end)
             || guest_addr % core::mem::align_of::<std::sync::atomic::AtomicU32>() as u64 != 0
         {
             return false;
         }
-        // SAFETY: same address/alignment/lifetime proof as atomic_load_u32.
+        // SAFETY: same address/alignment/lifetime proof as atomic_load_u32,
+        // plus host writability.
         unsafe {
             (&*(guest_addr as *const std::sync::atomic::AtomicU32))
                 .store(value, std::sync::atomic::Ordering::SeqCst);
@@ -2188,9 +2405,25 @@ impl raeen_gpu::GpuGuestMemory for GuestArena {
         ) {
             return false;
         }
-        // SAFETY: the validated identity-mapped guest range covers `out.len()`
-        // readable bytes, and the destination owns equal reserved capacity.
-        // `ptr::copy` also remains sound in the theoretical overlap case.
+        let Some(end) = addr.checked_add(out.len() as u64) else {
+            return false;
+        };
+        // `validate_gpu_range` released its lock internally, so a guest
+        // `munmap` could race in before the copy. Re-validate under a guard
+        // held ACROSS the copy — exactly like `GuestMemory::read` — so no
+        // release can pull the pages out from under the host pointer.
+        let state = self.read_state();
+        if !Self::range_is_committed_locked(&state, addr, end)
+            || state.intersects_host_noaccess(addr, end)
+        {
+            return false;
+        }
+        // SAFETY: the identity-mapped guest range was just re-validated as
+        // committed, host-readable memory under `state`, and the state lock
+        // stays held through the copy so `munmap` cannot release an external
+        // reservation underneath it. The destination owns equal reserved
+        // capacity. `ptr::copy` also remains sound in the theoretical overlap
+        // case.
         unsafe {
             std::ptr::copy(addr as *const u8, out.as_mut_ptr().cast::<u8>(), out.len());
         }
@@ -2262,6 +2495,9 @@ impl GuestAllocator for GuestArena {
             // `MEM_COMMIT` is a no-op if the range is handed out again. What
             // matters is that the *address space* returns, which under the bump
             // it never did.
+            if let Some(end) = addr.checked_add(size) {
+                self.restore_rw_on_release_locked(&mut state, addr, end);
+            }
             state.vmm.unmap_range(addr, size);
         }
         // An unrecognized `addr` is simply ignored (trait contract).
@@ -2851,6 +3087,9 @@ impl GuestAllocator for GuestArena {
         // hands it out again is a documented no-op. Returning the address space
         // is the part that was missing — under the bump, `munmap` was a no-op
         // and nothing ever came back.
+        if let Some(end) = addr.checked_add(length) {
+            self.restore_rw_on_release_locked(&mut state, addr, end);
+        }
         state.vmm.unmap_range(addr, length);
     }
 }
@@ -4127,6 +4366,82 @@ mod tests {
     /// `protect` re-protects a committed page when enforcement is on. The
     /// default no-op path is covered by the trait default; here we drive the
     /// arena override directly so the env gate does not have to be toggled.
+    #[test]
+    fn guard_pages_are_refused_not_touched() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[0x90u8; 0x40]).expect("reservation should succeed");
+        let base = GUEST_ARENA_BASE;
+        // Both inter-region guard pages are committed host memory carrying
+        // PAGE_NOACCESS: touching them from an HLE copy would AV while the
+        // state lock's read guard is live, and longjmp recovery would leak
+        // the lock. The access paths must REFUSE instead.
+        let image_guard = base + IMAGE_SIZE - PAGE_SIZE;
+        let stack_guard = base + STACK_OFFSET - PAGE_SIZE;
+        let mut buf = [0u8; 8];
+        for guard in [image_guard, stack_guard] {
+            assert!(!arena.read(guard, &mut buf), "read of guard {guard:#x}");
+            assert!(!arena.write(guard, &buf), "write of guard {guard:#x}");
+            assert!(
+                arena.atomic_load_u32(guard).is_none(),
+                "atomic load of guard {guard:#x}"
+            );
+            assert!(
+                !arena.atomic_store_u32(guard, 1),
+                "atomic store of guard {guard:#x}"
+            );
+        }
+    }
+
+    /// Soundness: an HLE write into W^X'd code must be REFUSED (recoverable
+    /// guest-fault semantics) rather than AV inside the host copy, while
+    /// `patch_code` — the runtime's own instrumentation seam — still lands.
+    #[test]
+    fn wx_write_is_refused_while_patch_code_lands() {
+        let _lock = crate::dispatch::call_lock();
+        let arena = GuestArena::new(&[0x90u8; 0x40]).expect("reservation should succeed");
+        let base = GUEST_ARENA_BASE;
+
+        // Pre-W^X the image is RWX and plain writes land.
+        assert!(arena.write(base + 0x8, &[0xAA]));
+        assert!(arena.enable_wx_image(&[(0, 0x40)]), "enable W^X");
+
+        assert!(
+            !arena.write(base + 0x8, &[0xBB]),
+            "plain write must be refused on W^X'd code"
+        );
+        let mut byte = [0u8; 1];
+        assert!(arena.read(base + 0x8, &mut byte), "reads still work");
+        assert_eq!(byte, [0xAA], "the refused write must not have landed");
+
+        assert!(arena.patch_code(base + 0x8, &[0xCC]));
+        assert!(arena.read(base + 0x8, &mut byte));
+        assert_eq!(byte, [0xCC], "patch_code still writes through the bar");
+    }
+
+    /// The interval sets behind the host-protection records: add coalesces,
+    /// remove splits, intersect sees partial overlap.
+    #[test]
+    fn host_restriction_interval_set_semantics() {
+        let mut set: Vec<(u64, u64)> = Vec::new();
+        interval_add(&mut set, 0x2000, 0x3000);
+        interval_add(&mut set, 0x3000, 0x4000); // abuts -> coalesce
+        assert_eq!(set, vec![(0x2000, 0x4000)]);
+        interval_add(&mut set, 0x1000, 0x2800); // overlaps -> coalesce
+        assert_eq!(set, vec![(0x1000, 0x4000)]);
+
+        assert!(interval_intersects(&set, 0x0, 0x1001));
+        assert!(interval_intersects(&set, 0x3FFF, 0x5000));
+        assert!(!interval_intersects(&set, 0x0, 0x1000));
+        assert!(!interval_intersects(&set, 0x4000, 0x5000));
+        assert!(!interval_intersects(&set, 0x2000, 0x2000), "empty range");
+
+        interval_remove(&mut set, 0x2000, 0x3000); // punch a hole -> split
+        assert_eq!(set, vec![(0x1000, 0x2000), (0x3000, 0x4000)]);
+        assert!(!interval_intersects(&set, 0x2000, 0x3000));
+        interval_remove(&mut set, 0x0, 0x10000);
+        assert!(set.is_empty());
+    }
+
     #[test]
     fn protect_reprotects_a_committed_heap_page_read_only() {
         use crate::vmm::prot;
