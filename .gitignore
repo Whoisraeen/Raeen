@@ -84,13 +84,17 @@ reference/
 !/plugins/README.md
 
 #AI
+# CLAUDE.md is project documentation and IS versioned (it says so itself).
+# .claude/ stays local (settings.local.json, worktrees, per-machine state).
 .claude/
-Claude.md
-.claude/skills
 .agents
-.claude/agents
 .codex/
 Agents.md
+
+# MSVC import-library byproducts of the present-plugin C ABI work
+# (self-generated for raeen_dlss.dll; never source, never distributed).
+raeen-dlss.exp
+raeen-dlss.lib
 # Diagnostic image written by raeen-gpu's `dump_triangle_image` test
 # (override the path with RAEEN_TRIANGLE_PPM). A build artifact, not source.
 triangle.ppm

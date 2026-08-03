@@ -1,5 +1,12 @@
 # Homebrew gap analysis
 
+> **STATUS (2026-08-03): HISTORICAL.** Every wall below is closed — M1 through
+> M5 are green (see `CLAUDE.md` milestones and `docs/m4-acceptance-minecraft.md`
+> / `docs/m5-acceptance-minecraft.md`). The Shell launches through
+> `execute_process_shared_with_control`, not `execute_linked`. This document is
+> kept as the honest record of what the early synthetic fixture sidestepped and
+> how each gap was defined when it was still open.
+
 ## What was just proven
 
 `crates/raeen-gui/src/launcher.rs` (`firmware_launcher_tests::executes_module`) now has an
