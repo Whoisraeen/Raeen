@@ -4295,6 +4295,15 @@ fn prepare_stage_binding(
 type ComputeStorageSnapshots = HashMap<(u64, usize), Arc<Vec<u8>>>;
 type ComputeImageSnapshots = HashMap<[u32; 8], StorageImageUpload>;
 
+fn invalidate_storage_snapshots(snapshots: &mut ComputeStorageSnapshots, writes: &[(u64, u64)]) {
+    snapshots.retain(|&(base, size), _| {
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        !writes
+            .iter()
+            .any(|&(write_base, write_size)| ranges_overlap(base, size, write_base, write_size))
+    });
+}
+
 fn prepare_compute_stage_binding(
     bind: &ShaderBindResources,
     storage_snapshots: &mut ComputeStorageSnapshots,
@@ -4369,9 +4378,16 @@ fn prepare_stage_binding_inner(
     // must not pollute the graphics `bind` reconciliation.
     let graphics_timing = stage != vk::ShaderStageFlags::COMPUTE
         && crate::vulkan::offscreen::draw_stage_timing_enabled();
+    let compute_timing = stage == vk::ShaderStageFlags::COMPUTE
+        && crate::vulkan::offscreen::draw_stage_timing_enabled();
     let vsharp_timer = graphics_timing.then(|| {
         crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_BIND_VSHARP_NS,
+        )
+    });
+    let compute_vsharp_timer = compute_timing.then(|| {
+        crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_VSHARP_NS,
         )
     });
 
@@ -4515,9 +4531,18 @@ fn prepare_stage_binding_inner(
                 crate::vulkan::offscreen::DRAW_STAGE_BIND_VSHARP_BYTES
                     .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
             }
+            if compute_timing {
+                crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_VSHARP_BYTES
+                    .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            }
             let _read_timer = graphics_timing.then(|| {
                 crate::vulkan::offscreen::StageTimer::start(
                     &crate::vulkan::offscreen::DRAW_STAGE_BIND_VSHARP_READ_NS,
+                )
+            });
+            let _compute_read_timer = compute_timing.then(|| {
+                crate::vulkan::offscreen::StageTimer::start(
+                    &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_VSHARP_READ_NS,
                 )
             });
             read_guest_bytes(resource.base48(), size, "storage buffer").map_err(|source| {
@@ -4602,15 +4627,27 @@ fn prepare_stage_binding_inner(
         }
     }
     drop(vsharp_timer);
+    drop(compute_vsharp_timer);
     if graphics_timing {
         crate::vulkan::offscreen::DRAW_STAGE_BIND_VSHARP_N
             .fetch_add(storage_num as u64, std::sync::atomic::Ordering::Relaxed);
         crate::vulkan::offscreen::DRAW_STAGE_BIND_TSHARP_N
             .fetch_add(texture_num as u64, std::sync::atomic::Ordering::Relaxed);
     }
+    if compute_timing {
+        crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_VSHARP_N
+            .fetch_add(storage_num as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_TSHARP_N
+            .fetch_add(texture_num as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     let tsharp_timer = graphics_timing.then(|| {
         crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_BIND_TSHARP_NS,
+        )
+    });
+    let compute_tsharp_timer = compute_timing.then(|| {
+        crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_TSHARP_NS,
         )
     });
 
@@ -4680,7 +4717,14 @@ fn prepare_stage_binding_inner(
                         &budget_entries,
                     ));
                 }
-                let upload = read_storage_image(&desc.texture)?;
+                let upload = {
+                    let _read_timer = compute_timing.then(|| {
+                        crate::vulkan::offscreen::StageTimer::start(
+                            &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_TSHARP_READ_NS,
+                        )
+                    });
+                    read_storage_image(&desc.texture)?
+                };
                 if let Some(snapshots) = compute_image_snapshots.as_deref_mut() {
                     snapshots.insert(desc.texture.fields, upload.clone());
                 }
@@ -4739,6 +4783,11 @@ fn prepare_stage_binding_inner(
                             &budget_entries,
                         ));
                     }
+                    let _read_timer = compute_timing.then(|| {
+                        crate::vulkan::offscreen::StageTimer::start(
+                            &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_TSHARP_READ_NS,
+                        )
+                    });
                     decode_texture(&desc.texture)?
                 }
             };
@@ -4872,9 +4921,15 @@ fn prepare_stage_binding_inner(
     }
 
     drop(tsharp_timer);
+    drop(compute_tsharp_timer);
     let _tail_timer = graphics_timing.then(|| {
         crate::vulkan::offscreen::StageTimer::start(
             &crate::vulkan::offscreen::DRAW_STAGE_BIND_TAIL_NS,
+        )
+    });
+    let _compute_tail_timer = compute_timing.then(|| {
+        crate::vulkan::offscreen::StageTimer::start(
+            &crate::vulkan::offscreen::DRAW_STAGE_CS_PREPARE_TAIL_NS,
         )
     });
 
@@ -6308,6 +6363,7 @@ impl DrawSink for OffscreenDrawSink<'_> {
     fn guest_memory_write_boundary(&mut self, writes: &[(u64, u64)]) {
         self.texture_sample_hashes.invalidate_ranges(writes);
         self.resolved_shaders.invalidate_ranges(writes);
+        invalidate_storage_snapshots(&mut self.compute_storage_snapshots, writes);
     }
 
     fn draw_index_auto(
@@ -9084,6 +9140,22 @@ mod tests {
 
         assert_ne!(a_first, a_after, "overlapping output must rehash");
         assert_eq!(b_first, b_after, "disjoint sampled texture stays memoized");
+    }
+
+    #[test]
+    fn packet_writes_invalidate_only_overlapping_compute_storage_snapshots() {
+        let mut snapshots = ComputeStorageSnapshots::new();
+        let a = Arc::new(vec![0x11; 0x1000]);
+        let b = Arc::new(vec![0x22; 0x2000]);
+        snapshots.insert((0x10_0000, a.len()), Arc::clone(&a));
+        snapshots.insert((0x20_0000, b.len()), Arc::clone(&b));
+
+        invalidate_storage_snapshots(&mut snapshots, &[(0x30_0000, 4)]);
+        assert_eq!(snapshots.len(), 2, "a disjoint label write changes nothing");
+
+        invalidate_storage_snapshots(&mut snapshots, &[(0x10_0800, 4)]);
+        assert!(!snapshots.contains_key(&(0x10_0000, a.len())));
+        assert!(snapshots.contains_key(&(0x20_0000, b.len())));
     }
 
     #[test]

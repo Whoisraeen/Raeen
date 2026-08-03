@@ -3138,6 +3138,28 @@ pub(crate) static DRAW_STAGE_CS_TRANSLATE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_CS_PREPARE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// `prepare_compute_stage_binding` internal split. `vsharp` is the storage
+/// buffer loop (`vsharp_read` is its guest-memory fetch subset), `tsharp` is
+/// the sampled/storage-image loop (`tsharp_read` is guest-backed image
+/// capture), and `tail` is sampler/GDS/direct-SGPR assembly. The difference
+/// between `cs_prepare` and these three top-level buckets is dispatch-side
+/// bookkeeping outside `prepare_compute_stage_binding`.
+pub(crate) static DRAW_STAGE_CS_PREPARE_VSHARP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_VSHARP_READ_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_VSHARP_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_VSHARP_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_TSHARP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_TSHARP_READ_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_TSHARP_N: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DRAW_STAGE_CS_PREPARE_TAIL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DRAW_STAGE_CS_BACKEND_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Per-draw work the sink does BEFORE `draw_common` starts its timer, so it is
@@ -3239,6 +3261,14 @@ fn draw_stage_tick() {
     let dispatches = DRAW_STAGE_DISPATCH_N.swap(0, Relaxed);
     let cs_translate = DRAW_STAGE_CS_TRANSLATE_NS.swap(0, Relaxed);
     let cs_prepare = DRAW_STAGE_CS_PREPARE_NS.swap(0, Relaxed);
+    let cs_prepare_vsharp = DRAW_STAGE_CS_PREPARE_VSHARP_NS.swap(0, Relaxed);
+    let cs_prepare_vsharp_read = DRAW_STAGE_CS_PREPARE_VSHARP_READ_NS.swap(0, Relaxed);
+    let cs_prepare_vsharp_bytes = DRAW_STAGE_CS_PREPARE_VSHARP_BYTES.swap(0, Relaxed);
+    let cs_prepare_vsharp_n = DRAW_STAGE_CS_PREPARE_VSHARP_N.swap(0, Relaxed);
+    let cs_prepare_tsharp = DRAW_STAGE_CS_PREPARE_TSHARP_NS.swap(0, Relaxed);
+    let cs_prepare_tsharp_read = DRAW_STAGE_CS_PREPARE_TSHARP_READ_NS.swap(0, Relaxed);
+    let cs_prepare_tsharp_n = DRAW_STAGE_CS_PREPARE_TSHARP_N.swap(0, Relaxed);
+    let cs_prepare_tail = DRAW_STAGE_CS_PREPARE_TAIL_NS.swap(0, Relaxed);
     let cs_backend = DRAW_STAGE_CS_BACKEND_NS.swap(0, Relaxed);
     let predraw = DRAW_STAGE_PREDRAW_NS.swap(0, Relaxed);
     // EXHAUSTIVE split. `resolve/setup/census/bind/backend` are the timed
@@ -3364,6 +3394,30 @@ fn draw_stage_tick() {
         backend_us = per_disp_us(cs_backend),
         "COMPUTE STAGES: shader analysis/cache, guest-resource preparation, and Vulkan backend (per dispatch)"
     );
+    {
+        let cs_prepare_inner = cs_prepare_vsharp
+            .saturating_add(cs_prepare_tsharp)
+            .saturating_add(cs_prepare_tail);
+        let cs_prepare_other = cs_prepare.saturating_sub(cs_prepare_inner);
+        let cs_prepare_pct = |x: u64| x.saturating_mul(100).checked_div(cs_prepare).unwrap_or(0);
+        tracing::warn!(
+            dispatches,
+            vsharp_us = per_disp_us(cs_prepare_vsharp),
+            vsharp_of_prepare_pct = cs_prepare_pct(cs_prepare_vsharp),
+            vsharp_read_us = per_disp_us(cs_prepare_vsharp_read),
+            vsharp_buffers_per_dispatch = cs_prepare_vsharp_n.checked_div(dispatches).unwrap_or(0),
+            vsharp_kib_per_dispatch = (cs_prepare_vsharp_bytes / 1024)
+                .checked_div(dispatches)
+                .unwrap_or(0),
+            tsharp_us = per_disp_us(cs_prepare_tsharp),
+            tsharp_of_prepare_pct = cs_prepare_pct(cs_prepare_tsharp),
+            tsharp_read_us = per_disp_us(cs_prepare_tsharp_read),
+            tsharps_per_dispatch = cs_prepare_tsharp_n.checked_div(dispatches).unwrap_or(0),
+            tail_us = per_disp_us(cs_prepare_tail),
+            other_us = per_disp_us(cs_prepare_other),
+            "COMPUTE PREPARE STAGES: storage-buffer V# loop and guest fetch, image T# loop and guest capture, sampler/GDS/SGPR tail, and dispatch-side bookkeeping outside binding preparation"
+        );
+    }
     tracing::warn!(
         pipeline_pct = bpct(pipeline),
         pipeline_us = per_draw_us(pipeline),

@@ -6590,3 +6590,387 @@ VERIFICATION:
   formatting, and `git diff --check` for the four GPU files are green.
 - Workspace formatting remains blocked only by unrelated dirty xtask files in
   the shared worktree; those files were preserved and not reformatted here.
+
+## 2026-08-01 - HLE dispatch fast-path A/B rejected on retail frame tails
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`** for the experimental
+Minecraft runs. The candidate existed only in the dirty working tree and was
+fully removed after measurement; retained source is clean `4089b15e16b3`.
+Game files, firmware, keys, raw reports, and shader caches remain machine-local
+and outside git. Phase 2 remains red: these were short runs, not the mandatory
+30-minute soak, and neither establishes the 60 FPS in-world gate.
+
+EXPERIMENT AND DECISION:
+
+- Cached pre-resolved HLE function pointers per guest-thread execution run to
+  avoid the registry `DashMap` lookup on every direct gateway call. The first
+  version cost 578.811 ms per one million synthetic direct calls versus an
+  immediate 391.912 ms reverted control and failed retail liveness after only
+  104.1 s, with an 11.0 s no-flip window. It was fully reverted.
+- An inline diagnostics-disabled second version measured 336.939-344.077 ms
+  per one million direct calls and passed 106 runtime unit tests, 64 execute
+  integration tests, the interactive 2D test, focused HLE-resolution/TLS
+  tests, and strict all-target Clippy for `raeen-runtime` and `raeen-hle`.
+- Retail nevertheless rejected it. Run
+  `scratch/mc-hle-resolved-v2-clean-ab-1/soak-1785633385533` lasted 193.7 s,
+  produced 8,864 flips, and recorded a 9.1 s worst no-flip window. Run
+  `scratch/mc-hle-resolved-v2-clean-ab-2/soak-1785633599664` lasted 194.4 s,
+  produced 9,856 flips, and recorded a 9.6 s worst no-flip window. Both had
+  zero deadlocks, shader refusals, Vulkan validation errors, and panics, but
+  their post-input frame p99 values were 287.0 and 279.2 ms versus 165.7 ms
+  for the retained HLE control. Worker p95/p99 also worsened from 67.3/87.8
+  ms to 74.6/95.2 and 75.4/94.1 ms. The optimization was therefore removed.
+- Three post-revert controls measured 375.803, 381.059, and 407.096 ms per one
+  million direct HLE calls, confirming that the microbenchmark gain and the
+  retail-tail loss were both real. No rejected pre-resolved-dispatch code
+  remains. The guest Streaming Pool owner critical section, not generic HLE
+  registry lookup, remains the measured stability wall.
+
+## 2026-08-01 - Native write-watch texture-cache experiment rejected cross-title
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`** from isolated target
+`../Raeen-target-write-watch`. The experiment was environment-gated behind
+`RAEEN_GPU_WRITE_WATCH=1`, existed only in the dirty working tree, and was
+fully removed after the retail cross-title failure. Game files, firmware,
+keys, raw reports, and shader caches remain machine-local and outside git.
+Phase 2 remains red: no 30-minute soak was run and the 60 FPS in-world gate was
+not established.
+
+EXPERIMENT AND DECISION:
+
+- Added Windows native page-write tracking to avoid re-reading and re-hashing
+  unchanged guest textures between submissions, retaining the sparse/rotating
+  exact hash path as fallback. GPU and runtime suites and strict all-target
+  Clippy were green before retail testing.
+- The profiled Minecraft run
+  `scratch/mc-write-watch-profile-ab/soak-1785636647282` lasted 193.6 s and
+  produced 11,072 flips. Against retained profiled baseline
+  `scratch/mc-texture-scratch-profile-ab/soak-1785629447975`, texture-hash
+  p50/p95/p99 fell from 7/30/40 to 0/6/16 us; T# resolution fell from
+  9/29/47 to 2/5/29 us; resource binding fell from 12/31/50 to 6/12/33 us;
+  and draw-common fell from 71/129/180 to 60/117/146 us. This confirms that
+  persistent dirty tracking can remove a real per-draw CPU cost.
+- Two clean Minecraft candidate runs were mixed rather than an acceptable
+  default win. Run `scratch/mc-write-watch-clean-ab/soak-1785635888316`
+  produced 9,664 flips in 194.4 s with a 9.6 s longest no-flip window; run
+  `scratch/mc-write-watch-clean-ab-2/soak-1785636421313` produced 10,112 flips
+  in 194.0 s with the same 9.6 s longest window. The same-build disabled
+  control `scratch/mc-write-watch-control-ab/soak-1785636169854` produced
+  9,728 flips in 194.2 s and a 7.1 s longest window.
+- The required unrelated-title smoke decisively rejected the approach.
+  `scratch/write-watch-astro-60.json` / raw run `run-1785636942300` crashed
+  ASTRO.BOT after 17.562 s with zero flips and process exit `0xC0000005`, while
+  retained baseline `artifacts/compat/astro-bc-budget-final-20260731.json`
+  reached 18 flips over 49.287 s and exited cleanly. The raw log ended during
+  startup without a distilled emulator fault, so no narrower safe exception
+  was justified.
+- All native write-watch changes and tests were removed. The measurements
+  justify pursuing explicit emulator-owned page generations/dirty ranges, not
+  changing the reservation policy of every guest allocation.
+
+## 2026-08-01 - Compatibility diff tool lifetime build fix
+
+- Current `main` could not compile `xtask` because the local `by_hash` closure
+  returned references whose lifetime could not be expressed across the
+  closure boundary. Replaced it with a named `results_by_hash` helper so the
+  returned map is correctly tied to the input `RunReport`.
+- `cargo test -p xtask` passed all 80 tests and strict all-target Clippy passed.
+- A literal `cargo xtask compat run --help` is not a help-only command in the
+  current CLI and accidentally ran the default 60-second Minecraft sweep.
+  Its shorter timeout makes its generated comparison unsuitable as baseline
+  evidence; it is intentionally not used for a compatibility claim.
+
+## 2026-08-01 - Minecraft owner-RIP localization and quiet draw profile
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**; the only retained
+dirty source at the time of the quiet profile was the progress/xtask work, but
+the measured result still does not belong to commit `4089b15e16b3` alone.
+User-owned Minecraft binaries and the temporary decrypted ELF/Ghidra project
+remain under gitignored `scratch/` and were never added to the tree.
+
+- Clean owner sampling reproduced two stable Streaming Pool convoys. Mutex
+  `0x101b4691098` was held by `Streaming Pool(5)`, acquired from title return
+  address `module+0x8e25e04`, while waiters parked for 5.0-5.6 s. Mutex
+  `0x101b4126718` was held by `Streaming Pool(1)`, acquired from
+  `module+0x8d19ca8`, with approximately 5.17 s waiters. During a convoy, the
+  other pool workers were parked in `ZwWaitForAlertByThreadId`; the owner was
+  in host code for 40/50 sweeps at `raeen.exe+0x9ff1db`.
+- PDB/disassembly resolves `raeen.exe+0x9ff1db` to the `GuestArena::read`
+  RwLock release immediately after `memcpy` (`+0x9ff0c1` entry, `+0x9ff108`
+  read-lock acquired, `+0x9ff1c0` copy, `+0x9ff1db` release). Temporary guest
+  read timing found only millisecond-scale lock waits and was itself
+  perturbative: the instrumented run hit a probable title deadlock after
+  139.5 s. The instrumentation was fully removed.
+- Clean-room Ghidra analysis of the user-owned decrypted ELF shows
+  `module+0x8e25e04` returns from a title container lookup/virtual call,
+  `module+0x8dc58ca` is a title object/vector traversal with virtual type checks
+  and hashing, and `module+0x8d19ca8` returns from another indirect call into a
+  hash-table lookup. None is an emulator wait primitive. Current evidence says
+  Minecraft holds its own mutex across a large title traversal whose host
+  memory/HLE microcosts accumulate; changing mutex fairness would mask the
+  symptom rather than repair the owner operation.
+- Quiet profiled run
+  `scratch/mc-phase2-draw-profile/soak-1785639607766` lasted 196.8 s, produced
+  9,664 flips (49.8 overall), had an 8.6 s worst no-flip window, zero deadlock
+  warnings, 380.7% average CPU, and 2,972 MiB peak RAM. After `Player
+  connected`, draw-common p50/p95/p99 was 101/147/198 us. Shader resolve was
+  34/57/76 us, resource bind 14/39/49 us, Vulkan backend 33/63/98 us, and
+  compute dispatch 293/493/587 us. Every 512-draw window had zero exact
+  resolve hits and 512 misses; same-program misses were 489/500/505 at
+  p50/p95/p99 and almost all churn was inside live GS+PS user-SGPR windows.
+  This justified testing a structural-program/data split, not narrowing the
+  exact key and serving stale values.
+
+## 2026-08-01 - Cached shader resource-plan A/B rejected on Minecraft
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, executable SHA-256
+`D0A0FD656803974645C517CF07995CD5AA16C11405325B6EBF8EDC568945DE4B`.
+Both A/B legs used that exact binary; `RAEEN_SHADER_PROGRAM_PLAN=0/1` was the
+only changed setting. The older soak helper printed the bare SHA in its report;
+the dirty suffix here is the honest source identity. The candidate was fully
+removed after measurement.
+
+- The environment-gated experiment cached only decoded instruction facts
+  (scalar-load positions/widths, live-in-base proof, sampled-image use) while
+  continuing to read current user SGPRs, EUD pointers, descriptors, formats,
+  and guest addresses per bind. A regression proved planned and legacy output
+  byte-identical, then changed the SGPR pointer and proved the second bind read
+  new descriptor bytes. Before retail, 729/729 `kyty-graphics` tests and
+  386/386 runnable `raeen-gpu` tests passed; strict all-target Clippy was green.
+- Disabled control `scratch/mc-shader-plan-ab-off/soak-1785641364959` ran
+  197.0 s, produced 9,280 flips (48.1 overall), had a 7.6 s worst no-flip
+  window, zero deadlocks, 373.5% average CPU, and 2,762 MiB peak RAM. Enabled
+  run `scratch/mc-shader-plan-ab-on/soak-1785641575509` ran 196.9 s, produced
+  9,344 flips (47.8 overall), had an 8.6 s worst window, zero deadlocks,
+  401.5% average CPU, and 2,733 MiB peak RAM. Both had zero shader refusals,
+  Vulkan validation errors, device loss, panics, or fatal events.
+- Post-connect shader resolve p50/p95/p99 regressed from **28/49/66 us** to
+  **33/53/59 us**. The targeted runtime-analysis stage stayed effectively
+  unchanged at 3/5/6 us in both legs; total analysis moved from 11/20/27 to
+  14/21/23 us. The lower p99 did not outweigh worse p50/p95, higher CPU, a
+  longer stall, and no targeted-stage win. The candidate and its tests were
+  fully removed. No `RAEEN_SHADER_PROGRAM_PLAN` path remains.
+- Phase 2 remains red. These were 3.25-minute profiled runs, not the mandatory
+  30-minute strict soak, and neither establishes 60 FPS in-world. Next measured
+  candidates are the remaining high-fan-out compute prepare/backend costs or a
+  narrower title-owner workload reduction; the rejected whole-program plan
+  should not be repeated without new evidence.
+
+## 2026-08-01 - Compute preparation/backend decomposition and PM4 write coherence
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, executable SHA-256
+`D89BE7BD48A56278E13BEBFD950F3E56DAB29818EDC3EAEBA8DAF3A9830FC67A`.
+The soak helper printed the bare SHA; the dirty suffix is the honest source
+identity. User-owned game files and raw reports remain gitignored and outside
+git. Phase 2 remains red: these were short diagnostic runs, not the mandatory
+30-minute strict soak.
+
+- Added behavior-neutral `RAEEN_TIME_DRAW` sub-timers that split compute
+  preparation into storage V# capture, storage-image T# capture, the
+  sampler/GDS/direct-SGPR tail, and remaining dispatch bookkeeping. GPU unit
+  tests and strict all-target Clippy passed before retail measurement.
+- `scratch/mc-compute-prepare-profile/soak-1785642767409` ran 196.6 s,
+  produced 9,472 flips (49.1 overall), recorded an 8.6 s worst no-flip window,
+  zero deadlocks, 377.4% average CPU, and 2,779 MiB peak RAM. Post-connect
+  compute preparation p50/p95/p99 was 138/233/270 us. Storage V# work consumed
+  135/230/258 us, of which guest reads consumed 134/227/255 us, at three
+  buffers and 623/1536/1536 KiB per dispatch. T#, tail, and other work stayed
+  at or near the timer floor.
+- Reused the existing `RAEEN_TIME_COMPUTE` backend split on the same binary in
+  `scratch/mc-compute-backend-profile/soak-1785643109348`: 196.9 s, 9,376
+  flips (48.0 overall), 9.6 s worst no-flip window, zero deadlocks, 387.9%
+  average CPU, and 2,942 MiB peak RAM. Deferred compute build p50/p95/p99 was
+  8/518/651 us while record was 0/7/15 us and commit 0/1/2 us. Cache deltas
+  showed roughly 98% hits and 62,918 skipped uploads, proving that full
+  unchanged-buffer comparison/capture rather than Vulkan recording dominates
+  the tail.
+- Retained one correctness fix exposed by the experiment: a PM4 guest-memory
+  write boundary now invalidates only overlapping submission-local compute
+  storage snapshots. Without this, a later dispatch in the same submission
+  could reuse bytes captured before `WRITE_DATA`/`DMA_DATA`. The regression
+  pins overlapping eviction and disjoint label-write preservation.
+- Broad Windows `MEM_WRITE_WATCH` remains rejected by the earlier ASTRO.BOT
+  crash. The profile justifies explicit emulator-owned dirty generations or
+  another exact invalidation contract; it does not justify sampling writable
+  storage or changing every guest reservation.
+
+## 2026-08-01 - Persistent vertex-upload reuse A/B rejected cross-title
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, exact A/B executable
+SHA-256 `99C3358CFC7A0FCE7A1D9C8C6569AC710C9DAB16678DFF3E61B8AEB0DBE9B6E9`.
+The environment-gated candidate and all public data-shape/lifetime changes
+were fully removed after retail measurement.
+
+- The candidate shared exact guest-addressed vertex snapshots within one PM4
+  submission and reused the existing fence-retired persistent host buffers.
+  It included overlapping PM4-write invalidation and distinguished cache-owned
+  allocations from transient deferred-draw resources. The full GPU target
+  graph compiled and strict all-target Clippy passed before retail.
+- Minecraft control `scratch/mc-vbuf-cache-control/soak-1785644598386` ran
+  197.0 s with 9,472 flips (48.6 overall), an 8.1 s worst stall, zero
+  deadlocks, 377.3% average CPU, and 3,054 MiB peak RAM. Enabled run
+  `scratch/mc-vbuf-cache-enabled/soak-1785644818248` ran 196.3 s with 15,136
+  flips (77.7 overall), the same 8.1 s worst stall, zero deadlocks, 386.8%
+  average CPU, and 2,384 MiB peak RAM. The headline gain was not accepted on
+  its own because the post-connect draw/dispatch mix differed materially.
+- ASTRO.BOT could not decide the gate: enabled
+  `scratch/vbuf-cache-astro-smoke/soak-1785645220452` access-violated at
+  16.2 s with zero flips, but the same-binary disabled control
+  `scratch/vbuf-cache-astro-control/soak-1785645245032` reproduced the same
+  `0xC0000005` earlier at 6.1 s. This current-tree startup instability is
+  independent evidence, not an attributable cache regression.
+- GTA V decided the gate. Enabled
+  `scratch/vbuf-cache-gta-enabled/soak-1785645276695` survived 61.6 s but
+  produced only 2,528 flips (44.7 overall), a 3.6 s worst stall, and 3,305 MiB
+  peak RAM. Same-binary disabled control
+  `scratch/vbuf-cache-gta-control/soak-1785645344484` produced 3,040 flips
+  (50.9 overall), a 2.6 s worst stall, and 3,167 MiB peak RAM. The candidate
+  therefore regressed an unrelated retail title and was fully removed.
+
+## 2026-08-01 - Exact shader-resolution memo bypass A/B rejected
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, exact A/B executable
+SHA-256 `DD97496DCAF02F520F6C4FFD6E177DAB4A6A407C7A4B47040AB08420E3E2F8DA`.
+The environment gate and bypass were fully removed after measurement.
+
+- The candidate bypassed only the exact-state resolved VS+PS LRU for guest
+  shaders. It still performed the normal hot shader-cache lookup, live SGPR
+  capture, resource analysis, and SPIR-V selection, so it changed no shader or
+  Vulkan data. The sequential GPU suite passed 387 tests with 3 ignored and
+  strict all-target Clippy was green.
+- Enabled `scratch/mc-no-resolve-memo-enabled/soak-1785645833118` ran 196.8 s,
+  produced 9,248 flips (47.5 overall), had an 8.2 s worst stall, zero
+  deadlocks, 412.7% average CPU, and 2,920 MiB peak RAM. Disabled control
+  `scratch/mc-no-resolve-memo-control/soak-1785646039605` ran 196.9 s,
+  produced 9,760 flips (50.1 overall), had a 10.7 s worst stall, zero
+  deadlocks, 408.8% average CPU, and 2,814 MiB peak RAM.
+- Bypass did reduce post-connect resolve p50/p95/p99 from 31/48/54 to
+  26/41/50 us, but overall flips fell 5.2%, worker p99 worsened from 97.2 to
+  103.7 ms, compute dispatch tails regressed, and CPU/RAM rose. The isolated
+  resolve win was not a net retail win, so no bypass remains.
+- The next compute optimization must avoid both unsound sampled invalidation
+  and reservation-wide write-watch. The current evidence points to an exact
+  guest dirty-generation contract or removal of duplicate full-buffer passes,
+  with Minecraft plus GTA V as the minimum A/B pair.
+
+## 2026-08-01 - Command-buffer destination zero-fill removed; resource-buffer reuse rejected on RAM
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**. The retained
+executable is SHA-256
+`5D461962B8A69AAA8DFA30F7F62F03B6547F8336C3B5C3366E8AE5673A83E12D`;
+the saved pre-change control is
+`F223C893F164D13D88E7386190C3AF0E422E4F93CF3C7129C44C39765BD0473C`.
+All game files and raw reports remain gitignored and outside git. These are
+short retail samples, not the mandatory 30-minute Phase 2 acceptance soak, so
+Phase 2 remains red.
+
+- Retained an exact command-processor copy reduction: validated dword/indirect
+  command-buffer reads now copy guest bytes directly into reserved `Vec<u32>`
+  capacity through the existing `GpuGuestMemory::read_gpu_uninit` contract,
+  instead of zero-filling the full destination and immediately overwriting it.
+  Allocation size, guest validation, byte budget, and returned bytes are
+  unchanged. A regression authority that refuses the initialized-copy method
+  proves the uninitialized contract is actually used.
+- Final verification passed 388 GPU tests with 3 measurement-only tests
+  ignored, package formatting, strict all-target Clippy, and a release GUI
+  build. Minecraft final
+  `scratch/mc-command-read-final/soak-1785649187693` ran 195.5 s with 14,624
+  flips (75.6 overall; 77.9 average telemetry-window FPS), a 2.0 s worst
+  no-flip window, zero deadlocks, 158.3% average CPU, and 1,830 MiB peak RAM.
+  The exact scripted saved-binary control
+  `scratch/mc-copy-elision-control/soak-1785647781839` ran 195.5 s with 14,144
+  flips (72.9 overall; 75.3 average window FPS), a 2.5 s worst stall, zero
+  deadlocks, 156.3% average CPU, and 1,795 MiB peak RAM. This is a promising
+  +3.4% flip-count / +3.7% overall-rate sample, not proof of a sustained gate.
+- GTA V final `scratch/gta-command-read-final/soak-1785649117044` ran 60.8 s
+  with 2,688 flips (46.9 overall; 69.0 average window FPS), a 4.1 s worst
+  stall, zero deadlocks, 147.0% average CPU, and 3,203 MiB peak RAM. Its two
+  saved-binary controls produced 2,688/2,912 flips, 46.2/50.0 overall,
+  69.3/68.6 average window FPS, 4.1/3.1 s stalls, 153.0/154.8% average CPU,
+  and 3,168/3,157 MiB peak RAM. The retained change is within GTA's run
+  variance while reducing the avoidable CPU write pass; it did not reproduce
+  the earlier vertex-cache regression.
+- Rejected a broader aligned/unaligned resource-window allocation reuse even
+  though Minecraft reached 14,240 flips (73.6 overall) and GTA's two-run
+  average improved slightly. Four GTA candidate samples consistently peaked
+  at 3,269-3,327 MiB versus stable 3,157-3,168 MiB controls. Peak RAM is a
+  first-class gate metric, so the helper, its regression, and every code path
+  using it were fully removed. Candidate evidence remains under
+  `scratch/*-copy-elision-*`; no rejected resource-buffer lifetime change is
+  present in the retained executable.
+
+## 2026-08-02 - Compute compare-before-copy A/B rejected on Minecraft
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, exact A/B executable
+SHA-256 `921D7CE0DFE74F81D3E001C147D18B96CB959C819CA07FA205C9E1DBD0F465F8`.
+Both legs used that exact binary and scripted saved-world input;
+`RAEEN_COMPUTE_COMPARE_BEFORE_COPY=0/1` was the only changed setting. The
+candidate and environment gate were fully removed after measurement.
+
+- The exact candidate retained the persistent compute-buffer shadow in an
+  `Arc` and, on a cache hit, compared guest memory directly against that
+  snapshot before allocating/copying another full buffer. It preserved byte
+  equality, guest-range validation, GPU-image-shadow precedence, submission
+  byte budgets, and copy-on-write safety for GPU updates. Before retail, 390
+  GPU tests passed with 3 ignored, 106 runtime tests passed, and strict
+  all-target Clippy was green.
+- Disabled control
+  `scratch/mc-compute-reuse-profile-control/soak-1785679796158` ran 195.6 s,
+  produced 13,984 flips (72.3 overall; 75.1 average telemetry-window FPS),
+  had a 3.1 s worst no-flip window, zero deadlocks, 151.5% average CPU, and
+  1,750 MiB peak RAM. Enabled
+  `scratch/mc-compute-reuse-profile-enabled/soak-1785679999885` ran 195.6 s,
+  produced 12,736 flips (65.6 overall; 68.0 average window FPS), had a 2.1 s
+  worst window, zero deadlocks, the same 151.5% average CPU, and 1,776 MiB
+  peak RAM.
+- The candidate lost 8.9% of flips and 9.5% of average window FPS while adding
+  26 MiB peak RAM. Post-world storage V# preparation grew from approximately
+  18-23 us to 81-89 us; its direct full-memory comparison was about four times
+  slower than copying into the current fresh `Vec`, while the backend already
+  skipped most uploads through exact submission-snapshot identity. The shorter
+  stall did not outweigh the frame-rate and memory regressions, so GTA V was
+  not needed to reject the candidate.
+- Post-removal verification passed 388 GPU tests with 3 measurement-only tests
+  ignored, 106 runtime tests, package formatting, and strict all-target Clippy.
+  No compare-before-copy code, public trait change, or cache lifetime change
+  remains. The KytyPS5 memory-tracker design informed the investigation only;
+  no reference code or Sony material was incorporated. Phase 2 remains red:
+  this was a 3.25-minute A/B, not the mandatory 30-minute strict soak.
+
+## 2026-08-02 - Shared compute-shadow lifetime rejected cross-title
+
+BUILD/EVIDENCE IDENTITY: release **`4089b15e16b3+dirty`**, exact A/B executable
+SHA-256 `DD516C8F6ED2CFB2EB79A98F8663E253978728D971CF37BF2EEDDFF546E1167D`.
+The candidate was isolated behind `RAEEN_COMPUTE_SHARE_SHADOW=0/1`; every leg
+used that same executable. The flag, `Arc` data-shape change, and regression
+test were fully removed after GTA V rejected the candidate.
+
+- The candidate did not attempt to detect guest writes. It only let the
+  persistent compute cache share an already captured, exactly validated
+  submission snapshot, with copy-on-write before GPU-output shadow updates.
+  A unit regression proved enabled identity sharing, disabled independent
+  ownership, byte equality, and mutation isolation. Before retail, 389 GPU
+  tests passed with 3 ignored and strict all-target Clippy was green.
+- Minecraft disabled control
+  `scratch/mc-shadow-share-control/soak-1785681154572` ran 195.5 s with 13,952
+  flips (72.1 overall; 74.6 average telemetry-window FPS), a 2.5 s worst
+  no-flip window, zero deadlocks, 152.8% average CPU, and 1,757 MiB peak RAM.
+  Enabled `scratch/mc-shadow-share-enabled/soak-1785681356712` ran 195.5 s
+  with 14,560 flips (75.1 overall; 77.4 average window FPS), a 2.0 s worst
+  window, zero deadlocks, 158.0% average CPU, and 1,768 MiB peak RAM. That was
+  a promising +4.4% flips and better pacing, but cost 11 MiB RAM and higher
+  average CPU, so it advanced to an unrelated-title gate rather than shipping.
+- GTA V reversed the order. Enabled
+  `scratch/gta-shadow-share-enabled/soak-1785681601243` ran 60.8 s with 2,272
+  flips (40.8 overall; 56.4 average window FPS), a 3.6 s worst stall, 186.5%
+  average CPU, and 3,277 MiB peak RAM. Disabled control
+  `scratch/gta-shadow-share-control/soak-1785681672056` ran 60.7 s with 2,624
+  flips (44.3 overall; 58.1 average window FPS), a 3.1 s worst stall, 207.0%
+  average CPU, and 3,118 MiB peak RAM. Sharing therefore lost 13.4% of flips,
+  worsened the average window and stall, and added 159 MiB peak RAM despite
+  lowering CPU. It is not a general improvement.
+- Post-removal verification passed 388 GPU tests with 3 measurement-only tests
+  ignored, package formatting, and strict all-target Clippy. No shared-shadow
+  environment gate or cache lifetime change remains. Raw reports and user game
+  files remain gitignored. Phase 2 remains red; neither short A/B is the
+  mandatory 30-minute strict Minecraft soak.

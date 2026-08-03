@@ -348,17 +348,24 @@ pub(crate) fn read_dwords_validated(addr: u64, count: u32) -> Option<Vec<u32>> {
     }
     let mut out = Vec::<u32>::new();
     out.try_reserve_exact(count as usize).ok()?;
-    out.resize(count as usize, 0);
-    // SAFETY: `out` owns `count * 4` initialized bytes and u32 has no invalid
-    // bit patterns. The slice is used only as the destination of a bounded
-    // process-authorized copy.
-    let raw = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
-    let accepted = with_active_memory(|memory| {
-        memory.validate_gpu_range(addr, bytes as u64, false) && memory.read_gpu(addr, raw)
+    let spare = &mut out.spare_capacity_mut()[..count as usize];
+    // SAFETY: `spare` owns `count * size_of::<u32>()` writable bytes. The
+    // authority may return true only after initializing every byte, and u32
+    // accepts every bit pattern. Length is exposed only on success below.
+    let raw = unsafe {
+        std::slice::from_raw_parts_mut(
+            spare.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+            bytes,
+        )
+    };
+    let accepted = with_active_memory(|memory| unsafe {
+        memory.validate_gpu_range(addr, bytes as u64, false) && memory.read_gpu_uninit(addr, raw)
     })?;
     if !accepted {
         return None;
     }
+    // SAFETY: the accepted authority call initialized all `count` u32 slots.
+    unsafe { out.set_len(count as usize) };
     Some(out)
 }
 
@@ -696,6 +703,60 @@ mod tests {
             read_bytes_validated(addr, expected.len() as u64)
         });
         assert_eq!(got, Some(expected));
+    }
+
+    #[test]
+    fn command_dword_reads_use_the_uninitialized_copy_contract() {
+        struct UninitOnly {
+            start: u64,
+            len: u64,
+        }
+
+        impl GpuGuestMemory for UninitOnly {
+            fn validate_gpu_range(&self, addr: u64, len: u64, _write: bool) -> bool {
+                addr >= self.start
+                    && addr
+                        .checked_add(len)
+                        .is_some_and(|end| end <= self.start + self.len)
+            }
+
+            fn read_gpu(&self, _addr: u64, _out: &mut [u8]) -> bool {
+                false
+            }
+
+            unsafe fn read_gpu_uninit(
+                &self,
+                addr: u64,
+                out: &mut [std::mem::MaybeUninit<u8>],
+            ) -> bool {
+                if !self.validate_gpu_range(addr, out.len() as u64, false) {
+                    return false;
+                }
+                // SAFETY: the validated source and destination both cover
+                // `out.len()` bytes and cannot overlap in this fixture.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        addr as *const u8,
+                        out.as_mut_ptr().cast::<u8>(),
+                        out.len(),
+                    )
+                };
+                true
+            }
+
+            fn write_gpu(&self, _addr: u64, _data: &[u8]) -> bool {
+                false
+            }
+        }
+
+        let data = vec![0xAABB_CCDD, 0x0102_0304, 0x1122_3344];
+        let addr = data.as_ptr() as u64;
+        let memory: Arc<dyn GpuGuestMemory> = Arc::new(UninitOnly {
+            start: addr,
+            len: std::mem::size_of_val(data.as_slice()) as u64,
+        });
+        let got = with_guest_memory(&memory, || read_dwords_validated(addr, 3));
+        assert_eq!(got, Some(data));
     }
 
     #[test]

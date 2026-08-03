@@ -232,16 +232,17 @@ impl CompatDiff {
     }
 }
 
+fn results_by_hash(report: &RunReport) -> BTreeMap<&str, &CompatResult> {
+    report
+        .results
+        .iter()
+        .map(|result| (result.content_sha1.as_str(), result))
+        .collect()
+}
+
 pub(crate) fn compute_diff(old: &RunReport, new: &RunReport, options: DiffOptions) -> CompatDiff {
-    let by_hash = |report: &RunReport| -> BTreeMap<&str, &CompatResult> {
-        report
-            .results
-            .iter()
-            .map(|result| (result.content_sha1.as_str(), result))
-            .collect()
-    };
-    let old_map = by_hash(old);
-    let new_map = by_hash(new);
+    let old_map = results_by_hash(old);
+    let new_map = results_by_hash(new);
     let build_of = |report: &RunReport| {
         report
             .results
@@ -303,7 +304,9 @@ fn classify_title(old: &CompatResult, new: &CompatResult, options: DiffOptions) 
             options.flip_tolerance_pct
         ));
     } else if old_flips == 0 && new_flips > 0 {
-        improvements.push(format!("started presenting frames (0 -> {new_flips} flips)"));
+        improvements.push(format!(
+            "started presenting frames (0 -> {new_flips} flips)"
+        ));
     } else if old_flips > 0 && (new_flips as f64) > old_flips as f64 * (1.0 + tolerance) {
         improvements.push(format!(
             "flips {old_flips} -> {new_flips} (beyond the +{:.0}% tolerance)",
@@ -702,7 +705,9 @@ mod tests {
         let old = real_sweep();
         let mut new = real_sweep();
         // Crashed at 57.8s before, crashes at 3s now: same stage, worse.
-        find(&mut new, "Avatar Frontiers of Pandora").metrics.wall_ms = 3000;
+        find(&mut new, "Avatar Frontiers of Pandora")
+            .metrics
+            .wall_ms = 3000;
         let diff = compute_diff(&old, &new, DiffOptions::default());
         let row = verdict_of(&diff, "Avatar Frontiers of Pandora");
         assert_eq!(row.verdict, Verdict::Regressed);
@@ -713,7 +718,9 @@ mod tests {
     fn wall_noise_inside_a_class_is_not_a_regression() {
         let old = real_sweep();
         let mut new = real_sweep();
-        find(&mut new, "Avatar Frontiers of Pandora").metrics.wall_ms = 31000;
+        find(&mut new, "Avatar Frontiers of Pandora")
+            .metrics
+            .wall_ms = 31000;
         let diff = compute_diff(&old, &new, DiffOptions::default());
         assert_eq!(
             verdict_of(&diff, "Avatar Frontiers of Pandora").verdict,
@@ -745,11 +752,16 @@ mod tests {
         let mut changed = real_sweep();
         find(&mut changed, "Avatar Frontiers of Pandora")
             .evidence
-            .first_blocker =
-            Some("2026-07-26T01:02:03.000000Z ERROR ThreadId(02) other::module: different fault".into());
+            .first_blocker = Some(
+            "2026-07-26T01:02:03.000000Z ERROR ThreadId(02) other::module: different fault".into(),
+        );
         let diff = compute_diff(&old, &changed, DiffOptions::default());
         let row = verdict_of(&diff, "Avatar Frontiers of Pandora");
-        assert_eq!(row.verdict, Verdict::Unchanged, "a changed blocker alone is a note");
+        assert_eq!(
+            row.verdict,
+            Verdict::Unchanged,
+            "a changed blocker alone is a note"
+        );
         assert_eq!(row.blocker_cell, "changed");
         assert!(row.notes[0].contains("different fault"));
     }
@@ -761,7 +773,8 @@ mod tests {
         let after = "2026-07-27T09:14:02.000001Z ERROR ThreadId(63) raeen_runtime::dispatch: \
                      guest fault at <ADDR> (execute <ADDR>) — 2733 HLE call(s) recorded before the fault";
         assert_eq!(normalize_blocker(before), normalize_blocker(after));
-        let unrelated = "ERROR kyty_graphics::shader::parse: unknown smem instruction s_load_dwordx16";
+        let unrelated =
+            "ERROR kyty_graphics::shader::parse: unknown smem instruction s_load_dwordx16";
         assert_ne!(normalize_blocker(before), normalize_blocker(unrelated));
     }
 
@@ -839,16 +852,10 @@ mod tests {
 
     #[test]
     fn positional_extraction_skips_value_flags() {
-        let args: Vec<String> = [
-            "old.json",
-            "--flip-tolerance",
-            "30",
-            "new.json",
-            "--strict",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let args: Vec<String> = ["old.json", "--flip-tolerance", "30", "new.json", "--strict"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
             positionals(&args, &["--flip-tolerance"]),
             vec!["old.json".to_string(), "new.json".to_string()]
