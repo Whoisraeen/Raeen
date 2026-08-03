@@ -71,6 +71,8 @@ pub const RAEEN_CAP_FRAME_GEN: u32 = 1 << 1;
 pub const RAEEN_CAP_WANTS_DEPTH: u32 = 1 << 2;
 /// Wants per-pixel motion vectors.
 pub const RAEEN_CAP_WANTS_MOTION_VECTORS: u32 = 1 << 3;
+/// Can provide its own conservative fallback when the host has no motion image.
+pub const RAEEN_CAP_ACCEPTS_MISSING_MOTION_VECTORS: u32 = 1 << 5;
 
 /// `process` succeeded and populated the output.
 pub const RAEEN_OK: i32 = 0;
@@ -740,6 +742,7 @@ fn capabilities_from_bits(bits: u32) -> Capabilities {
         frame_gen: bits & RAEEN_CAP_FRAME_GEN != 0,
         wants_depth: bits & RAEEN_CAP_WANTS_DEPTH != 0,
         wants_motion_vectors: bits & RAEEN_CAP_WANTS_MOTION_VECTORS != 0,
+        accepts_missing_motion_vectors: bits & RAEEN_CAP_ACCEPTS_MISSING_MOTION_VECTORS != 0,
         gpu_frames: bits & RAEEN_CAP_GPU_FRAMES != 0,
     }
 }
@@ -759,6 +762,9 @@ pub fn capabilities_to_bits(caps: Capabilities) -> u32 {
     }
     if caps.wants_motion_vectors {
         bits |= RAEEN_CAP_WANTS_MOTION_VECTORS;
+    }
+    if caps.accepts_missing_motion_vectors {
+        bits |= RAEEN_CAP_ACCEPTS_MISSING_MOTION_VECTORS;
     }
     if caps.gpu_frames {
         bits |= RAEEN_CAP_GPU_FRAMES;
@@ -883,7 +889,8 @@ impl PresentPlugin for DynamicPlugin {
         };
         if let Err(error) = frame.validate_for_inputs(
             self.capabilities.wants_depth,
-            self.capabilities.wants_motion_vectors,
+            self.capabilities.wants_motion_vectors
+                && !self.capabilities.accepts_missing_motion_vectors,
         ) {
             tracing::warn!(
                 plugin = %self.name,
@@ -2015,6 +2022,7 @@ mod tests {
                 frame_gen: true,
                 wants_depth: true,
                 wants_motion_vectors: true,
+                accepts_missing_motion_vectors: true,
                 gpu_frames: true,
             },
         ] {

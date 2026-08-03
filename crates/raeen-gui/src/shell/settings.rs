@@ -992,6 +992,7 @@ mod tests {
                 frame_gen: true,
                 wants_depth: true,
                 wants_motion_vectors: true,
+                accepts_missing_motion_vectors: false,
                 gpu_frames: true,
             }),
             "Upscale · Frame Gen · Depth · Motion Vectors · GPU"

@@ -106,6 +106,8 @@ result, and `destroy()` at teardown.
 #define RAEEN_CAP_FRAME_GEN            (1u << 1)
 #define RAEEN_CAP_WANTS_DEPTH          (1u << 2)
 #define RAEEN_CAP_WANTS_MOTION_VECTORS (1u << 3)
+#define RAEEN_CAP_GPU_FRAMES (1u << 4)
+#define RAEEN_CAP_ACCEPTS_MISSING_MOTION_VECTORS (1u << 5)
 
 #define RAEEN_OK 0
 
@@ -420,9 +422,12 @@ is what makes this an extension point rather than a copyleft-evasion device.
   extent, image, view, memory, and queue ownership. A plugin requesting depth
   is skipped for frames without an associated depth surface.
 - **Motion vectors are not populated yet.** A plugin requesting them is
-  declined before invocation. PM4-side render-target identification, coordinate
-  normalization, and scale validation are the remaining temporal-input work;
-  zero vectors are not a valid substitute.
+  declined before invocation unless it also advertises
+  `RAEEN_CAP_ACCEPTS_MISSING_MOTION_VECTORS`. That opt-in means the plugin owns
+  a conservative fallback and its history/reset policy; it does not claim that
+  zero object motion is equivalent to real game vectors. PM4-side render-target
+  identification, coordinate normalization, and scale validation remain the
+  full-quality temporal-input work.
 - **ABI v2 remains CPU-only.** It does not set `RAEEN_HOST_GPU_FRAMES`; use v3
   for live Vulkan command-buffer processing.
 - **`generated` frames are validated but not presented.** Frame-gen pacing is

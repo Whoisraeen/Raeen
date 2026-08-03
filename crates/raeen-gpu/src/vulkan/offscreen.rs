@@ -2078,9 +2078,11 @@ fn record_and_read_flush(
     unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
         .map_err(|e| GpuError::VulkanInitFailed(format!("flush vkBeginCommandBuffer: {e}")))?;
     let gpu_request = crate::present_plugin::active_gpu_v3_request().filter(|request| {
-        // Motion-vector extraction is not implemented yet. Keep temporal
-        // plugins fail-closed instead of fabricating zero vectors/history.
+        // Motion-vector extraction is not implemented yet. Plugins that need
+        // host-provided vectors still fail closed; an explicitly fallback-
+        // capable plugin may run and owns the quality/history consequences.
         !request.capabilities.wants_motion_vectors
+            || request.capabilities.accepts_missing_motion_vectors
     });
     let plugin_sync = gpu_request.and_then(|_| dev.next_plugin_timeline());
     let mut plugin_readbacks = Vec::new();

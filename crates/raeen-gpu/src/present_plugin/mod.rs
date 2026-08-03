@@ -56,6 +56,15 @@ pub struct Capabilities {
     /// owns the command stream can supply). Extraction from the PM4 stream is a
     /// follow-up; the flag lets an MV-aware plugin advertise the need now.
     pub wants_motion_vectors: bool,
+    /// Can run when Raeen has no game-provided motion-vector surface.
+    ///
+    /// Such a plugin is responsible for a conservative fallback (for example,
+    /// object-motion zero plus camera reconstruction from depth/matrices) and
+    /// must reset its own history when that fallback is not trustworthy. This
+    /// does not claim that zero vectors are equivalent to real game vectors;
+    /// it only lets the plugin make that explicit quality tradeoff instead of
+    /// being rejected before `process_gpu_v3` is called.
+    pub accepts_missing_motion_vectors: bool,
     /// Can consume GPU-resident frames — borrowed `VkImage`s recorded into a
     /// host command buffer, rather than CPU pixels.
     ///

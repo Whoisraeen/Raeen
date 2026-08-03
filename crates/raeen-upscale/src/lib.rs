@@ -296,6 +296,7 @@ impl PresentPlugin for VendorUpscaler {
             frame_gen: matches!(self.vendor, Vendor::Dlss),
             wants_depth: !matches!(self.vendor, Vendor::Fsr),
             wants_motion_vectors: !matches!(self.vendor, Vendor::Fsr),
+            accepts_missing_motion_vectors: false,
             gpu_frames: false,
         }
     }
