@@ -14,6 +14,7 @@ repository.workspace = true
 [dependencies]
 kyty-core = { path = "../kyty-core" }
 tracing.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 # Validity gate for spirv_asm tests: parse assembled binaries with a pure-Rust

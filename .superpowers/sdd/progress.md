@@ -7040,3 +7040,73 @@ comparison baseline was
 - Clean-room: this phase deleted original dead code and changed original Rust
   tests/documentation only. No reference code, Sony material, firmware, keys,
   decrypted modules, or game data was incorporated.
+
+## 2026-08-03 - Shader Phase 1: measured failure corpus and exact offline replay
+
+BUILD/EVIDENCE IDENTITY: release **`c54cae135eb8+dirty`**, accepted report
+`artifacts/compat/phase1-shader-corpus-c54cae1-dirty.json`, run
+`run-1785736066806`. The comparison baseline was
+`artifacts/compat/phase0-single-translator-rerun-44460ff-dirty.json`.
+Raw shader objects, exact analyzed ABIs, reports, replay results, logs, and game
+files remain local/gitignored under `artifacts/shader-corpus` or the existing
+raw-report directories; none are committed.
+
+- Added `cargo xtask shader-corpus capture`, `report`, and `replay`. Production
+  analysis/translation failures write one standard-SHA1 binary object plus an
+  idempotent provenance event only when `RAEEN_SHADER_CORPUS_DIR` is enabled.
+  Negative-cache retries hit a process-local event set and perform no repeated
+  directory creation or file open. Distinct structural binding states remain
+  distinct replay cases. Corpus I/O is diagnostic-only and cannot fail a draw.
+- Translation-failure events serialize the exact analyzed VS/PS/CS resource
+  ABI. Offline replay restores that ABI, sends the exact captured bytes through
+  the production next-gen/legacy parser and lowering table, applies the same
+  optimizer fallback policy, and requires the production SPIR-V validity gate.
+  Analysis failures, which have no ABI yet, use stage-safe defaults. Unsafe
+  object paths, schema/stage mismatches, missing translation ABIs, object-length
+  mismatches, and SHA-1 mismatches fail closed.
+- TDD went red then green for content-addressed binary/event deduplication,
+  binding-state separation, exact-ABI scalar-buffer replay, address-independent
+  MUBUF classification, cross-title fan-out ranking, production recompiler
+  function naming, missing-recompiler/MTBUF naming, and known compute translation
+  to validated SPIR-V.
+- The fresh accepted corpus contains **139 unique shader binaries**, **3,066
+  exact binding-aware cases**, and **48 stage/opcode/form clusters** from the two
+  swept titles that emitted shader failures (Avatar and Subnautica). The highest
+  fan-out class is compute MUBUF opcode `0x12` / raw `0xe0c82000`: three shaders
+  across both titles. The largest single-title classes are `SLoadDwordx8`
+  `Sdst8SbaseSoffset` (27 shaders / 1,386 cases), MIMG opcode `0x08` (22 shaders),
+  and MIMG opcode `0x00` (11 shaders). `BufferLoadFormatXyz` accounts for one
+  shader / 347 exact cases and is now classified as MTBUF instead of `unknown`.
+- Warm report generation completed in 11.925 s. Offline replay processed all
+  3,066 exact cases in **2.098 s** on its first run and **2.009 s** on the second
+  strict run. The initial burn-down is honestly 0 passed / 3,066 failed; these
+  are captured failures, not a compatibility percentage. The strict second run
+  reported 0 improved and 0 regressed, proving the fast delta loop.
+- The first compatibility candidate was rejected: Avatar reached 347 flips
+  versus 512 (-32.2%). After eliminating repeat corpus filesystem opens and
+  preserving exact binding-state events, the complete sweep was repeated and
+  passed: **8 unchanged, 0 improved, 0 regressed**. Avatar reached 416 flips
+  (-18.8%, within tolerance), Subnautica 4,808 (+0.1%), GTA V 12,512 (+3.4%),
+  and Minecraft 16,711 (+12.5%). GTA V and Minecraft each retained **zero
+  shader errors and zero GPU errors**. The rejected corpus is preserved locally
+  as `artifacts/shader-corpus-rejected-phase1-first-run`.
+- Standing no-silent-no-op audit: the accepted recompiler table's existing
+  invariant test proves it contains no `NotImplemented` rows; parser unknowns
+  and missing type/format pairs return named errors. The known base-zero sampled
+  T# fallback is not silent in the current production path: analysis folds it
+  into the deduplicated `shader-placeholder-texture` descriptor blocker and the
+  bind path records `texture-dummy-served` with the raw first descriptor. Phase
+  3 still requires eliminating these substitutions, not merely diagnosing them.
+- Verification passed all **728 `kyty-graphics` tests**, the complete
+  `raeen-gpu` suite, all **85 `xtask` tests**, strict all-target Clippy across
+  all three packages, touched-package formatting, and `git diff --check`.
+  Workspace-wide formatting remains red only on the pre-existing untouched
+  `xtask/src/main.rs` lines already recorded in Shader Phase 0.
+- Scorecard: failure corpus/clustering moves from D to **A+** because its exact
+  gate passed. The overall shader grade remains **C+ (6.3/10)**: Phase 1 makes
+  missing coverage fast and measurable but implements no new retail opcode.
+  Shader Phase 2 begins with the measured cross-title MUBUF `0x12` cluster.
+- Clean-room: all new corpus, replay, serialization, tests, and reporting code
+  is original Rust based on Raeen's existing public production types. No Sony
+  material, firmware, keys, decrypted modules, game data, or third-party source
+  was incorporated.

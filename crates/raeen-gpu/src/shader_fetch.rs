@@ -43,7 +43,7 @@ use kyty_graphics::shader::analysis::{
 };
 use kyty_graphics::shader::parse::ShaderParseError;
 use kyty_graphics::shader::recompile::{
-    shader_recompile_cs, shader_recompile_ps, shader_recompile_vs,
+    RecompileFn, recomp_func, shader_recompile_cs, shader_recompile_ps, shader_recompile_vs,
 };
 use kyty_graphics::shader::resources::{
     ShaderBindResources, ShaderComputeInputInfo, ShaderEmbeddedConstantLoad, ShaderMappedData,
@@ -52,12 +52,17 @@ use kyty_graphics::shader::resources::{
 use kyty_graphics::shader::types::{
     ShaderCode, ShaderInstruction, ShaderInstructionType, ShaderOperand, ShaderOperandType,
 };
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 /// One fetch step: 4 KiB.
@@ -357,6 +362,17 @@ pub struct TranslatedShader {
     pub cs_info: Arc<ShaderComputeInputInfo>,
 }
 
+/// Exact analyzed stage ABI retained beside a failed shader for offline
+/// replay. Corpus files are local and gitignored because these values are
+/// captured from a user's game process; Raeen supplies no proprietary data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "stage", content = "input", rename_all = "lowercase")]
+pub enum ShaderReplayInput {
+    Vs(Box<ShaderVertexInputInfo>),
+    Ps(Box<ShaderPixelInputInfo>),
+    Cs(Box<ShaderComputeInputInfo>),
+}
+
 /// Parse/analysis result held just long enough to consult the binding-aware
 /// module cache before running the expensive SPIR-V recompiler.
 ///
@@ -464,6 +480,14 @@ impl PreparedShader {
             }
         }
         id.into_boxed_slice()
+    }
+
+    fn replay_input(&self) -> ShaderReplayInput {
+        match self {
+            Self::Vs { info, .. } => ShaderReplayInput::Vs(Box::new(**info)),
+            Self::Ps { info, .. } => ShaderReplayInput::Ps(Box::new(**info)),
+            Self::Cs { info, .. } => ShaderReplayInput::Cs(Box::new(**info)),
+        }
     }
 
     fn recompile(&self) -> Result<Vec<u32>, AttemptError> {
@@ -847,6 +871,9 @@ pub struct ShaderTranslateCache {
     /// ([`Self::map_shader_metadata`]) is rare and copies on write.
     shader_map: Arc<ShaderMap>,
     dump_dir: Option<PathBuf>,
+    corpus_dir: Option<PathBuf>,
+    corpus_context: Option<CorpusContext>,
+    corpus_event_ids: HashSet<String>,
     persistent_dir: Option<PathBuf>,
     stats: ShaderCacheStats,
 }
@@ -865,6 +892,10 @@ impl ShaderTranslateCache {
             .ok()
             .filter(|d| !d.is_empty())
             .map(PathBuf::from);
+        let corpus_dir = std::env::var("RAEEN_SHADER_CORPUS_DIR")
+            .ok()
+            .filter(|d| !d.is_empty() && d != "0" && !d.eq_ignore_ascii_case("off"))
+            .map(PathBuf::from);
         let config = crate::agc_exec::AgcGpuSession::runtime_config();
         // Draw tracing instruments the recompiler itself (POS0 exports,
         // embedded Fetch* VGPR writes). A persistent SPIR-V hit bypasses those
@@ -880,18 +911,23 @@ impl ShaderTranslateCache {
                 .shader_cache_dir
                 .join(format!("spirv-v{DISK_CACHE_VERSION}"))
         });
-        Self::with_dirs(dump_dir, persistent_dir)
+        Self::with_dirs(dump_dir, persistent_dir, corpus_dir)
     }
 
     /// Cache with an explicit dump directory (tests; `None` disables dumps).
     #[must_use]
     #[cfg(test)]
     pub fn with_dump_dir(dump_dir: Option<PathBuf>) -> Self {
-        Self::with_dirs(dump_dir, None)
+        Self::with_dirs(dump_dir, None, None)
     }
 
     #[must_use]
-    fn with_dirs(dump_dir: Option<PathBuf>, persistent_dir: Option<PathBuf>) -> Self {
+    fn with_dirs(
+        dump_dir: Option<PathBuf>,
+        persistent_dir: Option<PathBuf>,
+        corpus_dir: Option<PathBuf>,
+    ) -> Self {
+        let corpus_context = corpus_dir.as_ref().map(|_| CorpusContext::from_env());
         Self {
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
@@ -900,6 +936,9 @@ impl ShaderTranslateCache {
             parsed_code: ParsedCodeCache::default(),
             shader_map: Arc::new(ShaderMap::new()),
             dump_dir,
+            corpus_dir,
+            corpus_context,
+            corpus_event_ids: HashSet::new(),
             persistent_dir,
             stats: ShaderCacheStats::default(),
         }
@@ -1460,6 +1499,7 @@ impl ShaderTranslateCache {
                     window.data.len() * 4,
                     e.msg
                 ));
+                self.capture_failure(stage, &window.data, "analysis", &reason, None, None);
                 warn!(
                     stage = stage.as_str(),
                     addr = format_args!("{addr:#x}"),
@@ -1580,6 +1620,15 @@ impl ShaderTranslateCache {
                     window.data.len() * 4,
                     e.msg
                 ));
+                let replay_input = prepared.replay_input();
+                self.capture_failure(
+                    stage,
+                    &window.data,
+                    "translation",
+                    &reason,
+                    Some(&key.binding),
+                    Some(&replay_input),
+                );
                 // The one loud line per distinct failing shader. Re-binds hit
                 // the negative cache and stay quiet.
                 warn!(
@@ -1756,6 +1805,46 @@ impl ShaderTranslateCache {
             Err(e) => warn!(error = %e, path = %path.display(), "SPIR-V dump failed"),
         }
     }
+
+    /// Persist one distinct failing shader and its exact classified input.
+    /// Corpus I/O is diagnostic-only and can never fail the draw. A process-
+    /// local content/provenance set prevents negative-cache retries from even
+    /// opening a file after the first successful capture of the same event.
+    fn capture_failure(
+        &mut self,
+        stage: Stage,
+        data: &[u32],
+        failure_kind: &'static str,
+        reason: &str,
+        binding_identity: Option<&[u32]>,
+        replay_input: Option<&ShaderReplayInput>,
+    ) {
+        let Some(dir) = self.corpus_dir.clone() else {
+            return;
+        };
+        let Some(context) = self.corpus_context.as_ref() else {
+            return;
+        };
+        if let Err(error) = write_shader_corpus_failure_once(
+            &dir,
+            CorpusFailureInput {
+                stage,
+                data,
+                failure_kind,
+                reason,
+                binding_identity,
+                replay_input,
+            },
+            context,
+            &mut self.corpus_event_ids,
+        ) {
+            warn!(
+                %error,
+                corpus_dir = %dir.display(),
+                "shader failure corpus capture failed"
+            );
+        }
+    }
 }
 
 /// Emit a bounded full binding-key trace for one explicitly requested shader.
@@ -1778,12 +1867,171 @@ fn trace_binding_identity(stage: Stage, addr: u64, binding: &[u32]) {
     if !matches || BINDING_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= BINDING_TRACE_LIMIT {
         return;
     }
+
     warn!(
         stage = stage.as_str(),
         addr = format_args!("{addr:#x}"),
         binding = ?binding,
         "TRACE_SHADER_BINDING module-cache miss"
     );
+}
+
+#[derive(Clone, Debug)]
+struct CorpusContext {
+    title: String,
+    game_id: String,
+    run_id: String,
+    build_revision: String,
+}
+
+impl CorpusContext {
+    fn from_env() -> Self {
+        let env_or = |name: &str, fallback: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| fallback.into())
+        };
+        Self {
+            title: env_or("RAEEN_SHADER_CORPUS_TITLE", "unknown-title"),
+            game_id: env_or("RAEEN_SHADER_CORPUS_GAME_ID", "unknown-game"),
+            run_id: env_or(
+                "RAEEN_COMPAT_RUN_ID",
+                &format!("process-{}", std::process::id()),
+            ),
+            build_revision: env_or("RAEEN_SHADER_CORPUS_BUILD", "unknown-build"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CorpusFailureRecord<'a> {
+    schema_version: u32,
+    captured_unix_ms: u128,
+    shader_sha1: &'a str,
+    stage: &'a str,
+    failure_kind: &'a str,
+    reason: &'a str,
+    binary: String,
+    fetched_bytes: usize,
+    binding_identity: Option<&'a [u32]>,
+    replay_input: Option<&'a ShaderReplayInput>,
+    title: &'a str,
+    game_id: &'a str,
+    run_id: &'a str,
+    build_revision: &'a str,
+}
+
+struct CorpusFailureInput<'a> {
+    stage: Stage,
+    data: &'a [u32],
+    failure_kind: &'a str,
+    reason: &'a str,
+    binding_identity: Option<&'a [u32]>,
+    replay_input: Option<&'a ShaderReplayInput>,
+}
+
+/// Write one corpus event unless this process has already captured its exact
+/// shader, failure, title/run provenance, and binding state. Returns `true`
+/// only when this call performed the bounded best-effort file operations.
+fn write_shader_corpus_failure_once(
+    dir: &Path,
+    failure: CorpusFailureInput<'_>,
+    context: &CorpusContext,
+    seen_event_ids: &mut HashSet<String>,
+) -> std::io::Result<bool> {
+    let CorpusFailureInput {
+        stage,
+        data,
+        failure_kind,
+        reason,
+        binding_identity,
+        replay_input,
+    } = failure;
+    let len_dwords = dump_len_heuristic(data);
+    let bytes: Vec<u8> = data[..len_dwords]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let shader_sha1 = bytes_sha1(&bytes);
+    let binding_bytes: Vec<u8> = binding_identity
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+
+    let event_sha1 = sha1_hex(&[
+        shader_sha1.as_bytes(),
+        stage.as_str().as_bytes(),
+        failure_kind.as_bytes(),
+        reason.as_bytes(),
+        context.title.as_bytes(),
+        context.game_id.as_bytes(),
+        context.run_id.as_bytes(),
+        context.build_revision.as_bytes(),
+        &binding_bytes,
+    ]);
+    if seen_event_ids.contains(&event_sha1) {
+        return Ok(false);
+    }
+
+    let objects = dir.join("objects");
+    let events = dir.join("events");
+    std::fs::create_dir_all(&objects)?;
+    std::fs::create_dir_all(&events)?;
+    write_new_file(&objects.join(format!("{shader_sha1}.bin")), &bytes)?;
+
+    let record = CorpusFailureRecord {
+        schema_version: 2,
+        captured_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        shader_sha1: &shader_sha1,
+        stage: stage.as_str(),
+        failure_kind,
+        reason,
+        binary: format!("objects/{shader_sha1}.bin"),
+        fetched_bytes: bytes.len(),
+        binding_identity,
+        replay_input,
+        title: &context.title,
+        game_id: &context.game_id,
+        run_id: &context.run_id,
+        build_revision: &context.build_revision,
+    };
+    let json = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+    write_new_file(&events.join(format!("{event_sha1}.json")), &json)?;
+    seen_event_ids.insert(event_sha1);
+    Ok(true)
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn sha1_hex(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha1::new();
+    for part in parts {
+        hasher.update(part);
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn bytes_sha1(bytes: &[u8]) -> String {
+    Sha1::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 const fn persistent_cache_enabled(config_enabled: bool, tracing_draws: bool) -> bool {
@@ -1867,6 +2115,133 @@ impl ShaderMemory for WindowMem {
         }
         crate::guest_mem::read_dwords_checked(addr, CHUNK_DWORDS as u32).map(Cow::Owned)
     }
+}
+
+/// Replay one content-addressed shader without launching a game. Translation
+/// failures use the exact analyzed ABI captured by the commercial pipeline;
+/// analysis failures have no ABI yet and replay against stage-safe defaults.
+/// The result passes through the same lowering table, optimizer policy, and
+/// SPIR-V validity gate as production.
+pub fn replay_corpus_shader(
+    stage: &str,
+    bytes: &[u8],
+    replay_input: Option<&ShaderReplayInput>,
+) -> Result<String, String> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return Err(format!("malformed binary length {}", bytes.len()));
+    }
+    let data = bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect();
+    let mem = CorpusReplayMem {
+        base: 0x1_0000,
+        data,
+    };
+    let code = parse_corpus_shader(stage, &mem)?;
+    for instruction in code.get_instructions() {
+        match recomp_func(instruction.type_, instruction.format) {
+            Some(function) => match function.func {
+                RecompileFn::Func(_) => {}
+                RecompileFn::NotImplemented { kyty_func, line } => {
+                    return Err(format!(
+                        "lowering not implemented: {kyty_func} at ShaderSpirv.cpp:{line} ({:?} [{:?}])",
+                        instruction.type_, instruction.format
+                    ));
+                }
+            },
+            None => {
+                return Err(format!(
+                    "no lowering table entry: {:?} [{:?}]",
+                    instruction.type_, instruction.format
+                ));
+            }
+        }
+    }
+
+    let words = match (stage, replay_input) {
+        ("vs", Some(ShaderReplayInput::Vs(info))) => shader_recompile_vs(&code, info),
+        ("ps", Some(ShaderReplayInput::Ps(info))) => shader_recompile_ps(&code, info),
+        ("cs", Some(ShaderReplayInput::Cs(info))) => shader_recompile_cs(&code, info),
+        ("vs", None) => shader_recompile_vs(&code, &ShaderVertexInputInfo::default()),
+        ("ps", None) => {
+            let mut info = ShaderPixelInputInfo::default();
+            info.target_output_mode[0] = 9;
+            shader_recompile_ps(&code, &info)
+        }
+        ("cs", None) => {
+            let info = ShaderComputeInputInfo {
+                threads_num: [1, 1, 1],
+                ..Default::default()
+            };
+            shader_recompile_cs(&code, &info)
+        }
+        ("vs" | "ps" | "cs", Some(input)) => {
+            return Err(format!(
+                "captured ABI stage does not match replay stage {stage:?}: {input:?}"
+            ));
+        }
+        (other, _) => return Err(format!("unknown shader stage {other:?}")),
+    }
+    .map_err(|error| error.to_string())?;
+
+    let words = match crate::spirv_gate::optimize_spirv(&words) {
+        Ok(optimized) => optimized,
+        Err(_) => words,
+    };
+    crate::spirv_gate::validate_spirv(&words)
+        .map_err(|error| format!("SPIR-V validation failed: {error}"))?;
+    Ok(format!(
+        "translated {} instruction(s) to {} validated SPIR-V word(s)",
+        code.get_instructions().len(),
+        words.len()
+    ))
+}
+
+struct CorpusReplayMem {
+    base: u64,
+    data: Vec<u32>,
+}
+
+impl ShaderMemory for CorpusReplayMem {
+    fn dwords_at(&self, addr: u64) -> Option<Cow<'_, [u32]>> {
+        let end = self.base + self.data.len() as u64 * 4;
+        if addr >= self.base && addr < end && (addr - self.base).is_multiple_of(4) {
+            Some(Cow::Borrowed(
+                &self.data[((addr - self.base) / 4) as usize..],
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_corpus_shader(stage: &str, mem: &CorpusReplayMem) -> Result<ShaderCode, String> {
+    let attempt = |next_gen: bool| -> Result<ShaderCode, String> {
+        let sh_regs = ShaderRegisters::default();
+        match stage {
+            "vs" => {
+                let mut vs = VertexShaderInfo::default();
+                vs.es_regs.data_addr = mem.base;
+                vs.gs_regs.chksum = 1;
+                shader_parse_vs(&vs, &sh_regs, mem, next_gen).map_err(|error| error.to_string())
+            }
+            "ps" => {
+                let mut ps = PixelShaderInfo::default();
+                ps.ps_regs.data_addr = mem.base;
+                shader_parse_ps(&ps, &sh_regs, mem, next_gen).map_err(|error| error.to_string())
+            }
+            "cs" => {
+                let mut cs = ComputeShaderInfo::default();
+                cs.cs_regs.data_addr = mem.base;
+                shader_parse_cs(&cs, &sh_regs, mem, next_gen).map_err(|error| error.to_string())
+            }
+            other => Err(format!("unknown shader stage {other:?}")),
+        }
+    };
+    attempt(true).or_else(|next| {
+        attempt(false).map_err(|legacy| format!("next_gen: {next}; legacy: {legacy}"))
+    })
 }
 
 /// A translation attempt failure, with the bit the grow loop needs: did the
@@ -2129,13 +2504,13 @@ mod tests {
         crate::guest_mem::with_test_ranges(
             &[(addr, std::mem::size_of_val(blob.as_slice()))],
             || {
-                let mut writer = ShaderTranslateCache::with_dirs(None, Some(dir.clone()));
+                let mut writer = ShaderTranslateCache::with_dirs(None, Some(dir.clone()), None);
                 let first = writer
                     .translate_vs(&vs_regs_at(addr), &sh_regs)
                     .expect("initial translation");
                 assert_eq!(writer.stats().disk_writes, 1);
 
-                let mut reader = ShaderTranslateCache::with_dirs(None, Some(dir.clone()));
+                let mut reader = ShaderTranslateCache::with_dirs(None, Some(dir.clone()), None);
                 let second = reader
                     .translate_vs(&vs_regs_at(addr), &sh_regs)
                     .expect("persistent hit");
@@ -2868,6 +3243,140 @@ mod tests {
             "a shader that failed translation has no SPIR-V: {files:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_failure_content_addresses_binary_and_deduplicates_the_event() {
+        let dir =
+            std::env::temp_dir().join(format!("raeen_shader_corpus_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = [0xE07C_2000, 0, 0xBF81_0000];
+        let context = CorpusContext {
+            title: "Subnautica Below Zero".into(),
+            game_id: "PPSA02456".into(),
+            run_id: "test-run".into(),
+            build_revision: "test-build+dirty".into(),
+        };
+
+        let mut seen = HashSet::new();
+        let first = write_shader_corpus_failure_once(
+            &dir,
+            CorpusFailureInput {
+                stage: Stage::Cs,
+                data: &data,
+                failure_kind: "analysis",
+                reason: "unknown mubuf instruction buffer_store_dwordx3, opcode = 0x1f",
+                binding_identity: Some(&[1, 2, 3]),
+                replay_input: None,
+            },
+            &context,
+            &mut seen,
+        )
+        .expect("capture first corpus failure");
+        let duplicate = write_shader_corpus_failure_once(
+            &dir,
+            CorpusFailureInput {
+                stage: Stage::Cs,
+                data: &data,
+                failure_kind: "analysis",
+                reason: "unknown mubuf instruction buffer_store_dwordx3, opcode = 0x1f",
+                binding_identity: Some(&[1, 2, 3]),
+                replay_input: None,
+            },
+            &context,
+            &mut seen,
+        )
+        .expect("deduplicate repeated corpus failure");
+        let distinct_binding = write_shader_corpus_failure_once(
+            &dir,
+            CorpusFailureInput {
+                stage: Stage::Cs,
+                data: &data,
+                failure_kind: "analysis",
+                reason: "unknown mubuf instruction buffer_store_dwordx3, opcode = 0x1f",
+                binding_identity: Some(&[1, 2, 4]),
+                replay_input: None,
+            },
+            &context,
+            &mut seen,
+        )
+        .expect("capture distinct binding state");
+
+        assert!(first, "first capture must touch the corpus files");
+        assert!(!duplicate, "repeat capture must perform no filesystem I/O");
+        assert!(
+            distinct_binding,
+            "binding-dependent translation failures must remain distinct"
+        );
+
+        let objects: Vec<_> = std::fs::read_dir(dir.join("objects"))
+            .expect("objects directory")
+            .filter_map(Result::ok)
+            .collect();
+        let events: Vec<_> = std::fs::read_dir(dir.join("events"))
+            .expect("events directory")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(objects.len(), 1, "binary must be hash-deduplicated");
+        assert_eq!(
+            events.len(),
+            2,
+            "identical occurrence is idempotent, distinct binding is preserved"
+        );
+
+        let event: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(events[0].path()).expect("read corpus event"))
+                .expect("valid event JSON");
+        assert_eq!(event["stage"], "cs");
+        assert_eq!(event["title"], context.title);
+        assert_eq!(event["failure_kind"], "analysis");
+        assert!(
+            event["shader_sha1"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 40)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_replay_restores_the_captured_resource_abi() {
+        // s_load_dwordx4 s[16:19], s[12:13], 0; two harmless VALU operations;
+        // s_endpgm. The scalar load cannot lower against an empty ABI.
+        let words = [
+            0xF408_0406u32,
+            0xFA00_0000,
+            0x7E00_0280,
+            0x7E02_0280,
+            S_ENDPGM,
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let missing = replay_corpus_shader("cs", &bytes, None)
+            .expect_err("empty ABI must not invent a storage buffer");
+        assert!(
+            missing.contains("can't recompile: SLoadDwordx4"),
+            "{missing}"
+        );
+
+        let mut info = ShaderComputeInputInfo {
+            threads_num: [1, 1, 1],
+            ..Default::default()
+        };
+        info.bind.push_constant_size = 16;
+        info.bind.extended.used = true;
+        info.bind.extended.start_register = 12;
+        info.bind.storage_buffers.buffers_num = 1;
+        info.bind.storage_buffers.start_register[0] = 12;
+        info.bind.storage_buffers.extended[0] = true;
+        info.bind.storage_buffers.slots[0] = 0;
+        info.bind.storage_buffers.usages[0] =
+            kyty_graphics::shader::resources::ShaderStorageUsage::ReadOnly;
+        let captured = ShaderReplayInput::Cs(Box::new(info));
+        let encoded = serde_json::to_vec(&captured).expect("serialize replay ABI");
+        let decoded: ShaderReplayInput =
+            serde_json::from_slice(&encoded).expect("deserialize replay ABI");
+        let translated = replay_corpus_shader("cs", &bytes, Some(&decoded))
+            .expect("captured ABI must make offline replay faithful");
+        assert!(translated.contains("validated SPIR-V"), "{translated}");
     }
 
     /// The dump-length heuristic: sentinel blobs use their declared size,

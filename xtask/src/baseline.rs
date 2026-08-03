@@ -65,6 +65,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let tier = option(args, "--tier").unwrap_or_else(|| "all".into());
     let profile = option(args, "--profile").unwrap_or_else(|| "max-fps".into());
     let output = PathBuf::from(option(args, "--output").unwrap_or_else(|| DEFAULT_RESULTS.into()));
+    let shader_corpus_dir = PathBuf::from(
+        option(args, "--shader-corpus")
+            .unwrap_or_else(|| crate::shader_corpus::DEFAULT_CORPUS_DIR.into()),
+    );
     let selected = select_games(&registry.games, &tier)?;
     if selected.is_empty() {
         bail!("registry has no games; run `cargo xtask compat discover` first");
@@ -98,6 +102,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 &run_id,
                 &build_revision,
                 &raw_dir,
+                &shader_corpus_dir,
             ) {
                 Ok(result) => {
                     println!(

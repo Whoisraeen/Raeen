@@ -33,6 +33,7 @@ libloading = { workspace = true }
 # keeping adjacent vendor/runtime DLLs out of the executable-plugin scan.
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha1 = { workspace = true }
 # Row-parallel texture detiling. Detiling is per-texel work over millions of
 # elements on the frame's critical path (a 1024x1024x6 panorama is 6.3 M), and
 # every output row is an independent destination slice. SharpEmu parallelizes

@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "generated_unix_ms": 1785737006093,
+  "machine_id": "machine-ddfbe4e61ec9",
+  "results": [
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736080600,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "sha1-b4a5bbff2d87",
+      "title": "A Plague Tale Requiem",
+      "content_sha1": "b4a5bbff2d873f896da8cb8b85d08f254175a779",
+      "stage": "exited",
+      "metrics": {
+        "wall_ms": 13693,
+        "cpu_ms": 10265,
+        "peak_working_set_bytes": 225902592,
+        "exit_code": 0,
+        "flip_events": 0,
+        "shader_errors": 0,
+        "gpu_errors": 0,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": null
+      },
+      "evidence": {
+        "log_sha1": "4405142db31d62981909ef81275f1992e28297b2",
+        "blocker_signature": "197e3b8590ee95d0c3e622e4682bc4593f513c73",
+        "first_blocker": "2026-08-03T05:48:00.364079Z ERROR ThreadId(01) raeen_runtime::dispatch: guest fault at <ADDR> (write 0x390) — 4096 HLE call(s) recorded before the fault; distilled leads follow at WARN, the full oldest-first ring once at DEBUG",
+        "measured": true,
+        "unresolved_nids": []
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736090255,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA21564",
+      "title": "ASTRO.BOT",
+      "content_sha1": "d1d2e75669019a070acb969656e811160b8b0e76",
+      "stage": "crashed",
+      "metrics": {
+        "wall_ms": 9638,
+        "cpu_ms": 2390,
+        "peak_working_set_bytes": 1396989952,
+        "exit_code": -1073741819,
+        "flip_events": 0,
+        "shader_errors": 0,
+        "gpu_errors": 0,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": null
+      },
+      "evidence": {
+        "log_sha1": "9ff0e3d16f6ff8dcb6d8ac606ac703b8e0d1ea09",
+        "blocker_signature": null,
+        "first_blocker": null,
+        "measured": true,
+        "unresolved_nids": []
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736274309,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA01576",
+      "title": "Avatar Frontiers of Pandora",
+      "content_sha1": "d075058339cba635b3f8f1ed5b525347ea895c11",
+      "stage": "timed_out",
+      "metrics": {
+        "wall_ms": 180531,
+        "cpu_ms": 317687,
+        "peak_working_set_bytes": 4937420800,
+        "exit_code": 1,
+        "flip_events": 416,
+        "shader_errors": 16087,
+        "gpu_errors": 13965,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": 2.6
+      },
+      "evidence": {
+        "log_sha1": "c30f255d6ead2d85d68111e19e07d2c7d5edaffd",
+        "blocker_signature": "1fa1efd5b5fcf630637a3d9a6c082e7e4d7f3235",
+        "first_blocker": "2026-08-03T05:48:15.956673Z ERROR ThreadId(65) kyty_graphics::shader::spirv: can't recompile: SLoadDword [SdstSbaseSoffset ] vcc_lo, s[2:3], 8",
+        "measured": true,
+        "unresolved_nids": [
+          {
+            "library": "\"libSceJson2\"",
+            "nid": "0x1af1afb306f4bf7e",
+            "function": "\"_ZN3sce4Json14InitParameter2C2Ev\""
+          },
+          {
+            "library": "\"libSceJson2\"",
+            "nid": "0x5956413f823233e1",
+            "function": "\"_ZN3sce4Json14InitParameter225setSpecialFloatFormatTypeENS0_22SpecialFloatFormatTypeE\""
+          },
+          {
+            "library": "\"libSceJson2\"",
+            "nid": "0x5bbd81f72954d890",
+            "function": "\"_ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv\""
+          },
+          {
+            "library": "\"libSceNet\"",
+            "nid": "0x442098d355ddfb9f",
+            "function": "\"sceNetResolverStartNtoaMultipleRecords\""
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736277539,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA15210",
+      "title": "Dragon Ball Sparking Zero",
+      "content_sha1": "55dab42a702dbba46997255c6fea4d33edca7026",
+      "stage": "exited",
+      "metrics": {
+        "wall_ms": 2416,
+        "cpu_ms": 906,
+        "peak_working_set_bytes": 609177600,
+        "exit_code": 0,
+        "flip_events": 0,
+        "shader_errors": 0,
+        "gpu_errors": 0,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": null
+      },
+      "evidence": {
+        "log_sha1": "800cdb3550157c88ac65beb52353c56847203426",
+        "blocker_signature": null,
+        "first_blocker": null,
+        "measured": true,
+        "unresolved_nids": []
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736458190,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA04264",
+      "title": "Grand Theft Auto V",
+      "content_sha1": "e94fe9c5ee187ab94462886d12812b9e2e15ff05",
+      "stage": "timed_out",
+      "metrics": {
+        "wall_ms": 180624,
+        "cpu_ms": 406109,
+        "peak_working_set_bytes": 3491790848,
+        "exit_code": 1,
+        "flip_events": 12512,
+        "shader_errors": 0,
+        "gpu_errors": 0,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": 82.6
+      },
+      "evidence": {
+        "log_sha1": "d1f2f3ff4e60d8ebc99c56de8528e7df0de2281b",
+        "blocker_signature": null,
+        "first_blocker": null,
+        "measured": true,
+        "unresolved_nids": []
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736638549,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA17221",
+      "title": "Minecraft",
+      "content_sha1": "05b59012cd4ebea8be5ab195b62bd842d158deeb",
+      "stage": "timed_out",
+      "metrics": {
+        "wall_ms": 180325,
+        "cpu_ms": 295218,
+        "peak_working_set_bytes": 1942847488,
+        "exit_code": 1,
+        "flip_events": 16711,
+        "shader_errors": 0,
+        "gpu_errors": 0,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": 104.2
+      },
+      "evidence": {
+        "log_sha1": "7629884e08dd99699b2b9651d25e53aec736c917",
+        "blocker_signature": null,
+        "first_blocker": null,
+        "measured": true,
+        "unresolved_nids": []
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785736825959,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA02456",
+      "title": "Subnautica Below Zero",
+      "content_sha1": "94ff7a9b9eefb17540651e0061d0dd4e97734f5c",
+      "stage": "timed_out",
+      "metrics": {
+        "wall_ms": 187292,
+        "cpu_ms": 668531,
+        "peak_working_set_bytes": 2437652480,
+        "exit_code": 1,
+        "flip_events": 4808,
+        "shader_errors": 552,
+        "gpu_errors": 552,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": 19.4
+      },
+      "evidence": {
+        "log_sha1": "a99d24090839a15cca5f5952e7d1fd2a36eaeb62",
+        "blocker_signature": "21a98597ce71e04392ccf536c06f066873d4ea95",
+        "first_blocker": "2026-08-03T05:57:49.067695Z ERROR ThreadId(24) raeen_runtime::dispatch: guest fault at <ADDR> (read 0x2b) — 4096 HLE call(s) recorded before the fault; distilled leads follow at WARN, the full oldest-first ring once at DEBUG",
+        "measured": true,
+        "unresolved_nids": [
+          {
+            "library": "\"libSceHttp\"",
+            "nid": "0x2166a5027fe0b85b",
+            "function": "\"sceHttpUriParse\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0x049822d021fb6a5e",
+            "function": "\"sceHttp2SetRedirectCallback\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0x077ed2aee85e4396",
+            "function": "\"sceHttp2SslDisableOption\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0x1167303296ebe45f",
+            "function": "\"sceHttp2SslEnableOption\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0x5cfb56e39c622c79",
+            "function": "\"sceHttp2SetSendTimeOut\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0x8b3bc786a803b78e",
+            "function": "\"sceHttp2SetRecvTimeOut\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0x8e315a86404f098b",
+            "function": "\"sceHttp2SetAuthEnabled\""
+          },
+          {
+            "library": "\"libSceHttp2\"",
+            "nid": "0xfc720ee154fceeff",
+            "function": "\"sceHttp2SetConnectTimeOut\""
+          },
+          {
+            "library": "\"libSceIme\"",
+            "nid": "0x564a8b3c0adf15d7",
+            "function": "\"sceImeKeyboardGetInfo\""
+          },
+          {
+            "library": "\"libSceNpManager\"",
+            "nid": "0x39a777aef63f3494",
+            "function": "\"sceNpHasSignedUp\""
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "measured_unix_ms": 1785737006092,
+      "run_id": "run-1785736066806",
+      "build_revision": "c54cae135eb8+dirty",
+      "profile": "max-fps",
+      "game_id": "PPSA15421",
+      "title": "Until Dawn",
+      "content_sha1": "29658d5fc568bc59d46af20b8a7050554622cf83",
+      "stage": "timed_out",
+      "metrics": {
+        "wall_ms": 180092,
+        "cpu_ms": 179687,
+        "peak_working_set_bytes": 1579974656,
+        "exit_code": 1,
+        "flip_events": 0,
+        "shader_errors": 0,
+        "gpu_errors": 0,
+        "audio_errors": 0,
+        "input_events": 0,
+        "observed_fps": null
+      },
+      "evidence": {
+        "log_sha1": "aa67803f04b70ce1a5247eb79253359b2d2d93cd",
+        "blocker_signature": "fd33503d3f43c4addf114488d99d1374fcdcc9cb",
+        "first_blocker": "silent zero-frame run: the guest reached NO frame-path stage — it never opened a video-out handle. Counters: videoout_open=0 buffers_registered=0 flip_rate_set=0 dcb_submitted=0 draws=0 dispatches=0 flips_submitted=0 frames_published=0 process_loaded=@4469ms deps_linked=@4469ms entry_reached=@4606ms initializers_ran=@4651ms first_hle_call=@4650ms first_guest_thread=@5395ms",
+        "measured": true,
+        "unresolved_nids": []
+      }
+    }
+  ]
+}

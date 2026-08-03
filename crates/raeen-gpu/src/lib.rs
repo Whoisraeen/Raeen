@@ -58,5 +58,5 @@ pub use present_plugin::{
     Capabilities, PluginFrame, PluginInfo, PluginOutput, PresentContext, PresentFrame,
     PresentPlugin,
 };
-pub use shader_fetch::ShaderCacheStats;
+pub use shader_fetch::{ShaderCacheStats, ShaderReplayInput, replay_corpus_shader};
 pub use vulkan::offscreen::RenderedImage;

@@ -31,7 +31,7 @@ pub const fn get_dst_sel(swizzle: u32, channel: u32) -> u8 {
 /// Kyty: Shader.h `ShaderBufferResource` (L552) — a V# (vertex/buffer
 /// descriptor), 4 dwords. Legacy (PS4) accessors: `base44`/`nfmt`/`dfmt`;
 /// next-gen (PS5): `base48`/`format`/`out_of_bounds`.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderBufferResource {
     pub fields: [u32; 4],
 }
@@ -151,7 +151,7 @@ impl ShaderBufferResource {
 
 /// Kyty: Shader.h `ShaderTextureResource` (L597) — a T# (texture descriptor),
 /// 8 dwords. Legacy accessors use a 38-bit base; next-gen a 40-bit base.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderTextureResource {
     pub fields: [u32; 8],
 }
@@ -441,7 +441,7 @@ impl ShaderTextureResource {
 
 /// Kyty: Shader.h `ShaderSamplerResource` (L675) — an S# (sampler
 /// descriptor), 4 dwords.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderSamplerResource {
     pub fields: [u32; 4],
 }
@@ -602,7 +602,7 @@ impl ShaderSamplerResource {
 }
 
 /// Kyty: Shader.h `ShaderGdsResource` (L714).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderGdsResource {
     pub field: u32,
 }
@@ -620,13 +620,13 @@ impl ShaderGdsResource {
 }
 
 /// Kyty: Shader.h `ShaderDirectSgprResource` (L722).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderDirectSgprResource {
     pub field: u32,
 }
 
 /// Kyty: Shader.h `ShaderExtendedResource` (L727) — EUD base pointer.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderExtendedResource {
     pub fields: [u32; 2],
 }
@@ -645,7 +645,7 @@ impl ShaderExtendedResource {
 }
 
 /// Kyty: Shader.h `ShaderVertexInputBuffer` (L742).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderVertexInputBuffer {
     pub addr: u64,
     pub stride: u32,
@@ -662,7 +662,7 @@ impl ShaderVertexInputBuffer {
 }
 
 /// Kyty: Shader.h `ShaderVertexDestination` (L754).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderVertexDestination {
     pub register_start: i32,
     pub registers_num: i32,
@@ -697,7 +697,7 @@ impl Default for ShaderVertexDestination {
 }
 
 /// Kyty: Shader.h `ShaderStorageUsage` (L760).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShaderStorageUsage {
     #[default]
     Unknown,
@@ -707,7 +707,7 @@ pub enum ShaderStorageUsage {
 }
 
 /// Kyty: Shader.h `ShaderTextureUsage` (L768).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShaderTextureUsage {
     #[default]
     Unknown,
@@ -716,7 +716,7 @@ pub enum ShaderTextureUsage {
 }
 
 /// Kyty: Shader.h `ShaderStorageResources` (L775).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderStorageResources {
     pub buffers: [ShaderBufferResource; Self::BUFFERS_MAX],
     pub usages: [ShaderStorageUsage; Self::BUFFERS_MAX],
@@ -739,7 +739,7 @@ impl ShaderStorageResources {
 }
 
 /// Kyty: Shader.h `ShaderTextureDescriptor` (L788).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderTextureDescriptor {
     pub texture: ShaderTextureResource,
     pub usage: ShaderTextureUsage,
@@ -750,7 +750,7 @@ pub struct ShaderTextureDescriptor {
 }
 
 /// Kyty: Shader.h `ShaderTextureResources` (L798).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderTextureResources {
     pub desc: [ShaderTextureDescriptor; Self::RES_MAX],
     pub textures_num: i32,
@@ -772,7 +772,7 @@ impl ShaderTextureResources {
 }
 
 /// Kyty: Shader.h `ShaderSamplerResources` (L810).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderSamplerResources {
     pub samplers: [ShaderSamplerResource; Self::RES_MAX],
     pub slots: [i32; Self::RES_MAX],
@@ -787,7 +787,7 @@ impl ShaderSamplerResources {
 }
 
 /// Kyty: Shader.h `ShaderGdsResources` (L822).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderGdsResources {
     pub pointers: [ShaderGdsResource; Self::POINTERS_MAX],
     pub slots: [i32; Self::POINTERS_MAX],
@@ -802,7 +802,7 @@ impl ShaderGdsResources {
 }
 
 /// Kyty: Shader.h `ShaderDirectSgprsResources` (L834).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderDirectSgprsResources {
     pub sgprs: [ShaderDirectSgprResource; Self::SGPRS_MAX],
     pub start_register: [i32; Self::SGPRS_MAX],
@@ -817,7 +817,7 @@ impl ShaderDirectSgprsResources {
 }
 
 /// Kyty: Shader.h `ShaderExtendedResources` (L843).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderExtendedResources {
     pub used: bool,
     pub slot: i32,
@@ -842,7 +842,7 @@ pub struct ShaderExtendedResources {
 /// the recompiler lowers uncovered dwords to clamped reads of the `%eud_raw`
 /// SSBO; the dispatch path snapshots the guest window behind the EUD base
 /// pointer into that SSBO (`raeen-gpu` `prepare_stage_binding`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderEudRawResources {
     /// A raw-window read exists: declare + bind the `%eud_raw` SSBO.
     pub used: bool,
@@ -877,7 +877,7 @@ pub struct ShaderEudRawResources {
 /// past the bound length clamp to 0 and stores past it drop, matching RDNA
 /// out-of-bounds behaviour. `used`/`binding_index` are assigned by
 /// `shader_detect_flat_global_window` after every other resource group.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderGlobalMemResources {
     /// A FLAT-class op is present: declare + bind the `%global_mem` SSBO.
     pub used: bool,
@@ -919,7 +919,7 @@ impl Default for ShaderGlobalMemResources {
 /// `shader_detect_embedded_constant_loads` reads the values out of guest
 /// memory during analysis (the recompiler has no raw shader bytes); the
 /// recompiler's `sload_dword_extended` matches by `pc` and emits the stores.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderEmbeddedConstantLoad {
     /// PC of the `s_load` instruction this capture belongs to (the recompiler
     /// matches on `ShaderInstruction::pc`).
@@ -938,7 +938,7 @@ impl ShaderEmbeddedConstantLoad {
 
 /// Beyond Kyty: the set of PC-relative embedded-constant scalar loads a stage
 /// performs (see [`ShaderEmbeddedConstantLoad`]).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderEmbeddedConstantLoads {
     pub loads: [ShaderEmbeddedConstantLoad; Self::LOADS_MAX],
     pub loads_num: i32,
@@ -974,7 +974,7 @@ impl ShaderEmbeddedConstantLoads {
 /// (`base + voffset`) read from those constants — a select over the captured
 /// window keyed by the per-lane byte offset. Measured on the ASTRO.BOT
 /// full-screen-triangle vertex shader (embedded verts `(-1,-1),(3,-1),(-1,3)`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderEmbeddedBufferFetch {
     /// PC of the buffer-load instruction this capture belongs to.
     pub pc: u32,
@@ -1009,7 +1009,7 @@ impl Default for ShaderEmbeddedBufferFetch {
 
 /// Beyond Kyty: the set of in-shader-V# `offen` buffer loads a stage performs
 /// (see [`ShaderEmbeddedBufferFetch`]).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderEmbeddedBufferFetches {
     pub loads: [ShaderEmbeddedBufferFetch; Self::LOADS_MAX],
     pub loads_num: i32,
@@ -1029,7 +1029,7 @@ impl ShaderEmbeddedBufferFetches {
 
 /// Kyty: Shader.h `ShaderBindResources` (L851). Aggregated per-stage binding
 /// info: push-constant window plus every resource group.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderBindResources {
     pub push_constant_offset: u32,
     pub push_constant_size: u32,
@@ -1055,7 +1055,7 @@ pub struct ShaderBindResources {
 }
 
 /// Kyty: Shader.h `ShaderVertexInputInfo` (L864).
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderVertexInputInfo {
     pub resources: [ShaderBufferResource; Self::RES_MAX],
     pub resources_dst: [ShaderVertexDestination; Self::RES_MAX],
@@ -1078,7 +1078,7 @@ impl ShaderVertexInputInfo {
 }
 
 /// Kyty: Shader.h `ShaderComputeInputInfo` (L884).
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderComputeInputInfo {
     pub threads_num: [u32; 3],
     pub group_id: [bool; 3],
@@ -1092,7 +1092,7 @@ pub struct ShaderComputeInputInfo {
 }
 
 /// Kyty: Shader.h `ShaderPixelInputInfo` (L893).
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderPixelInputInfo {
     pub interpolator_settings: [u32; 32],
     pub input_num: u32,

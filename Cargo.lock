@@ -2460,6 +2460,7 @@ version = "0.2.0"
 dependencies = [
  "kyty-core",
  "naga",
+ "serde",
  "spirv-tools",
  "tracing",
 ]
@@ -3784,6 +3785,7 @@ dependencies = [
  "rspirv",
  "serde",
  "serde_json",
+ "sha1",
  "spirv-tools",
  "thiserror 2.0.18",
  "tracing",
@@ -6210,6 +6212,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "raeen-firmware",
+ "raeen-gpu",
  "raeen-hle",
  "raeen-input",
  "serde",

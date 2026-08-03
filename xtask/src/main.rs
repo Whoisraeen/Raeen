@@ -2,6 +2,7 @@ mod baseline;
 mod compat_diff;
 mod nids;
 mod schema;
+mod shader_corpus;
 mod soak;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -66,6 +67,8 @@ fn main() -> Result<()> {
         soak::run(args.get(1..).unwrap_or_default())
     } else if area == "nids" && command == "coverage" {
         nids::coverage(rest)
+    } else if area == "shader-corpus" {
+        shader_corpus::run(command, rest)
     } else if area == "acceptance" && command == "run" {
         acceptance_run(rest)
     } else if area == "--help" || area == "-h" {
@@ -96,6 +99,9 @@ fn print_help() {
                    [--output-dir PATH] [--allow-stale]
   cargo xtask refs report [--state compat/reference-state.json] [--output PATH] [--fetch]
   cargo xtask nids coverage [--registry PATH] [--eboot PATH] [--output PATH] [--full]
+  cargo xtask shader-corpus capture [compat-run options]
+  cargo xtask shader-corpus report [--corpus PATH] [--output PATH]
+  cargo xtask shader-corpus replay [--corpus PATH] [--output PATH] [--strict]
   cargo xtask acceptance run [--output PATH] [--timeout SECONDS]
 
 Raw logs, executable paths, and local machine details stay under gitignored artifacts/.
@@ -342,6 +348,10 @@ fn compat_run(args: &[String]) -> Result<()> {
     let diff_options = compat_diff::parse_options(args)?;
     let selected = select_games(&registry.games, &tier)?;
     let output = PathBuf::from(option(args, "--output").unwrap_or_else(|| DEFAULT_RESULTS.into()));
+    let shader_corpus_dir = PathBuf::from(
+        option(args, "--shader-corpus")
+            .unwrap_or_else(|| shader_corpus::DEFAULT_CORPUS_DIR.into()),
+    );
     // Resolve and read the baseline before the sweep: the default output IS
     // the previous latest.json, so it must be captured before being replaced,
     // and an unreadable explicit --baseline should fail before a long run.
@@ -369,6 +379,7 @@ fn compat_run(args: &[String]) -> Result<()> {
             &run_id,
             &build_revision,
             &raw_dir,
+            &shader_corpus_dir,
         )?);
     }
     let report = RunReport {
@@ -502,6 +513,7 @@ fn run_one(
     run_id: &str,
     build_revision: &str,
     raw_dir: &Path,
+    shader_corpus_dir: &Path,
 ) -> Result<CompatResult> {
     let local_path = game
         .local_path
@@ -526,6 +538,10 @@ fn run_one(
         // heavier diagnostic separately.
         .env("RAEEN_TIME_WORKER", "1")
         .env("RAEEN_COMPAT_RUN_ID", run_id)
+        .env("RAEEN_SHADER_CORPUS_DIR", shader_corpus_dir)
+        .env("RAEEN_SHADER_CORPUS_TITLE", &game.title)
+        .env("RAEEN_SHADER_CORPUS_GAME_ID", &game.id)
+        .env("RAEEN_SHADER_CORPUS_BUILD", build_revision)
         // Frame-path progress. One INFO line every 15 s, and the only thing in
         // the log that survives the hard `child.kill()` below with a record of
         // how far a stalled title actually got. Without it a silent zero-frame
